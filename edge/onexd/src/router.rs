@@ -22,12 +22,12 @@ use tracing::{info, warn};
 
 pub use crate::pricing::Tokens;
 
-use crate::id;
 use crate::lease::{Block, CutoffReason, Ticket};
 use crate::outbox::now_ms;
 use crate::pricing::{cost_milli, estimate_tokens, format_ms, pick_rate};
 use crate::sse::{Event, Splitter};
 use crate::state::State;
+use crate::{chat, id};
 
 /// Claude Code 带图片和长上下文时请求体可达数十 MB。
 const MAX_BODY: usize = 64 * 1024 * 1024;
@@ -257,14 +257,17 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
             &format!("OneX 没有为模型 {model} 配置路由，请联系管理员开通，或换用已开通的模型。"),
         );
     };
-    if route.protocol != "anthropic" {
-        // TODO(S1 之后): 协议转换
-        return anthropic_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "api_error",
-            &format!("OneX Edge 暂不支持 {} 协议的上游。", route.protocol),
-        );
-    }
+    let to_chat = match route.protocol.as_str() {
+        "anthropic" => false,
+        "openai_chat" => true,
+        other => {
+            return anthropic_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "api_error",
+                &format!("OneX Edge 暂不支持 {other} 协议的上游。"),
+            );
+        }
+    };
     // 没有单价就无法计费，不放行。
     let Some(rate) = rate else {
         warn!(model = %model, model_id = %route.model_id, "no rate for model");
@@ -282,11 +285,28 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         );
     };
 
-    let mut url = format!("{}/v1/messages", route.base_url.trim_end_matches('/'));
-    if let Some(q) = uri.query() {
-        url.push('?');
-        url.push_str(q);
-    }
+    let upstream_model = route.upstream_model.clone().unwrap_or_else(|| model.clone());
+    let (url, body) = if to_chat {
+        // `?beta=true` 之类的查询参数属于 Anthropic，不带给 Chat 上游。
+        let chat_req = match chat::build_request(&req, &upstream_model, stream) {
+            Ok(v) => v,
+            Err(msg) => return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg),
+        };
+        (chat::chat_url(&route.base_url), Bytes::from(serde_json::to_vec(&chat_req).unwrap()))
+    } else {
+        let mut url = format!("{}/v1/messages", route.base_url.trim_end_matches('/'));
+        if let Some(q) = uri.query() {
+            url.push('?');
+            url.push_str(q);
+        }
+        let body = if upstream_model != model {
+            req["model"] = Value::String(upstream_model.clone());
+            Bytes::from(serde_json::to_vec(&req).unwrap())
+        } else {
+            body
+        };
+        (url, body)
+    };
     let client = match rt.client_for(&url, route.proxy.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -305,15 +325,14 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
     };
     rt.state.upstream.lock().unwrap().inflight += 1;
 
-    let upstream_model = route.upstream_model.clone().unwrap_or_else(|| model.clone());
-    let body = if upstream_model != model {
-        req["model"] = Value::String(upstream_model.clone());
-        Bytes::from(serde_json::to_vec(&req).unwrap())
+    // Anthropic 的请求头（anthropic-version、anthropic-beta）对 Chat 上游没有意义，不转发。
+    let mut out_headers = if to_chat {
+        let mut h = HeaderMap::new();
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        h
     } else {
-        body
+        forward_headers(&headers)
     };
-
-    let mut out_headers = forward_headers(&headers);
     match route.auth {
         UpstreamAuth::XApiKey => out_headers.insert("x-api-key", header_value(&key)),
         UpstreamAuth::Bearer => out_headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {key}"))),
@@ -376,29 +395,21 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("text/event-stream"));
 
+    if to_chat {
+        return chat_response(req, resp, status, is_sse, stream).await;
+    }
+
     if status.is_success() && is_sse {
         let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
-        tokio::spawn(pump(req, resp, tx));
+        tokio::spawn(pump(req, resp, tx, None));
         let body = Body::from_stream(tokio_stream_from(rx));
         return (status, resp_headers, body).into_response();
     }
 
-    // 非流式，或上游返回错误：读完整个响应再转发。cutoff 和过期时放弃读取。
-    let read = tokio::select! {
-        r = read_limited(resp, MAX_UPSTREAM_BODY) => r,
-        b = req.ticket.stopped() => {
-            req.rec.outcome = Outcome::Stopped(b);
-            req.finish();
-            return block_response(b);
-        }
-    };
-    let bytes = match read {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(request_id = %req.rec.request_id, error = %e, "upstream body read failed");
-            req.finish();
-            return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", "上游模型服务的响应中断，请重试。");
-        }
+    // 非流式，或上游返回错误：读完整个响应再转发。
+    let (mut req, bytes) = match req.read_body(resp).await {
+        Ok(x) => x,
+        Err(r) => return r,
     };
     if status.is_success() {
         req.rec.outcome = Outcome::Ok;
@@ -451,6 +462,27 @@ struct Req {
 }
 
 impl Req {
+    /// 读完整个上游响应。cutoff 或过期时放弃读取；读失败返回 502。失败时已结算。
+    async fn read_body(self, resp: reqwest::Response) -> Result<(Req, Bytes), Response> {
+        let mut req = self;
+        let read = tokio::select! {
+            r = read_limited(resp, MAX_UPSTREAM_BODY) => r,
+            b = req.ticket.stopped() => {
+                req.rec.outcome = Outcome::Stopped(b);
+                req.finish();
+                return Err(block_response(b));
+            }
+        };
+        match read {
+            Ok(b) => Ok((req, b)),
+            Err(e) => {
+                warn!(request_id = %req.rec.request_id, error = %e, "upstream body read failed");
+                req.finish();
+                Err(anthropic_error(StatusCode::BAD_GATEWAY, "api_error", "上游模型服务的响应中断，请重试。"))
+            }
+        }
+    }
+
     /// 第一次尝试没收到响应头就失败了，另记一条 usage，之后重试。
     fn record_failed_attempt(&self, nothing_sent: bool) {
         let mut rec = self.rec.clone();
@@ -512,10 +544,123 @@ impl Router {
     }
 }
 
+/// Chat 上游的响应：流开始前的错误转成 Anthropic 错误；SSE 边译边转；非流式整包转换。
+async fn chat_response(req: Req, resp: reqwest::Response, status: StatusCode, is_sse: bool, stream: bool) -> Response {
+    let client_model = req.rec.model.clone();
+    if status.is_success() && is_sse && stream {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+        tokio::spawn(pump(req, resp, tx, Some(chat::StreamTranslator::new(&client_model))));
+        let headers = [(header::CONTENT_TYPE, "text/event-stream"), (header::CACHE_CONTROL, "no-cache")];
+        return (StatusCode::OK, headers, Body::from_stream(tokio_stream_from(rx))).into_response();
+    }
+    let (mut req, bytes) = match req.read_body(resp).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if !status.is_success() {
+        req.rec.outcome = Outcome::UpstreamStatus(status.as_u16());
+        req.rec.usage_final = true;
+        req.finish();
+        let (kind, msg) = chat::error_to_anthropic(status.as_u16(), &bytes);
+        return anthropic_error(status, kind, &msg);
+    }
+    // 非流式客户端拿到了 SSE（上游无视 stream:false）也照样译完再整包返回。
+    let parsed = if is_sse {
+        collect_chat_sse(&bytes, &client_model)
+    } else {
+        serde_json::from_slice::<Value>(&bytes)
+            .map_err(|_| "上游响应不是有效的 JSON。".to_string())
+            .and_then(|v| chat::response_to_anthropic(&v, &client_model))
+    };
+    match parsed {
+        Ok((msg, has_usage)) => {
+            if has_usage {
+                apply_usage(&mut req.meter.tokens, &msg["usage"]);
+            }
+            req.rec.usage_final = has_usage;
+            req.rec.outcome = Outcome::Ok;
+            req.finish();
+            axum::Json(msg).into_response()
+        }
+        Err(e) => {
+            warn!(request_id = %req.rec.request_id, error = %e, "chat response conversion failed");
+            req.finish();
+            anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &format!("OneX 无法转换上游模型的响应：{e}"))
+        }
+    }
+}
+
+/// 把一整段 Chat SSE 译完，聚合成一个 Anthropic message。
+fn collect_chat_sse(bytes: &[u8], client_model: &str) -> Result<(Value, bool), String> {
+    let mut split = Splitter::default();
+    let (_, mut events) = split.push(bytes);
+    events.extend(split.push(b"\n\n").1);
+    let mut tr = chat::StreamTranslator::new(client_model);
+    let mut out = Vec::new();
+    let mut step = chat::Step::Continue;
+    for ev in &events {
+        step = tr.push(ev, &mut out);
+        if step != chat::Step::Continue {
+            break;
+        }
+    }
+    if step == chat::Step::Continue {
+        step = tr.eof(&mut out);
+    }
+    if step != chat::Step::Done {
+        return Err("上游的流式响应不完整。".into());
+    }
+    let mut content: Vec<Value> = Vec::new();
+    let mut json_buf: Vec<String> = Vec::new();
+    let mut msg = Value::Null;
+    for ev in &out {
+        let v: Value = serde_json::from_str(&ev.data).unwrap();
+        match ev.event.as_deref() {
+            Some("message_start") => msg = v["message"].clone(),
+            Some("content_block_start") => {
+                content.push(v["content_block"].clone());
+                json_buf.push(String::new());
+            }
+            Some("content_block_delta") => {
+                let i = v["index"].as_u64().unwrap() as usize;
+                let d = &v["delta"];
+                if let Some(t) = d.get("text").and_then(Value::as_str) {
+                    let cur = content[i]["text"].as_str().unwrap_or("").to_string();
+                    content[i]["text"] = (cur + t).into();
+                } else if let Some(p) = d.get("partial_json").and_then(Value::as_str) {
+                    json_buf[i].push_str(p);
+                }
+            }
+            Some("message_delta") => {
+                msg["stop_reason"] = v["delta"]["stop_reason"].clone();
+                msg["usage"] = v["usage"].clone();
+            }
+            _ => {}
+        }
+    }
+    for (i, b) in content.iter_mut().enumerate() {
+        if b["type"] == "tool_use" {
+            let s = if json_buf[i].is_empty() { "{}" } else { &json_buf[i] };
+            b["input"] = serde_json::from_str(s).map_err(|_| "上游返回的工具参数不是有效 JSON。".to_string())?;
+        }
+    }
+    msg["content"] = content.into();
+    Ok((msg, tr.usage_final()))
+}
+
 /// 把上游 SSE 转发给客户端，直到上游结束、上游出错、客户端断开或租约中断。
-async fn pump(mut req: Req, mut resp: reqwest::Response, tx: mpsc::Sender<Result<Bytes, std::io::Error>>) {
+/// `tr` 不为空时上游是 Chat，逐事件译成 Anthropic 再发。
+async fn pump(
+    mut req: Req,
+    mut resp: reqwest::Response,
+    tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
+    mut tr: Option<chat::StreamTranslator>,
+) {
     let mut split = Splitter::default();
     let mut stopped = false;
+    let mut translated = Vec::new();
+    // Chat 上游在流里报的错，translator 已经输出了 error 事件
+    let mut reported = false;
     let outcome = 'pump: loop {
         let chunk = tokio::select! {
             // 慢流期间客户端断开也要及时发现，不能等到上游下一个字节。
@@ -523,9 +668,56 @@ async fn pump(mut req: Req, mut resp: reqwest::Response, tx: mpsc::Sender<Result
             b = req.ticket.stopped() => break Outcome::Stopped(b),
             c = resp.chunk() => c,
         };
+        let chunk = match (chunk, tr.as_mut()) {
+            // Chat 上游结束：有终态就补发 message_delta 和 message_stop
+            (Ok(None), Some(t)) => {
+                translated.clear();
+                let step = t.eof(&mut translated);
+                for ev in &translated {
+                    observe(&mut req.rec, &mut req.meter, &mut stopped, ev);
+                }
+                if step == chat::Step::Done {
+                    let _ = tx.send(Ok(chat::encode(&translated))).await;
+                    break Outcome::Ok;
+                }
+                warn!(request_id = %req.rec.request_id, "chat upstream ended without finish_reason");
+                break Outcome::UpstreamError;
+            }
+            (c, _) => c,
+        };
         match chunk {
             Ok(Some(c)) => {
-                let (out, events) = split.push(&c);
+                let (raw, mut events) = split.push(&c);
+                let mut out = raw;
+                if let Some(t) = tr.as_mut() {
+                    translated.clear();
+                    let mut step = chat::Step::Continue;
+                    for ev in &events {
+                        step = t.push(ev, &mut translated);
+                        if step != chat::Step::Continue {
+                            break;
+                        }
+                    }
+                    events = std::mem::take(&mut translated);
+                    out = chat::encode(&events);
+                    match step {
+                        chat::Step::UpstreamError => {
+                            warn!(request_id = %req.rec.request_id, "chat upstream reported an error mid-stream");
+                            let _ = tx.send(Ok(out)).await;
+                            reported = true;
+                            break Outcome::UpstreamError;
+                        }
+                        // 见到 [DONE] 就结束，不等上游关连接
+                        chat::Step::Done => {
+                            for ev in &events {
+                                observe(&mut req.rec, &mut req.meter, &mut stopped, ev);
+                            }
+                            let _ = tx.send(Ok(out)).await;
+                            break Outcome::Ok;
+                        }
+                        _ => {}
+                    }
+                }
                 for ev in &events {
                     observe(&mut req.rec, &mut req.meter, &mut stopped, ev);
                 }
@@ -559,7 +751,20 @@ async fn pump(mut req: Req, mut resp: reqwest::Response, tx: mpsc::Sender<Result
     };
     // 先丢掉上游响应，关闭上游连接，再处理收尾。
     drop(resp);
+    // 流在中途被打断：先把打开的块关上，Anthropic 客户端才能正确显示 error
+    if let (Some(t), true) = (tr.as_mut(), !matches!(outcome, Outcome::Ok | Outcome::ClientCancelled)) {
+        let mut closing = Vec::new();
+        t.abort(&mut closing);
+        if !closing.is_empty() {
+            let _ = tokio::time::timeout(Duration::from_secs(1), tx.send(Ok(chat::encode(&closing)))).await;
+        }
+    }
+    // 译出的 message_delta 总带 usage 字段，是否收到真实的尾部用量以 translator 为准
+    if let Some(t) = &tr {
+        req.rec.usage_final = t.usage_final();
+    }
     let ev = match outcome {
+        _ if reported => None,
         Outcome::UpstreamError => {
             Some(sse_error("api_error", None, "上游模型服务的连接中断，本次回复不完整，请重试。"))
         }

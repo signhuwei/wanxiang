@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod id;
 pub mod ipc;
 pub mod lastgood;

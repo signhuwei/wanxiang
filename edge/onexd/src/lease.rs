@@ -6,7 +6,8 @@
 //!
 //! 续租：总花费到 80% 或剩余租期不足 2 分钟时发 `lease_renew{used_milli=总花费}`，记下快照。
 //! 新租约到来时 `used -= 快照`，快照之后进行中的请求继续花的钱在本机算到新租约上（偏保守）。
-//! `op_id` 由 lease_id 和 used_milli 决定，重发同一份续租是幂等的。
+//! `op_id` 由 lease_id 和 used_milli 决定。快照落盘，收到回应（lease 或 cutoff）之前，
+//! 重连、重发、重启都原样重放同一份，Server 按第一次的结果回。
 //! 没有回应时按 `renew_retry` 重发，等待不超过剩余租期的一半。
 //!
 //! 时间：剩余租期用单调时钟算。收到租约时按 Server 时间换算出剩余时长，之后本机挂钟跳变不影响。
@@ -121,6 +122,9 @@ struct Saved {
     cutoff: Option<String>,
     /// 见过的最大租约 seq，小于等于它的租约是过时的
     lease_seq: u64,
+    /// 已发出、还没收到回应的续租的 used_milli。Server 可能已经提交，回应之前只重放这一份。
+    #[serde(default)]
+    renew_used: Option<i64>,
 }
 
 const VERSION: u32 = 1;
@@ -167,14 +171,10 @@ struct Flight {
     stop: Arc<StopSlot>,
 }
 
-struct Pending {
-    at: Instant,
-    used: i64,
-}
-
 #[derive(Default)]
 struct Renew {
-    pending: Option<Pending>,
+    /// 上一次发送续租的时刻；None 表示可以立即发（新连接、刚重启）
+    sent_at: Option<Instant>,
     sent: u64,
     last_result: Option<(RenewResult, i64)>,
 }
@@ -347,7 +347,7 @@ impl Ledger {
             "expires_at": g.map(|g| &g.expires_at),
             "remaining_ms": g.map(|_| i.remaining(now).as_millis() as u64),
             "renew": {
-                "pending": i.renew.pending.is_some(),
+                "pending": i.saved.renew_used.is_some(),
                 "sent": i.renew.sent,
                 "last_result": i.renew.last_result.map(|(r, _)| r.as_str()),
                 "last_result_at": i.renew.last_result.map(|(_, at)| format_ms(at)),
@@ -380,14 +380,16 @@ impl Ledger {
             return Ok(false);
         }
         let remaining_ms = expires - i.server_now_ms();
-        let carried = match i.renew.pending.take() {
-            Some(p) => {
+        let carried = match i.saved.renew_used {
+            Some(u) => {
                 i.set_result(RenewResult::Granted);
-                i.saved.used_milli - p.used
+                i.saved.used_milli - u
             }
             None => 0,
         };
+        i.renew.sent_at = None;
         let mut next = i.saved.clone();
+        next.renew_used = None;
         next.lease = Some(Grant {
             lease_id: l.lease_id.clone(),
             expires_at: l.expires_at.clone(),
@@ -416,13 +418,15 @@ impl Ledger {
         let mut i = self.inner.lock().unwrap();
         // 先中断再落盘：落盘失败也不能让流继续花钱。
         i.stop_all(Block::Cutoff(CutoffReason::parse(reason)));
-        if i.renew.pending.take().is_some() {
+        if i.saved.renew_used.is_some() {
             i.set_result(RenewResult::Rejected);
         }
+        i.renew.sent_at = None;
         let mut next = i.saved.clone();
         next.cutoff = Some(reason.to_string());
         next.lease = None;
         next.used_milli = 0;
+        next.renew_used = None;
         let r = self.persist(&next);
         i.saved = next;
         i.deadline = None;
@@ -447,12 +451,13 @@ impl Ledger {
             let mut next = i.saved.clone();
             next.lease = None;
             next.used_milli = 0;
+            next.renew_used = None;
             if let Err(e) = self.persist(&next) {
                 error!(error = %format!("{e:#}"), "persist lease state");
             }
             i.saved = next;
             i.deadline = None;
-            i.renew.pending = None;
+            i.renew.sent_at = None;
             return;
         }
         if i.deadline_from_wall {
@@ -469,31 +474,46 @@ impl Ledger {
     /// 新连接建立：之前发出的续租可能没送到，允许立即重发。
     pub fn on_connected(&self) {
         let mut i = self.inner.lock().unwrap();
-        i.renew.pending = None;
+        i.renew.sent_at = None;
         self.check_renew(&i, Instant::now());
     }
 
     /// 控制连接断开：等待中的续租记为网络不可达。不影响进行中的请求。
     pub fn on_disconnected(&self) {
         let mut i = self.inner.lock().unwrap();
-        if i.renew.pending.take().is_some() {
+        if i.renew.sent_at.take().is_some() && i.saved.renew_used.is_some() {
             i.set_result(RenewResult::Unreachable);
         }
     }
 
-    /// 需要续租时返回续租请求，并记为已发送。上一次续租超时没回应时重发。
+    /// 需要续租时返回续租请求，并记为已发送。
+    /// 已有发出但没收到回应的续租时，原样重放它（同一 used_milli、同一 op_id），
+    /// 因为 Server 可能已经提交，换一份会被当作冲突。
     pub fn take_renew(&self) -> Option<RenewRequest> {
         let now = Instant::now();
         let mut i = self.inner.lock().unwrap();
         if !self.renew_ready(&i, now) {
             return None;
         }
-        if i.renew.pending.is_some() {
+        if i.renew.sent_at.is_some() {
             i.set_result(RenewResult::NoResponse);
         }
         let lease_id = i.saved.lease.as_ref()?.lease_id.clone();
-        let used = i.total();
-        i.renew.pending = Some(Pending { at: now, used });
+        let used = match i.saved.renew_used {
+            Some(u) => u,
+            None => {
+                let u = i.total();
+                let mut next = i.saved.clone();
+                next.renew_used = Some(u);
+                // 落盘失败也照样发：最坏情况是重启后换一份 used，被 Server 拒绝后等新租约。
+                if let Err(e) = self.persist(&next) {
+                    error!(error = %format!("{e:#}"), "persist lease state");
+                }
+                i.saved = next;
+                u
+            }
+        };
+        i.renew.sent_at = Some(now);
         i.renew.sent += 1;
         drop(i);
         // 让定时任务按重发时间重新排程
@@ -538,8 +558,8 @@ impl Ledger {
                 next = next.min(renew_at - now);
             }
         }
-        if let Some(p) = &i.renew.pending {
-            let retry_at = p.at + self.retry_wait(&i, now);
+        if let Some(at) = i.renew.sent_at {
+            let retry_at = at + self.retry_wait(&i, now);
             next = next.min(retry_at.saturating_duration_since(now));
         }
         next.max(Duration::from_millis(1))
@@ -555,12 +575,13 @@ impl Ledger {
             return false;
         }
         let Some(g) = &i.saved.lease else { return false };
-        i.total() * 100 >= g.budget_milli * self.opts.renew_at_pct || i.remaining(now) <= self.opts.renew_before
+        i.saved.renew_used.is_some()
+            || i.total() * 100 >= g.budget_milli * self.opts.renew_at_pct
+            || i.remaining(now) <= self.opts.renew_before
     }
 
     fn renew_ready(&self, i: &Inner, now: Instant) -> bool {
-        self.renew_due(i, now)
-            && i.renew.pending.as_ref().is_none_or(|p| now.duration_since(p.at) >= self.retry_wait(i, now))
+        self.renew_due(i, now) && i.renew.sent_at.is_none_or(|at| now.duration_since(at) >= self.retry_wait(i, now))
     }
 
     fn check_renew(&self, i: &Inner, now: Instant) {
@@ -790,6 +811,33 @@ mod tests {
         let r = l.take_renew().unwrap();
         // 用量没变，op_id 相同，Server 按第一次的结果回
         assert_eq!(r.op_id, "l1:0");
+    }
+
+    #[test]
+    fn unanswered_renew_is_replayed_unchanged_even_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::open(&dir.path().join("o.sqlite")).unwrap();
+        let path = dir.path().join("lease.json");
+        {
+            let l = Arc::new(Ledger::open(path.clone(), LeaseOptions::default(), &ob).unwrap());
+            l.grant(&lease("l1", 1, 100, 600_000)).unwrap();
+            l.admit(0).unwrap().finish(85);
+            assert_eq!(l.take_renew().unwrap().op_id, "l1:85");
+            // 回应之前又花了 10：重连后仍重放 85 那一份，不换 op_id
+            l.admit(0).unwrap().finish(10);
+            l.on_disconnected();
+            l.on_connected();
+            let r = l.take_renew().unwrap();
+            assert_eq!((r.used_milli, r.op_id.as_str()), (85, "l1:85"));
+        }
+        // 重启后也一样
+        let l = Arc::new(Ledger::open(path, LeaseOptions::default(), &ob).unwrap());
+        let r = l.take_renew().unwrap();
+        assert_eq!((r.used_milli, r.op_id.as_str()), (85, "l1:85"));
+        // 新租约到来后，85 之后的 10 记到新租约，下一次续租按新租约算
+        l.grant(&lease("l2", 2, 100, 600_000)).unwrap();
+        assert_eq!(l.snapshot().used_milli, 10);
+        assert!(l.take_renew().is_none());
     }
 
     #[test]
