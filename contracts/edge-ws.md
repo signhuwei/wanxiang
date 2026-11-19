@@ -85,6 +85,12 @@ Server 回 `welcome`：
 - Edge 收到确认后不立即删除，保留已确认条目 72 小时（且总量不超过 200 MB，超出时先删最旧的）。
 - 如果 `welcome.ack_seq` 小于本地已确认的最大 seq，说明 Server 丢了数据。Edge 从 `ack_seq + 1` 重传仍保留的条目，并发一条 `diag_result`（`diag_id` 为 `"ack_regression"`），带本地已确认的 seq 和能重传的范围，同时写警告日志。
 
+## OpenAI Chat 路由（v0.10）
+
+- `protocol: "openai_chat"` 的路由由 Edge 把 Anthropic Messages 转成 OpenAI Chat。`base_url` 以 `/v1` 结尾时直接接 `/chat/completions`，否则先补 `/v1`。
+- 用量按 OpenAI 口径：`prompt_tokens` 包含缓存，`input_tokens = prompt_tokens − cached_tokens − cache_write_tokens`；`reasoning_tokens` 是 `completion_tokens` 的子集，只作明细，不重复计费。
+- Provider 以后可以声明 `usage_semantics` 覆盖口径，S1 不实现。
+
 ## 网络代理
 
 Edge 连 Server 和上游时，默认使用环境变量中的代理设置（`HTTPS_PROXY`、`NO_PROXY`）。访问 `127.0.0.1` 和 `localhost` 一律不走代理。route 的 `proxy` 字段可以覆盖：`"none"` 表示直连，URL 表示指定代理。企业员工的电脑上常有公司代理，所以默认遵从代理。
