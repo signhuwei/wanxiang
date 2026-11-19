@@ -6,16 +6,22 @@
 
 每个对象返回 `actions` 数组，列出当前调用者对它能执行的操作（例如 `["read","update","disable"]`）。页面按 `actions` 显示按钮，不自己推导权限。
 
+所有公开对象带 `revision` 和 `actions`。
+
 ## 登录与设备
+
+验证码是登录的必要条件；邀请码只用于加入租户。`target` 是邮箱或手机号。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/auth/code` | `{target}`，发送验证码（S0 开发环境把验证码打印到 Server 日志） |
-| POST | `/auth/login` | `{target, code}` 或 `{invite_code, target, code}`，返回 `{token, user, tenants[]}` |
-| POST | `/auth/select-tenant` | `{tenant_id}`，返回租户范围的令牌 |
-| POST | `/auth/logout` | |
-| GET | `/me` | 当前用户、租户、角色、可用 Agent |
-| POST | `/devices` | `{name, os, arch, public_key}`，返回 `{device_id, device_token}` |
+| POST | `/auth/code` | `{target}`，202。发送验证码（开发环境打印到 Server 日志） |
+| POST | `/auth/login` | `{target, code, invite_code?, kind?}`，`kind` 为 `web`（默认）或 `desktop`。返回全局令牌 `{token, user, tenants[]}` |
+| POST | `/auth/select-tenant` | `{tenant_id, kind?}`，`kind` 不传时继承当前令牌。返回新的租户范围令牌 |
+| POST | `/auth/logout` | 204 |
+| GET | `/me` | `{user, tenant, role, agents}`；未选租户时 `tenant`、`role` 为 null |
+| POST | `/devices` | `{name, os, arch, public_key}`，201，返回 `{device_id, device_token}` |
+
+S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀请码；`POST /invites` 在 S1 实现。
 
 ## 租户管理
 

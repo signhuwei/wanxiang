@@ -9,7 +9,6 @@
 | `identities` | user_id、kind（`email`、`phone`）、value；同一个人可在多个租户 |
 | `memberships` | tenant_id、user_id、role（`owner`、`admin`、`group_admin`、`member`）、status |
 | `login_codes` | target、code_hash、expires_at、attempts |
-| `invites` | code_hash、tenant_id、role、group_id、max_uses、used、expires_at、created_by |
 | `sessions` | token_hash、user_id、tenant_id、kind（`web`、`desktop`）、expires_at |
 | `providers` | id、name、protocol（`anthropic`、`openai_chat`、`openai_responses`）、base_url、secret_ciphertext、status |
 | `models` | id、provider_id、upstream_name、display_name、context_window、status |
@@ -26,12 +25,29 @@
 | `contract` | revision、seat_limit、allowed_agents_json、allowed_models_json、lease_minutes、lease_budget_milli、visibility_json、updated_by、updated_at |
 | `ledger` | id、kind（`topup`、`reserve`、`settle`、`release`、`adjust`）、amount_milli、user_id、lease_id、request_ref、by、at |
 | `leases` | id、device_id、user_id、budget_milli、used_milli、expires_at、status |
-| `devices` | id、user_id、name、os、arch、edge_version、public_key、last_seen_at、status |
+| `devices` | id、user_id、name、os、arch、edge_version、public_key、token_hash、token_expires_at、last_seen_at、status |
+| `invites` | code_hash、role、group_id、max_uses、used、expires_at、created_by |
 | `agent_sessions` | id、device_id、user_id、agent、agent_version、model、started_at、ended_at、event_count、cost_milli |
 | `session_events` | device_id、seq、session_id、kind、at、payload_json；主键 (device_id, seq) |
 | `usage` | device_id、seq、request_id、session_id、model_id、input/output/cache_read/cache_write_tokens、cost_milli、status、at |
 | `diag_jobs` | id、device_id、kind、status、object_key、requested_by、at |
 | `audit` | id、actor、action、target、detail_json、at |
+
+## 权威与索引（v0.1）
+
+租户内的事实以租户库为准。system 库中与租户有关的表只是路由索引，可以从各租户库重建：
+
+| 索引表 | 字段 | 来源 |
+| --- | --- | --- |
+| `memberships` | tenant_id、user_id、role、status | 租户库 `members` |
+| `invite_directory` | code_hash、tenant_id | 租户库 `invites` |
+| `device_directory` | device_id、token_hash、tenant_id | 租户库 `devices` |
+
+因此 `invites` 从 system 库移到租户库（字段不变）；`devices` 增加 `token_hash`、`token_expires_at`（滑动续期）。
+
+接受邀请时，校验邀请、检查 `seat_limit`、增加使用次数、写 `members`，在租户库的一个事务里完成。提交成功后再幂等写 system 索引。索引缺失或不一致时以租户库为准修复：Server 启动时全量核对，查询未命中时按需回查。这样不需要跨库事务。
+
+S0 和 S1 只运行一个 Server 写进程（SQLite 本身也要求单节点写）。水平扩展另行设计。
 
 余额 = `ledger` 中 topup + adjust − settle 的合计，再减去未结算租约的 reserve。Server 在单个事务里写 ledger 和 leases。
 
