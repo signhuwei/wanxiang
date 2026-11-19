@@ -1,0 +1,281 @@
+//! Edge ↔ Server WebSocket 消息，对应 `contracts/edge-ws.md` v0。
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const PROTOCOL_VERSION: &str = "0";
+pub const WS_PATH: &str = "/v1/edge/ws";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Msg {
+    Hello(Hello),
+    Welcome(Welcome),
+    Ping {
+        id: String,
+    },
+    // CONTRACT-PENDING: 契约没写 pong 的字段，这里用 `re` 指向 ping 的 id。
+    Pong {
+        #[serde(default)]
+        re: Option<String>,
+    },
+    Ack(Ack),
+
+    // Server → Edge
+    Config(Config),
+    Secret(Secret),
+    Lease(Lease),
+    Cutoff(Cutoff),
+    Diag(Diag),
+    AgentCmd(AgentCmd),
+    EventsAck(EventsAck),
+
+    // Edge → Server
+    Events(Events),
+    Usage(UsageBatch),
+    LeaseRenew(LeaseRenew),
+    DiagResult(DiagResult),
+    AgentState(AgentState),
+
+    /// 不认识的 type。新版 Server 加消息时旧 Edge 不至于断线。
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ErrorBody {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Hello {
+    pub id: String,
+    pub edge_version: String,
+    pub os: String,
+    pub arch: String,
+    pub config_revision: i64,
+    pub lease_id: Option<String>,
+    pub outbox_last_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Welcome {
+    pub re: String,
+    pub device_id: String,
+    pub user_id: String,
+    pub tenant_id: String,
+    pub server_time: String,
+    pub ack_seq: u64,
+    pub heartbeat_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Ack {
+    pub re: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorBody>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Config {
+    pub id: String,
+    pub revision: i64,
+    #[serde(default)]
+    pub routes: Vec<Route>,
+    #[serde(default)]
+    pub agents: Vec<Value>,
+    #[serde(default)]
+    pub rates: Vec<Value>,
+}
+
+// CONTRACT-PENDING: 契约只写了 `routes[]`，字段是 Edge 的提议，等 gateway.md 定稿后对齐。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Route {
+    /// Agent 请求里的模型名。以 `*` 结尾时按前缀匹配，单独一个 `*` 匹配全部。
+    pub model: String,
+    pub provider_id: String,
+    /// 上游协议，S1 只支持 `anthropic`。
+    pub protocol: String,
+    /// 不含 `/v1/messages`，例如 `https://openrouter.ai/api`。
+    pub base_url: String,
+    /// 转发前把请求里的 `model` 换成这个值；为空时原样转发。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    #[serde(default)]
+    pub auth: UpstreamAuth,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamAuth {
+    /// Anthropic 官方：`x-api-key: <key>`
+    #[default]
+    XApiKey,
+    /// OpenRouter、Kimi 等兼容端点：`Authorization: Bearer <key>`
+    Bearer,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Secret {
+    pub id: String,
+    pub provider_id: String,
+    pub ciphertext: String,
+    pub nonce: String,
+    pub key_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Lease {
+    pub id: String,
+    pub lease_id: String,
+    pub expires_at: String,
+    pub budget_milli: i64,
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Cutoff {
+    pub id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Diag {
+    pub id: String,
+    pub diag_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub upload_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentCmd {
+    pub id: String,
+    pub agent: String,
+    pub action: String,
+}
+
+// CONTRACT-PENDING: 契约写的是 `events_ack{ack_seq}`，没说带 `id` 还是 `re`，两个都接受。
+// 这里把它当作累计确认：所有 seq ≤ ack_seq 的 events 和 usage 都已持久化。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventsAck {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub re: Option<String>,
+    pub ack_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Events {
+    pub id: String,
+    pub batch: Vec<EventItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventItem {
+    pub seq: u64,
+    pub session_id: String,
+    pub kind: String,
+    pub at: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageBatch {
+    pub id: String,
+    pub batch: Vec<UsageItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageItem {
+    pub seq: u64,
+    pub request_id: String,
+    pub session_id: Option<String>,
+    pub provider_id: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_milli: i64,
+    pub at: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LeaseRenew {
+    pub id: String,
+    pub lease_id: String,
+    pub used_milli: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagResult {
+    pub id: String,
+    pub diag_id: String,
+    pub ok: bool,
+    pub detail: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentState {
+    pub id: String,
+    pub agent: String,
+    pub session_id: String,
+    pub state: String,
+    pub exit_code: Option<i32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_contract_examples() {
+        let hello: Msg = serde_json::from_value(
+            json!({"type":"hello","id":"m1","edge_version":"0.1.0","os":"darwin","arch":"arm64",
+            "config_revision":12,"lease_id":"lse_1","outbox_last_seq":4810}),
+        )
+        .unwrap();
+        assert!(matches!(hello, Msg::Hello(Hello { outbox_last_seq: 4810, .. })));
+
+        let welcome: Msg = serde_json::from_value(
+            json!({"type":"welcome","re":"m1","device_id":"dev_1","user_id":"usr_1","tenant_id":"ten_1",
+            "server_time":"2026-11-19T08:00:00Z","ack_seq":4790,"heartbeat_ms":15000}),
+        )
+        .unwrap();
+        assert!(matches!(welcome, Msg::Welcome(Welcome { ack_seq: 4790, heartbeat_ms: 15000, .. })));
+
+        let ack: Msg = serde_json::from_value(json!({"type":"events_ack","ack_seq":7})).unwrap();
+        assert!(matches!(ack, Msg::EventsAck(EventsAck { ack_seq: 7, .. })));
+    }
+
+    #[test]
+    fn unknown_type_does_not_fail() {
+        let m: Msg = serde_json::from_value(json!({"type":"from_the_future","id":"x","n":1})).unwrap();
+        assert_eq!(m, Msg::Unknown);
+    }
+
+    #[test]
+    fn serializes_with_type_tag() {
+        let v = serde_json::to_value(Msg::Ping { id: "m3".into() }).unwrap();
+        assert_eq!(v, json!({"type":"ping","id":"m3"}));
+        let v = serde_json::to_value(Msg::Ack(Ack { re: "s1".into(), ok: true, error: None })).unwrap();
+        assert_eq!(v, json!({"type":"ack","re":"s1","ok":true}));
+    }
+
+    #[test]
+    fn route_defaults() {
+        let r: Route = serde_json::from_value(json!({"model":"claude-*","provider_id":"prv_1","protocol":"anthropic",
+            "base_url":"https://example.invalid"}))
+        .unwrap();
+        assert_eq!(r.auth, UpstreamAuth::XApiKey);
+        assert_eq!(r.upstream_model, None);
+    }
+}
