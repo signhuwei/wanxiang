@@ -1,6 +1,7 @@
 import { randomToken } from './credentials';
 import { MemoryPresence, ValkeyPresence } from './presence';
 import { createServer } from './server';
+import { masterKeyFromEnv } from './provider-secret';
 
 const env = process.env;
 const dev = env.NODE_ENV !== 'production';
@@ -12,7 +13,8 @@ function integer(name: string, fallback: number, min: number, max: number) {
 
 const configuredSecret = env.ONEX_AUTH_SECRET;
 if (configuredSecret !== undefined && configuredSecret.length < 32) throw new Error('ONEX_AUTH_SECRET must contain at least 32 characters');
-if (!dev && (!configuredSecret || !env.ONEX_VALKEY_URL)) throw new Error('Production requires ONEX_AUTH_SECRET and ONEX_VALKEY_URL');
+const masterKey = masterKeyFromEnv(env.ONEX_MASTER_KEY);
+if (!dev && (!configuredSecret || !env.ONEX_VALKEY_URL || !masterKey)) throw new Error('Production requires ONEX_AUTH_SECRET, ONEX_VALKEY_URL and ONEX_MASTER_KEY');
 const codeSecret = configuredSecret ?? randomToken();
 const presence = env.ONEX_VALKEY_URL ? new ValkeyPresence(env.ONEX_VALKEY_URL) : new MemoryPresence();
 try {
@@ -21,7 +23,7 @@ try {
   const app = await createServer({
     dataDir: env.ONEX_DATA_DIR ?? '.local', hostname: env.ONEX_HOST ?? '127.0.0.1',
     port: integer('ONEX_PORT', 3000, 0, 65_535), tenantCacheSize: integer('ONEX_TENANT_CACHE_SIZE', 16, 1, 1_000),
-    heartbeatMs: 15_000, commit: env.ONEX_COMMIT ?? 'unknown', codeSecret, presence,
+    heartbeatMs: 15_000, commit: env.ONEX_COMMIT ?? 'unknown', codeSecret, masterKey, presence,
     deliverCode: dev ? (target, code) => console.info(`[onex-dev] login code for ${target}: ${code}`) : undefined,
   });
   console.info(`OneX Server listening on ${app.server.url}`);

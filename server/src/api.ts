@@ -6,7 +6,7 @@ const errors = {
   unauthenticated: [401, '登录凭据无效或已过期'],
   forbidden: [403, '没有权限执行此操作'],
   not_found: [404, '对象不存在'],
-  conflict: [409, '重复请求的参数不一致'],
+  conflict: [409, '对象版本或重复请求的参数不一致'],
   invalid: [422, '请求参数无效'],
   seat_limit: [403, '租户人数已达合约上限'],
   rate_limited: [429, '请求过快，请稍后再试'],
@@ -35,11 +35,20 @@ export function field(value: unknown, name: string, max = 128) {
 type Result = { status: 200 | 201 | 202 | 204; payload?: Record<string, unknown>; credential?: 'token' | 'device_token' };
 type Cached = { fingerprint: string; status: Result['status']; payload_json: string | null; nonce: string | null; credential: Result['credential'] };
 
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value !== null && typeof value === 'object') {
+    const row = value as Record<string, unknown>;
+    return Object.fromEntries(Object.keys(row).sort().map((key) => [key, canonical(row[key])]));
+  }
+  return value;
+}
+
 export function operation(c: Context, secret: string, now: number, scopeValue: string, params?: unknown) {
   const key = c.req.header('Idempotency-Key');
   if (key !== undefined && !/^[\x21-\x7e]{1,128}$/.test(key)) invalid('Idempotency-Key');
   const scope = hash(`${c.req.path}:${scopeValue}`);
-  const fingerprint = hmac(secret, ['request', params ?? null]);
+  const fingerprint = hmac(secret, ['request', canonical(params ?? null)]);
   const nonce = key === undefined ? null : randomToken();
   const token = nonce ? hmac(secret, ['credential', nonce]) : randomToken();
   const time = iso(now);

@@ -7,6 +7,8 @@ import { ApiError } from './api';
 import { authRoutes } from './auth';
 import { edgeGateway } from './edge';
 import { openapi } from './openapi';
+import { platformRoutes } from './platform-management';
+import { tenantRoutes } from './tenant-management';
 import type { Presence } from './presence';
 import { Store } from './store';
 
@@ -18,6 +20,7 @@ type Options = {
   heartbeatMs: number;
   commit: string;
   codeSecret: string;
+  masterKey?: Uint8Array;
   deliverCode?: (target: string, code: string) => void;
   now?: () => number;
   presence: Presence;
@@ -44,6 +47,8 @@ export async function createServer(opts: Options) {
     app.get('/v1/healthz', (c) => c.json({ status: 'ok', version: pkg.version, commit: opts.commit }));
     app.get('/v1/openapi.json', (c) => c.json(openapi));
     authRoutes(app, store, { ...opts, now });
+    tenantRoutes(app, store, { ...opts, now });
+    platformRoutes(app, store, { ...opts, now });
     edgeGateway(app, store, opts.presence, now, opts.heartbeatMs);
     const server = Bun.serve({ hostname: opts.hostname, port: opts.port,
       fetch: app.fetch, websocket: { ...websocket, maxPayloadLength: 64 * 1024, idleTimeout: 0, sendPings: false },

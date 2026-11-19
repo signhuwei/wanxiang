@@ -19,15 +19,16 @@ function store(capacity = 2) {
 test('migrations persist version, WAL mode and independent tenant databases', async () => {
   const db = store(1);
   try {
-    const a = await seedTenant(db, { target: 'a@example.test' });
+    const a = await seedTenant(db, { target: 'a@example.test', platformAdmin: true });
     const b = await seedTenant(db, { target: 'b@example.test' });
+    expect(db.system.all('SELECT user_id FROM platform_admins')).toEqual([{ user_id: a.userId }]);
     const first = db.tenant(a.tenantId);
     expect(first.get('PRAGMA journal_mode')).toEqual({ journal_mode: 'wal' });
-    expect(first.get('PRAGMA user_version')).toEqual({ user_version: 1 });
+    expect(first.get('PRAGMA user_version')).toEqual({ user_version: 2 });
     expect(db.tenant(b.tenantId).get('SELECT user_id FROM members')).toEqual({ user_id: b.userId });
     expect(() => first.get('SELECT 1')).toThrow();
     expect(db.tenant(a.tenantId).get('SELECT user_id FROM members')).toEqual({ user_id: a.userId });
-    expect(db.system.get('PRAGMA user_version')).toEqual({ user_version: 1 });
+    expect(db.system.get('PRAGMA user_version')).toEqual({ user_version: 2 });
   } finally {
     db.close();
   }
