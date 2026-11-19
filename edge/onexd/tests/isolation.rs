@@ -166,6 +166,8 @@ async fn env() -> Env {
         router_addr: None,
         server_url: None,
         launch: None,
+        credentials: None,
+        identity_transition: Default::default(),
         shutdown: cancel.clone(),
     });
     tokio::spawn(ipc::serve(listener, sock.clone(), srv));

@@ -77,6 +77,8 @@ pub struct State {
     pub upstream: Mutex<Upstream>,
     /// 当前受管 Agent 的会话，router 把 usage 记到它名下
     pub active_session: RwLock<Option<String>>,
+    /// Each managed launch gets its own loopback route credential.
+    pub launch_tokens: RwLock<HashMap<String, String>>,
 }
 
 impl Default for State {
@@ -91,6 +93,7 @@ impl Default for State {
             lease: Default::default(),
             upstream: Default::default(),
             active_session: Default::default(),
+            launch_tokens: Default::default(),
         }
     }
 }

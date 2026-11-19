@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use onexd::credentials::{CredentialStore, DeviceCredentials};
 use onexd::ipc::{self, Ipc};
 use onexd::outbox::{Kind, Outbox};
 use onexd::state::State;
@@ -11,6 +12,24 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 const T: Duration = Duration::from_secs(5);
+
+/// 测试用凭据存储：和真实 Keychain 行为一致（保存/清除/找不到），但不碰系统钥匙串。
+#[derive(Default)]
+struct FakeCredentials(Mutex<Option<DeviceCredentials>>);
+
+impl CredentialStore for FakeCredentials {
+    fn load(&self) -> anyhow::Result<Option<DeviceCredentials>> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+    fn save(&self, creds: &DeviceCredentials) -> anyhow::Result<()> {
+        *self.0.lock().unwrap() = Some(creds.clone());
+        Ok(())
+    }
+    fn clear(&self) -> anyhow::Result<()> {
+        *self.0.lock().unwrap() = None;
+        Ok(())
+    }
+}
 
 struct Client {
     r: BufReader<tokio::net::unix::OwnedReadHalf>,
@@ -52,7 +71,9 @@ async fn status_login_shutdown() {
         outbox: outbox.clone(),
         router_addr: Some("127.0.0.1:1".into()),
         server_url: Some("http://127.0.0.1:2".into()),
-        launch: Some(ipc::LaunchCtx::new(dir.path().to_path_buf(), "localtok".into())),
+        launch: Some(ipc::LaunchCtx::new(dir.path().to_path_buf(), reqwest::Client::new())),
+        credentials: None,
+        identity_transition: Default::default(),
         shutdown: shutdown.clone(),
     });
     let task = tokio::spawn(ipc::serve(listener, path.clone(), srv));
@@ -93,7 +114,10 @@ async fn status_login_shutdown() {
     state.config.write().unwrap().routes = vec![wild];
     let l = c.call(&launch(None)).await;
     assert_eq!((l["ok"].as_bool(), l["model"].as_str()), (Some(true), Some("Qwen3.8-27B")));
-    assert_eq!(l["env"]["ANTHROPIC_API_KEY"], "localtok");
+    assert_eq!(
+        state.launch_tokens.read().unwrap().get(l["env"]["ANTHROPIC_API_KEY"].as_str().unwrap()).map(String::as_str),
+        l["session_id"].as_str()
+    );
     assert_eq!(l["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:1");
     assert!(l["env"].get("SECRET").is_none());
     let run_dir = dir.path().join("run").join(l["launch_id"].as_str().unwrap());
@@ -161,4 +185,188 @@ async fn stale_socket_file_is_replaced() {
     drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
     assert!(path.exists());
     ipc::bind(&path).await.unwrap();
+}
+
+async fn start(
+    dir: &std::path::Path,
+    store: Option<Arc<dyn CredentialStore>>,
+) -> (Arc<State>, Client, CancellationToken) {
+    let path = dir.join("onexd.sock");
+    let state = Arc::new(State::default());
+    let outbox = Arc::new(Outbox::open(&dir.join("o.sqlite")).unwrap());
+    let shutdown = CancellationToken::new();
+    let listener = ipc::bind(&path).await.unwrap();
+    let srv = Arc::new(Ipc {
+        state: state.clone(),
+        outbox,
+        router_addr: Some("127.0.0.1:1".into()),
+        server_url: Some("http://srv.example".into()),
+        launch: Some(ipc::LaunchCtx::new(dir.to_path_buf(), reqwest::Client::new())),
+        credentials: store,
+        identity_transition: Default::default(),
+        shutdown: shutdown.clone(),
+    });
+    tokio::spawn(ipc::serve(listener, path.clone(), srv));
+    (state, Client::connect(&path).await, shutdown)
+}
+
+#[tokio::test]
+async fn login_persists_identity_and_rejects_conflicting_device_until_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn CredentialStore> = Arc::new(FakeCredentials::default());
+    let (state, mut c, _shutdown) = start(dir.path(), Some(store.clone())).await;
+
+    // 正常登录：server + device_id 齐全，落 Keychain
+    let body = json!({"cmd":"login","token":"dev_tok_1","server":"http://srv.example","device_id":"dev_1"}).to_string();
+    let r = c.call(&body).await;
+    assert_eq!(r, json!({"ok": true}));
+    assert_eq!(state.token.borrow().as_deref(), Some("dev_tok_1"));
+    assert_eq!(state.expected_device_id.read().unwrap().as_deref(), Some("dev_1"));
+    let saved = store.load().unwrap().unwrap();
+    assert_eq!(saved.device_id, "dev_1");
+    assert_eq!(saved.device_token, "dev_tok_1");
+    assert_eq!(saved.server, "http://srv.example");
+    // 保存的是 daemon 内存里这把私钥，不是 IPC 输入的任何值（Login 请求根本不带私钥字段）
+    assert_eq!(onexd::secret::DeviceKey::from_bytes(saved.device_key).public_b64(), state.device_key.public_b64());
+
+    // 同一次运行里换一个不同的设备身份登录：拒绝，不覆盖已生效的身份
+    let conflict =
+        json!({"cmd":"login","token":"dev_tok_2","server":"http://srv.example","device_id":"dev_2"}).to_string();
+    let r = c.call(&conflict).await;
+    assert_eq!(r["error"]["code"], "conflict");
+    assert_eq!(state.token.borrow().as_deref(), Some("dev_tok_1"));
+    assert_eq!(store.load().unwrap().unwrap().device_id, "dev_1");
+
+    assert_eq!(c.call(&body).await, json!({"ok": true}));
+    let legacy = c.call(r#"{"cmd":"login","token":"legacy"}"#).await;
+    assert_eq!(legacy["error"]["code"], "conflict");
+    assert_eq!(state.token.borrow().as_deref(), Some("dev_tok_1"));
+}
+
+#[tokio::test]
+async fn logout_clears_keychain_and_shuts_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn CredentialStore> = Arc::new(FakeCredentials::default());
+    let (state, mut c, shutdown) = start(dir.path(), Some(store.clone())).await;
+
+    let body = json!({"cmd":"login","token":"t","server":"http://srv.example","device_id":"dev_1"}).to_string();
+    assert_eq!(c.call(&body).await, json!({"ok": true}));
+    assert!(store.load().unwrap().is_some());
+    state.config.write().unwrap().routes = vec![route("*")];
+    state.secrets.write().unwrap().insert("prv_1".into(), "sk".into());
+
+    let r = c.call(r#"{"cmd":"logout"}"#).await;
+    assert_eq!(r, json!({"ok": true}));
+    assert!(store.load().unwrap().is_none(), "keychain entry must be cleared");
+    assert!(state.secrets.read().unwrap().is_empty());
+    assert_eq!(state.config.read().unwrap().routes.len(), 0);
+    assert!(shutdown.is_cancelled());
+}
+
+#[tokio::test]
+async fn logout_fails_without_clearing_state_when_keychain_delete_fails() {
+    struct Failing;
+    impl CredentialStore for Failing {
+        fn load(&self) -> anyhow::Result<Option<DeviceCredentials>> {
+            Ok(None)
+        }
+        fn save(&self, _: &DeviceCredentials) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn clear(&self) -> anyhow::Result<()> {
+            anyhow::bail!("keychain is locked")
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mut c, shutdown) = start(dir.path(), Some(Arc::new(Failing))).await;
+    state.config.write().unwrap().routes = vec![route("*")];
+
+    let r = c.call(r#"{"cmd":"logout"}"#).await;
+    assert_eq!(r["error"]["code"], "internal");
+    assert!(!shutdown.is_cancelled(), "daemon must not shut down when it cannot report a clean logout");
+    // 失败时不假装已经清了状态
+    assert_eq!(state.config.read().unwrap().routes.len(), 1);
+}
+
+#[tokio::test]
+async fn launch_without_program_downloads_the_managed_release() {
+    let body = b"#!/bin/sh\necho hi\n".to_vec();
+    let sha256 = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&body);
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let app = axum::Router::new().route(
+        "/claude",
+        axum::routing::get({
+            let body = body.clone();
+            move || async move { body }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/claude", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mut c, _shutdown) = start(dir.path(), None).await;
+    assert_eq!(c.call(r#"{"cmd":"login","token":"t"}"#).await, json!({"ok": true}));
+    let mut wild = route("*");
+    wild.upstream_model = Some("Qwen3.8-27B".into());
+    let release = onex_core::ws::AgentRelease {
+        id: "rel_1".into(),
+        agent: "claude-code".into(),
+        version: "2.1.311".into(),
+        os: onex_core::ipc::os_name().into(),
+        arch: onex_core::ipc::arch_name().into(),
+        url,
+        sha256,
+        size: body.len() as u64,
+    };
+    *state.config.write().unwrap() =
+        onexd::state::ConfigSnapshot { revision: 1, routes: vec![wild], rates: vec![], agents: vec![release] };
+
+    let cwd = dir.path().to_string_lossy().to_string();
+    let req =
+        json!({"cmd":"launch","agent":"claude-code","program":null,"cwd":cwd,"env":{"PATH":"/usr/bin"}}).to_string();
+    let l = c.call(&req).await;
+    assert_eq!(l["ok"], true, "{l}");
+    let program = l["program"].as_str().unwrap();
+    assert!(program.contains("/agents/claude-code/releases/"), "{program}");
+    assert_eq!(std::fs::read(program).unwrap(), body);
+
+    let second = c.call(&req).await;
+    assert_eq!(second["ok"], true);
+    assert_eq!(second["program"], l["program"]);
+    let first_token = l["env"]["ANTHROPIC_API_KEY"].as_str().unwrap();
+    let second_token = second["env"]["ANTHROPIC_API_KEY"].as_str().unwrap();
+    assert_ne!(first_token, second_token);
+    assert_ne!(l["session_id"], second["session_id"]);
+    let finish = json!({"cmd":"launch_done","launch_id":l["launch_id"],"exit_code":0}).to_string();
+    assert_eq!(c.call(&finish).await["ok"], true);
+    {
+        let tokens = state.launch_tokens.read().unwrap();
+        assert!(!tokens.contains_key(first_token));
+        assert_eq!(tokens.get(second_token).map(String::as_str), second["session_id"].as_str());
+    }
+    let s = c.call(r#"{"cmd":"status"}"#).await;
+    assert_eq!(s["managed_agents"], json!([{"id":"claude-code","version":"2.1.311","status":"running"}]));
+    let finish = json!({"cmd":"launch_done","launch_id":second["launch_id"],"exit_code":0}).to_string();
+    assert_eq!(c.call(&finish).await["ok"], true);
+    let s = c.call(r#"{"cmd":"status"}"#).await;
+    assert_eq!(s["managed_agents"], json!([{"id":"claude-code","version":"2.1.311","status":"cached"}]));
+}
+
+#[tokio::test]
+async fn launch_without_program_and_no_matching_release_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, mut c, _shutdown) = start(dir.path(), None).await;
+    assert_eq!(c.call(r#"{"cmd":"login","token":"t"}"#).await, json!({"ok": true}));
+    let cwd = dir.path().to_string_lossy().to_string();
+    let req =
+        json!({"cmd":"launch","agent":"claude-code","program":null,"cwd":cwd,"env":{"PATH":"/usr/bin"}}).to_string();
+    let r = c.call(&req).await;
+    // 没有匹配 agent/os/arch 的发行记录：在选型下载这一步就失败，不等到校验模型
+    assert_eq!(r["error"]["code"], "agent_not_allowed", "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("没有可用的受管发行版本"), "{r}");
 }

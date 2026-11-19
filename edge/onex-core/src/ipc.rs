@@ -1,6 +1,6 @@
 //! onexd 本机 IPC：Unix socket，每行一个 JSON 请求，每行一个 JSON 应答。
 //!
-//! 请求：`{"cmd":"status"}`、`{"cmd":"login","token":"..."}`、`{"cmd":"shutdown"}`。
+//! 请求：`{"cmd":"status"}`、`{"cmd":"login","token":"..."}`、`{"cmd":"logout"}`、`{"cmd":"shutdown"}`。
 //! 应答：成功 `{"ok":true,...}`；失败 `{"ok":false,"error":{"code":"...","message":"..."}}`，
 //! code 用 `contracts/errors.md` 里的错误码。
 
@@ -15,18 +15,34 @@ pub const SOCKET_NAME: &str = "onexd.sock";
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
-    /// S0 只把 device_token 存在 daemon 内存里，随后用它连 Server。
+    /// 登录成功后交给 onexd 的设备身份。只带 token 时（旧用法／调试）只存内存，不落 Keychain，
+    /// daemon 重启要重新登录。带齐 `server`/`device_id` 时额外持久化到 macOS Keychain（私钥是
+    /// daemon 自己内存里生成的那把，从不经 IPC 输入或输出），daemon 重启后自动恢复同一个已登录
+    /// 设备身份，不需要重新走验证码登录。
+    ///
+    /// `device_id` 和当前控制连接已用的设备身份不一致时，说明是另一个设备身份登录；onexd 拒绝这次 Login
+    /// （`invalid`），请先 `logout` 或重启 onexd，避免旧身份的 outbox 被新身份的 hello 误续传。
     Login {
         token: String,
+        #[serde(default)]
+        server: Option<String>,
+        #[serde(default)]
+        device_id: Option<String>,
     },
+    /// 注销：先删 Keychain 里持久化的设备身份（失败则整体失败，不报告已注销），
+    /// 再断流、清内存里的配置和密钥、停掉正在跑的受管启动，和 `shutdown` 一样让 daemon 退出。
+    /// 打包环境由 LaunchAgent 用新设备身份重新拉起；手工调试按原来的方式重新执行 onexd。
+    Logout,
     /// 注册设备用的信息：`{public_key, server_url}`。`server_url` 是 Server 的 HTTP 根地址，onexd 没配置 Server 时为 null。
     DeviceInfo,
     /// 准备一次受管启动。onexd 建好目录和策略文件，回 `{launch_id, session_id, program, args, env, cwd, model}`，
     /// 由调用方在自己的终端里用这份 env（清空后设置）前台启动。
     Launch {
         agent: String,
-        /// claude 的绝对路径
-        program: String,
+        /// claude 的绝对路径。不填时 onexd 按 Server 下发的发行目录（`config.agents`）自己选型、下载、
+        /// 校验 SHA-256 并原子缓存，返回缓存里已校验好的绝对路径；没有匹配发行或下载失败时整个请求失败。
+        #[serde(default)]
+        program: Option<String>,
         cwd: String,
         /// 调用方终端的环境，onexd 只取终端相关的几项和 PATH
         env: std::collections::BTreeMap<String, String>,
@@ -109,4 +125,16 @@ pub struct Status {
     /// 本机 router 到上游：进行中的流数、最近一次结束的结果（ok、upstream_error、client_cancelled 等）
     #[serde(default)]
     pub upstream: Value,
+    /// Server 下发、本机已知的受管 Agent 发行目录，只给公开信息：`{id, version, status}`。
+    /// 不含下载地址、摘要或本机缓存路径，避免诊断信息里带着能绕过校验的材料。
+    #[serde(default)]
+    pub managed_agents: Vec<ManagedAgent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManagedAgent {
+    pub id: String,
+    pub version: String,
+    /// `available`（已选型，未必已下载）、`cached`（本机已校验缓存）
+    pub status: String,
 }

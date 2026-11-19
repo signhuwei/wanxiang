@@ -2,9 +2,12 @@
 //!
 //! ```text
 //! onex login <邮箱或手机号> [--invite <邀请码>] [--tenant <租户名或 id>] [--server <https://...>] [--name <设备名>]
-//! onex run claude-code [--model <模型>]   在当前目录受管启动 PATH 里的 Claude Code
+//! onex run claude-code [--model <模型>] [--managed]   在当前目录启动 Claude Code
+//!   不带 --managed：用 PATH 里已安装的 claude（旧用法）
+//!   带 --managed：由 onexd 按 Server 下发的发行目录自己选型、下载、校验、缓存后启动
 //! onex status
-//! onex token <device_token>    调试用：直接交给 onexd 一个已有的 device_token
+//! onex token <device_token>    调试用：直接交给 onexd 一个已有的 device_token，不落 Keychain
+//! onex logout    注销并让 onexd 退出；重新拉起后用新身份登录
 //! onex shutdown
 //! ```
 
@@ -22,9 +25,10 @@ use tokio::net::UnixStream;
 
 const USAGE: &str = "usage:
   onex login <邮箱或手机号> [--invite <邀请码>] [--tenant <租户>] [--server <地址>] [--name <设备名>]
-  onex run claude-code [--model <模型>]
+  onex run claude-code [--model <模型>] [--managed]
   onex status
   onex token <device_token>
+  onex logout
   onex shutdown";
 
 #[tokio::main(flavor = "current_thread")]
@@ -33,7 +37,10 @@ async fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("login") => cmd_login(&args[1..]).await,
         Some("status") if args.len() == 1 => print_reply(call(&Request::Status).await?),
-        Some("token") if args.len() == 2 => print_reply(call(&Request::Login { token: args[1].clone() }).await?),
+        Some("token") if args.len() == 2 => {
+            print_reply(call(&Request::Login { token: args[1].clone(), server: None, device_id: None }).await?)
+        }
+        Some("logout") if args.len() == 1 => print_reply(call(&Request::Logout).await?),
         Some("shutdown") if args.len() == 1 => print_reply(call(&Request::Shutdown).await?),
         Some("run") if args.get(1).map(String::as_str) == Some("claude-code") => cmd_run(&args[2..]).await,
         _ => bail!("{USAGE}"),
@@ -66,10 +73,12 @@ async fn cmd_login(args: &[String]) -> Result<()> {
         }
     };
     let device_name = name.unwrap_or_else(default_device_name);
-    let a = login::LoginArgs { server, target, invite, tenant, device_name, public_key };
+    let a = login::LoginArgs { server: server.clone(), target, invite, tenant, device_name, public_key };
     let r = login::login(&a, &mut prompt).await?;
 
-    let reply = call(&Request::Login { token: r.device_token }).await?;
+    let reply =
+        call(&Request::Login { token: r.device_token, server: Some(server), device_id: Some(r.device_id.clone()) })
+            .await?;
     if reply["ok"] != Value::Bool(true) {
         return print_reply(reply);
     }
@@ -77,31 +86,42 @@ async fn cmd_login(args: &[String]) -> Result<()> {
         "已登录租户「{}」，设备 {} 已注册。onexd 正在连接 Server，可用 onex status 查看。",
         r.tenant_name, r.device_id
     );
-    println!("注意：登录信息只保存在 onexd 内存里，onexd 重启后需要重新运行 onex login。");
+    println!("macOS 上设备身份已保存到系统 Keychain，onexd 重启后会自动恢复，不需要重新运行 onex login。");
     Ok(())
 }
 
-/// 用 PATH 里的 claude，在当前目录前台启动（MVP 不做下载和校验）。环境完全按 onexd 给的来。
+/// 默认用 PATH 里已安装的 claude（旧用法／调试）。`--managed` 时改由 onexd 按 Server 下发的发行目录
+/// 自己选型、下载、校验、缓存后启动。环境完全按 onexd 给的来。
 async fn cmd_run(args: &[String]) -> Result<()> {
-    let model = match args {
-        [] => None,
-        [f, m] if f == "--model" => Some(m.clone()),
-        _ => bail!("{USAGE}"),
-    };
+    let mut model = None;
+    let mut managed = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--model" => model = Some(it.next().cloned().with_context(|| format!("--model 需要一个值\n{USAGE}"))?),
+            "--managed" => managed = true,
+            _ => bail!("{USAGE}"),
+        }
+    }
     let env: BTreeMap<String, String> = std::env::vars().collect();
-    let program = find_on_path("claude", env.get("PATH").map(String::as_str).unwrap_or(""))
-        .context("PATH 里找不到 claude。请先安装 Claude Code（https://claude.com/claude-code）")?;
-    let version = std::process::Command::new(&program)
-        .arg("--version")
-        .env_clear()
-        .env("PATH", env.get("PATH").cloned().unwrap_or_default())
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let (program, version) = if managed {
+        (None, None)
+    } else {
+        let program = find_on_path("claude", env.get("PATH").map(String::as_str).unwrap_or(""))
+            .context("PATH 里找不到 claude。请先安装 Claude Code（https://claude.com/claude-code），或加 --managed 让 onexd 自动下载")?;
+        let version = std::process::Command::new(&program)
+            .arg("--version")
+            .env_clear()
+            .env("PATH", env.get("PATH").cloned().unwrap_or_default())
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        (Some(program.to_string_lossy().into_owned()), version)
+    };
     let cwd = std::env::current_dir()?;
     let req = Request::Launch {
         agent: "claude-code".into(),
-        program: program.to_string_lossy().into(),
+        program,
         cwd: cwd.to_string_lossy().into(),
         env,
         model,
@@ -113,9 +133,9 @@ async fn cmd_run(args: &[String]) -> Result<()> {
     }
     let launch_id = l["launch_id"].as_str().context("no launch_id")?.to_string();
     eprintln!(
-        "OneX：用 {} 启动 Claude Code{}，模型 {}，会话 {}",
-        program.display(),
-        version.map(|v| format!(" {v}")).unwrap_or_default(),
+        "OneX：用 {}{} 启动 Claude Code，模型 {}，会话 {}",
+        l["program"].as_str().unwrap_or("?"),
+        version.map(|v| format!(" ({v})")).unwrap_or_default(),
         l["model"].as_str().unwrap_or(""),
         l["session_id"].as_str().unwrap_or("")
     );

@@ -4,7 +4,7 @@
 //! `key_id` 是临时公钥；共享密钥经 HKDF-SHA256（无 salt，info `onex-edge-secret-v1`）派生 32 字节；
 //! XChaCha20-Poly1305，24 字节 nonce，AAD 为 `provider_id`，密文后接 16 字节 tag。二进制字段都是标准 base64。
 //!
-//! 私钥只在 daemon 内存里，不写盘、不经 IPC 发出；daemon 重启后需要重新登录注册。
+//! 私钥由 daemon 持有，macOS 上仅通过 Keychain 持久化，不经 IPC 传输。
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -38,6 +38,10 @@ impl DeviceKey {
 
     pub fn from_bytes(b: [u8; 32]) -> Self {
         Self { secret: StaticSecret::from(b) }
+    }
+
+    pub(crate) fn bytes_for_keychain(&self) -> [u8; 32] {
+        self.secret.to_bytes()
     }
 
     /// 注册设备时提交的公钥（标准 base64）

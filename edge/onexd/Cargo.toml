@@ -30,6 +30,10 @@ base64 = "0.22"
 zeroize = "1"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+security-framework-sys = "2"
+
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["stream", "json"] }
 tempfile = "3"

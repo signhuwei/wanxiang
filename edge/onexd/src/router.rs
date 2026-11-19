@@ -180,12 +180,16 @@ impl Router {
         AxumRouter::new().route("/v1/messages", post(messages)).layer(DefaultBodyLimit::max(MAX_BODY)).with_state(self)
     }
 
-    fn authorized(&self, h: &HeaderMap) -> bool {
+    fn session_for(&self, h: &HeaderMap) -> Result<Option<String>, ()> {
         // Claude Code 用 ANTHROPIC_API_KEY 时发 x-api-key，用 ANTHROPIC_AUTH_TOKEN 时发 Bearer。
         let presented = h.get("x-api-key").and_then(|v| v.to_str().ok()).or_else(|| {
             h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "))
         });
-        presented.is_some_and(|p| p.as_bytes().ct_eq(self.local_token.as_bytes()).into())
+        let token = presented.ok_or(())?;
+        if token.as_bytes().ct_eq(self.local_token.as_bytes()).into() {
+            return Ok(self.state.active_session.read().unwrap().clone());
+        }
+        self.state.launch_tokens.read().unwrap().get(token).cloned().map(Some).ok_or(())
     }
 
     /// 回环地址一律直连；`proxy` 为 `"none"` 直连，为 URL 用指定代理；不填用环境变量代理。
@@ -232,13 +236,13 @@ pub fn select_route<'a>(routes: &'a [Route], model: &str) -> Option<&'a Route> {
 
 async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let started = Instant::now();
-    if !rt.authorized(&headers) {
+    let Ok(session_id) = rt.session_for(&headers) else {
         return anthropic_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             "OneX 本机令牌无效。请从 OneX Desktop 重新启动这个 Agent。",
         );
-    }
+    };
 
     let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v @ Value::Object(_)) => v,
@@ -368,7 +372,7 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         stream,
         started_at_ms: now_ms(),
         duration_ms: 0,
-        session_id: rt.state.active_session.read().unwrap().clone(),
+        session_id,
     };
     let mut req = Req { rt: rt.clone(), rec, meter, ticket, started };
 

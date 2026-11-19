@@ -1,11 +1,13 @@
 pub mod capture;
 pub mod chat;
+pub mod credentials;
 mod diagnostics;
 pub mod id;
 pub mod ipc;
 pub mod lastgood;
 pub mod launch;
 pub mod lease;
+pub mod managed_runtime;
 pub mod outbox;
 pub mod pricing;
 pub mod router;

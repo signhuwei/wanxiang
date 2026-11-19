@@ -1,0 +1,8 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "desktop-main",
+  "description": "OneX 本地员工窗口的业务桥",
+  "local": true,
+  "webviews": ["main"],
+  "permissions": ["allow-desktop-call"]
+}
