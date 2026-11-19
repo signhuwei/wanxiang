@@ -1,14 +1,14 @@
-//! 本机 IPC：Unix socket 上的 JSON 行协议，见 `onex_core::ipc`。
+//! 本机 IPC：按行分隔的 JSON 协议，Unix 走 socket、Windows 走具名管道，见 `onex_core::transport`
+//! 和 `onex_core::ipc`。
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use onex_core::ipc::{ErrorBody, ManagedAgent, Request, Status};
+use onex_core::transport::{self, Connection, Listener};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -56,31 +56,21 @@ impl LaunchCtx {
     }
 }
 
-/// 绑定 socket，权限 0600。已有 socket 能连上说明另一个 onexd 在跑，报错退出；连不上就是残留文件，删掉重建。
-pub async fn bind(path: &Path) -> Result<UnixListener> {
-    if path.exists() {
-        if UnixStream::connect(path).await.is_ok() {
-            bail!("another onexd is listening on {}", path.display());
-        }
-        std::fs::remove_file(path).with_context(|| format!("remove stale socket {}", path.display()))?;
-    }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let l = UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(l)
+/// 绑定本机 IPC 入口（Unix socket 或 Windows 具名管道，权限收紧到当前用户，拒绝远程）。
+/// 已有入口能连上说明另一个 onexd 在跑，报错退出；Unix 下连不上是残留文件，删掉重建。
+pub async fn bind(path: &std::path::Path) -> Result<Listener> {
+    transport::bind(path).await
 }
 
-pub async fn serve(listener: UnixListener, path: PathBuf, ipc: Arc<Ipc>) {
+pub async fn serve(listener: Listener, path: PathBuf, ipc: Arc<Ipc>) {
     loop {
         tokio::select! {
             _ = ipc.shutdown.cancelled() => break,
             r = listener.accept() => match r {
-                Ok((stream, _)) => {
+                Ok(conn) => {
                     let ipc = ipc.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle(stream, &ipc).await {
+                        if let Err(e) = handle(conn, &ipc).await {
                             warn!(error = %format!("{e:#}"), "ipc connection");
                         }
                     });
@@ -89,10 +79,10 @@ pub async fn serve(listener: UnixListener, path: PathBuf, ipc: Arc<Ipc>) {
             }
         }
     }
-    let _ = std::fs::remove_file(&path);
+    transport::cleanup(&path);
 }
 
-async fn handle(stream: UnixStream, ipc: &Ipc) -> Result<()> {
+async fn handle(stream: Connection, ipc: &Ipc) -> Result<()> {
     let (r, mut w) = stream.into_split();
     let mut r = BufReader::new(r);
     let mut line = String::new();
@@ -144,13 +134,14 @@ async fn dispatch(req: Request, ipc: &Ipc) -> (Value, bool) {
         ),
         Request::LaunchDone { launch_id, exit_code } => {
             let Some(ctx) = &ipc.launch else { return (err("invalid", "这个 onexd 不支持启动 Agent"), false) };
+            let Some(launch) = ctx.running.lock().unwrap().remove(&launch_id) else {
+                return (json!({"ok": true}), false);
+            };
             info!(%launch_id, ?exit_code, "agent exited");
-            if let Some(launch) = ctx.running.lock().unwrap().remove(&launch_id) {
-                ipc.state.launch_tokens.write().unwrap().remove(&launch.token);
-                *launch.code.lock().unwrap() = exit_code;
-                launch.stop.cancel();
-                ipc.state.active_session.write().unwrap().take_if(|s| *s == launch.session_id);
-            }
+            ipc.state.launch_tokens.write().unwrap().remove(&launch.token);
+            *launch.code.lock().unwrap() = exit_code;
+            launch.stop.cancel();
+            ipc.state.active_session.write().unwrap().take_if(|s| *s == launch.session_id);
             match crate::launch::finish(&ctx.home, &launch_id) {
                 Ok(()) => (json!({"ok": true}), false),
                 Err(e) => (err("invalid", &format!("{e:#}")), false),

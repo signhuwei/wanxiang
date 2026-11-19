@@ -21,7 +21,6 @@ use anyhow::{Context, Result, bail};
 use onex_core::ipc::{Request, SOCKET_NAME};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 const USAGE: &str = "usage:
   onex login <邮箱或手机号> [--invite <邀请码>] [--tenant <租户>] [--server <地址>] [--name <设备名>]
@@ -107,12 +106,15 @@ async fn cmd_run(args: &[String]) -> Result<()> {
     let (program, version) = if managed {
         (None, None)
     } else {
-        let program = find_on_path("claude", env.get("PATH").map(String::as_str).unwrap_or(""))
+        // Windows 的环境变量名大小写不敏感，`std::env::vars()` 多半给出 `Path` 而不是全大写的
+        // `PATH`；精确字符串匹配会漏掉它，见 onexd/src/launch.rs 的 client_env_get 同一个问题。
+        let path = env_get(&env, "PATH");
+        let program = find_on_path("claude", path.map(String::as_str).unwrap_or(""))
             .context("PATH 里找不到 claude。请先安装 Claude Code（https://claude.com/claude-code），或加 --managed 让 onexd 自动下载")?;
         let version = std::process::Command::new(&program)
             .arg("--version")
             .env_clear()
-            .env("PATH", env.get("PATH").cloned().unwrap_or_default())
+            .env("PATH", path.cloned().unwrap_or_default())
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
@@ -158,12 +160,37 @@ async fn cmd_run(args: &[String]) -> Result<()> {
     std::process::exit(code.unwrap_or(if status.success() { 0 } else { 1 }));
 }
 
+/// Unix：`PATH` 按目录找 `name`，要求有可执行位。Windows 没有可执行位的概念，按 `PATHEXT`
+/// 逐个后缀试（`claude` 在 Windows 上一般装成 `claude.cmd` 或 `claude.exe`），不带可执行位检查。
+#[cfg(unix)]
 fn find_on_path(name: &str, path: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(path)
         .filter(|d| d.is_absolute())
         .map(|d| d.join(name))
         .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
+#[cfg(windows)]
+fn find_on_path(name: &str, path: &str) -> Option<PathBuf> {
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    let exts: Vec<&str> = pathext.split(';').filter(|e| !e.is_empty()).collect();
+    std::env::split_paths(path)
+        .filter(|d| d.is_absolute())
+        .find_map(|d| exts.iter().map(|ext| d.join(format!("{name}{ext}"))).find(|p| p.is_file()))
+}
+
+/// Windows 环境变量名大小写不敏感，`std::env::vars()` 收进 `BTreeMap` 之后精确字符串匹配会漏掉
+/// 实际存在但大小写不同的键（典型是 `Path` 而不是 `PATH`）。Unix 保持精确匹配，环境变量本身
+/// 大小写敏感，不该把 `path` 和 `PATH` 当成同一个变量。
+#[cfg(unix)]
+fn env_get<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a String> {
+    env.get(key)
+}
+
+#[cfg(windows)]
+fn env_get<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a String> {
+    env.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v)
 }
 
 fn prompt(p: &str) -> Result<String> {
@@ -176,6 +203,7 @@ fn prompt(p: &str) -> Result<String> {
     Ok(s)
 }
 
+#[cfg(target_os = "macos")]
 fn default_device_name() -> String {
     std::process::Command::new("scutil")
         .args(["--get", "ComputerName"])
@@ -188,10 +216,21 @@ fn default_device_name() -> String {
         .unwrap_or_else(|| "OneX Edge".into())
 }
 
+/// Windows 没有对应的 `scutil`；机器名就是 `COMPUTERNAME` 环境变量（登录会话一直有效）。
+#[cfg(windows)]
+fn default_device_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "OneX Edge".into())
+}
+
 async fn call(req: &Request) -> Result<Value> {
     let path = socket_path()?;
-    let stream =
-        UnixStream::connect(&path).await.with_context(|| format!("connect {} (is onexd running?)", path.display()))?;
+    let stream = onex_core::transport::connect(&path)
+        .await
+        .with_context(|| format!("connect {} (is onexd running?)", path.display()))?;
     let (r, mut w) = stream.into_split();
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
@@ -211,11 +250,6 @@ fn print_reply(v: Value) -> Result<()> {
 }
 
 fn socket_path() -> Result<PathBuf> {
-    let home = match std::env::var_os("ONEX_HOME") {
-        Some(h) => PathBuf::from(h),
-        None => {
-            PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join("Library/Application Support/OneX")
-        }
-    };
+    let home = onex_core::ipc::default_home().map_err(anyhow::Error::msg)?;
     Ok(home.join(SOCKET_NAME))
 }

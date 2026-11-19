@@ -1,8 +1,11 @@
-//! onexd 本机 IPC：Unix socket，每行一个 JSON 请求，每行一个 JSON 应答。
+//! onexd 本机 IPC：按行分隔的 JSON 协议（Unix socket 或 Windows 具名管道，见 `transport` 模块），
+//! 每行一个 JSON 请求，每行一个 JSON 应答。
 //!
 //! 请求：`{"cmd":"status"}`、`{"cmd":"login","token":"..."}`、`{"cmd":"logout"}`、`{"cmd":"shutdown"}`。
 //! 应答：成功 `{"ok":true,...}`；失败 `{"ok":false,"error":{"code":"...","message":"..."}}`，
 //! code 用 `contracts/errors.md` 里的错误码。
+
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,6 +13,30 @@ use serde_json::Value;
 pub use crate::ws::ErrorBody;
 
 pub const SOCKET_NAME: &str = "onexd.sock";
+
+/// `onexd`、`onex-cli`、Desktop 三处都要用同一套默认数据目录；显式设了 `ONEX_HOME` 一律优先。
+/// macOS 用 `~/Library/Application Support/OneX`，Windows 用 `%LOCALAPPDATA%\OneX`
+/// （每用户、不漫游，和受管 Agent 缓存、设备凭据的体量相符）。
+pub fn default_home() -> Result<PathBuf, &'static str> {
+    if let Some(h) = std::env::var_os("ONEX_HOME") {
+        return Ok(PathBuf::from(h));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME").ok_or("HOME not set")?;
+        Ok(PathBuf::from(home).join("Library/Application Support/OneX"))
+    }
+    #[cfg(windows)]
+    {
+        let local = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA not set")?;
+        Ok(PathBuf::from(local).join("OneX"))
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let home = std::env::var_os("HOME").ok_or("HOME not set")?;
+        Ok(PathBuf::from(home).join(".local/share/onex"))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -62,10 +89,14 @@ pub enum Request {
     Shutdown,
 }
 
-/// 设备的 os、arch，hello 和设备注册用同一套写法（`darwin`/`arm64`）。
+/// 设备的 os、arch，hello 和设备注册用同一套写法（`darwin`/`arm64`、`win32`/`x64`）。
+/// `win32` 沿用 Node.js 的平台键：受管 CLI 发行目录（`AgentRelease.os`）按这个键匹配，
+/// 和 `docs/specs/agents/kimi-code.md` 的 `win32-x64` 一致；Desktop 安装包发布契约
+/// （`contracts/desktop-releases.md`）是独立的一套字段，用 `windows`/`x64`，不混用。
 pub fn os_name() -> &'static str {
     match std::env::consts::OS {
         "macos" => "darwin",
+        "windows" => "win32",
         other => other,
     }
 }

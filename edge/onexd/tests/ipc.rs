@@ -1,13 +1,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use onex_core::transport;
 use onexd::credentials::{CredentialStore, DeviceCredentials};
 use onexd::ipc::{self, Ipc};
 use onexd::outbox::{Kind, Outbox};
 use onexd::state::State;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -32,13 +32,13 @@ impl CredentialStore for FakeCredentials {
 }
 
 struct Client {
-    r: BufReader<tokio::net::unix::OwnedReadHalf>,
-    w: tokio::net::unix::OwnedWriteHalf,
+    r: BufReader<transport::ReadHalf>,
+    w: transport::WriteHalf,
 }
 
 impl Client {
     async fn connect(path: &std::path::Path) -> Self {
-        let (r, w) = UnixStream::connect(path).await.unwrap().into_split();
+        let (r, w) = transport::connect(path).await.unwrap().into_split();
         Self { r: BufReader::new(r), w }
     }
 
@@ -60,10 +60,15 @@ async fn status_login_shutdown() {
     let shutdown = CancellationToken::new();
     let listener = ipc::bind(&path).await.unwrap();
 
-    use std::os::unix::fs::PermissionsExt;
-    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    // Unix：socket 文件权限 0600。Windows 具名管道没有对应的文件系统权限位，
+    // ACL 收紧的校验见 `transport` 模块自己的裸指针封装，这里不是跨平台契约，不重复断言。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
 
-    // 第二个实例不能抢同一个 socket
+    // 第二个实例不能抢同一个 socket/管道
     assert!(ipc::bind(&path).await.is_err());
 
     let srv = Arc::new(Ipc {
@@ -99,10 +104,16 @@ async fn status_login_shutdown() {
     assert_eq!(d["server_url"], "http://127.0.0.1:2");
     assert_eq!(d.as_object().unwrap().len(), 3);
 
-    // 受管启动：只用 Server 下发的精确模型名
+    // 受管启动：只用 Server 下发的精确模型名。`prepare()` 只校验 program 是绝对路径、把它和
+    // PATH 原样写进策略文件，从不实际执行它，所以这里用什么路径字符串不影响测试意图，只要在目标
+    // 平台上语法合法（Windows 的"绝对"要求盘符根）。
+    #[cfg(unix)]
+    let (program, path_env) = ("/bin/echo", "/usr/bin");
+    #[cfg(windows)]
+    let (program, path_env) = (r"C:\Windows\System32\cmd.exe", r"C:\Windows\System32");
     let cwd = dir.path().to_string_lossy().to_string();
     let launch = |model: Option<&str>| {
-        json!({"cmd":"launch","agent":"claude-code","program":"/bin/echo","cwd":cwd,"env":{"PATH":"/usr/bin","SECRET":"x"},"model":model})
+        json!({"cmd":"launch","agent":"claude-code","program":program,"cwd":cwd,"env":{"PATH":path_env,"SECRET":"x"},"model":model})
             .to_string()
     };
     assert_eq!(c.call(&launch(None)).await["error"]["code"], "model_not_allowed");
@@ -151,7 +162,7 @@ async fn status_login_shutdown() {
     .await
     .unwrap();
     assert_eq!(kinds, ["session_start", "user_message", "session_end"]);
-    let bad = json!({"cmd":"launch","agent":"codex","program":"/bin/echo","cwd":cwd,"env":{}}).to_string();
+    let bad = json!({"cmd":"launch","agent":"codex","program":program,"cwd":cwd,"env":{}}).to_string();
     assert_eq!(c.call(&bad).await["error"]["code"], "agent_not_allowed");
 
     let r = c.call("not json").await;
@@ -162,6 +173,8 @@ async fn status_login_shutdown() {
     assert_eq!(c.call(r#"{"cmd":"shutdown"}"#).await, json!({"ok": true}));
     assert!(shutdown.is_cancelled());
     timeout(T, task).await.unwrap().unwrap();
+    // Unix 关停时清理 socket 文件；Windows 具名管道没有对应文件，`transport::cleanup` 是空操作。
+    #[cfg(unix)]
     assert!(!path.exists());
 }
 
@@ -178,6 +191,9 @@ fn route(model: &str) -> onex_core::ws::Route {
     }
 }
 
+/// Windows 具名管道没有"残留 socket 文件"的概念（管道没有文件系统残留，进程退出后管道名
+/// 自动失效），这个用例只在 Unix 上有意义。
+#[cfg(unix)]
 #[tokio::test]
 async fn stale_socket_file_is_replaced() {
     let dir = tempfile::tempdir().unwrap();

@@ -7,7 +7,6 @@
 //! 增量：游标 `(inode, offset)`，从 offset 读到最后一个换行，半行留到下次。事件和游标在 outbox 的同一个事务里提交。
 //! 文件变短或 inode 变了，记 gap 后从头重读。
 
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -118,8 +117,7 @@ impl Capture {
     fn read_file(&self, path: &Path, cur: &mut Value, events: &mut Vec<Value>) -> Result<()> {
         let meta = std::fs::symlink_metadata(path)?;
         // 只读普通文件，拒绝符号链接和别人的文件（受管配置目录由 onexd 自己创建，以它的所有者为准）
-        let owner = std::fs::metadata(&self.s.config_dir)?.uid();
-        if !meta.file_type().is_file() || meta.uid() != owner {
+        if !meta.file_type().is_file() || !owned_by_same_principal(path, &self.s.config_dir)? {
             if cur["refused"] != true {
                 events.push(self.gap("not_regular_file", 0));
                 cur["refused"] = true.into();
@@ -127,14 +125,15 @@ impl Capture {
             return Ok(());
         }
         let mut offset = cur["offset"].as_u64().unwrap_or(0);
-        if cur["ino"].as_u64().is_some_and(|i| i != meta.ino()) {
+        let identity = file_identity(path, &meta)?;
+        if cur["ino"].as_u64().is_some_and(|i| i != identity) {
             events.push(self.gap("file_replaced", offset));
             offset = 0;
         } else if meta.len() < offset {
             events.push(self.gap("file_truncated", offset));
             offset = 0;
         }
-        cur["ino"] = meta.ino().into();
+        cur["ino"] = identity.into();
         if meta.len() == offset {
             cur["offset"] = offset.into();
             return Ok(());
@@ -361,6 +360,100 @@ fn find_newline(path: &Path, mut from: u64) -> Result<Option<u64>> {
         }
         from += buf.len() as u64;
     }
+}
+
+/// 文件被替换（同名新文件）的判定：Unix 用 `(dev, ino)`，这里把两者打包成一个 64 位值存进游标
+/// （按 outbox 游标里 `"ino"` 这个既有字段名存，不是跨平台契约字段，不需要迁移）。换了设备号
+/// 极少见但理论上可能导致误判"没换"，这里接受这个已知的小概率，和此前只看 `ino` 的精度一致。
+#[cfg(unix)]
+fn file_identity(_path: &Path, meta: &std::fs::Metadata) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(meta.ino())
+}
+
+/// Windows 版文件身份：打开文件句柄，用 `GetFileInformationByHandle` 的 64 位文件索引
+/// （`nFileIndexHigh`/`nFileIndexLow`）拼成一个值，和 Unix 的 inode 是同一个层级的身份标识——
+/// 只看路径或时间戳会被"同名新文件刚好同一秒创建"骗过，必须经句柄查询真正的文件系统身份。
+/// 不含卷序列号：同一次采集过程里文件不会跨卷，加进去只会增加误判"换了"的概率。
+#[cfg(windows)]
+fn file_identity(path: &Path, _meta: &std::fs::Metadata) -> Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
+    let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `f` 的句柄在这次调用期间保持有效（`f` 没有被 drop），`info` 是一块足够大小的
+    // 栈上缓冲区，`GetFileInformationByHandle` 只在成功时写入它。`as_raw_handle()` 已经是
+    // `HANDLE`（windows-sys 0.59 里是 `*mut c_void`）的等价表示，不需要再转成 `isize`。
+    let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) };
+    anyhow::ensure!(ok != 0, "GetFileInformationByHandle failed for {}", path.display());
+    Ok(((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
+}
+
+/// 只接受和受管配置目录同一个所有者创建的文件，拒绝别人（或符号链接指向别处）的文件。
+/// Unix 直接比 uid；Windows 比文件的 owner SID 和当前进程的 token owner SID。
+#[cfg(unix)]
+fn owned_by_same_principal(path: &Path, reference_dir: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(reference_dir)?.uid();
+    Ok(std::fs::symlink_metadata(path)?.uid() == owner)
+}
+
+/// Windows 没有 uid；受管配置目录、本次会话文件都应该是当前用户自己创建的，直接比较两者的
+/// owner SID（Claude Code 以当前用户身份运行，onexd 也以当前用户身份运行，受管目录由 onexd
+/// 创建，三者是同一个用户主体）。
+#[cfg(windows)]
+fn owned_by_same_principal(path: &Path, reference_dir: &Path) -> Result<bool> {
+    let a = windows_owner_sid(path)?;
+    let b = windows_owner_sid(reference_dir)?;
+    Ok(a == b)
+}
+
+#[cfg(windows)]
+fn windows_owner_sid(path: &Path) -> Result<String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSID};
+    let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `wide` 是有效的、以 NUL 结尾的宽字符串；成功时系统分配一份安全描述符到 `sd`，
+    // `owner` 指向该描述符内部的数据（生命周期绑定在 `sd` 上，`sd` 释放前不能丢弃 `owner`）。
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    anyhow::ensure!(status == 0, "GetNamedSecurityInfoW failed for {} (status {status})", path.display());
+    let result = (|| -> Result<String> {
+        let mut sid_str: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `owner` 是上面成功调用返回的有效 SID 指针；成功时系统分配一个以 NUL 结尾的
+        // 宽字符串到 `sid_str`，用 `LocalFree` 释放。
+        let ok = unsafe { ConvertSidToStringSidW(owner, &mut sid_str) };
+        anyhow::ensure!(ok != 0, "ConvertSidToStringSidW failed");
+        let len = unsafe {
+            let mut n = 0usize;
+            while *sid_str.add(n) != 0 {
+                n += 1;
+            }
+            n
+        };
+        let s = unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(sid_str, len)) };
+        // SAFETY: `sid_str` 是上面成功调用分配的、尚未释放的内存；`LocalFree` 接受本地分配返回的指针。
+        unsafe { LocalFree(sid_str as *mut std::ffi::c_void) };
+        Ok(s)
+    })();
+    // SAFETY: `sd` 是 `GetNamedSecurityInfoW` 成功时分配的、尚未释放的安全描述符。
+    unsafe { LocalFree(sd) };
+    result
 }
 
 #[cfg(test)]

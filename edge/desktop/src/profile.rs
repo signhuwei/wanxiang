@@ -2,7 +2,6 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -26,7 +25,14 @@ pub(crate) fn load(socket: &Path) -> Option<StoredProfile> {
 pub(crate) fn store(socket: &Path, profile: &StoredProfile) -> io::Result<()> {
     let path = profile_path(socket);
     let tmp = socket.with_file_name(format!(".desktop-profile.{}.tmp", std::process::id()));
-    let mut file = OpenOptions::new().create_new(true).write(true).mode(0o600).open(&tmp)?;
+    let mut open = OpenOptions::new();
+    open.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    let mut file = open.open(&tmp)?;
     let result = (|| {
         serde_json::to_writer(&mut file, profile)?;
         file.flush()?;

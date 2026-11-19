@@ -6,7 +6,6 @@
 //! 缓存命中也要重新算一次完整 SHA-256，不是只信文件名或大小——文件可能在磁盘上被篡改或截断。
 
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -188,12 +187,14 @@ async fn download_and_verify(http: &reqwest::Client, release: &AgentRelease, des
     }
 
     let tmp = dir.join(format!(".tmp-{}", id::new("dl")));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("create {}", tmp.display()))?;
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    let mut file = open.open(&tmp).with_context(|| format!("create {}", tmp.display()))?;
     let cleanup = DownloadTemp(tmp);
     let mut hasher = Sha256::new();
     let mut written: u64 = 0;
@@ -217,7 +218,13 @@ async fn download_and_verify(http: &reqwest::Client, release: &AgentRelease, des
     if !got.eq_ignore_ascii_case(&release.sha256) {
         bail!("downloaded artifact sha256 mismatch: want {}, got {got}", release.sha256);
     }
-    std::fs::set_permissions(&cleanup.0, std::fs::Permissions::from_mode(0o700))?;
+    // Windows 的可执行权限不是文件属性而是文件扩展名（`.exe`）；`cache_path` 对 `win32` 已经
+    // 带了 `.exe` 后缀，这里不需要额外设置任何位。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cleanup.0, std::fs::Permissions::from_mode(0o700))?;
+    }
     std::fs::rename(&cleanup.0, dest)?;
     Ok(())
 }
@@ -281,7 +288,11 @@ mod tests {
 
         let p1 = resolve(home.path(), &http, &[rel.clone()], "claude-code", "darwin", "arm64").await.unwrap();
         assert_eq!(std::fs::read(&p1).unwrap(), body);
-        assert_eq!(std::fs::metadata(&p1).unwrap().permissions().mode() & 0o777, 0o700);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p1).unwrap().permissions().mode() & 0o777, 0o700);
+        }
         assert_eq!(*hits.lock().unwrap(), 1);
 
         // 第二次命中缓存，不重新下载
