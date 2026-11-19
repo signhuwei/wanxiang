@@ -54,6 +54,12 @@
 
 单窗口单 WebView 使用同一 `main` 标签；如壳采用独立 WebView 标签，应绑定实际唯一标签。不要同时再匹配全部窗口、全部 WebView 或 URL；不要允许远程页面获得本地桥。
 
+### 原生出站边界（所有 phase 和错误分支）
+
+使用独立的出站 DTO 逐字段构造快照：仅给 `version, phase, user{name}, tenant{id,name}, tenants[]{id,name}, connection, agents[]{id,name,version,status,actions,message?}, settings{server_origin,hide_on_close}`。服务地址仅为规范化 origin，不含身份、路径、query 或 fragment；错误只给白名单 `code` 和固定的脱敏文案。禁止直接序列化 daemon 对象、下游响应、异常链/栈、请求体或调试 detail；这同样适用于 Tauri 的 reject 和日志。Agent `message` 可省略，不能包含原始错误。UI 依 [IPC 中文文案表](IPC.md) 按码选择文字，但不能撤销已经跨过桥的数据。
+
+在原生测试夹具的额外嵌套字段、错误链和地址 query 中放入合成标记，覆盖登录成功/失败、启动失败、断线、注销。逐个检查**完整 IPC 回包及 reject**、界面和日志均无标记；不使用真实密钥作探针。
+
 ## 4. edge 的发布验收（待真实壳执行）
 
 | 检查 | 通过判据 |
@@ -61,6 +67,7 @@
 | 包内资源与离线冷启动 | 核对最终资源清单仅含上述三个 UI 文件；断开外网仍能绘出窗口和调用本地 `state`，无开发服务器依赖。`mock.js`、测试和 Markdown 不可加载。 |
 | CSP 实效 | 在签收构建中检查最终文档策略与 WebView 控制台：本地 CSS/ESM 和 `desktop_call(state)` 正常，无 CSP 错误；受控测试的非允许源请求被拒绝。不可用放开 localhost 或整个脚本策略来修复。 |
 | 最小权限 | 检查生成的 capability 和注册表。用原生集成测试验证：本地 `main` 的 `state` 成功；未知命令、其他 WebView 的调用、未知 op/字段、非目录 Agent 均被拒，且无网络写入或进程启动。导航到外部页面/弹出窗口被取消。 |
+| WebView 零外部请求 | 用打包配置的验收构建，在 WebView Network 面板保留跨导航记录（macOS 用 Web Inspector），覆盖冷启动、发码、登录、选租户、启动、设置和登出。按发起方与 origin 核对：只应看到打包资源及本机 Tauri IPC，**外部请求数为 0**，包括 Server/上游、远程字体/图片、遥测、WS；即使被 CORS 拒绝的外发尝试也不算通过。分别记录原生层网络，不将原生登录流量计到 WebView。留脱敏的目标分类/计数和最终生效 CSP（含 Tauri 注入项，与 §1 比较），不留含请求体或令牌的 HAR。 |
 | 业务与边界 | 登录→选租户→启动→设置→注销；Desktop 版本可见，`update_available` 无操作；重开窗口不复活旧身份。只记录状态、版本、错误码，不记录验证码、令牌或请求体。浏览器 mock 通过不代替此项。 |
 
 配置依据：Tauri 2 [Configuration](https://v2.tauri.app/reference/config/)、[Capabilities](https://v2.tauri.app/security/capabilities/)、[CSP](https://v2.tauri.app/security/csp/)。本次对照了本机 `tauri-utils 2.9.3`（`FrontendDist`、capability、权限生成）和 `tauri-build / tauri-codegen 2.6.3`（`AppManifest`、文件路径解析）；edge 锁定不同版本时以其 schema 和实际打包结果为准。
