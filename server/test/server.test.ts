@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -165,7 +166,9 @@ test('tenant management enforces scope, revisions, pagination, and one-time invi
   expect((await f.request(`/members/${user.id}`, update, scoped)).status).toBe(409);
   const set = { revision: 1, seat_limit: 3, allowed_agents: ['claude-code'], allowed_models: [], lease_minutes: 10, lease_budget_milli: 2000, visibility: {} };
   expect((await f.request('/contract', set, employee, undefined, 'PUT')).status).toBe(403);
-  expect(await (await f.request('/contract', set, scoped, undefined, 'PUT')).json()).toMatchObject({ ...set, revision: 2 });
+  expect(await (await f.request('/contract', set, scoped, undefined, 'PUT')).json()).toMatchObject({ ...set, revision: 2, visibility: {
+    admin: { summary: true, content: false }, group_admin: { summary: true, content: false },
+  } });
   expect((await f.request('/contract', set, scoped, undefined, 'PUT')).status).toBe(409);
 });
 
@@ -307,10 +310,10 @@ test('new device connection replaces old; heartbeat is correlated and closes aft
   expect(await f.presence.get(device_id)).toBeTruthy();
   current.send({ type: 'ping', id: 'client-ping' });
   expect(await current.nextOf('pong')).toEqual({ type: 'pong', re: 'client-ping' });
-  const ping = await current.next();
+  const ping = await current.nextOf('ping');
   expect(ping.type).toBe('ping');
   current.send({ type: 'pong', re: ping.id });
-  for (let i = 0; i < 3; i++) expect((await current.next()).type).toBe('ping');
+  for (let i = 0; i < 3; i++) expect((await current.nextOf('ping')).type).toBe('ping');
   expect((await current.closed).code).toBe(1008);
   await until(async () => await f.presence.get(device_id) === null);
 });
@@ -373,6 +376,67 @@ test('configuration scopes model routes and encrypts provider secrets to the reg
   expect(removed.revision).toBeGreaterThan(changed.revision);
   edge.send({ type: 'ping', id: 'barrier' });
   expect(await edge.next()).toEqual({ type: 'pong', re: 'barrier' });
+});
+
+test('event and usage acknowledgments share a durable cursor, and observation is scoped and audited', async () => {
+  const f = await fixture();
+  const scoped = await f.select(await f.login());
+  const a = await linkedEdge(f, scoped);
+  await a.nextOf('cutoff');
+  const session_id = randomUUID();
+  const at = new Date(f.now()).toISOString();
+  const input = { seq: 3, session_id, kind: 'user_message', at, source_offset: 50, payload: { content: 'private test text' } };
+  const stream = await f.request('/observe/stream', undefined, scoped);
+  expect(stream.headers.get('content-type')).toContain('text/event-stream');
+  const reader = stream.body!.getReader();
+  try {
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain('connected');
+    a.send({ type: 'events', id: 'out-of-order', batch: [input] });
+    expect(await a.nextOf('events_ack')).toMatchObject({ ack_seq: 0 });
+    const summary = new TextDecoder().decode((await reader.read()).value);
+    expect(summary).toContain(session_id);
+    expect(summary).not.toContain('private test text');
+    expect(await (await f.request(`/observe/sessions/${session_id}/events`, undefined, scoped)).json()).toMatchObject({ items: [], total: 0 });
+    a.send({ type: 'usage', id: 'usage', batch: [{ seq: 2, request_id: 'req_test', session_id,
+      provider_id: 'prv_test', model: 'fake', model_id: 'mod_test', input_tokens: 5, output_tokens: 2,
+      cache_read_tokens: 0, cache_write_tokens: 0, at, status: 'client_cancelled', complete: false, cost_milli: 3 }] });
+    expect(await a.nextOf('events_ack')).toMatchObject({ ack_seq: 0 });
+    const start = { seq: 1, session_id, kind: 'session_start', at, source_offset: 0, payload: { agent: 'claude-code', agent_version: 'test', model: 'fake' } };
+    a.send({ type: 'events', id: 'complete', batch: [start, input] });
+    expect(await a.nextOf('events_ack')).toMatchObject({ ack_seq: 3 });
+    a.send({ type: 'events', id: 'gap', batch: [{ seq: 4, session_id, kind: 'gap', at, payload: { reason: 'bad_line', offset: 55 } }] });
+    expect(await a.nextOf('events_ack')).toMatchObject({ ack_seq: 4 });
+    expect(await (await f.request('/observe/people', undefined, scoped)).json()).toMatchObject({ items: [{ user_id: f.userId, session_count: 1, cost_milli: 3 }] });
+    expect(await (await f.request('/observe/sessions', undefined, scoped)).json()).toMatchObject({ items: [{ id: session_id, event_count: 3,
+      cost_milli: 3, pending_usage_count: 1, input_tokens: 5, output_tokens: 2 }] });
+    expect(await (await f.request(`/observe/sessions/${session_id}/events?after_seq=1`, undefined, scoped)).json()).toMatchObject({
+      items: [{ seq: 3, source_offset: 50, payload: input.payload }, { seq: 4, kind: 'gap' }], total: 2 });
+    expect(f.store.tenant(f.tenantId).all('SELECT actor, action, target FROM audit ORDER BY rowid')).toEqual([
+      { actor: f.userId, action: 'observe.events.read', target: session_id },
+      { actor: f.userId, action: 'observe.events.read', target: session_id },
+    ]);
+  } finally { await reader.cancel(); }
+  a.ws.close();
+  await a.closed;
+  const b = connect(f, a.device_token);
+  expect(await b.opened).toBe(true);
+  b.hello(undefined, 4);
+  expect(await b.next()).toMatchObject({ type: 'welcome', ack_seq: 4 });
+  const unrelated = await linkedEdge(f, scoped);
+  await unrelated.nextOf('cutoff');
+  unrelated.send({ type: 'events', id: 'cross-device', batch: [{ ...input, seq: 1 }] });
+  expect(await unrelated.nextOf('ack')).toMatchObject({ ok: false, error: { code: 'conflict' } });
+  const target = 'observe-admin@example.test';
+  const invite = await (await f.request('/invites', { role: 'admin', max_uses: 1, expires_in_ms: 60_000 }, scoped)).json() as { invite_code: string };
+  const login = await f.request('/auth/login', { target, code: await f.code(target), invite_code: invite.invite_code });
+  const admin = await f.select((await login.json() as { token: string }).token);
+  expect(await (await f.request('/observe/people', undefined, admin)).json()).toMatchObject({ total: 2 });
+  expect((await f.request(`/observe/sessions/${session_id}/events`, undefined, admin)).status).toBe(404);
+  const contract = await (await f.request('/contract', undefined, scoped)).json() as Record<string, unknown>;
+  const grants = { admin: { summary: true, content: true }, group_admin: { summary: true, content: false } };
+  expect((await f.request('/contract', { ...contract, visibility: grants }, scoped, undefined, 'PUT')).status).toBe(200);
+  expect((await f.request(`/observe/sessions/${session_id}/events`, undefined, admin)).status).toBe(200);
+  expect(f.store.tenant(f.tenantId).get("SELECT actor FROM audit WHERE action = 'contract.visibility.update'")).toEqual({ actor: f.userId });
 });
 
 async function fund(f: Awaited<ReturnType<typeof fixture>>, token: string, amount: number) {
@@ -469,7 +533,7 @@ test('an offline lease is settled on return and late usage reconciles without a 
     input_tokens: 5, output_tokens: 2, cache_read_tokens: 0, cache_write_tokens: 0, at: new Date(f.now()).toISOString(), status: 'ok' };
   b.send({ type: 'usage', id: 'offline-batch', batch: [{ ...usage, seq: 1, complete: true, cost_milli: 3 },
     { ...usage, request_id: 'req_2', seq: 2, complete: false, cost_milli: 2 }] });
-  expect(await b.next()).toMatchObject({ type: 'events_ack', ack_seq: 2 });
+  expect(await b.nextOf('events_ack')).toMatchObject({ type: 'events_ack', ack_seq: 2 });
   const rows = f.store.tenant(f.tenantId).all('SELECT model, model_id, cost_milli, settlement_status FROM usage ORDER BY seq');
   expect(rows).toEqual([{ model: 'fake', model_id: 'mod_fake', cost_milli: 3, settlement_status: 'reconciled' },
     { model: 'fake', model_id: 'mod_fake', cost_milli: 2, settlement_status: 'pending' }]);

@@ -5,7 +5,7 @@ import { ulid } from 'ulid';
 import { ApiError } from './api';
 import { deviceTtl } from './auth';
 import { initialLease, renewLease } from './billing';
-import { ackCursor, ingestUsage, usageItems } from './ingest';
+import { ackCursor, eventItems, ingestEvents, ingestUsage, usageItems, type PublishSummary } from './ingest';
 import { int } from './management';
 import type { PendingWork } from './pending';
 import { bearer, hash, iso, randomToken } from './credentials';
@@ -17,7 +17,8 @@ const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.
 const isText = (value: unknown, max = 128): value is string => typeof value === 'string' && value.length > 0 && value.length <= max;
 const isSeq = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
-export function edgeGateway(app: Hono, store: Store, presence: Presence, now: () => number, heartbeatMs: number, config: ConfigPublisher, pending: PendingWork) {
+export function edgeGateway(app: Hono, store: Store, presence: Presence, now: () => number, heartbeatMs: number,
+  config: ConfigPublisher, pending: PendingWork, publish: PublishSummary) {
   const current = new Map<string, WSContext>();
   const sockets = new Set<WSContext>();
   let closing = false;
@@ -157,7 +158,12 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             return;
           }
           if (msg.type === 'usage' && isText(msg.id)) {
-            const ack_seq = await ingestUsage(store, tenantId, deviceId, now(), live, usageItems(msg.batch));
+            const ack_seq = await ingestUsage(store, tenantId, deviceId, userId, now(), live, usageItems(msg.batch), publish);
+            send({ type: 'events_ack', re: msg.id, ack_seq });
+            return;
+          }
+          if (msg.type === 'events' && isText(msg.id)) {
+            const ack_seq = await ingestEvents(store, tenantId, deviceId, userId, now(), live, eventItems(msg.batch), publish);
             send({ type: 'events_ack', re: msg.id, ack_seq });
             return;
           }
@@ -168,7 +174,12 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
           }
         } catch (error) {
           if (error instanceof ApiError && msg && isText(msg.id)) send({ type: 'ack', re: msg.id, ok: false, error: error.body() });
-          else if (live()) stop(1011, 'gateway unavailable');
+          else if (live()) {
+            const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+            console.error('OneX Edge gateway failed', { device_id: deviceId, name: error instanceof Error ? error.name : 'unknown',
+              code: typeof code === 'string' ? code : undefined });
+            stop(1011, 'gateway unavailable');
+          }
         }
     }
   });

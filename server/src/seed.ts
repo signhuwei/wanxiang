@@ -1,6 +1,7 @@
 import { ulid } from 'ulid';
 import { day, hash, iso, normalizedTarget, randomToken } from './credentials';
 import { indexInvite, indexMember, Store, type Transaction } from './store';
+import { defaultVisibility } from './visibility';
 
 export type User = { id: string; email: string | null; phone: string | null; name: string; created_at: string; revision: number };
 
@@ -24,7 +25,7 @@ export function ensureUser(sql: Transaction, target: NonNullable<ReturnType<type
 
 export function insertInitialContract(sql: Transaction, owner: string, seats: number, now: number) {
   sql.run(`INSERT INTO contract (revision, seat_limit, allowed_agents_json, allowed_models_json, visibility_json, updated_by, updated_at)
-    VALUES (1, ?, '["claude-code"]', '[]', '{}', ?, ?)`, [seats, owner, iso(now)]);
+    VALUES (1, ?, '["claude-code"]', '[]', ?, ?, ?)`, [seats, JSON.stringify(defaultVisibility), owner, iso(now)]);
 }
 
 export async function seedTenant(store: Store, opts: { target: string; name?: string; seats?: number; maxUses?: number; now?: number; platformAdmin?: boolean }) {
