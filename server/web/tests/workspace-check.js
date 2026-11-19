@@ -14,11 +14,22 @@ let code
 const app = await createServer({ dataDir: dir, hostname: '127.0.0.1', port: 0, heartbeatMs: 15000,
   tenantCacheSize: 2, presence: new MemoryPresence(), commit: 'test', codeSecret: crypto.randomUUID(), masterKey: crypto.getRandomValues(new Uint8Array(32)),
   deliverCode: (_, value) => { code = value } })
-const browser = await chromium.launch({ channel: 'chrome' })
+const browser = await chromium.launch({ channel: 'chrome', args: ['--disable-gpu'] })
 try {
   await seedTenant(app.store, { target, name: '联调租户', platformAdmin: true })
   const page = await browser.newPage({ viewport: { width: 1280, height: 720 } })
   page.setDefaultTimeout(3500)
+  const shots = process.argv[2]
+  async function capture(label) {
+    if (!shots) return
+    for (const [width,height] of [[1280,720],[1440,900]]) {
+      await page.setViewportSize({width,height})
+      const r=await page.evaluate(async label=>(await import('/tests/layout-check.js')).runLayoutChecks(label),label)
+      assert(r.pass, JSON.stringify(r.checks.filter(c=>!c.pass)))
+      await page.evaluate(() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done))))
+      await page.screenshot({path:join(shots,`${width}x${height}-${label}.png`), fullPage:true})
+    }
+  }
   const errors = []
   page.on('pageerror', e => errors.push(e.message))
   await page.route('**/*', async route => {
@@ -50,6 +61,7 @@ try {
   await field('name').fill('研发组')
   await button('保存').click()
   await page.locator('tr.clickable').getByText('研发组').waitFor()
+  await capture('groups-real')
   await link('成员').click()
   await button('生成邀请码').click()
   await button('生成').click()
@@ -79,11 +91,13 @@ try {
   await field('input_milli_per_mtok').fill('15')
   await button('保存').click()
   await page.locator('.table-scroll').last().getByText('15', { exact: true }).waitFor()
+  await capture('pricing-real')
   await link('租户').click()
   await link('合约').click()
   await button('编辑').click()
   await field('seat_limit').fill('19')
   await button('租约').click()
+  await capture('contract-real')
   await button('保存').click()
   await page.getByText('19', { exact: true }).waitFor()
   await link('橡皮').click()
@@ -91,6 +105,8 @@ try {
   await field('amount').fill('2.075')
   await button('确认充值').click()
   await page.getByText('2.075', {exact:true}).first().waitFor()
+  await page.locator('tr').getByText('充值',{exact:true}).waitFor()
+  await capture('billing-real')
   assert.deepEqual(errors, [])
   console.log('真实 Server：登录、成员筛选、分组、邀请码、平台目录、倍率、租户合约和充值通过')
 } finally {
