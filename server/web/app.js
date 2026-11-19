@@ -4,6 +4,8 @@
 import { createApi } from './api.js'
 import { createSessionStore } from './session.js'
 import { showToast } from './toast.js'
+import { catalog } from './catalog.js'
+import { contractPage } from './contract.js'
 import { groupsPage } from './groups.js'
 import { renderLogin } from './login.js'
 import { renderMembersPage } from './members.js'
@@ -54,7 +56,7 @@ function renderTop(hash) {
     tenantLink.classList.toggle('selected', hash.startsWith('#/tenant'))
     domains.appendChild(tenantLink)
     if (session.tenant && hash.startsWith('#/tenant')) {
-      for (const [path, label] of [['members','成员'], ['groups','分组']]) {
+      for (const [path, label] of [['members','成员'], ['groups','分组'], ['contract','合约']]) {
         const link = el('a', hash === '#/tenant/' + path ? 'selected' : '', label)
         link.href = '#/tenant/' + path
         domains.append(link)
@@ -150,7 +152,7 @@ function route() {
       location.replace(defaultHash())
       return
     }
-    renderPlatformPlaceholder(ws)
+    catalog(ws, createApi({getToken: () => session?.globalToken, onUnauthorized: () => { sessionStore.clear(); session = null; location.hash = '#/login' }}), session.globalActions || [])
     return
   }
 
@@ -160,6 +162,7 @@ function route() {
       return
     }
     if (hash === '#/tenant/groups') groupsPage(ws, api, session.actions || [])
+    else if (hash === '#/tenant/contract') contractPage(ws, api)
     else renderMembersPage(ws, { api, actions: session.actions || [] })
     return
   }

@@ -60,7 +60,7 @@ try {
     assert.equal(await page.locator('.inline-drill').count(), 1)
     await button('← 返回').click()
     await page.getByRole('link', { name: '平台' }).click()
-    await page.getByRole('heading', { name: '平台' }).waitFor()
+    await page.getByRole('heading', { name: 'Provider' }).waitFor()
     await button('退出').click()
     await button('邀请码登录').click()
     await page.getByPlaceholder('邮箱或手机号').fill('demo@onex.dev')

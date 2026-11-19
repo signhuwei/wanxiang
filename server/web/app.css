@@ -164,6 +164,8 @@ tr.clickable { cursor: pointer; }
   display: flex; justify-content: flex-end; gap: 8px; flex: none; background: #fcfdff;
 }
 .inline-foot:empty { display: none; }
+.inline-body.child-ledger { padding: 0; overflow: hidden; }
+.child-ledger .drill-context { width: 184px; }
 
 /* 表单：查看与编辑同一布局；多区块互斥折叠 */
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 20px; max-width: 960px; }

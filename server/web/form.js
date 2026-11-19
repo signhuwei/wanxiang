@@ -48,7 +48,8 @@ export function renderForm(body, { sections, values = {}, mode = 'view' }) {
       input.value = values[field.key] ?? ''
     } else {
       input = el('input')
-      input.type = field.type === 'number' ? 'number' : field.type === 'email' ? 'email' : 'text'
+      input.type = ['number','email','password'].includes(field.type) ? field.type : 'text'
+      if (input.type === 'password') input.autocomplete = 'new-password'
       if (field.type === 'number' && field.step) input.step = String(field.step)
       const v = values[field.key]
       input.value = v === null || v === undefined ? '' : String(v)
