@@ -18,4 +18,4 @@ HTTP 和 WS 共用。HTTP 返回 `{"error": {"code": "...", "message": "...", "d
 | `upstream_error` | 502 | 上游 Provider 出错，`detail.upstream_status` |
 | `internal` | 500 | 服务内部错误，带 `detail.trace_id` |
 
-本机 router 拒绝 Agent 的模型请求时，按 Agent 所用协议的错误格式返回（Anthropic 用 `{"type":"error","error":{"type":"...","message":"..."}}`），`message` 里写明原因和处理方法，例如“OneX 橡皮余额已用完，请联系管理员充值”。
+本机 router 拒绝 Agent 的模型请求时，按 Agent 所用协议的错误格式返回（Anthropic 用 `{"type":"error","error":{"type":"...","code":"<本表 code>","message":"..."}}`，`code` 是扩展字段，Anthropic 客户端会忽略），`message` 里写明原因和处理方法，例如“OneX 橡皮余额已用完，请联系管理员充值”。

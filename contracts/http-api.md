@@ -62,7 +62,7 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET/POST | `/platform/tenants` | 租户 |
-| GET/POST | `/platform/providers`，`/platform/models`，`/platform/rates` | Provider、模型、倍率 |
+| GET/POST | `/platform/providers`，`/platform/models`，`/platform/rates` | Provider、模型、倍率。`/platform/models?provider_id=`、`/platform/rates?model_id=` 在服务端过滤，`total` 和 `cursor` 都按过滤后的结果计算 |
 | GET/POST | `/platform/agent-releases` | Agent 发行目录 |
 
 ## 运维
