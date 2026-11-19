@@ -44,8 +44,10 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 | GET | `/ledger` | 橡皮流水。 `overage_pending` 单列超租约待核对的差额，`amount_milli` 不计入余额、预留或本月消耗。 |
 | POST | `/platform/ledger/topup` | 平台管理员手工加分，全局令牌，`{tenant_id, amount_milli, note?}` |
 | GET | `/devices`，`/devices/:id` | 设备台账 |
-| POST | `/devices/:id/diag` | `{kind}`，返回 `diag_id` |
-| GET | `/diag/:id` | 状态和日志包下载地址 |
+| POST | `/devices/:id/diag` | 租户 owner、admin 或平台管理员发起。`{kind}`，返回 `diag_id` |
+| GET | `/diag/:id` | 查询状态。日志包可取回时返回 OneX 同源 `download_url` |
+| PUT | `/diag/:id/upload` | 指定设备以有效设备令牌上送 `application/x-tar` 日志包 |
+| GET | `/diag/:id/download` | 对发起诊断有权限的身份下载未过期日志包，通过 OneX API 鉴权。对象存储保持私有 |
 | GET | `/audit` | 审计 |
 
 ## 监察

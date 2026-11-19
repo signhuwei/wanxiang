@@ -26,6 +26,8 @@ case "$service" in
     fi
     ONEX_MASTER_KEY=$(<"$home/secrets/master.key")
     ONEX_AUTH_SECRET=$(<"$home/secrets/auth.key")
+    ONEX_RUSTFS_SECRET_KEY=$(<"$home/secrets/rustfs.key")
+    export ONEX_RUSTFS_ENDPOINT=http://127.0.0.1:$ONEX_RUSTFS_PORT ONEX_RUSTFS_ACCESS_KEY=onex-sidecar ONEX_RUSTFS_SECRET_KEY
     export ONEX_MASTER_KEY ONEX_AUTH_SECRET
     cd "$release/server"
     exec "$bin/bun" --no-env-file src/index.ts;;

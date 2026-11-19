@@ -29,15 +29,16 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     let home = home_dir()?;
     std::fs::create_dir_all(&home)?;
+    let started_at = time::OffsetDateTime::now_utc();
     let _log_guard = init_logging(&home)?;
-    if let Err(e) = run(home).await {
+    if let Err(e) = run(home, started_at).await {
         error!(error = %format!("{e:#}"), "onexd exited with error");
         return Err(e);
     }
     Ok(())
 }
 
-async fn run(home: PathBuf) -> Result<()> {
+async fn run(home: PathBuf, started_at: time::OffsetDateTime) -> Result<()> {
     info!(version = env!("CARGO_PKG_VERSION"), home = %home.display(), "onexd starting");
     let shutdown = CancellationToken::new();
     let outbox = Arc::new(Outbox::open(&home.join("outbox.sqlite"))?);
@@ -91,7 +92,10 @@ async fn run(home: PathBuf) -> Result<()> {
     let ipc_task = tokio::spawn(ipc::serve(listener, sock_path, ipc));
 
     let ws_task = match server {
-        Some(url) => Some(tokio::spawn(ws::run(ws::WsOptions::new(url), state, outbox, shutdown.clone()))),
+        Some(url) => {
+            let options = ws::WsOptions::new(url).with_diagnostic_logs(home.join("logs"), started_at);
+            Some(tokio::spawn(ws::run(options, state, outbox, shutdown.clone())))
+        }
         None => {
             info!("ONEX_SERVER not set; running without server connection");
             None

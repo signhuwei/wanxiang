@@ -1,5 +1,6 @@
 //! 到 Server 的 WebSocket 长连接：握手、心跳、配置下发、outbox 回流、指数退避重连。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use onex_core::ws::{Ack, Config, DiagResult, ErrorBody, Hello, LeaseRenew, Msg, PROTOCOL_VERSION, Welcome};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
+use tokio::task::JoinSet;
 use tokio::time::{Instant, interval_at, sleep, timeout};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
@@ -19,9 +21,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::id;
 use crate::outbox::{AckOutcome, Kind, Outbox};
 use crate::state::{ConfigSnapshot, Phase, State};
+use crate::{diagnostics, id};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Tx = SplitSink<Ws, Message>;
@@ -42,6 +44,7 @@ pub struct WsOptions {
     pub batch_max: usize,
     /// 已发送未确认的条目上限，超过就等 events_ack。
     pub window: u64,
+    logs: Option<diagnostics::LogSource>,
 }
 
 impl WsOptions {
@@ -54,7 +57,13 @@ impl WsOptions {
             connect_timeout: Duration::from_secs(10),
             batch_max: 500,
             window: 5000,
+            logs: None,
         }
+    }
+
+    pub fn with_diagnostic_logs(mut self, directory: PathBuf, started_at: time::OffsetDateTime) -> Self {
+        self.logs = Some(diagnostics::LogSource { directory, started_at });
+        self
     }
 }
 
@@ -161,7 +170,7 @@ async fn session(opts: &WsOptions, state: &State, outbox: &Outbox, token: &str, 
         Err(e) => return classify(e, false),
     };
 
-    match connected(opts, state, outbox, &mut tx, &mut rx, &welcome, cancel).await {
+    match connected(opts, state, outbox, (&mut tx, &mut rx), &welcome, token, cancel).await {
         Ok(()) => {
             let _ =
                 tx.send(Message::Close(Some(CloseFrame { code: CloseCode::Normal, reason: "shutdown".into() }))).await;
@@ -250,11 +259,12 @@ async fn connected(
     opts: &WsOptions,
     state: &State,
     outbox: &Outbox,
-    tx: &mut Tx,
-    rx: &mut Rx,
+    socket: (&mut Tx, &mut Rx),
     welcome: &Welcome,
+    token: &str,
     cancel: &CancellationToken,
 ) -> Result<()> {
+    let (tx, rx) = socket;
     if state.expected_device_id.read().unwrap().as_ref().is_some_and(|id| id != &welcome.device_id) {
         return Err(Special::Unauthenticated.into());
     }
@@ -285,6 +295,7 @@ async fn connected(
     let mut missed: u32 = 0;
     let mut outbox_rx = outbox.subscribe();
     let mut renew_rx = state.lease.subscribe_renew();
+    let mut diagnostic_tasks = JoinSet::new();
     state.lease.on_connected();
     send_renew(state, tx).await?;
 
@@ -306,6 +317,11 @@ async fn connected(
             r = renew_rx.changed() => {
                 r.context("lease closed")?;
                 send_renew(state, tx).await?;
+            }
+            r = diagnostic_tasks.join_next(), if !diagnostic_tasks.is_empty() => {
+                if let Some(Ok(result)) = r {
+                    send(tx, &Msg::DiagResult(result)).await?;
+                }
             }
             m = recv(rx) => {
                 missed = 0;
@@ -356,8 +372,19 @@ async fn connected(
                         };
                         send(tx, &reply).await?;
                     }
+                    Msg::Diag(job) if diagnostic_tasks.is_empty() => {
+                        let source = opts.logs.clone();
+                        let server = opts.url.clone();
+                        let token = token.to_string();
+                        let status = json!({"connected": true, "outbox_last_seq": outbox.last_seq(),
+                            "config_revision": state.config_revision()});
+                        diagnostic_tasks.spawn(async move { diagnostics::run(job, source, &server, &token, status).await });
+                    }
+                    Msg::Diag(job) => {
+                        let reply = DiagResult { id: id::new("msg"), diag_id: job.diag_id, ok: false, detail: json!({"reason": "busy"}) };
+                        send(tx, &Msg::DiagResult(reply)).await?;
+                    }
                     Msg::Ack(Ack { re, ok: false, error }) => warn!(%re, ?error, "server rejected message"),
-                    // TODO(S1-E5): diag、agent_cmd
                     other => debug!(?other, "ignored"),
                 }
             }

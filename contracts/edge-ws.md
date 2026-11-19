@@ -37,7 +37,7 @@ Server 回 `welcome`：
 | `secret` | `provider_id`、`ciphertext`、`nonce`、`key_id` | 加密的上游密钥，只在内存解密。算法见下方“密钥下发” |
 | `lease` | `lease_id`、`expires_at`、`budget_milli`、`seq` | 额度租约。Edge 在 `expires_at` 前或已用 80% 时发 `lease_renew` |
 | `cutoff` | `reason`（`balance`、`disabled`、`contract`） | 立即断流：拒绝新请求，中断进行中的流 |
-| `diag` | `diag_id`、`kind`（`logs`、`status`）、`upload_url` | 诊断指令。`logs` 打包日志上传到 `upload_url`（预签名 PUT）；`status` 直接回 `diag_result` |
+| `diag` | `diag_id`、`kind`（`logs`、`status`）、`upload_url` | `logs` 将白名单日志打包，经当前控制连接同源的 `/v1/diag/:id/upload` 上传，使用该连接的设备令牌。`status` 直接回 `diag_result` |
 | `agent_cmd` | `agent`、`action`（`stop`） | 管理指令 |
 
 ## Edge → Server

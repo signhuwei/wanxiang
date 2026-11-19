@@ -1,5 +1,6 @@
 pub mod capture;
 pub mod chat;
+mod diagnostics;
 pub mod id;
 pub mod ipc;
 pub mod lastgood;
