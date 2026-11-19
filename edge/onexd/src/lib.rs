@@ -6,6 +6,7 @@ pub mod lease;
 pub mod outbox;
 pub mod pricing;
 pub mod router;
+pub mod secret;
 pub mod sse;
 pub mod state;
 pub mod ws;

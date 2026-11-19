@@ -327,16 +327,26 @@ async fn connected(
                         send(tx, &reply).await?;
                     }
                     Msg::Cutoff(c) => {
-                        // 落盘失败也已经断流了，照样确认。
+                        // 落盘失败也已经断流了，照样确认。cutoff 不清续租快照，见 lease::Ledger::cutoff。
                         if let Err(e) = state.lease.cutoff(&c.reason) {
                             warn!(error = %format!("{e:#}"), "persist cutoff");
                         }
                         send(tx, &ack_ok(c.id)).await?;
                     }
                     Msg::Secret(s) => {
-                        // TODO(S1-E2): X25519 + XChaCha20-Poly1305 解密，等设备注册交换公钥后实现。
-                        warn!(provider_id = %s.provider_id, "secret decryption not implemented");
-                        send(tx, &ack_err(s.id, "internal", "Edge 暂不支持解密上游密钥")).await?;
+                        let reply = match state.device_key.open(&s.provider_id, &s.key_id, &s.nonce, &s.ciphertext) {
+                            Ok(key) => {
+                                // 明文只进内存表，不写日志
+                                state.secrets.write().unwrap().insert(s.provider_id.clone(), key.to_string());
+                                info!(provider_id = %s.provider_id, "upstream secret installed");
+                                ack_ok(s.id)
+                            }
+                            Err(e) => {
+                                warn!(provider_id = %s.provider_id, error = ?e, "secret rejected");
+                                ack_err(s.id, "invalid", "无法解密上游密钥，请重新登录 OneX 以重新注册设备")
+                            }
+                        };
+                        send(tx, &reply).await?;
                     }
                     Msg::Ack(Ack { re, ok: false, error }) => warn!(%re, ?error, "server rejected message"),
                     // TODO(S1-E5): diag、agent_cmd

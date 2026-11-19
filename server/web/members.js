@@ -22,6 +22,7 @@ const ROLE_OPTIONS = [
 ]
 
 export function renderMembersPage(host, { api, actions = [] }) {
+  const grantable = ROLE_OPTIONS.filter(({value}) => actions.includes('assign_role:' + value))
   let ledger
   const invite = detailPanel(host, () => ledger)
 
@@ -113,12 +114,12 @@ export function renderMembersPage(host, { api, actions = [] }) {
         document.createTextNode(formatDateTime(member.last_active_at))
       )
 
-      const canEditRole = member.role !== 'owner'
+      const canEditRole = mode !== 'view' && grantable.some(option => option.value === member.role)
       const fields = [
         { key: 'name', label: '姓名', readonly: true },
         { key: 'target', label: '账号', readonly: true },
         canEditRole
-          ? { key: 'role', label: '角色', type: 'select', options: ROLE_OPTIONS, allowEmpty: false }
+          ? { key: 'role', label: '角色', type: 'select', options: grantable, allowEmpty: false }
           : { key: 'role', label: '角色', readonly: true, format: roleLabel },
         { key: 'group_id', label: '分组', type: 'select', options: [] },
         { key: 'quota_eraser', label: '橡皮配额', type: 'number', step: 0.001, placeholder: '不限' },
@@ -197,7 +198,7 @@ export function renderMembersPage(host, { api, actions = [] }) {
           saveBtn.disabled = true
           try {
             member = await api.post('/members/' + encodeURIComponent(member.user_id), {
-              role: v.role,
+              ...(canEditRole && v.role !== member.role ? { role: v.role } : {}),
               group_id: v.group_id,
               quota_milli: quotaMilli,
               revision: member.revision
@@ -225,7 +226,7 @@ export function renderMembersPage(host, { api, actions = [] }) {
   ledger = createLedger(host, {
     title: '成员',
     createLabel: '生成邀请码',
-    onCreate: actions.includes('create_invite') ? () => invite('生成邀请码', pane => invitePanel(pane, api)) : null,
+    onCreate: actions.includes('create_invite') && grantable.length ? () => invite('生成邀请码', pane => invitePanel(pane, api, grantable)) : null,
     rowKey: 'user_id',
     fetchPage,
     onOpen: openMember,

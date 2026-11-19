@@ -49,6 +49,28 @@
 
 S0 和 S1 只运行一个 Server 写进程（SQLite 本身也要求单节点写）。水平扩展另行设计。
 
+## 监察可见范围（v0.11）
+
+依据访谈：户主（owner）决定给管理员和组管开放哪些可见范围，户主自己全部可见；所有正文查看都写审计。
+
+`contract.visibility_json` 的结构：
+
+```json
+{
+  "admin":       {"summary": true,  "content": false},
+  "group_admin": {"summary": true,  "content": false}
+}
+```
+
+- `summary`：人员台账、会话台账、token 和橡皮费用，不含对话正文。
+- `content`：对话正文（`/observe/sessions/:id/events`）。
+- owner 始终两者都可见，不受此字段影响。
+- `group_admin` 只能看本组及子组的成员。
+- 新租户的默认值：admin 和 group_admin 的 `summary` 为 true，`content` 为 false。理由是费用透明是付费的主要理由之一，而正文是最敏感的数据。
+- 只有 owner 能修改 visibility，修改写审计。
+- 每次读取正文写一条审计（读者、会话、时间）。SSE `/observe/stream` 只推摘要，不推正文。
+- 成员本人可以看自己的会话正文。
+
 余额 = `ledger` 中 topup + adjust − settle 的合计，再减去未结算租约的 reserve。Server 在单个事务里写 ledger 和 leases。
 
 `session_events` 和 `usage` 用 (device_id, seq) 做主键，重复回流直接忽略，保证不重。

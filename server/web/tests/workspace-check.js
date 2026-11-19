@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { chromium } from 'playwright'
+import { checkLiveObservation } from './observe-live.js'
 import { createServer } from '../../src/server.ts'
 import { seedTenant } from '../../src/seed.ts'
 import { MemoryPresence } from '../../src/presence.ts'
@@ -16,8 +17,8 @@ const app = await createServer({ dataDir: dir, hostname: '127.0.0.1', port: 0, h
   deliverCode: (_, value) => { code = value } })
 const browser = await chromium.launch({ channel: 'chrome', args: ['--disable-gpu'] })
 try {
-  await seedTenant(app.store, { target, name: '联调租户', platformAdmin: true })
-  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } })
+  const seed = await seedTenant(app.store, { target, name: '联调租户', platformAdmin: true })
+  const page = await browser.newPage({ baseURL:app.server.url.href, viewport: { width: 1280, height: 720 } })
   page.setDefaultTimeout(3500)
   const shots = process.argv[2]
   async function capture(label) {
@@ -34,10 +35,7 @@ try {
   page.on('pageerror', e => errors.push(e.message))
   await page.route('**/*', async route => {
     const path = new URL(route.request().url()).pathname
-    if (path.startsWith('/v1/')) {
-      const res = await route.fetch()
-      return route.fulfill({ response: res })
-    }
+    if (path.startsWith('/v1/')) return route.continue()
     const file = Bun.file(new URL('..' + (path === '/' ? '/index.html' : path), import.meta.url))
     return route.fulfill({ status: await file.exists() ? 200 : 404, contentType: file.type, body: await file.exists() ? await file.text() : '' })
   })
@@ -96,6 +94,13 @@ try {
   await link('合约').click()
   await button('编辑').click()
   await field('seat_limit').fill('19')
+  await button('可见范围').click()
+  assert.equal(await field('admin_summary').inputValue(),'true')
+  assert.equal(await field('admin_content').inputValue(),'false')
+  assert.equal(await field('group_admin_summary').inputValue(),'true')
+  assert.equal(await field('group_admin_content').inputValue(),'false')
+  await field('admin_content').selectOption('true')
+  await field('group_admin_summary').selectOption('false')
   await button('租约').click()
   await capture('contract-real')
   await button('保存').click()
@@ -107,10 +112,48 @@ try {
   await page.getByText('2.075', {exact:true}).first().waitFor()
   await page.locator('tr').getByText('充值',{exact:true}).waitFor()
   await capture('billing-real')
+  const staff = 'staff@example.test', admin = 'admin@example.test'
+  const roles = () => field('role').locator('option').evaluateAll(opts => opts.map(o => o.value).sort())
+  await page.request.post('/v1/auth/code', {data:{target:staff}})
+  assert((await page.request.post('/v1/auth/login', {data:{target:staff,code,invite_code:invite}})).ok())
+  await link('成员').click()
+  const staffRow = page.locator('tr.clickable').filter({hasText:staff})
+  await staffRow.click()
+  await button('编辑').click()
+  await field('role').waitFor()
+  assert.deepEqual(await roles(), ['admin','group_admin','member'])
+  await button('← 返回').click()
+  await button('生成邀请码').click()
+  assert.deepEqual(await roles(), ['admin','group_admin','member'])
+  await field('role').selectOption('admin')
+  await button('生成').click()
+  const adminInvite = await page.getByLabel('一次性邀请码').inputValue()
+  await button('退出').click()
+  await button('邀请码登录').click()
+  await page.getByPlaceholder('邮箱或手机号').fill(admin)
+  await page.getByPlaceholder('邀请码',{exact:true}).fill(adminInvite)
+  await button('发送验证码').click()
+  await page.getByText('验证码已发送，请查收').waitFor()
+  await page.getByPlaceholder('6 位验证码').fill(code)
+  await button('登录').click()
+  await staffRow.click()
+  await button('编辑').click()
+  await field('role').waitFor()
+  assert.deepEqual(await roles(), ['member'])
+  await button('← 返回').click()
+  await button('生成邀请码').click()
+  assert.deepEqual(await roles(), ['member'])
+  await link('合约').click()
+  await button('可见范围').click()
+  assert.equal(await page.locator('output[data-field=admin_content]').innerText(),'可见')
+  assert.equal(await page.locator('output[data-field=group_admin_summary]').innerText(),'不可见')
+  assert.equal(await button('编辑').count(),0)
+  assert.equal(await field('admin_content').count(),0)
+  await checkLiveObservation({app,seed,page,target,capture})
   assert.deepEqual(errors, [])
   console.log('真实 Server：登录、成员筛选、分组、邀请码、平台目录、倍率、租户合约和充值通过')
 } finally {
   await browser.close()
-  app.close()
+  await app.close()
   await rm(dir, { recursive: true, force: true })
 }
