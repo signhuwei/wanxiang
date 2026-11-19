@@ -33,6 +33,7 @@ struct Seen {
     headers: Option<HeaderMap>,
     body: Option<Value>,
     query: Option<String>,
+    path: Option<String>,
 }
 
 struct Upstream {
@@ -85,24 +86,26 @@ impl Upstream {
         let seen = Arc::new(Mutex::new(Seen::default()));
         let dropped: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::default();
         let (s, d) = (seen.clone(), dropped.clone());
-        let app = axum::Router::new().route(
-            "/v1/messages",
-            post(move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
-                let (s, d) = (s.clone(), d.clone());
-                async move {
-                    let scenario =
-                        headers.get("x-test-scenario").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-                    {
-                        let mut s = s.lock().unwrap();
-                        s.calls += 1;
-                        s.headers = Some(headers);
-                        s.body = serde_json::from_slice(&body).ok();
-                        s.query = uri.query().map(String::from);
-                    }
-                    upstream_response(&scenario, d.lock().unwrap().take())
+        let messages = post(move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
+            let (s, d) = (s.clone(), d.clone());
+            async move {
+                let scenario = headers.get("x-test-scenario").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                {
+                    let mut s = s.lock().unwrap();
+                    s.calls += 1;
+                    s.headers = Some(headers);
+                    s.body = serde_json::from_slice(&body).ok();
+                    s.query = uri.query().map(String::from);
+                    s.path = Some(uri.path().into());
                 }
-            }),
-        );
+                if uri.path() == "/v1/messages/count_tokens" && scenario == "count" {
+                    return axum::Json(json!({"input_tokens": 128})).into_response();
+                }
+                upstream_response(&scenario, d.lock().unwrap().take())
+            }
+        });
+        let app =
+            axum::Router::new().route("/v1/messages", messages.clone()).route("/v1/messages/count_tokens", messages);
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
@@ -390,6 +393,15 @@ impl Env {
             .header("anthropic-beta", "prompt-caching-2024-07-31")
             .header("x-test-scenario", scenario)
             .json(&json!({"model":"claude-sonnet-5-5","max_tokens":100,"stream":stream,"messages":[{"role":"user","content":"hi"}]}))
+    }
+
+    fn count_req(&self, scenario: &str) -> reqwest::RequestBuilder {
+        self.http
+            .post(format!("{}/count_tokens?beta=true", self.url))
+            .header("x-api-key", LOCAL)
+            .header("anthropic-beta", "fixture-beta")
+            .header("x-test-scenario", scenario)
+            .json(&json!({"model":"claude-sonnet-5-5","messages":[{"role":"user","content":"hi"}]}))
     }
 
     /// max_tokens=1：预留 = 1×2 + 估算输入 2×1 = 4，用来测实际花费超过预留的情形。
@@ -724,6 +736,74 @@ async fn upstream_error_status_is_passed_through() {
     let u = e.usage().await;
     assert_eq!(u.outcome, Outcome::UpstreamStatus(529));
     assert_eq!(u.tokens, Tokens::default());
+}
+
+#[tokio::test]
+async fn count_tokens_preserves_request_and_sends_no_usage() {
+    let mut e = env_with(UpstreamAuth::Bearer, Some("claude-up")).await;
+    // No price is needed for an upstream input-token estimate.
+    e.state.config.write().unwrap().rates.clear();
+    let before = e.state.lease.snapshot();
+    let messages = json!([{"role":"user","content":[
+        {"type":"text","text":"test"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"fixture"}}
+    ]}]);
+    let response = e
+        .count_req("count")
+        .json(&json!({"model":"claude-sonnet-5-5","messages":messages,"tools":[{"name":"fixture"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap(), json!({"input_tokens":128}));
+
+    {
+        let seen = e.upstream.seen.lock().unwrap();
+        let headers = seen.headers.as_ref().unwrap();
+        let body = seen.body.as_ref().unwrap();
+        assert_eq!(seen.path.as_deref(), Some("/v1/messages/count_tokens"));
+        assert_eq!(seen.query.as_deref(), Some("beta=true"));
+        assert_eq!(headers["anthropic-beta"], "fixture-beta");
+        assert_eq!(headers["authorization"], format!("Bearer {KEY}"));
+        assert!(!headers.contains_key("x-api-key"));
+        assert_eq!(body["model"], "claude-up");
+        assert_eq!(body["messages"], messages);
+        assert_eq!(body["tools"], json!([{"name":"fixture"}]));
+    }
+    assert_eq!(e.calls(), 1);
+    assert_eq!(e.state.lease.snapshot(), before);
+    assert!(matches!(e.usage.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    assert_eq!(e.state.upstream.lock().unwrap().completed, 0);
+}
+
+#[tokio::test]
+async fn count_tokens_enforces_access_and_requires_anthropic_upstream() {
+    let e = env().await;
+    let request = e
+        .http
+        .post(format!("{}/count_tokens", e.url))
+        .header("x-api-key", "wrong")
+        .json(&json!({"model":"claude-sonnet-5-5"}));
+    assert_eq!(request.send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    e.state.config.write().unwrap().routes[0].protocol = "openai_chat".into();
+    assert_eq!(e.count_req("count").send().await.unwrap().status(), StatusCode::NOT_IMPLEMENTED);
+
+    e.state.config.write().unwrap().routes[0].protocol = "anthropic".into();
+    e.state.lease.cutoff("device_disabled").unwrap();
+    assert_eq!(e.count_req("count").send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(e.calls(), 0);
+}
+
+#[tokio::test]
+async fn count_tokens_preserves_upstream_http_error_without_retry_or_usage() {
+    let mut e = env().await;
+    let response = e.count_req("overloaded").send().await.unwrap();
+    assert_eq!(response.status().as_u16(), 529);
+    assert_eq!(response.json::<Value>().await.unwrap()["error"]["type"], "overloaded_error");
+    assert_eq!(e.calls(), 1);
+    assert_eq!(e.ledger(), (0, 0));
+    assert!(matches!(e.usage.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
 }
 
 #[tokio::test]

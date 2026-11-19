@@ -33,6 +33,7 @@ use crate::{chat, id};
 const MAX_BODY: usize = 64 * 1024 * 1024;
 const MAX_UPSTREAM_BODY: usize = 64 * 1024 * 1024;
 const MVP_LOCAL_QWEN_PROVIDER_ID: &str = "prv_mvp_local_qwen";
+const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -176,8 +177,11 @@ impl Router {
     }
 
     pub fn app(self: Arc<Self>) -> AxumRouter {
-        // TODO(claude-code.md): Claude Code 是否还会调 /v1/messages/count_tokens、/v1/models，规格出来后补。
-        AxumRouter::new().route("/v1/messages", post(messages)).layer(DefaultBodyLimit::max(MAX_BODY)).with_state(self)
+        AxumRouter::new()
+            .route("/v1/messages", post(messages))
+            .route(COUNT_TOKENS_PATH, post(messages))
+            .layer(DefaultBodyLimit::max(MAX_BODY))
+            .with_state(self)
     }
 
     fn session_for(&self, h: &HeaderMap) -> Result<Option<String>, ()> {
@@ -236,6 +240,7 @@ pub fn select_route<'a>(routes: &'a [Route], model: &str) -> Option<&'a Route> {
 
 async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let started = Instant::now();
+    let counts_tokens = uri.path() == COUNT_TOKENS_PATH;
     let Ok(session_id) = rt.session_for(&headers) else {
         return anthropic_error(
             StatusCode::UNAUTHORIZED,
@@ -279,15 +284,22 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
             );
         }
     };
+    if counts_tokens && to_chat {
+        return anthropic_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "api_error",
+            "此模型的上游使用 OpenAI Chat 协议，OneX 无法透传 Anthropic token 计数请求。",
+        );
+    }
     // 没有单价就无法计费，不放行。
-    let Some(rate) = rate else {
+    if !counts_tokens && rate.is_none() {
         warn!(model = %model, model_id = %route.model_id, "no rate for model");
         return anthropic_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
             &format!("OneX 还没有收到模型 {model} 的计价配置，请稍后重试；如果持续出现，请联系管理员检查倍率表。"),
         );
-    };
+    }
     let Some(key) = rt.state.secrets.read().unwrap().get(&route.provider_id).cloned() else {
         return anthropic_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -311,7 +323,7 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         };
         (chat::chat_url(&route.base_url), Bytes::from(serde_json::to_vec(&chat_req).unwrap()))
     } else {
-        let mut url = format!("{}/v1/messages", route.base_url.trim_end_matches('/'));
+        let mut url = format!("{}{}", route.base_url.trim_end_matches('/'), uri.path());
         if let Some(q) = uri.query() {
             url.push('?');
             url.push_str(q);
@@ -332,16 +344,6 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         }
     };
 
-    let meter = Meter::new(rate, max_tokens, estimate_input(&req));
-    let ticket = match rt.state.lease.admit(meter.reservation) {
-        Ok(t) => t,
-        Err(b) => {
-            info!(model = %model, reason = ?b, reservation_milli = meter.reservation, "request blocked by lease");
-            return block_response(b);
-        }
-    };
-    rt.state.upstream.lock().unwrap().inflight += 1;
-
     // Anthropic 的请求头（anthropic-version、anthropic-beta）对 Chat 上游没有意义，不转发。
     let mut out_headers = if to_chat {
         let mut h = HeaderMap::new();
@@ -356,6 +358,20 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
     };
     // 不要压缩，才能边转发边解析 SSE。
     out_headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+
+    if counts_tokens {
+        return forward_count_tokens(&rt.state.lease, client, &url, out_headers, body).await;
+    }
+
+    let meter = Meter::new(rate.expect("a message requires a rate"), max_tokens, estimate_input(&req));
+    let ticket = match rt.state.lease.admit(meter.reservation) {
+        Ok(t) => t,
+        Err(b) => {
+            info!(model = %model, reason = ?b, reservation_milli = meter.reservation, "request blocked by lease");
+            return block_response(b);
+        }
+    };
+    rt.state.upstream.lock().unwrap().inflight += 1;
 
     let rec = UsageRecord {
         request_id: id::new("req"),
@@ -458,6 +474,37 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
     }
     req.finish();
     (status, resp_headers, bytes).into_response()
+}
+
+async fn forward_count_tokens(
+    lease: &crate::lease::Ledger,
+    client: reqwest::Client,
+    url: &str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let request = || client.post(url).headers(headers.clone()).body(body.clone());
+    let unavailable =
+        || anthropic_error(StatusCode::BAD_GATEWAY, "api_error", "OneX 连接上游模型服务失败，请稍后重试。");
+    for attempt in 1..=2 {
+        if let Err(blocked) = lease.check_access() {
+            return block_response(blocked);
+        }
+        match request().send().await {
+            Ok(response) => {
+                let status = response.status();
+                let headers = response_headers(response.headers());
+                return match read_limited(response, MAX_UPSTREAM_BODY).await {
+                    Ok(body) => (status, headers, body).into_response(),
+                    Err(_) => unavailable(),
+                };
+            }
+            Err(error) => {
+                warn!(attempt, error = %error.without_url(), "upstream token count failed");
+            }
+        }
+    }
+    unavailable()
 }
 
 /// 估算请求的输入 token：所有字符串值的字节数按 3 字节 1 个 token 算，跳过图片等 base64 的 `data`。
