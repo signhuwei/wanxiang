@@ -16,7 +16,9 @@ export function createLedger(host, {
   fetchPage,        // async ({q, filters, cursor, limit, signal}) => {items, next_cursor, total}
   rowKey = 'id',
   filters = [],     // [{key, label, options:[{value,label}], value}]
-  onOpen,           // (item) => void；提供后行可点击
+  onOpen,           // (item) => void；有对应 action 时行可点击
+  openAction = 'read',
+  noOpenText = '',
   onCreate,         // () => void；提供后工具栏出现“新建”
   createLabel = '新建',
   pageSize = 50,
@@ -123,7 +125,7 @@ export function createLedger(host, {
       return
     }
     for (const item of items) {
-      const canRead = onOpen && item.actions?.includes('read')
+      const canRead = onOpen && Array.isArray(item.actions) && item.actions.includes(openAction)
       const tr = el('tr', canRead ? 'clickable' : null)
       tr.dataset.key = item[rowKey]
       if (selectedKey === item[rowKey]) tr.classList.add('selected')
@@ -143,6 +145,8 @@ export function createLedger(host, {
             markSelected()
             onOpen(item)
           })
+        } else if (noOpenText) {
+          action.appendChild(el('span', 'muted', noOpenText))
         }
         tr.appendChild(action)
       }

@@ -77,7 +77,7 @@ export async function observePage(host,api,session,signal) {
       pane.body.classList.add('child-ledger'); reading=null
       let list
       const open=detailPanel(pane.body,()=>list)
-      sessions={host:pane.body,list:list=createLedger(pane.body,{title:'会话',rowKey:'id',columns:[{key:'agent',title:'会话',render:s=>compactCell(agentName(s.agent)+' · '+formatDateTime(s.started_at),`${turns(s)} · ${formatMilli(s.cost_milli)} 橡皮`)},{key:'model',title:'模型'},
+      sessions={host:pane.body,list:list=createLedger(pane.body,{title:'会话',rowKey:'id',openAction:'read_content',noOpenText:'无正文查看权限，可请户主开放',columns:[{key:'agent',title:'会话',render:s=>compactCell(agentName(s.agent)+' · '+formatDateTime(s.started_at),`${turns(s)} · ${formatMilli(s.cost_milli)} 橡皮`)},{key:'model',title:'模型'},
         {key:'started_at',title:'开始时间 ↓',render:s=>formatDateTime(s.started_at)},{key:'turn_count',title:'轮数',render:turns},{key:'input_tokens',title:'输入 token'},{key:'output_tokens',title:'输出 token'},{key:'cost_milli',title:'橡皮',render:s=>formatMilli(s.cost_milli)}],
         fetchPage:async ({q,cursor,limit,signal:listSignal})=>{
           const data=await api.get('/observe/sessions',{params:{user_id:p.user_id,q,cursor,limit},signal:listSignal})

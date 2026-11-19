@@ -20,7 +20,8 @@ try {
   const seed = await seedTenant(app.store, { target, name: '联调租户', platformAdmin: true })
   const page = await browser.newPage({ baseURL:app.server.url.href, viewport: { width: 1280, height: 720 } })
   page.setDefaultTimeout(3500)
-  const shots = process.argv[2]
+  const summaryOnly=process.argv.includes('--summary-only')
+  const shots = process.argv.slice(2).find(a=>a!=='--summary-only')
   async function capture(label) {
     if (!shots) return
     for (const [width,height] of [[1280,720],[1440,900]]) {
@@ -99,7 +100,7 @@ try {
   assert.equal(await field('admin_content').inputValue(),'false')
   assert.equal(await field('group_admin_summary').inputValue(),'true')
   assert.equal(await field('group_admin_content').inputValue(),'false')
-  await field('admin_content').selectOption('true')
+  await field('admin_content').selectOption(summaryOnly?'false':'true')
   await field('group_admin_summary').selectOption('false')
   await button('租约').click()
   await capture('contract-real')
@@ -145,11 +146,11 @@ try {
   assert.deepEqual(await roles(), ['member'])
   await link('合约').click()
   await button('可见范围').click()
-  assert.equal(await page.locator('output[data-field=admin_content]').innerText(),'可见')
+  assert.equal(await page.locator('output[data-field=admin_content]').innerText(),summaryOnly?'不可见':'可见')
   assert.equal(await page.locator('output[data-field=group_admin_summary]').innerText(),'不可见')
   assert.equal(await button('编辑').count(),0)
   assert.equal(await field('admin_content').count(),0)
-  await checkLiveObservation({app,seed,page,target,capture})
+  await checkLiveObservation({app,seed,page,target,capture,summaryOnly})
   assert.deepEqual(errors, [])
   console.log('真实 Server：登录、成员筛选、分组、邀请码、平台目录、倍率、租户合约和充值通过')
 } finally {
