@@ -8,6 +8,7 @@ HTTP 和 WS 共用。HTTP 返回 `{"error": {"code": "...", "message": "...", "d
 | `forbidden` | 403 | 身份有效，但没有这个操作或这个对象的权限 |
 | `not_found` | 404 | 对象不存在，或调用者无权知道它存在 |
 | `conflict` | 409 | `revision` 不一致 |
+| `too_large` | 413 | 上传内容超出大小上限 |
 | `invalid` | 422 | 参数校验失败，`detail.fields` 列出字段 |
 | `seat_limit` | 403 | 租户人数已达合约上限 |
 | `balance_exhausted` | 402 | 橡皮余额不足 |

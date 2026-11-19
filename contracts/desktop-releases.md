@@ -17,8 +17,9 @@
 
 | 方法和相对路径 | 请求 | 成功响应 |
 | --- | --- | --- |
-| GET | 可选 `limit`、`cursor` | `200 {items, total, next_cursor, actions}` |
+| GET | 可选 `q`、`limit`、`cursor` | `200 {items, total, next_cursor, actions}` |
 | POST | JSON `{version, os, arch}` | `201`，新草稿记录 |
+| GET `/:id` | 按 ID 读取当前修订 | `200`，管理端记录 |
 | PUT `/:id/artifact?revision=N` | `application/octet-stream`，安装包原始字节 | `200`，带大小和摘要的草稿记录 |
 | POST `/:id/publish` | JSON `{revision}` | `200`，已发布记录 |
 | POST `/:id/unpublish` | JSON `{revision}` | `200`，已下架记录 |
