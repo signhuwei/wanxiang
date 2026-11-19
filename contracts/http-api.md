@@ -21,6 +21,13 @@
 | GET | `/me` | `{user, tenant, role, agents}`；未选租户时 `tenant`、`role` 为 null |
 | POST | `/devices` | `{name, os, arch, public_key}`，201，返回 `{device_id, device_token}` |
 
+## 写入与角色（v0.3）
+
+- 新建用 `POST /<资源>`；更新用 `POST /<资源>/:id`（`PATCH` 同义），请求体带 `revision`。
+- 平台管理员由 system 库的 `platform_admins` 表显式授权，不继承任何租户角色；用全局令牌调用 `/platform/*`。
+- 租户 owner 可以改合约、任免 admin；admin 管普通成员和组，不能任免 admin 或 owner。
+- 邀请码只在第一次创建时返回明文；同一 `Idempotency-Key` 重放时返回同一对象，带 `code_returned: false`。
+
 S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀请码；`POST /invites` 在 S1 实现。
 
 ## 租户管理
