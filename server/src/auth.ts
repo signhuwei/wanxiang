@@ -28,6 +28,20 @@ function insertSession(sql: Transaction, token: string, user: string, tenant: st
     [hash(token), user, tenant, kind, iso(now + (kind === 'desktop' ? 7 * day : day))]);
 }
 
+function tokenOf(c: Context) {
+  const raw = bearer(c.req.header('Authorization'));
+  if (!raw) throw new ApiError('unauthenticated');
+  return hash(raw);
+}
+
+export function readSession(store: Store, tokenHash: string, at: number) {
+  const s = store.system.get<Session>('SELECT * FROM sessions WHERE token_hash = ? AND expires_at > ?', [tokenHash, iso(at)]);
+  if (!s) throw new ApiError('unauthenticated');
+  return s;
+}
+
+export function authenticate(store: Store, c: Context, at: number) { return readSession(store, tokenOf(c), at); }
+
 export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; now: () => number; deliverCode?: (target: string, code: string) => void }) {
   const { now, codeSecret } = opts;
   const pending = new Map<string, Promise<Response>>();
@@ -37,16 +51,7 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
   const publicTenant = (t: Tenant, m: Member) => ({ ...t, role: m.role, actions: ['select'] });
   const otpHash = (target: string, code: string) => hmac(codeSecret, ['login-code', target, code]);
 
-  function tokenOf(c: Context) {
-    const raw = bearer(c.req.header('Authorization'));
-    if (!raw) throw new ApiError('unauthenticated');
-    return hash(raw);
-  }
-  function session(tokenHash: string, at: number) {
-    const s = store.system.get<Session>('SELECT * FROM sessions WHERE token_hash = ? AND expires_at > ?', [tokenHash, iso(at)]);
-    if (!s) throw new ApiError('unauthenticated');
-    return s;
-  }
+  const session = (tokenHash: string, at: number) => readSession(store, tokenHash, at);
   async function requireMember(id: string, userId: string) {
     const t = tenant(id);
     const m = t ? await store.member(id, userId) : null;
@@ -66,8 +71,10 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
     const { response, deliver } = await store.system.write((sql) => {
       const cached = op.read(sql);
       if (cached) return { response: cached, deliver: false };
-      const previous = sql.get<{ issued_at: string }>('SELECT issued_at FROM login_codes WHERE target = ?', [target.value]);
-      const retry = previous ? Date.parse(previous.issued_at) + codeCooldown - at : 0;
+      const previous = sql.get<{ issued_at: string; expires_at: string; attempts: number; consumed: number }>(
+        'SELECT issued_at, expires_at, attempts, consumed FROM login_codes WHERE target = ?', [target.value]);
+      const retry = previous ? Math.max(Date.parse(previous.issued_at) + codeCooldown,
+        previous.attempts >= 5 && !previous.consumed ? Date.parse(previous.expires_at) : at) - at : 0;
       if (retry > 0) throw new ApiError('rate_limited', { retry_after_ms: retry });
       sql.run('DELETE FROM login_codes WHERE expires_at <= ?', [iso(at)]);
       sql.run(`INSERT INTO login_codes (target, code_hash, expires_at, issued_at) VALUES (?, ?, ?, ?)
@@ -95,13 +102,16 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
       const cached = op.read(store.system);
       if (cached) return cached;
       const accepted = await store.system.write((sql) => {
-        const row = sql.get<{ code_hash: string; attempts: number }>(`SELECT code_hash, attempts FROM login_codes
+        const row = sql.get<{ code_hash: string; attempts: number; expires_at: string }>(`SELECT code_hash, attempts, expires_at FROM login_codes
           WHERE target = ? AND expires_at > ? AND consumed = 0`, [target.value, iso(at)]);
-        if (!row || row.attempts >= 5) return false;
+        if (!row) return false;
+        const retry = Date.parse(row.expires_at) - at;
+        if (row.attempts >= 5) return retry;
         const ok = timingSafeEqual(Buffer.from(row.code_hash), Buffer.from(otpHash(target.value, code)));
         sql.run('UPDATE login_codes SET attempts = attempts + 1, consumed = ? WHERE target = ?', [Number(ok), target.value]);
-        return ok;
+        return !ok && row.attempts === 4 ? retry : ok;
       });
+      if (typeof accepted === 'number') throw new ApiError('rate_limited', { retry_after_ms: accepted });
       if (!accepted) throw new ApiError('unauthenticated');
       let u = findUser(store.system, target);
       if (inviteHash) {
@@ -134,7 +144,9 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
         if (t && m?.status === 'active') memberships.push(publicTenant(t, m));
       }
       // An account created before a failed invite must not become an active login.
-      if (memberships.length === 0) throw new ApiError('unauthenticated');
+      if (memberships.length === 0 && !store.system.get('SELECT 1 FROM platform_admins WHERE user_id = ?', [u.id])) {
+        throw new ApiError('unauthenticated');
+      }
       const account = u;
       return store.system.write((sql) => {
         insertSession(sql, op.token, account.id, null, k, at);
