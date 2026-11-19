@@ -48,13 +48,13 @@ export function advanceCursor(sql: Transaction, device: string) {
 export function usageItems(value: unknown) {
   return batchItems(value).map((row) => {
     const status = field(row.status, 'status');
-    if (!/^(ok|upstream_[1-5]\d\d|upstream_error|client_cancelled)$/.test(status)) invalid('status');
+    if (!/^(ok|upstream_[1-5]\d\d|upstream_error|client_cancelled|lease_exhausted|lease_expired|cutoff)$/.test(status)) invalid('status');
     if (typeof row.complete !== 'boolean') invalid('complete');
     return {
       seq: int(row.seq, 'seq', 1), request: field(row.request_id, 'request_id'),
       session: row.session_id == null ? null : field(row.session_id, 'session_id'),
       lease: row.lease_id == null ? null : field(row.lease_id, 'lease_id'),
-      provider: field(row.provider_id, 'provider_id'), model: field(row.model, 'model'),
+      provider: field(row.provider_id, 'provider_id'), model: field(row.model_id ?? row.model, row.model_id == null ? 'model' : 'model_id'),
       input: int(row.input_tokens, 'input_tokens'), output: int(row.output_tokens, 'output_tokens'),
       cacheRead: int(row.cache_read_tokens, 'cache_read_tokens'), cacheWrite: int(row.cache_write_tokens, 'cache_write_tokens'),
       cost: int(row.cost_milli, 'cost_milli'), at: eventTime(row.at), complete: row.complete, status,

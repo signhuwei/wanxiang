@@ -7,6 +7,8 @@ import { seedTenant } from '../src/seed';
 import { MemoryPresence } from '../src/presence';
 import { hash } from '../src/credentials';
 import { decryptProviderSecret } from '../src/provider-secret';
+import { diffieHellman, generateKeyPairSync, hkdfSync, createPublicKey } from 'node:crypto';
+import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
 
 type DeviceReply = { device_id: string; device_token: string };
 
@@ -218,8 +220,15 @@ function connect(f: Awaited<ReturnType<typeof fixture>>, token: string, version 
     return queue.shift();
   }
   function send(message: unknown) { ws.send(JSON.stringify(message)); }
-  function hello(leaseId?: string, outboxLastSeq = 0) { send({ type: 'hello', id: 'edge-hello', edge_version: version, os: 'darwin', arch: 'arm64', config_revision: 0, outbox_last_seq: outboxLastSeq, lease_id: leaseId }); }
-  return { ws, opened, closed, next, send, hello };
+  function hello(leaseId?: string, outboxLastSeq = 0, configRevision = 0) { send({ type: 'hello', id: 'edge-hello', edge_version: version, os: 'darwin', arch: 'arm64', config_revision: configRevision, outbox_last_seq: outboxLastSeq, lease_id: leaseId }); }
+  async function nextOf(type: string) {
+    for (;;) {
+      const message = await next();
+      if (message.type === type) return message;
+      if (message.type !== 'config' && message.type !== 'secret') throw new Error(`Expected ${type}, received ${message.type}`);
+    }
+  }
+  return { ws, opened, closed, next, nextOf, send, hello };
 }
 
 test('device credentials are scoped, hashed, repaired on lookup, and renewed only after hello', async () => {
@@ -264,13 +273,73 @@ test('new device connection replaces old; heartbeat is correlated and closes aft
   expect((await old.closed).code).toBe(4001);
   expect(await f.presence.get(device_id)).toBeTruthy();
   current.send({ type: 'ping', id: 'client-ping' });
-  expect(await current.next()).toEqual({ type: 'pong', re: 'client-ping' });
+  expect(await current.nextOf('pong')).toEqual({ type: 'pong', re: 'client-ping' });
   const ping = await current.next();
   expect(ping.type).toBe('ping');
   current.send({ type: 'pong', re: ping.id });
   for (let i = 0; i < 3; i++) expect((await current.next()).type).toBe('ping');
   expect((await current.closed).code).toBe(1008);
   await until(async () => await f.presence.get(device_id) === null);
+});
+
+test('configuration scopes model routes and encrypts provider secrets to the registered device', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const scoped = await f.select(global);
+  await f.store.system.write((sql) => sql.run('INSERT INTO platform_admins VALUES (?)', [f.userId]));
+  const providerResponse = await f.request('/platform/providers', { name: 'Fake', protocol: 'anthropic',
+    base_url: 'http://127.0.0.1:3333', secret: 'test-only-provider-key', auth: 'bearer', proxy: 'none' }, global);
+  expect(providerResponse.status).toBe(201);
+  const provider = await providerResponse.json() as { id: string };
+  const modelResponse = await f.request('/platform/models', { provider_id: provider.id, upstream_name: 'fake-upstream',
+    route_model: 'managed-*', display_name: 'Fake', context_window: 1024 }, global);
+  expect(modelResponse.status).toBe(201);
+  const model = await modelResponse.json() as { id: string };
+  expect((await f.request('/platform/rates', { model_id: model.id, effective_from: new Date(f.now()).toISOString(),
+    input_milli_per_mtok: 1, output_milli_per_mtok: 2, cache_read_milli_per_mtok: 0, cache_write_milli_per_mtok: 0 }, global)).status).toBe(201);
+  const update = { revision: 1, seat_limit: 2, allowed_agents: ['claude-code'], allowed_models: [model.id], lease_minutes: 10, lease_budget_milli: 2000, visibility: {} };
+  expect((await f.request('/contract', update, scoped, undefined, 'PUT')).status).toBe(200);
+  const keys = generateKeyPairSync('x25519');
+  const raw = keys.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
+  const device = await (await f.request('/devices', { ...f.device, public_key: raw.toString('base64') }, scoped)).json() as DeviceReply;
+  const edge = connect(f, device.device_token);
+  expect(await edge.opened).toBe(true);
+  edge.hello();
+  expect(await edge.next()).toMatchObject({ type: 'welcome' });
+  expect(await edge.next()).toMatchObject({ type: 'cutoff' });
+  const config = await edge.next();
+  expect(config).toMatchObject({ type: 'config', routes: [{ model: 'managed-*', model_id: model.id,
+    provider_id: provider.id, protocol: 'anthropic', upstream_model: 'fake-upstream', auth: 'bearer', proxy: 'none' }],
+    rates: [{ model_id: model.id, input_milli_per_mtok: 1 }] });
+  const secret = await edge.next();
+  expect(secret).toMatchObject({ type: 'secret', provider_id: provider.id });
+  const der = Buffer.concat([Buffer.from('302a300506032b656e032100', 'hex'), Buffer.from(secret.key_id, 'base64')]);
+  const shared = diffieHellman({ privateKey: keys.privateKey, publicKey: createPublicKey({ key: der, format: 'der', type: 'spki' }) });
+  const key = Buffer.from(hkdfSync('sha256', shared, Buffer.alloc(0), 'onex-edge-secret-v1', 32));
+  expect(Buffer.from(xchacha20poly1305(key, Buffer.from(secret.nonce, 'base64'), Buffer.from(provider.id))
+    .decrypt(Buffer.from(secret.ciphertext, 'base64'))).toString()).toBe('test-only-provider-key');
+  edge.send({ type: 'ack', re: secret.id, ok: true });
+  edge.send({ type: 'ack', re: config.id, ok: true });
+  expect((await f.request(`/platform/models/${model.id}`, { revision: 1, route_model: 'renamed' }, global, undefined, 'PATCH')).status).toBe(200);
+  const changed = await edge.next();
+  expect(changed).toMatchObject({ type: 'config', routes: [{ model: 'renamed' }] });
+  expect(changed.revision).toBeGreaterThan(config.revision);
+  expect(await edge.next()).toMatchObject({ type: 'secret' });
+  const noKey = await (await f.request('/devices', { name: 'No key', os: 'darwin', arch: 'arm64' }, scoped)).json() as DeviceReply;
+  const secondary = connect(f, noKey.device_token);
+  expect(await secondary.opened).toBe(true);
+  secondary.hello();
+  expect(await secondary.next()).toMatchObject({ type: 'welcome' });
+  expect(await secondary.next()).toMatchObject({ type: 'cutoff' });
+  expect(await secondary.next()).toMatchObject({ type: 'config', routes: [{ model: 'renamed' }] });
+  secondary.send({ type: 'ping', id: 'no-secret' });
+  expect(await secondary.next()).toEqual({ type: 'pong', re: 'no-secret' });
+  expect((await f.request('/contract', { ...update, revision: 2, allowed_models: [] }, scoped, undefined, 'PUT')).status).toBe(200);
+  const removed = await edge.next();
+  expect(removed).toMatchObject({ type: 'config', routes: [], rates: [] });
+  expect(removed.revision).toBeGreaterThan(changed.revision);
+  edge.send({ type: 'ping', id: 'barrier' });
+  expect(await edge.next()).toEqual({ type: 'pong', re: 'barrier' });
 });
 
 async function fund(f: Awaited<ReturnType<typeof fixture>>, token: string, amount: number) {
@@ -305,9 +374,9 @@ test('concurrent renewals stay inside tenant funds and a replay settles only onc
   a.send(msg);
   a.send({ ...msg, id: 'renew-a-retry' });
   b.send({ ...msg, id: 'renew-b', lease_id: lb.lease_id });
-  expect(await a.next()).toMatchObject({ type: 'cutoff', reason: 'balance', re: 'renew-a' });
-  expect(await a.next()).toMatchObject({ type: 'cutoff', reason: 'balance', re: 'renew-a-retry' });
-  expect(await b.next()).toMatchObject({ type: 'cutoff', reason: 'balance' });
+  expect(await a.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'balance', re: 'renew-a' });
+  expect(await a.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'balance', re: 'renew-a-retry' });
+  expect(await b.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'balance' });
   const balance = await f.request('/balance', undefined, scoped);
   expect(await balance.json()).toMatchObject({ balance_milli: 0, reserved_milli: 0, month_used_milli: 2 });
   expect(f.store.tenant(f.tenantId).get("SELECT count(*) AS n FROM ledger WHERE kind = 'settle'")).toEqual({ n: 2 });
@@ -332,7 +401,7 @@ test('an offline lease is settled on return and late usage reconciles without a 
   b.hello(lease.lease_id);
   expect(await b.next()).toMatchObject({ type: 'welcome' });
   b.send({ type: 'lease_renew', id: 'offline-renew', lease_id: lease.lease_id, used_milli: 3 });
-  expect(await b.next()).toMatchObject({ type: 'lease', seq: 2 });
+  expect(await b.nextOf('lease')).toMatchObject({ type: 'lease', seq: 2 });
   const usage = { request_id: 'req_1', lease_id: lease.lease_id, session_id: null, provider_id: 'prv_fake', model: 'fake',
     input_tokens: 5, output_tokens: 2, cache_read_tokens: 0, cache_write_tokens: 0, at: new Date(f.now()).toISOString(), status: 'ok' };
   b.send({ type: 'usage', id: 'offline-batch', batch: [{ ...usage, seq: 1, complete: true, cost_milli: 3 },
