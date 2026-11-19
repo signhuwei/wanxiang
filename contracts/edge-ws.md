@@ -45,7 +45,7 @@ Server 回 `welcome`：
 | type | 字段 | 作用 |
 | --- | --- | --- |
 | `events` | `batch[]`：`{seq, session_id, kind, at, payload}` | 会话事件回流。`seq` 每台设备单调递增、无空洞。Server 持久化后回 `events_ack{ack_seq}` |
-| `usage` | `batch[]`：`{seq, request_id, session_id, provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_milli, at, status, complete}` | 用量计量。与 events 共用 seq 空间。`status`：`ok`、`upstream_<HTTP 状态码>`、`upstream_error`、`client_cancelled`。`complete=false` 表示流中断、用量不全，cost 按已收到的部分计算，Server 记为待结算，不当作零 |
+| `usage` | `batch[]`：`{seq, request_id, session_id, lease_id, provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_milli, at, status, complete}` | 用量计量。与 events 共用 seq 空间。`status`：`ok`、`upstream_<HTTP 状态码>`、`upstream_error`、`client_cancelled`。`complete=false` 表示流中断、用量不全，cost 按已收到的部分计算，Server 记为待结算，不当作零 |
 | `lease_renew` | `lease_id`、`used_milli` | 续租。Server 结算已用额度，签发新租约或回 `cutoff` |
 | `diag_result` | `diag_id`、`ok`、`detail` | 诊断结果 |
 | `agent_state` | `agent`、`session_id`、`state`（`started`、`exited`、`crashed`）、`exit_code` | Agent 生命周期 |
@@ -82,4 +82,12 @@ Edge 连 Server 和上游时，默认使用环境变量中的代理设置（`HTT
 
 - 断线期间 Edge 继续使用当前租约，直到 `expires_at` 或 `budget_milli` 用完，先到先停。
 - 事件和用量写本地 outbox，重连后按 seq 补传。outbox 超过 500 MB 时停止接受新请求并提示。
-- Server 侧租约默认 10 分钟、额度为“余额的 5% 与 2 橡皮中较小者”。具体数字由合约配置。
+- Server 侧租约默认 10 分钟、额度为“余额的 5% 与 2 橡皮中较小者”（向下取整，最低 1 毫橡皮）。具体数字由合约配置，始终不超过可用余额。
+
+## 租约生命周期（v0.5）
+
+- `hello` 不带 `lease_id`，且租户有可用余额时，Server 在 `welcome` 之后发初始 `lease`。
+- `hello` 带 `lease_id` 时，Server 不在握手时自动结算，等 Edge 发 `lease_renew` 报 `used_milli`。
+- `lease_renew` 带 `op_id`（缺省时用消息 `id`），重复的 `op_id` 返回第一次的结果，不重复扣款。
+- 每条 `usage` 带 `lease_id`。Server 对账时按 lease 汇总；没有 `lease_id` 的条目只标“待核对”，不重复扣款。
+- 租约过期后，它的预留一直保留，直到 Edge 回连并报 `used_milli`。S1 不自动释放，以免离线用量超发。监察页列出超过 24 小时未回连的租约，由管理员人工处理（S2 再设计自动处理）。

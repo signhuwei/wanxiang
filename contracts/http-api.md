@@ -40,7 +40,7 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 | GET/PUT | `/contract` | 当前租户合约 |
 | GET | `/balance` | 余额、已预留、本月消耗 |
 | GET | `/ledger` | 橡皮流水 |
-| POST | `/ledger/topup` | 管理员手工加分（平台管理员） |
+| POST | `/platform/ledger/topup` | 平台管理员手工加分，全局令牌，`{tenant_id, amount_milli, note?}` |
 | GET | `/devices`，`/devices/:id` | 设备台账 |
 | POST | `/devices/:id/diag` | `{kind}`，返回 `diag_id` |
 | GET | `/diag/:id` | 状态和日志包下载地址 |
