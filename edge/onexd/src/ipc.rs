@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::outbox::Outbox;
+use crate::pricing::format_ms;
 use crate::state::State;
 
 /// 一行请求的长度上限，防止本机其他进程塞大包。
@@ -108,7 +109,20 @@ fn dispatch(req: Request, ipc: &Ipc) -> (Value, bool) {
 
 fn status(ipc: &Ipc) -> Status {
     let conn = ipc.state.conn.lock().unwrap().clone();
+    let up = ipc.state.upstream.lock().unwrap().clone();
+    let entry = |e: Option<(String, String, i64)>| {
+        e.map(|(outcome, request_id, at)| json!({"outcome": outcome, "request_id": request_id, "at": format_ms(at)}))
+    };
     Status {
+        ws_last_error: conn.last_error.as_ref().map(|(r, _)| r.clone()),
+        ws_last_error_at: conn.last_error.as_ref().map(|(_, at)| format_ms(*at)),
+        lease: ipc.state.lease.status(),
+        upstream: json!({
+            "inflight": up.inflight,
+            "completed": up.completed,
+            "last": entry(up.last),
+            "last_error": entry(up.last_error),
+        }),
         version: env!("CARGO_PKG_VERSION").into(),
         logged_in: ipc.state.token.borrow().is_some(),
         ws: conn.phase.as_str().into(),

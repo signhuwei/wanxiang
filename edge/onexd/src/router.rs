@@ -121,8 +121,9 @@ struct Meter {
 }
 
 impl Meter {
-    fn new(rate: Rate, max_tokens: u64) -> Self {
-        let reservation = cost_milli(&rate, &Tokens { output: max_tokens, ..Default::default() });
+    /// 预留 = max_tokens × 输出单价 + 估算输入 × 输入单价（sprint-1 范围决定）。
+    fn new(rate: Rate, max_tokens: u64, est_input: u64) -> Self {
+        let reservation = cost_milli(&rate, &Tokens { input: est_input, output: max_tokens, ..Default::default() });
         Self { rate, tokens: Tokens::default(), est_output: 0, metered: false, reservation }
     }
 
@@ -294,7 +295,7 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         }
     };
 
-    let meter = Meter::new(rate, max_tokens);
+    let meter = Meter::new(rate, max_tokens, estimate_input(&req));
     let ticket = match rt.state.lease.admit(meter.reservation) {
         Ok(t) => t,
         Err(b) => {
@@ -302,6 +303,7 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
             return block_response(b);
         }
     };
+    rt.state.upstream.lock().unwrap().inflight += 1;
 
     let upstream_model = route.upstream_model.clone().unwrap_or_else(|| model.clone());
     let body = if upstream_model != model {
@@ -338,24 +340,32 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
     };
     let mut req = Req { rt: rt.clone(), rec, meter, ticket, started };
 
-    let send = client.post(&url).headers(out_headers).body(body).send();
-    let resp = tokio::select! {
-        r = send => r,
-        b = req.ticket.stopped() => {
-            req.rec.outcome = Outcome::Stopped(b);
-            req.finish();
-            return block_response(b);
-        }
-    };
-    let resp = match resp {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(request_id = %req.rec.request_id, provider_id = %req.rec.provider_id, error = %e.without_url(), "upstream request failed");
-            // 没收到任何响应，按零计。
-            req.rec.usage_final = true;
+    // 只在没收到任何响应头时重试一次，不换路。每次尝试各记一条 usage。
+    let mut attempt = 0;
+    let resp = loop {
+        attempt += 1;
+        let send = client.post(&url).headers(out_headers.clone()).body(body.clone()).send();
+        let r = tokio::select! {
+            r = send => r,
+            b = req.ticket.stopped() => {
+                req.rec.outcome = Outcome::Stopped(b);
+                req.finish();
+                return block_response(b);
+            }
+        };
+        let e = match r {
+            Ok(resp) => break resp,
+            Err(e) => e,
+        };
+        // 连不上时请求肯定没到上游，按零计；其余情况上游可能已经处理并收费，标待结算。
+        let reached = !e.is_connect();
+        warn!(request_id = %req.rec.request_id, provider_id = %req.rec.provider_id, attempt, reached, error = %e.without_url(), "upstream request failed");
+        if attempt >= 2 {
+            req.rec.usage_final = !reached;
             req.finish();
             return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", "OneX 连接上游模型服务失败，请稍后重试。");
         }
+        req.record_failed_attempt(!reached);
     };
 
     let status = resp.status();
@@ -412,6 +422,25 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
     (status, resp_headers, bytes).into_response()
 }
 
+/// 估算请求的输入 token：所有字符串值的字节数按 3 字节 1 个 token 算，跳过图片等 base64 的 `data`。
+fn estimate_input(req: &Value) -> u64 {
+    fn walk(v: &Value, n: &mut usize) {
+        match v {
+            Value::String(s) => *n += s.len(),
+            Value::Array(a) => a.iter().for_each(|x| walk(x, n)),
+            Value::Object(o) => o.iter().filter(|(k, _)| k.as_str() != "data").for_each(|(_, x)| walk(x, n)),
+            _ => {}
+        }
+    }
+    let mut n = 0;
+    for k in ["system", "messages", "tools"] {
+        if let Some(v) = req.get(k) {
+            walk(v, &mut n);
+        }
+    }
+    estimate_tokens(n)
+}
+
 /// 进行中的请求：计量、租约票据和收尾。
 struct Req {
     rt: Arc<Router>,
@@ -422,6 +451,19 @@ struct Req {
 }
 
 impl Req {
+    /// 第一次尝试没收到响应头就失败了，另记一条 usage，之后重试。
+    fn record_failed_attempt(&self, nothing_sent: bool) {
+        let mut rec = self.rec.clone();
+        rec.request_id = id::new("req");
+        rec.outcome = Outcome::UpstreamError;
+        rec.usage_final = nothing_sent;
+        rec.lease_id = self.ticket.lease_id().map(str::to_owned);
+        rec.duration_ms = self.started.elapsed().as_millis() as u64;
+        info!(request_id = %rec.request_id, retry_of = %self.rec.request_id, "upstream attempt failed before headers; retrying once");
+        self.rt.note_upstream(&rec);
+        let _ = self.rt.usage_tx.send(rec);
+    }
+
     fn finish(self) {
         let Req { rt, mut rec, meter, ticket, started } = self;
         rec.tokens = meter.final_tokens(rec.usage_final);
@@ -449,7 +491,24 @@ impl Req {
             duration_ms = rec.duration_ms,
             "request done"
         );
+        rt.note_upstream(&rec);
+        {
+            let mut u = rt.state.upstream.lock().unwrap();
+            u.inflight = u.inflight.saturating_sub(1);
+            u.completed += 1;
+        }
         let _ = rt.usage_tx.send(rec);
+    }
+}
+
+impl Router {
+    fn note_upstream(&self, rec: &UsageRecord) {
+        let entry = (rec.outcome.as_str(), rec.request_id.clone(), now_ms());
+        let mut u = self.state.upstream.lock().unwrap();
+        if rec.outcome == Outcome::UpstreamError {
+            u.last_error = Some(entry.clone());
+        }
+        u.last = Some(entry);
     }
 }
 
@@ -751,7 +810,7 @@ mod tests {
     #[test]
     fn usage_from_events() {
         let mut rec = rec();
-        let mut m = Meter::new(rate(), 1000);
+        let mut m = Meter::new(rate(), 1000, 0);
         let mut stopped = false;
         observe(
             &mut rec,
@@ -780,7 +839,7 @@ mod tests {
     #[test]
     fn zero_fields_in_delta_do_not_erase_start_usage() {
         let mut rec = rec();
-        let mut m = Meter::new(rate(), 0);
+        let mut m = Meter::new(rate(), 0, 0);
         let mut s = false;
         observe(
             &mut rec,
@@ -801,7 +860,7 @@ mod tests {
     fn live_cost_uses_reservation_until_usage_known() {
         let mut rec = rec();
         // 预留 = 1000 × 15000 / 1e6 = 15
-        let mut m = Meter::new(rate(), 1000);
+        let mut m = Meter::new(rate(), 1000, 0);
         assert_eq!(m.live(), 15);
         let mut s = false;
         // message_start 全是 0：继续按预留
@@ -830,7 +889,7 @@ mod tests {
     #[test]
     fn live_cost_after_usage_known_tracks_deltas() {
         let mut rec = rec();
-        let mut m = Meter::new(rate(), 100_000);
+        let mut m = Meter::new(rate(), 100_000, 0);
         let mut s = false;
         observe(
             &mut rec,
@@ -851,6 +910,18 @@ mod tests {
     }
 
     #[test]
+    fn reservation_includes_estimated_input() {
+        let req = json!({"model":"m","max_tokens":1000,"system":"x".repeat(300),
+            "messages":[{"role":"user","content":[{"type":"text","text":"y".repeat(2700)},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"z".repeat(90000)}}]}]});
+        // 300 + 2700 + "user" + "text" + "image" + "base64" + "image/png" 字节，图片数据不算
+        let n = estimate_input(&req);
+        assert!((1000..1020).contains(&n), "{n}");
+        // 1000 输入 × 3000 + 1000 输出 × 15000 = 18
+        assert_eq!(Meter::new(rate(), 1000, 1000).reservation, 18);
+    }
+
+    #[test]
     fn usage_item_matches_contract() {
         let mut r = rec();
         r.tokens = Tokens { input: 1, output: 2, cache_read: 3, cache_write: 4 };
@@ -862,6 +933,7 @@ mod tests {
         for k in [
             "request_id",
             "session_id",
+            "lease_id",
             "provider_id",
             "model",
             "input_tokens",
