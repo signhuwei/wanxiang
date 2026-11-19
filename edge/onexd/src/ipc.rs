@@ -23,6 +23,8 @@ pub struct Ipc {
     pub state: Arc<State>,
     pub outbox: Arc<Outbox>,
     pub router_addr: Option<String>,
+    /// Server 的 HTTP 根地址，从 WS 地址推出
+    pub server_url: Option<String>,
     pub shutdown: CancellationToken,
 }
 
@@ -99,6 +101,10 @@ fn dispatch(req: Request, ipc: &Ipc) -> (Value, bool) {
             info!("device token updated via ipc");
             ipc.state.token.send_replace(Some(token));
             (json!({"ok": true}), false)
+        }
+        // 只给公钥，私钥不出 daemon
+        Request::DeviceInfo => {
+            (json!({"ok": true, "public_key": ipc.state.device_key.public_b64(), "server_url": ipc.server_url}), false)
         }
         Request::Shutdown => {
             info!("shutdown requested via ipc");

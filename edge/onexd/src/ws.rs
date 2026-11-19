@@ -210,8 +210,8 @@ async fn handshake(opts: &WsOptions, state: &State, outbox: &Outbox, tx: &mut Tx
         &Msg::Hello(Hello {
             id: hello_id.clone(),
             edge_version: opts.edge_version.clone(),
-            os: os_name().into(),
-            arch: std::env::consts::ARCH.into(),
+            os: onex_core::ipc::os_name().into(),
+            arch: onex_core::ipc::arch_name().into(),
             config_revision: state.config_revision(),
             lease_id: state.lease.lease_id(),
             outbox_last_seq: outbox.last_seq(),
@@ -453,13 +453,6 @@ fn ack_ok(re: String) -> Msg {
 
 fn ack_err(re: String, code: &str, message: &str) -> Msg {
     Msg::Ack(Ack { re, ok: false, error: Some(ErrorBody { code: code.into(), message: message.into(), detail: None }) })
-}
-
-fn os_name() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "darwin",
-        other => other,
-    }
 }
 
 #[cfg(test)]

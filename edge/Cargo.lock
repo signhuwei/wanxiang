@@ -982,7 +982,10 @@ name = "onex-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "onex-core",
+ "reqwest",
+ "serde",
  "serde_json",
  "tokio",
 ]

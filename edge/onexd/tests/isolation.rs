@@ -159,8 +159,13 @@ async fn env() -> Env {
 
     let sock = dir.path().join("onexd.sock");
     let listener = ipc::bind(&sock).await.unwrap();
-    let srv =
-        Arc::new(Ipc { state: state.clone(), outbox: outbox.clone(), router_addr: None, shutdown: cancel.clone() });
+    let srv = Arc::new(Ipc {
+        state: state.clone(),
+        outbox: outbox.clone(),
+        router_addr: None,
+        server_url: None,
+        shutdown: cancel.clone(),
+    });
     tokio::spawn(ipc::serve(listener, sock.clone(), srv));
 
     let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

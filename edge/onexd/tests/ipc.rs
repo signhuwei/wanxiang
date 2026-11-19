@@ -51,6 +51,7 @@ async fn status_login_shutdown() {
         state: state.clone(),
         outbox,
         router_addr: Some("127.0.0.1:1".into()),
+        server_url: Some("http://127.0.0.1:2".into()),
         shutdown: shutdown.clone(),
     });
     let task = tokio::spawn(ipc::serve(listener, path.clone(), srv));
@@ -69,6 +70,12 @@ async fn status_login_shutdown() {
     assert_eq!(r, json!({"ok": true}));
     assert_eq!(state.token.borrow().as_deref(), Some("dev_tok"));
     assert_eq!(c.call(r#"{"cmd":"status"}"#).await["logged_in"], true);
+
+    // 只暴露公钥，与 daemon 内存里的私钥对应
+    let d = c.call(r#"{"cmd":"device_info"}"#).await;
+    assert_eq!(d["public_key"], state.device_key.public_b64());
+    assert_eq!(d["server_url"], "http://127.0.0.1:2");
+    assert_eq!(d.as_object().unwrap().len(), 3);
 
     let r = c.call("not json").await;
     assert_eq!((r["ok"].as_bool(), r["error"]["code"].as_str()), (Some(false), Some("invalid")));

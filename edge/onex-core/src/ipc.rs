@@ -19,7 +19,50 @@ pub enum Request {
     Login {
         token: String,
     },
+    /// 注册设备用的信息：`{public_key, server_url}`。`server_url` 是 Server 的 HTTP 根地址，onexd 没配置 Server 时为 null。
+    DeviceInfo,
     Shutdown,
+}
+
+/// 设备的 os、arch，hello 和设备注册用同一套写法（`darwin`/`arm64`）。
+pub fn os_name() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+pub fn arch_name() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        other => other,
+    }
+}
+
+/// `wss://host/v1/edge/ws` → `https://host`
+pub fn http_base(ws_url: &str) -> Option<String> {
+    let (scheme, rest) = ws_url.split_once("://")?;
+    let scheme = match scheme {
+        "wss" => "https",
+        "ws" => "http",
+        _ => return None,
+    };
+    let host = rest.split('/').next().filter(|h| !h.is_empty())?;
+    Some(format!("{scheme}://{host}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_base_from_ws_url() {
+        assert_eq!(http_base("wss://onex.example.com/v1/edge/ws").as_deref(), Some("https://onex.example.com"));
+        assert_eq!(http_base("ws://192.168.3.211:8080/v1/edge/ws").as_deref(), Some("http://192.168.3.211:8080"));
+        assert_eq!(http_base("http://x/v1"), None);
+        assert_eq!(http_base("ws:///v1"), None);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -78,17 +78,19 @@ async fn run(home: PathBuf) -> Result<()> {
         }
     });
 
+    let server = std::env::var("ONEX_SERVER").ok();
     let ipc = Arc::new(Ipc {
         state: state.clone(),
         outbox: outbox.clone(),
         router_addr: Some(router_addr.to_string()),
+        server_url: server.as_deref().and_then(onex_core::ipc::http_base),
         shutdown: shutdown.clone(),
     });
     let ipc_task = tokio::spawn(ipc::serve(listener, sock_path, ipc));
 
-    let ws_task = match std::env::var("ONEX_SERVER") {
-        Ok(url) => Some(tokio::spawn(ws::run(ws::WsOptions::new(url), state, outbox, shutdown.clone()))),
-        Err(_) => {
+    let ws_task = match server {
+        Some(url) => Some(tokio::spawn(ws::run(ws::WsOptions::new(url), state, outbox, shutdown.clone()))),
+        None => {
             info!("ONEX_SERVER not set; running without server connection");
             None
         }
