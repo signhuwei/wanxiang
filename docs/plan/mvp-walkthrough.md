@@ -41,26 +41,35 @@ ssh root@192.168.3.211 'bash ~/apps/onex/current/deploy/onex.sh logs server'
 
 ## 2. 员工登录并注册 Mac Edge
 
-两个终端共用同一个隔离的 `ONEX_HOME`，不要用默认目录，避免和本机其它 OneX 实例混用。终端 A 启动专用 daemon（已启动同一验收实例则不再启动第二份）。HTTPS 部署使用匹配的 `wss://` 地址。
+两个终端共用同一个隔离的 `ONEX_HOME`，不要用默认目录，避免和本机其它 OneX 实例混用。两个终端都要把 211 和 212 的局域网地址排除在代理之外：本机访问公网走 FlClash 代理，LAN 地址必须直连，否则 `onex login` 的 HTTP 请求和 onexd 转发给本地 qwen 的请求可能被代理拦截或经代理对外暴露。终端 A 启动专用 daemon（已启动同一验收实例则不再启动第二份）。HTTPS 部署使用匹配的 `wss://` 地址。
 
 ```sh
+export NO_PROXY="127.0.0.1,localhost,192.168.3.211,192.168.3.212"
+export no_proxy="$NO_PROXY"
 export ONEX_HOME="$HOME/Library/Application Support/OneX-MVP"
 export ONEX_SERVER=ws://192.168.3.211:18700/v1/edge/ws
 edge/target/debug/onexd
 ```
 
-终端 B 用同一个 `ONEX_HOME`，交互式登录已入租的员工账号（按 seed 身份实配，例如 `employee@example.test`），`--tenant` 传 seed 的租户名「OneX MVP」：
+终端 B 用同一个 `ONEX_HOME` 和同样的代理豁免，交互式登录已入租的员工账号（按 seed 身份实配，例如 `employee@example.test`），`--tenant` 传 seed 的租户名「OneX MVP」：
 
 ```sh
+export NO_PROXY="127.0.0.1,localhost,192.168.3.211,192.168.3.212"
+export no_proxy="$NO_PROXY"
 export ONEX_HOME="$HOME/Library/Application Support/OneX-MVP"
 edge/target/debug/onex login employee@example.test --server http://192.168.3.211:18700 --tenant 'OneX MVP'
 ```
 
-命令会先请求验证码，再在终端里提示「验证码已发送到 ...，请输入 6 位验证码」。按第 0 步的方式查 211 的 Server 日志，取 `[onex-dev] login code for employee@example.test: <验证码>` 这一条，粘回终端回车。登录成功会打印「已登录租户「OneX MVP」，设备 ... 已注册」，并提示 onexd 重启后要重新登录（设备私钥只在内存里，MVP 的取舍，不要当作缺陷）。管理员同时到「租户 → 设备」核对这台 Mac 和所属员工。
+命令会先请求验证码，再在终端里提示「验证码已发送到 ...，请输入 6 位验证码」。按第 0 步的方式查 211 的 Server 日志，取 `[onex-dev] login code for employee@example.test: <验证码>` 这一条，粘回终端回车。登录成功会打印「已登录租户「OneX MVP」，设备 ... 已注册」，并提示 onexd 重启后要重新登录（设备私钥只在内存里，MVP 的取舍，不要当作缺陷）。管理员同时到「租户 → 设备」核对这台 Mac 和所属员工。登录完成后在终端 B 跑一次状态查询，确认 onexd 已经连上并拿到路由和租约，而不只是 CLI 回显成功：
 
-**期望：** 发码、登录、注册设备、CLI 回显依次成功；之后终端 A 的 onexd 日志应看到 WS `welcome`、配置应用、Provider 密钥就绪、有效正额租约依次出现；密钥只看状态，不打印值。设备显示在线并不单独证明可请求模型。
+```sh
+export ONEX_HOME="$HOME/Library/Application Support/OneX-MVP"
+edge/target/debug/onex status
+```
 
-**失败去哪看：** 先看 CLI stderr，核对两个终端的 `ONEX_HOME`；再看 Mac `$ONEX_HOME/logs/onexd.*.log` 与 211 `onex.sh logs server`。没有 `welcome` 查 WS 地址/设备鉴权；有 `welcome` 无路由，查模型合约、费率及 Chat 路由下发；有路由无密钥，查注册公钥和 secret 解密状态；无租约查「橡皮」及 Server 发放日志。只收集时间、结果和关联 ID。
+**期望：** 发码、登录、注册设备、CLI 回显依次成功；`onex status` 的 `ws` 为 `connected`、`device_id` 非空、`lease` 显示有效正额度。密钥只看状态，不打印值。设备显示在线并不单独证明可请求模型。
+
+**失败去哪看：** 先看 CLI stderr，核对两个终端的 `ONEX_HOME` 和 `NO_PROXY`/`no_proxy`（`echo $NO_PROXY`，确认含 `192.168.3.211`、`192.168.3.212`）；再看 Mac `$ONEX_HOME/logs/onexd.*.log` 与 211 `onex.sh logs server`。登录卡住或连不上 211，先排除代理把 LAN 请求转发到公网出口。没有 `welcome` 查 WS 地址/设备鉴权；有 `welcome` 无路由，查模型合约、费率及 Chat 路由下发；有路由无密钥，查注册公钥和 secret 解密状态；无租约查「橡皮」及 Server 发放日志；`onex status` 长期停在 `connecting`/`backoff` 同上一并排查。只收集时间、结果和关联 ID。
 
 ## 3. 启动受管 Claude Code，做三轮对话
 
@@ -94,15 +103,32 @@ cd "$DEMO_DIR"
 
 ## 5. 独立小余额租户：真耗尽后拒绝下一次模型请求
 
-请有权限的操作者备新租户、已入租员工、同上游的独立测试模型记录，无历史未结租约。建议夹具：初始为 0，平台管理员在「橡皮 → 充值」加 `0.001` 橡皮（1 毫橡皮）；测试模型输入、输出各 `1` 毫橡皮/Mtok，缓存费率 0，确保首次请求预留可放进 1 毫橡皮，真实非零用量整笔向上取整到 1。不要改变主演示模型费率；若夹具不能满足首轮成功，先换等价的小额度夹具，否则本项标「无法验证」。不要设合约额度为零、停设备或直接改 DB 来模拟耗尽。
+请有权限的操作者备**新租户**（独立 `tenant_id`，不要照抄第 1–4 步的主演示租户）、该租户下已入租的员工（新账号或新设备均可，但 `onex login` 的 `--tenant` 必须指向这个新租户名/ID）、同上游的独立测试模型记录，无历史未结租约。建议夹具：初始为 0，平台管理员在「橡皮 → 充值」加 `0.001` 橡皮（1 毫橡皮）；测试模型输入、输出各 `1` 毫橡皮/Mtok，缓存费率 0，确保首次请求预留可放进 1 毫橡皮，真实非零用量整笔向上取整到 1。不要改变主演示模型费率；若夹具不能满足首轮成功，先换等价的小额度夹具，否则本项标「无法验证」。不要设合约额度为零、停设备或直接改 DB 来模拟耗尽。
 
-**已知风险：** 新版本 macOS Claude Code 在第一轮可能并发发出不止一个请求（例如主回复之外还有一个辅助调用），每个并发请求各自预留额度。1 毫橡皮的夹具下，这些并发预留可能在第一轮内就把额度占满，不一定等到人工发的「第二轮」才触发拒绝。按下面步骤走，如果受控的真实首次请求就已经把额度耗尽（即并发中的某一路先被拒），改用该次真实拒绝作为 402 证据，不强求先有一轮完全成功、再有一轮被拒的顺序；两种情形都要在报告里写清楚实际发生的请求数和哪一路被拒。
+**已知风险，不能作为耗尽证据：** 新版本 macOS Claude Code 在第一轮可能并发发出不止一个请求（例如主回复之外还有一个辅助调用），每个并发请求各自预留额度。1 毫橡皮的夹具下，这些并发预留可能在额度还没有真实结算、没有真实非零用量之前就把预留占满，其中一路因此收到 402。这只证明「并发请求之间抢占预留」，不证明「真实用量耗尽余额」，不能代签本步要的耗尽证据。本步因此不用受管 Claude Code 发首轮，改用下面的单发合成请求绕开并发问题，确认真实结算耗尽后，才用受管 Claude Code 验证下一次请求被拒。
 
-1. 用独立 `ONEX_HOME` 和该员工重复第 2 步、运行 `onex`（路径同第 3 步）。如要关掉旧测试实例，在启动它的专用终端按 Ctrl+C，不按进程名批量停止。发送一轮短文本，例如 `只回复「余额首轮」`。
-2. 核对该租约用量/续租结算，确认额度确实耗尽。**页面可用余额为 0、但还有可花预留时，不算耗尽。** 若第一轮的并发请求已经让额度耗尽（即其中一路已经是 402），直接跳到第 3 步用那一路的拒绝作证据；若第一轮完全成功，再在同一会话发送 `只回复「余额次轮」`，记录这一轮的拒绝。
-3. 对照本机 router、上游请求计数或运维可查的对应请求记录以及 Server 流水。被拒的那一路不得发上游或新增扣款，应返回 Anthropic 格式 HTTP 402 `balance_exhausted`，Claude Code 可见明确的额度原因及联系管理员充值提示。首轮预留过大、租约过期、设备被停用、上游掉线都不能代签。没有拒绝轮零出站证据，单列缺证。
+1. 用独立 `ONEX_HOME` 和该员工重复第 2 步登录（新租户、同样的 `NO_PROXY` 豁免），不要启动 `onex run claude-code`。登录完成后读取 onexd 为本机 router 生成的地址和令牌（只在测试进程内读取，不要把取出的值写进命令行历史、日志或工具输出）：
 
-**失败去哪看：** Mac `onexd.*.log` 对照首轮 usage（含并发请求各自的预留和结算）、续租/`cutoff` 和本机拒绝，211 用 `onex.sh logs server` 查对应设备；在「橡皮」核对已预留、结算、可用余额，勿只凭 Claude Code 的通用错误文案判定。
+   ```sh
+   export ONEX_HOME="$HOME/Library/Application Support/OneX-MVP-exhaust"
+   ROUTER_ADDR="$(cat "$ONEX_HOME/router.addr")"
+   ROUTER_TOKEN="$(cat "$ONEX_HOME/router.token")"
+   ```
+
+   向本机 router 发一个合成的 Anthropic Messages 单请求，同 MVP 演示模型、`stream:false`、`max_tokens:1024`：
+
+   ```sh
+   curl -sS -o /tmp/mvp-exhaust-1.json -w '%{http_code}\n' \
+     -H "x-api-key: $ROUTER_TOKEN" -H 'content-type: application/json' \
+     "http://$ROUTER_ADDR/v1/messages" \
+     -d '{"model":"*","stream":false,"max_tokens":1024,"messages":[{"role":"user","content":"只回复「余额首轮」"}]}'
+   ```
+
+2. 核对这一发请求：HTTP 状态必须是 `200`；`/tmp/mvp-exhaust-1.json` 的 `usage` 字段必须是真实非零用量（`input_tokens`、`output_tokens` 等，不是估算或占位）；在「橡皮」页确认这笔用量已经结算为 1 毫橡皮，充值的 1 毫橡皮之后可用余额和在途预留都归零。**页面可用余额为 0、但还有可花预留时，不算耗尽**；预留非零也不能继续到第 3 步。只要这一步没有真实非零用量或没有结算到 0，本项标「无法验证」，不要用并发抢占时的 402 顶替。
+3. 确认耗尽后，用同一个 `ONEX_HOME` 跑 `onex run claude-code`（和第 3 步一样新建空目录），发一轮短文本，例如 `只回复「余额次轮」`。记录这次 Claude Code 里看到的拒绝。
+4. 对照 `onex status` 里的 `upstream.completed`/`upstream.inflight` 在第 1 步之后、第 3 步前后没有变化，以及运维可查的 211 Server 流水、账本（`/v1/balance` 或「橡皮」页）在第 3 步前后没有新增扣款或预留。第 3 步这一路不得发上游，应返回 Anthropic 格式 HTTP 402 `balance_exhausted`，Claude Code 可见明确的额度原因及联系管理员充值提示。首轮预留过大、租约过期、设备被停用、上游掉线都不能代签。没有「结算到 0 在先、第二次请求零出站被拒在后」这个顺序的证据，单列缺证。
+
+**失败去哪看：** Mac `onexd.*.log` 对照第 1 步合成请求的 usage、结算和第 3 步的本机拒绝，211 用 `onex.sh logs server` 查对应设备；在「橡皮」核对已预留、结算、可用余额，勿只凭 Claude Code 的通用错误文案判定；`onex status` 核对上游计数前后差异。
 
 ## 结束记录
 
