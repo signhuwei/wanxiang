@@ -164,6 +164,11 @@ tr.clickable { cursor: pointer; }
   display: flex; justify-content: flex-end; gap: 8px; flex: none; background: #fcfdff;
 }
 .observe-status { display:flex; align-items:center; gap:10px; padding:6px 16px; border-bottom:1px solid var(--line); }
+.observe-stats { display:none; }
+.drill-context .observe-identity { line-height:16px; }
+.drill-context td:has(.observe-identity) { padding:2px 6px; }
+.drill-context .observe-stats { display:block; }
+.page:has(.observe-status) .drill-context { width:clamp(212px,22vw,310px); }
 .conversation .message { max-width:86%; margin:12px 0; padding:10px 14px; border-radius:5px; background:#f5f7fa; }
 .conversation .user-message { margin-left:auto; background:var(--soft); }
 .conversation .gap { border-left:4px solid #aa6a00; background:#fff4da; }
