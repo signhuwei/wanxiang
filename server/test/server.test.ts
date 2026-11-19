@@ -41,7 +41,9 @@ async function fixture(heartbeatMs = 15_000, testTime?: number) {
     });
   }
   async function code(target: string) {
-    expect((await request('/auth/code', { target })).status).toBe(202);
+    const response = await request('/auth/code', { target });
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({});
     return codes.get(target)!;
   }
   async function login(target = owner) {

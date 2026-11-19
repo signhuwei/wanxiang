@@ -13,6 +13,8 @@ if [[ ! $home =~ ^/[a-zA-Z0-9_./-]+$ || ! $release =~ ^/[a-zA-Z0-9_./-]+$ ]]; th
 fi
 
 load_settings() {
+  # LAN OTP must be opted into in the operator's persistent settings, not the caller's environment.
+  unset ONEX_ALLOW_LAN_DEV
   if [[ -f $home/service.env ]]; then
     set -a
     # Operator-owned shell settings. Never read secrets from the release tree.
@@ -31,8 +33,17 @@ load_settings() {
   if [[ ! $ONEX_HOST =~ ^[a-zA-Z0-9.:_-]+$ || ! $NODE_ENV =~ ^(development|production)$ ]]; then
     echo 'Invalid ONEX_HOST or NODE_ENV' >&2; exit 2
   fi
+  export ONEX_ALLOW_LAN_DEV=${ONEX_ALLOW_LAN_DEV:-0}
+  if [[ $ONEX_ALLOW_LAN_DEV != 0 && $ONEX_ALLOW_LAN_DEV != 1 ]]; then
+    echo 'ONEX_ALLOW_LAN_DEV must be 0 or 1' >&2; exit 2
+  fi
   if [[ $NODE_ENV != production && $ONEX_HOST != 127.0.0.1 ]]; then
-    echo 'Development login codes may only be enabled on a loopback bind' >&2; exit 2
+    if [[ $ONEX_ALLOW_LAN_DEV != 1 ]]; then
+      echo 'Development login codes require a loopback bind unless service.env sets ONEX_ALLOW_LAN_DEV=1' >&2; exit 2
+    fi
+    if [[ ! $ONEX_HOST =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)[0-9.]+$ ]]; then
+      echo 'LAN development requires a specific private IPv4 bind, not a wildcard or public address' >&2; exit 2
+    fi
   fi
 }
 
@@ -90,13 +101,14 @@ stop_mac() {
 }
 
 ready() {
-  local app=$1 i
+  local app=$1 i address=$ONEX_HOST
+  case "$address" in 0.0.0.0) address=127.0.0.1;; ::) address='[::1]';; *:*) address="[$address]";; esac
   for ((i=0; i<120; i++)); do
     case "$app" in
       valkey) if [[ $("$bin/valkey-cli" -h 127.0.0.1 -p "$ONEX_VALKEY_PORT" ping 2>/dev/null) == PONG ]]; then return; fi;;
       rustfs) if curl -fsS --max-time 1 "http://127.0.0.1:$ONEX_RUSTFS_PORT/health" >/dev/null 2>&1 ||
         curl -fsS --max-time 1 "http://127.0.0.1:$ONEX_RUSTFS_PORT/minio/health/live" >/dev/null 2>&1; then return; fi;;
-      server) if curl -fsS --max-time 1 "http://127.0.0.1:$ONEX_PORT/v1/healthz" >/dev/null 2>&1; then return; fi;;
+      server) if curl --noproxy '*' -fsS --max-time 1 "http://$address:$ONEX_PORT/v1/healthz" >/dev/null 2>&1; then return; fi;;
     esac
     sleep 0.25
   done
@@ -116,7 +128,7 @@ start_linux() {
     printf '%s\n' '[Unit]' "Description=OneX $app" "$ordering" '' '[Service]' 'Type=simple' 'Restart=on-failure' 'RestartSec=2s' \
       'TimeoutStopSec=35s' 'KillMode=mixed' 'NoNewPrivileges=true' 'UMask=0077' "WorkingDirectory=$release" \
       "Environment=ONEX_HOST=$ONEX_HOST" "Environment=ONEX_PORT=$ONEX_PORT" "Environment=ONEX_VALKEY_PORT=$ONEX_VALKEY_PORT" \
-      "Environment=ONEX_RUSTFS_PORT=$ONEX_RUSTFS_PORT" "Environment=NODE_ENV=$NODE_ENV" \
+      "Environment=ONEX_RUSTFS_PORT=$ONEX_RUSTFS_PORT" "Environment=NODE_ENV=$NODE_ENV" "Environment=ONEX_ALLOW_LAN_DEV=$ONEX_ALLOW_LAN_DEV" \
       "ExecStart=/bin/bash $release/deploy/run-service.sh $home $app $release" '' '[Install]' 'WantedBy=multi-user.target' > "$tmp"
     install -m 0644 "$tmp" "$unit"
     rm -f -- "$tmp"
