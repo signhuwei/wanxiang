@@ -8,5 +8,22 @@ try{
   const p=await b.newPage({viewport:{width:620,height:580}});p.setDefaultTimeout(5000)
   await p.goto(server.url.href);await p.getByText('未连接桌面服务',{exact:true}).waitFor()
   await p.goto(server.url.href+'?mock=1');await p.getByLabel('邮箱或手机号').fill('demo@example.test');await p.getByLabel('邀请码（选填）').fill('DEMO');await p.getByRole('button',{name:'发送验证码'}).click();await p.getByLabel('验证码',{exact:true}).fill('246810');await p.getByRole('button',{name:'登录',exact:true}).click();await p.getByRole('button',{name:'示例实验室'}).click();const update=p.locator('.row').filter({hasText:'有可用更新'});await update.waitFor();assert.equal(await update.getByRole('button').count(),0);await p.getByRole('button',{name:'启动',exact:true}).click();await p.getByText('运行中',{exact:true}).waitFor();await p.getByRole('button',{name:'设置',exact:true}).click();await p.getByText('Desktop 版本：0.1.0-demo',{exact:true}).waitFor();await p.getByLabel('关闭窗口时隐藏到托盘').uncheck();await p.getByRole('button',{name:'保存设置'}).click();await p.getByText('设置已保存',{exact:true}).waitFor();assert.equal(await p.getByLabel('关闭窗口时隐藏到托盘').isChecked(),false);await p.getByRole('button',{name:'退出登录'}).click();await p.getByText('登录 OneX',{exact:true}).waitFor();assert.equal(await p.evaluate(()=>localStorage.length),0)
-  console.log('Desktop mock：无桥提示、OTP+邀请、选租户、启动、设置、登出通过')
+  const bridge=await b.newPage();bridge.setDefaultTimeout(3000)
+  await bridge.addInitScript(()=>{
+    let attempts=0
+    window.__TAURI__={core:{invoke:async (_, {request})=>{
+      if(request.op==='state')return {ok:true,state:{version:'test',phase:'ready',tenant:null,connection:'idle',settings:{server_origin:'https://example.invalid',hide_on_close:true},agents:[{id:'test',name:'测试 Agent',status:'failed',message:'TEST-ONLY-RAW-TEXT',actions:['launch']}]}}
+      if(++attempts===1)return {ok:false,error:{code:'forbidden',message:'TEST-ONLY-RAW-TEXT'}}
+      if(attempts===2)return {ok:false,error:{code:'toString',message:'TEST-ONLY-RAW-TEXT'}}
+      throw Error('TEST-ONLY-RAW-TEXT')
+    }}}
+  })
+  await bridge.goto(server.url.href)
+  await bridge.getByText('测试 Agent',{exact:true}).waitFor()
+  assert(!await bridge.locator('body').innerText().then(text=>text.includes('TEST-ONLY-RAW-TEXT')))
+  for(const safe of ['没有权限执行此操作','操作失败，请稍后重试','本机服务暂不可用，请稍后重试']){
+    await bridge.getByRole('button',{name:'启动',exact:true}).click()
+    await bridge.getByRole('status').getByText(safe,{exact:true}).waitFor()
+  }
+  console.log('Desktop mock：登录、启动、设置、登出及桥错误安全文案通过')
 }finally{await b.close();server.stop(true)}
