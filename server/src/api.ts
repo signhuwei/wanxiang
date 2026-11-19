@@ -8,6 +8,7 @@ const errors = {
   not_found: [404, '对象不存在'],
   conflict: [409, '对象版本或重复请求的参数不一致'],
   invalid: [422, '请求参数无效'],
+  too_large: [413, '请求体超出大小上限'],
   seat_limit: [403, '租户人数已达合约上限'],
   rate_limited: [429, '请求过快，请稍后再试'],
   internal: [500, '服务内部错误'],

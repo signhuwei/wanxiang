@@ -2,6 +2,7 @@ import { createLedger } from './ledger.js'
 import { detailPanel, el, button } from './panel.js'
 import { formatDateTime } from './format.js'
 import { deviceFixture } from './mock/devices.js'
+import { idempotencyKey } from './idempotency.js'
 
 export function downloadUrl(value,base) {
   if (typeof value !== 'string' || !value.trim()) return null
@@ -41,7 +42,7 @@ export async function devicesPage(host,api,signal,mockOnly=false) {
       const launch=button('拉取日志',async()=>{
         launch.disabled=true;result.textContent='正在请求设备…'
         try {
-          const {diag_id}=await source.post('/devices/'+encodeURIComponent(item.id)+'/diag',{kind:'logs'},{signal,idempotencyKey:crypto.randomUUID()})
+          const {diag_id}=await source.post('/devices/'+encodeURIComponent(item.id)+'/diag',{kind:'logs'},{signal,idempotencyKey:idempotencyKey()})
           if(!diag_id)throw Error('服务未返回诊断任务 ID')
           const poll=async()=>{
             if(signal.aborted||!result.isConnected)return

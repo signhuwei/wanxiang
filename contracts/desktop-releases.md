@@ -11,7 +11,7 @@
 
 ## 管理端 API
 
-列表的 `actions` 包含 `create_desktop_release`。记录的 `actions` 控制操作按钮，草稿有 `upload_artifact`，校验完成后增加 `publish`，当前版本有 `unpublish`，已下架为空。JSON 写操作沿用 `Idempotency-Key`。上传结果未知时，重新读取草稿的当前修订与摘要再继续。
+列表的 `actions` 包含 `create_desktop_release`。管理端记录有 `read`，草稿另有 `upload_artifact`，校验完成后增加 `publish`，当前版本另有 `unpublish`。JSON 写操作沿用 `Idempotency-Key`。上传结果未知时，重新读取草稿的当前修订与摘要再继续。
 
 路径前缀 `/v1/platform/desktop-releases`。使用现有 Bearer 会话和 API 错误结构。
 

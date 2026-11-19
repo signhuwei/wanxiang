@@ -27,6 +27,12 @@ button.link { border: 0; background: transparent; color: var(--blue); padding: 2
 button.danger { color: #b42336; }
 button.active { background: var(--soft); color: var(--blue); border-color: #b8cef6; }
 a { color: var(--blue); text-decoration: none; }
+/* 用于需要原生导航（如直接下载）而不是脚本点击的场景，视觉上与 button.primary 一致 */
+a.button-like {
+  color: #fff; background: var(--blue); border: 1px solid var(--blue); border-radius: 4px;
+  padding: 4px 10px; min-height: 28px; display: inline-flex; align-items: center;
+}
+a.button-like:hover { background: #1d4fcb; }
 button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible,
 textarea:focus-visible, summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 input, select, textarea {

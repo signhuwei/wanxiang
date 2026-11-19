@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { formatMilli, formatDateTime, roleLabel, memberStatusLabel, tenantStatusLabel } from '../format.js'
+import { formatMilli, formatDateTime, formatBytes, roleLabel, memberStatusLabel, tenantStatusLabel } from '../format.js'
 
 test('formatMilli renders 毫橡皮 as 橡皮 without floating point noise', () => {
   expect(formatMilli(1500)).toBe('1.5')
@@ -20,6 +20,18 @@ test('formatDateTime renders local YYYY-MM-DD HH:mm', () => {
   expect(formatDateTime(null)).toBe('—')
   expect(formatDateTime('')).toBe('—')
   expect(formatDateTime('not-a-date')).toBe('—')
+})
+
+test('formatBytes picks the largest unit that keeps the number readable', () => {
+  expect(formatBytes(0)).toBe('0 B')
+  expect(formatBytes(512)).toBe('512 B')
+  expect(formatBytes(2048)).toBe('2 KB')
+  expect(formatBytes(1536)).toBe('1.5 KB')
+  expect(formatBytes(256 * 1024 * 1024)).toBe('256 MB')
+  expect(formatBytes(1.5 * 1024 * 1024 * 1024)).toBe('1.5 GB')
+  expect(formatBytes(null)).toBe('—')
+  expect(formatBytes(undefined)).toBe('—')
+  expect(formatBytes(-1)).toBe('—')
 })
 
 test('role and status labels are Chinese', () => {

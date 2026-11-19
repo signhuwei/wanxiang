@@ -37,6 +37,13 @@ const models = { id: text, provider_id: text, upstream_name: text, route_model: 
 const providers = { id: text, name: text, protocol: { type: 'string', enum: ['anthropic', 'openai_chat', 'openai_responses'] }, base_url: text,
   status: text, auth: { enum: ['x_api_key', 'bearer', null] }, proxy: nullableText };
 const releases = { id: text, agent: text, version: text, os: text, arch: text, url: text, sha256: text, size: sequence, status: text };
+const desktopOs = { type: 'string', enum: ['darwin', 'windows'] };
+const desktopArch = { type: 'string', enum: ['arm64', 'x64'] };
+const desktopRelease = managed({ id: text, version: text, os: desktopOs, arch: desktopArch,
+  status: { type: 'string', enum: ['draft', 'published', 'unlisted'] }, size: { type: ['integer', 'null'], minimum: 0 },
+  sha256: nullableText, published_at: nullableText });
+const publicDesktopRelease = object({ id: text, version: text, os: desktopOs, arch: desktopArch,
+  size: { type: 'integer', minimum: 0 }, sha256: text, published_at: text, download_url: text });
 const tenantFields = { id: tenantId, name: text, owner_user_id: text, status: { type: 'string', enum: ['active', 'suspended'] } };
 const rates = { model_id: text, effective_from: { ...text, format: 'date-time' }, input_milli_per_mtok: sequence,
   output_milli_per_mtok: sequence, cache_read_milli_per_mtok: sequence, cache_write_milli_per_mtok: sequence };
@@ -141,6 +148,25 @@ export const openapi = {
     ...platformPaths('/v1/platform/providers', providers, ['name', 'protocol', 'base_url', 'secret'], { secret: { ...text, writeOnly: true } }),
     ...platformPaths('/v1/platform/models', models, ['provider_id', 'upstream_name', 'display_name', 'context_window']),
     ...platformPaths('/v1/platform/agent-releases', releases, ['agent', 'version', 'os', 'arch', 'url', 'sha256', 'size']),
+    '/v1/platform/desktop-releases': { get: listOf(desktopRelease), post: { ...write(object({ version: text, os: desktopOs, arch: desktopArch }, ['version', 'os', 'arch']), desktopRelease, 'create'),
+      description: '新建草稿；同一 os/arch/version 已存在时返回 409。' } },
+    '/v1/platform/desktop-releases/{id}': { get: { ...detailOf(desktopRelease), description: '上传结果未知时用来重新确认当前修订与摘要。' } },
+    '/v1/platform/desktop-releases/{id}/artifact': { put: { summary: '上传安装包原始字节', security: bearer,
+      parameters: [idPath, { name: 'revision', in: 'query', required: true, schema: revision }],
+      requestBody: { required: true, content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
+      responses: { ...status, 200: response('校验通过的草稿，带字节数和摘要', desktopRelease), 404: error('对象不存在'),
+        409: error('不是草稿状态或 revision 已过期'), 413: error('超出单包大小上限'), 422: error('格式或参数无效') },
+      description: '仅平台管理员；S2 单包上限 256 MiB，校验实际字节数和 XAR/PE 格式后才改草稿元数据。' } },
+    '/v1/platform/desktop-releases/{id}/publish': { post: { summary: '发布草稿为当前版本', security: bearer, parameters: [idPath, ...headers],
+      requestBody: requestBody(object({ revision })), responses: { 200: response('已发布', desktopRelease), 404: error('对象不存在'), ...status },
+      description: '要求草稿已校验（size/sha256 非空）；同一 os/arch 原来的当前版本在同一事务内转为 unlisted。' } },
+    '/v1/platform/desktop-releases/{id}/unpublish': { post: { summary: '下架当前版本', security: bearer, parameters: [idPath, ...headers],
+      requestBody: requestBody(object({ revision })), responses: { 200: response('已下架', desktopRelease), 404: error('对象不存在'), ...status } } },
+    '/v1/desktop-releases': { get: { summary: '员工入口：当前已发布的安装包列表', description: '无需登录；只含当前已发布版本，不回退到历史记录。',
+      responses: { 200: response('列表', object({ items: { type: 'array', items: publicDesktopRelease } })) } } },
+    '/v1/desktop-releases/{id}/download': { get: { summary: '员工入口：下载安装包', parameters: [idPath],
+      responses: { 200: { description: '安装包二进制', content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
+        404: error('未发布或不存在') }, description: '无需登录；同源附件下载，固定文件名。' } },
     '/v1/platform/rates': { get: listOf(managed(rates), [{ name: 'model_id', in: 'query', schema: text }]), post: write(object({ ...rates, revision }, Object.keys(rates)), managed(rates), 'upsert') },
     '/v1/edge/ws': { get: { summary: 'Edge WebSocket 握手', description: '升级后先发送 hello，收到 welcome 后进行 ping/pong。',
       security: [{ DeviceToken: [] }], parameters: [

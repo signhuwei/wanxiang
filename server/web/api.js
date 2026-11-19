@@ -12,7 +12,7 @@ export class ApiError extends Error {
 }
 
 export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthorized = () => {}, fetchImpl = globalThis.fetch } = {}) {
-  async function request(path, { method = 'GET', params, body, idempotencyKey, signal, binary = false } = {}) {
+  async function request(path, { method = 'GET', params, body, rawBody, idempotencyKey, signal, binary = false } = {}) {
     let url = baseUrl + path
     if (params) {
       const qs = new URLSearchParams()
@@ -25,7 +25,8 @@ export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthoriz
     const headers = { Accept: binary ? 'application/octet-stream' : 'application/json' }
     const token = getToken()
     if (token) headers.Authorization = 'Bearer ' + token
-    if (body !== undefined) headers['Content-Type'] = 'application/json'
+    if (rawBody !== undefined) headers['Content-Type'] = 'application/octet-stream'
+    else if (body !== undefined) headers['Content-Type'] = 'application/json'
     if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey
 
     let res
@@ -33,7 +34,7 @@ export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthoriz
       res = await fetchImpl(url, {
         method,
         headers,
-        body: body !== undefined ? JSON.stringify(body) : undefined,
+        body: rawBody !== undefined ? rawBody : (body !== undefined ? JSON.stringify(body) : undefined),
         signal,
         ...(binary && { redirect: 'error' })
       })
@@ -76,6 +77,7 @@ export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthoriz
     get: (path, opts) => request(path, { ...opts, method: 'GET' }),
     download: (path, opts) => request(path, { ...opts, method: 'GET', binary: true }),
     post: (path, body, opts) => request(path, { ...opts, method: 'POST', body }),
-    put: (path, body, opts) => request(path, { ...opts, method: 'PUT', body })
+    put: (path, body, opts) => request(path, { ...opts, method: 'PUT', body }),
+    putBinary: (path, rawBody, opts) => request(path, { ...opts, method: 'PUT', rawBody })
   }
 }

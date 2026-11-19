@@ -150,7 +150,7 @@ export function installMock() {
       if (!s) return err(401, 'unauthenticated', '未登录或登录已过期，请重新登录')
       const user = db.users[s.target]
       const is_platform_admin = !!user.platform_admin
-      if (!s.tenantId) return json({ user, tenant: null, role: null, agents: [], is_platform_admin, actions: is_platform_admin ? ['create_provider','create_model','create_rate','topup'] : [] })
+      if (!s.tenantId) return json({ user, tenant: null, role: null, agents: [], is_platform_admin, actions: is_platform_admin ? ['create_provider','create_model','create_rate','topup','create_desktop_release'] : [] })
       const t = db.tenants.find(t => t.id === s.tenantId)
       const ms = db.memberships[s.target].find(m => m.tenant_id === s.tenantId)
       const actions = ['owner','admin'].includes(ms?.role) ? ['create_group','create_invite','assign_role:member'] : []

@@ -1,5 +1,5 @@
 // 外壳：顶栏（工作域切换、租户与账号、登出）+ hash 路由。
-// 路由只有两层：#/login、#/tenant/members、#/platform。钻取状态留在内存里，不进 URL。
+// 路由最多两层：#/login、#/tenant/members、#/platform、#/platform/releases。钻取状态留在内存里，不进 URL。
 
 import { createApi } from './api.js'
 import { createSessionStore } from './session.js'
@@ -12,6 +12,7 @@ import { contractPage } from './contract.js'
 import { groupsPage } from './groups.js'
 import { renderLogin } from './login.js'
 import { renderMembersPage } from './members.js'
+import { releasesPage } from './releases.js'
 import { mockEnabled, installMock } from './mock/index.js'
 
 const mockOn = mockEnabled()
@@ -73,6 +74,14 @@ function renderTop(hash) {
       platformLink.href = '#/platform'
       platformLink.classList.toggle('selected', hash.startsWith('#/platform'))
       domains.appendChild(platformLink)
+      if (hash.startsWith('#/platform')) {
+        for (const [path, label] of [['catalog', 'Provider'], ['releases', '安装包发布']]) {
+          const sel = hash === '#/platform/' + path || (path === 'catalog' && hash === '#/platform')
+          const link = el('a', sel ? 'selected' : '', label)
+          link.href = '#/platform/' + path
+          domains.append(link)
+        }
+      }
     }
     top.appendChild(domains)
 
@@ -161,7 +170,8 @@ function route() {
       location.replace(defaultHash())
       return
     }
-    catalog(ws, platformApi, session.globalActions || [])
+    if (hash === '#/platform/releases') releasesPage(ws, platformApi, session.globalActions || [])
+    else catalog(ws, platformApi, session.globalActions || [])
     return
   }
 

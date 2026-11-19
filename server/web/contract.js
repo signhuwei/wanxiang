@@ -1,5 +1,6 @@
 import { el, button } from './panel.js'
 import { renderForm } from './form.js'
+import { idempotencyKey } from './idempotency.js'
 
 const visibilityRoles = [['admin','管理员'], ['group_admin','组管（本组及子组）']]
 const visibilityFields = visibilityRoles.flatMap(([role,label]) => [
@@ -46,7 +47,7 @@ export async function contractPage(host, api) {
           summary:draft[role+'_summary'] === 'true', content:draft[role+'_content'] === 'true'
         }]))
         try {
-          contract = await api.put('/contract',{seat_limit,lease_minutes,lease_budget_milli,revision,visibility,allowed_agents:lines(draft.allowed_agents),allowed_models:lines(draft.allowed_models)},{idempotencyKey:crypto.randomUUID()})
+          contract = await api.put('/contract',{seat_limit,lease_minutes,lease_budget_milli,revision,visibility,allowed_agents:lines(draft.allowed_agents),allowed_models:lines(draft.allowed_models)},{idempotencyKey:idempotencyKey()})
           reset(false)
         } catch(e) { form.setNotice(e.message,'error'); save.disabled=false }
       },'primary')

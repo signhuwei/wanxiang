@@ -18,6 +18,16 @@ bun server/web/tests/browser-check.js .local/web-screenshots
 
 静态测试服务 `http://127.0.0.1:8123/?mock=1` 显式开启离线 mock，正常部署默认使用真实 API。`bun server/web/tests/workspace-check.js` 从临时 SQLite 数据库启动真实 Server，用 Playwright 验证写入，API 不使用 mock。真实接口需由同源 Server 同时托管页面和 `/v1`，使用 `?mock=0`（不向静态测试服务发送真实凭据）。两个模式不共用登录存储。
 
+### 安装包发布与员工下载页
+
+`bun server/web/tests/releases-check.js` 用真实 Server 跑一遍管理端的草稿、上传、发布、下架，以及员工 `/download` 入口（无登录 context 下载发布的版本，下架后变为空态）。
+依赖 `/v1/platform/desktop-releases`、`/v1/desktop-releases`（见 `contracts/desktop-releases.md`），这两个路由落地前脚本会在创建草稿处失败。
+
+脚本自己合成一个结构合规（28 字节头 + zlib 压缩 TOC）但内容最小的 XAR 作为上传夹具；设置 `ONEX_TEST_PKG_FIXTURE=/path/to/real.pkg` 可换成真实安装包（例如 RC3）跑同一条断言路径。
+Server 绑定在 `127.0.0.2`（仍是本机回环）而不是 `127.0.0.1`，因为 Chrome 把 `127.0.0.1`/`localhost` 当作安全上下文——用 211 这类内网 `http://` 地址时 `crypto.randomUUID()` 会抛 `NotSupportedError`，绑在 `127.0.0.1` 会掩盖这个问题，验证不到 `idempotencyKey()`（见 `idempotency.js`）这个修复点。
+
+`/download` 当前依赖 `server/src/server.ts` 的静态路由（本脚本之外，不在 `server/web` 范围内）；该路由落地前，本脚本用 `page.route` 把 `/download` 映射到磁盘上的 `download.html`，先验证页面本身。
+
 ### 真实监察延迟
 
 运行 `bun server/web/tests/workspace-check.js`（可追加已有截图目录）。脚本在隔离租户中授权 admin 阅读其他成员正文，模拟一个 Edge 完成 WS 握手，并通过真实 `/v1/edge/ws` 发出一条唯一的 `assistant_message`。用同一单调时钟从发送前计时，到 Chrome 阅读区出现该正文并经过两次 `requestAnimationFrame`；超过 5000 ms 测试失败。随后检查 usage 增量、待结算提示、无重复正文和读取审计。`observe-real.png` 来自这个链路；离线脚本不提供模拟监察。这个单样本不能替代真机或负载验收。

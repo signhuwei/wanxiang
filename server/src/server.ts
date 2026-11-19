@@ -7,6 +7,7 @@ import { ApiError } from './api';
 import { authRoutes } from './auth';
 import { billingRoutes } from './billing';
 import { deviceRoutes, diagRoutes, DIAG_UPLOAD_PATH, sweepExpiredJobs } from './diag';
+import { DESKTOP_ARTIFACT_DOWNLOAD_PATH, DESKTOP_ARTIFACT_MAX_BYTES, DESKTOP_ARTIFACT_UPLOAD_PATH, desktopReleaseRoutes } from './desktop-releases';
 import { edgeGateway } from './edge';
 import { configPublisher } from './edge-config';
 import { openapi } from './openapi';
@@ -45,12 +46,20 @@ export async function createServer(opts: Options) {
     app.get('/:asset{[a-zA-Z0-9_-]+\\.(js|css)}', web);
     app.get('/mock/:asset{[a-zA-Z0-9_-]+\\.(js|txt)}', web);
     app.use('/v1/*', async (c, next) => {
+      if (c.req.method === 'GET' && DESKTOP_ARTIFACT_DOWNLOAD_PATH.test(c.req.path)) {
+        // Mutating headers after the handler converts a BunFile into a chunked response.
+        c.header('Cache-Control', 'no-store');
+        return next();
+      }
       await next();
       c.header('Cache-Control', 'no-store');
     });
     const smallBody = bodyLimit({ maxSize: 8192, onError: (c) => c.json({ error: new ApiError('invalid', { fields: ['body'] }).body() }, 422) });
-    // The diagnostic route checks the device and job before reading its bounded body.
-    app.use('/v1/*', (c, next) => c.req.method === 'PUT' && DIAG_UPLOAD_PATH.test(c.req.path) ? next() : smallBody(c, next));
+    // The diagnostic and desktop artifact upload routes check auth and draft state, then read their
+    // own bounded body directly; every other route keeps the small JSON limit.
+    const isRawUpload = (c: { req: { method: string; path: string } }) => c.req.method === 'PUT'
+      && (DIAG_UPLOAD_PATH.test(c.req.path) || DESKTOP_ARTIFACT_UPLOAD_PATH.test(c.req.path));
+    app.use('/v1/*', (c, next) => isRawUpload(c) ? next() : smallBody(c, next));
     app.onError((error, c) => {
       if (error instanceof ApiError) return c.json({ error: error.body() }, error.status);
       const trace_id = `trc_${ulid()}`;
@@ -70,11 +79,15 @@ export async function createServer(opts: Options) {
     const observation = observationRoutes(app, store, now);
     const diag = diagRoutes(app, store, management, opts.objectStorage);
     deviceRoutes(app, store, management, diag);
+    desktopReleaseRoutes(app, store, management);
     const closeSockets = edgeGateway(app, store, opts.presence, now, opts.heartbeatMs, config, pending, observation.publish, diag);
     let shuttingDown = false;
     const server = Bun.serve({ hostname: opts.hostname, port: opts.port,
       fetch: (request, server) => shuttingDown ? new Response(null, { status: 503 }) : pending.track(Promise.resolve(app.fetch(request, server))),
       websocket: { ...websocket, maxPayloadLength: 4 * 1024 * 1024, idleTimeout: 0, sendPings: false },
+      // Bun's own default (128 MiB) is below the 256 MiB desktop installer cap; every other route still
+      // enforces its own, much smaller limit above (smallBody, DIAG_MAX_BYTES), so this doesn't widen them.
+      maxRequestBodySize: DESKTOP_ARTIFACT_MAX_BYTES,
     });
     let sweeping = false;
     const expire = () => {

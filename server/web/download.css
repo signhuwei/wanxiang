@@ -1,0 +1,14 @@
+/* 员工下载页：独立于管理端外壳，复用 app.css 的基础 token 与按钮样式。 */
+
+body { background: #f5f7fa; }
+.download-panel {
+  max-width: 480px; margin: 48px auto; padding: 0 20px;
+}
+.download-os-row { display: flex; gap: 8px; margin: 14px 0; }
+.download-card {
+  border: 1px solid var(--line); border-radius: 6px; padding: 16px;
+  background: #fff; display: flex; flex-direction: column; gap: 8px;
+}
+.download-card .button-like {
+  display: inline-block; width: fit-content; margin-top: 4px;
+}

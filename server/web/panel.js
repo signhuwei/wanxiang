@@ -1,5 +1,6 @@
 import { openDrill } from './drill.js'
 import { renderForm } from './form.js'
+import { idempotencyKey } from './idempotency.js'
 
 export function el(tag, cls, text) {
   const n = document.createElement(tag)
@@ -37,10 +38,10 @@ export function editForm(pane, { fields, values = {}, submit, mode = 'edit', lab
   const form = renderForm(pane.body, { sections: [{ fields }], values, mode })
   pane.foot.replaceChildren()
   if (mode === 'view') return
-  let key = crypto.randomUUID(), previous
+  let key = idempotencyKey(), previous
   const save = button(label, async () => {
     const values = form.collect(), fingerprint = JSON.stringify(values)
-    if (previous !== fingerprint) key = crypto.randomUUID()
+    if (previous !== fingerprint) key = idempotencyKey()
     previous = fingerprint
     save.disabled = true
     try {
