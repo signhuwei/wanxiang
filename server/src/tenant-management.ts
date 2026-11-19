@@ -62,11 +62,20 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     const p = pagination(c);
     const matching = p.query ? store.system.all<{ id: string }>(`SELECT id FROM platform_users
       WHERE instr(lower(name), lower(?)) OR instr(lower(coalesce(email, phone, '')), lower(?)) OR instr(id, ?)`, [p.query, p.query, p.query]) : [];
-    const where = p.query ? 'WHERE user_id IN (SELECT value FROM json_each(?))' : '';
-    const params = p.query ? [JSON.stringify(matching.map(({ id }) => id))] : [];
+    const filters: string[] = [];
+    const params: string[] = [];
+    if (p.query) {
+      filters.push('user_id IN (SELECT value FROM json_each(?))');
+      params.push(JSON.stringify(matching.map(({ id }) => id)));
+    }
+    for (const [key, choices] of [['role', ['owner', ...roles]], ['status', statuses]] as const) {
+      const value = c.req.query(key);
+      if (value) { filters.push(`${key} = ?`); params.push(enumField(value, key, choices)); }
+    }
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
     const { n } = db.get<{ n: number }>(`SELECT count(*) AS n FROM members ${where}`, params)!;
     const rows = db.all<MemberRow>(`SELECT * FROM members ${where} ORDER BY user_id LIMIT ? OFFSET ?`, [...params, p.limit, p.offset]);
-    return c.json(p.page(rows.map((row) => memberView(row, role)), n));
+    return c.json(p.page(rows.map((row) => memberView(row, role)), n, ['create_member']));
   });
   app.get('/v1/members/:id', (c) => {
     const { db, role } = manager(c, opts.now());
@@ -122,7 +131,7 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     const p = pagination(c);
     const where = 'WHERE instr(lower(name), lower(?)) > 0';
     const { n } = db.get<{ n: number }>(`SELECT count(*) AS n FROM groups ${where}`, [p.query])!;
-    return c.json(p.page(db.all<Group>(`SELECT * FROM groups ${where} ORDER BY id LIMIT ? OFFSET ?`, [p.query, p.limit, p.offset]).map(groupView), n));
+    return c.json(p.page(db.all<Group>(`SELECT * FROM groups ${where} ORDER BY id LIMIT ? OFFSET ?`, [p.query, p.limit, p.offset]).map(groupView), n, ['create_group']));
   });
   app.get('/v1/groups/:id', (c) => {
     const { db } = manager(c, opts.now());

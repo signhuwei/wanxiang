@@ -2,6 +2,7 @@ import type { SQLQueryBindings } from 'bun:sqlite';
 import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
 import { ApiError, field, invalid, json, operation } from './api';
+import type { platformCreateActions } from './actions';
 import { iso } from './credentials';
 import { enumField, expectRevision, int, pagination, platformActor, urlField, type ManagementOptions } from './management';
 import { encryptProviderSecret } from './provider-secret';
@@ -30,21 +31,21 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
   const requirePlatform = (sql: Transaction, userId: string) => {
     if (!sql.get('SELECT 1 FROM platform_admins WHERE user_id = ?', [userId])) throw new ApiError('forbidden');
   };
-  function list(path: string, table: string, columns: string, search: string, order: string) {
+  function list(path: string, table: string, columns: string, search: string, order: string, action: typeof platformCreateActions[number]) {
     app.get(path, (c) => {
       platformActor(store, c, opts.now());
       const p = pagination(c);
       const where = `WHERE instr(lower(${search}), lower(?)) > 0`;
       const { n } = store.system.get<{ n: number }>(`SELECT count(*) AS n FROM ${table} ${where}`, [p.query])!;
       return c.json(p.page(store.system.all<RecordRow>(`SELECT ${columns} FROM ${table} ${where} ORDER BY ${order} LIMIT ? OFFSET ?`,
-        [p.query, p.limit, p.offset]).map(view), n));
+        [p.query, p.limit, p.offset]).map(view), n, [action]));
     });
   }
 
-  function register(entry: { path: string; table: string; columns: string; search: string; prefix: string;
+  function register(entry: { path: string; table: string; columns: string; search: string; prefix: string; action: typeof platformCreateActions[number];
     parse: (input: Input, row: RecordRow | null, sql: Transaction) => Record<string, SQLQueryBindings> }) {
     const path = `/v1/platform/${entry.path}`;
-    list(path, entry.table, entry.columns, entry.search, 'id');
+    list(path, entry.table, entry.columns, entry.search, 'id', entry.action);
     // CONTRACT-PENDING: platform collection POST can also update by id; item PATCH aliases item POST.
     const write = async (c: Context) => {
       const body = await json(c);
@@ -76,17 +77,17 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
     app.on(['POST', 'PATCH'], `${path}/:id`, write);
   }
 
-  register({ path: 'providers', table: 'providers', columns: 'id, name, protocol, base_url, status, revision', search: 'name', prefix: 'prv',
+  register({ path: 'providers', table: 'providers', columns: 'id, name, protocol, base_url, status, revision', search: 'name', prefix: 'prv', action: 'create_provider',
     parse: (body, row) => ({ name: text(body, row, 'name'), protocol: enumField(value(body, row, 'protocol'), 'protocol', protocols),
       base_url: urlField(value(body, row, 'base_url'), 'base_url'), status: status(body, row) }) });
-  register({ path: 'models', table: 'models', columns: '*', search: "display_name || ' ' || upstream_name", prefix: 'mod',
+  register({ path: 'models', table: 'models', columns: '*', search: "display_name || ' ' || upstream_name", prefix: 'mod', action: 'create_model',
     parse: (body, row, sql) => {
       const provider_id = text(body, row, 'provider_id');
       if (!sql.get('SELECT 1 FROM providers WHERE id = ?', [provider_id])) invalid('provider_id');
       return { provider_id, upstream_name: text(body, row, 'upstream_name'), display_name: text(body, row, 'display_name'),
         context_window: number(body, row, 'context_window', 1), status: status(body, row) };
     } });
-  register({ path: 'agent-releases', table: 'agent_releases', columns: '*', search: "agent || ' ' || version", prefix: 'rel',
+  register({ path: 'agent-releases', table: 'agent_releases', columns: '*', search: "agent || ' ' || version", prefix: 'rel', action: 'create_agent_release',
     parse: (body, row) => {
       const sha256 = text(body, row, 'sha256').toLowerCase();
       if (!/^[0-9a-f]{64}$/.test(sha256)) invalid('sha256');
@@ -94,7 +95,7 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
         url: urlField(value(body, row, 'url'), 'url'), sha256, size: number(body, row, 'size', 1), status: status(body, row) };
     } });
 
-  list('/v1/platform/rates', 'rates', '*', 'model_id', 'model_id, effective_from');
+  list('/v1/platform/rates', 'rates', '*', 'model_id', 'model_id, effective_from', 'create_rate');
   app.post('/v1/platform/rates', async (c) => {
     const body = await json(c);
     const at = opts.now();
@@ -128,7 +129,7 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
   });
 
   const tenantColumns = 'id, name, owner_user_id, status, created_at, revision';
-  list('/v1/platform/tenants', 'tenants', tenantColumns, 'name', 'id');
+  list('/v1/platform/tenants', 'tenants', tenantColumns, 'name', 'id', 'create_tenant');
   const provisioning = new Map<string, Promise<Response>>();
   const writeTenant = async (c: Context) => {
     const body = await json(c);

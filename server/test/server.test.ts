@@ -115,6 +115,13 @@ test('tenant management enforces scope, revisions, pagination, and one-time invi
   const global = await f.login();
   const scoped = await f.select(global);
   expect((await f.request('/members', undefined, global)).status).toBe(403);
+  expect(await (await f.request('/me', undefined, scoped)).json()).toMatchObject({
+    actions: ['create_member', 'create_group', 'create_invite', 'update_contract'],
+  });
+  expect(await (await f.request('/members?role=member&status=disabled', undefined, scoped)).json()).toMatchObject({
+    items: [], total: 0, actions: ['create_member'],
+  });
+  expect(await (await f.request('/groups', undefined, scoped)).json()).toMatchObject({ items: [], actions: ['create_group'] });
   const body = { name: 'Engineering', quota_milli: 200 };
   const created = await f.request('/groups', body, scoped, 'group');
   expect(created.status).toBe(201);
@@ -154,7 +161,9 @@ test('platform privileges are independent and provider secrets are never returne
   const scoped = await f.select(global);
   expect((await f.request('/platform/tenants', undefined, global)).status).toBe(403);
   await f.store.system.write((sql) => sql.run('INSERT INTO platform_admins (user_id) VALUES (?)', [f.userId]));
-  expect(await (await f.request('/me', undefined, global)).json()).toMatchObject({ is_platform_admin: true });
+  expect(await (await f.request('/me', undefined, global)).json()).toMatchObject({ is_platform_admin: true,
+    actions: expect.arrayContaining(['topup', 'create_provider']) });
+  expect(await (await f.request('/platform/providers', undefined, global)).json()).toMatchObject({ items: [], actions: ['create_provider'] });
   expect((await f.request('/platform/tenants', undefined, scoped)).status).toBe(403);
   const secret = 'fake-secret-not-for-storage';
   const provider = { name: 'Fake', protocol: 'anthropic', base_url: 'http://127.0.0.1:3333', secret };
