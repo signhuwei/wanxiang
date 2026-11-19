@@ -7,7 +7,7 @@ import { int, pagination, platformActor, tenantActor, type ManagementOptions } f
 import type { Store, Transaction } from './store';
 
 type Reader = Pick<Transaction, 'get'>;
-type LedgerKind = 'topup' | 'reserve' | 'settle' | 'release';
+type LedgerKind = 'topup' | 'reserve' | 'settle' | 'release' | 'overage_pending';
 type LeaseRow = { id: string; device_id: string; user_id: string; budget_milli: number; used_milli: number; expires_at: string; status: string; seq: number };
 export type Cutoff = { type: 'cutoff'; id: string; reason: 'balance' | 'contract' | 'disabled' };
 type Lease = { type: 'lease'; id: string; lease_id: string; expires_at: string; budget_milli: number; seq: number };
@@ -90,10 +90,13 @@ export function renewLease(store: Store, tenantId: string, deviceId: string, use
     const lease = sql.get<LeaseRow>('SELECT * FROM leases WHERE id = ? AND device_id = ?', [leaseId, deviceId]);
     if (!lease) throw new ApiError('not_found');
     if (lease.status !== 'active') throw new ApiError('conflict');
-    if (used > lease.budget_milli) invalid('used_milli');
-    sql.run("UPDATE leases SET used_milli = ?, status = 'settled', revision = revision + 1 WHERE id = ?", [used, leaseId]);
-    if (used) entry(sql, 'settle', used, at, { lease, requestRef: opId });
-    if (used < lease.budget_milli) entry(sql, 'release', lease.budget_milli - used, at, { lease, requestRef: opId });
+    // Edge 诚实上报的实际用量可能略超这份额度（尾部花费在发出预留之后才计出）。租户只按这份额度实扣，
+    // 多出的部分单独记一笔 overage_pending 挂账待核对，不计入余额、消费或预留，也不转嫁到下一份租约。
+    const charged = Math.min(used, lease.budget_milli);
+    sql.run("UPDATE leases SET used_milli = ?, status = 'settled', revision = revision + 1 WHERE id = ?", [charged, leaseId]);
+    if (charged) entry(sql, 'settle', charged, at, { lease, requestRef: opId });
+    if (charged < lease.budget_milli) entry(sql, 'release', lease.budget_milli - charged, at, { lease, requestRef: opId });
+    if (used > charged) entry(sql, 'overage_pending', used - charged, at, { lease, requestRef: opId, note: '超租约差额待核对' });
     reconcileUsage(sql, deviceId);
     const response = issue(sql, deviceId, userId, at);
     sql.run('INSERT INTO lease_operations (device_id, op_id, lease_id, used_milli, result_json) VALUES (?, ?, ?, ?, ?)',

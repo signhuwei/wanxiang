@@ -70,13 +70,20 @@ impl Fixture {
 
     /// (amount_milli, request_ref) 的列表
     fn settles(&self, lease_id: &str) -> Vec<(i64, String)> {
+        self.ledger_entries(lease_id, "settle")
+    }
+
+    /// (amount_milli, request_ref) 的列表：超租约差额待核对
+    fn overage(&self, lease_id: &str) -> Vec<(i64, String)> {
+        self.ledger_entries(lease_id, "overage_pending")
+    }
+
+    fn ledger_entries(&self, lease_id: &str, kind: &str) -> Vec<(i64, String)> {
         let db = self.db();
         let mut st = db
-            .prepare(
-                "SELECT kind, amount_milli, lease_id, request_ref FROM ledger WHERE kind = 'settle' AND lease_id = ?",
-            )
+            .prepare("SELECT amount_milli, request_ref FROM ledger WHERE kind = ? AND lease_id = ?")
             .unwrap();
-        st.query_map([lease_id], |r| Ok((r.get::<_, i64>(1)?, r.get::<_, String>(3)?)))
+        st.query_map([kind, lease_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
             .unwrap()
             .map(Result::unwrap)
             .collect()
@@ -248,6 +255,60 @@ async fn committed_renew_with_lost_reply_settles_once_across_restart() {
     assert_eq!(newest, l2);
     let s = edge.state.lease.snapshot();
     assert_eq!((s.used_milli, s.inflight_milli, s.lease.unwrap().budget_milli), (5, 0, budget));
+    let st = edge.state.lease.status();
+    assert_eq!((st["state"].as_str(), st["renew"]["pending"].as_bool()), (Some("active"), Some(false)));
+    assert_eq!(st["renew"]["last_result"], "granted");
+    edge.stop().await;
+}
+
+/// 用户裁决（S1-E2 超额归属）：实际用量略超租约额度，且续租回包丢失后 Edge 重启重连。
+/// 期望：租户只按额度实扣，差额单独挂 overage_pending 待核对、只记一次；新租约不继承这笔差额；
+/// 重放（原样同一 op_id）不重复入账。
+#[tokio::test]
+async fn committed_renew_over_budget_with_lost_reply_settles_budget_once_and_parks_overage() {
+    let srv_dir = tempfile::tempdir().unwrap();
+    let srv = start_server(srv_dir.path()).await;
+    let mut proxy = start_proxy(srv.port).await;
+    let home = tempfile::tempdir().unwrap();
+
+    // 第一次运行：拿初始租约（夹具上限 100）
+    let edge = start_edge(home.path(), &proxy.url, &srv.device_token, Duration::from_secs(30));
+    wait_for(|| edge.state.lease.lease_id().is_some()).await;
+    let l1 = edge.state.lease.lease_id().unwrap();
+    assert_eq!(edge.state.lease.snapshot().lease.unwrap().budget_milli, 100);
+
+    // 实际花费 101，超出额度 1（尾部字节在预留之后才计出）；Server 提交后回包被丢
+    proxy.drop_renew_reply.store(true, Ordering::SeqCst);
+    edge.state.lease.admit(0).unwrap().finish(101);
+    let r1 = timeout(T, proxy.renews.recv()).await.unwrap().unwrap();
+    // Edge 诚实上报真实快照 101，不是裁剪后的 100
+    assert_eq!((r1["used_milli"].as_i64(), r1["op_id"].as_str()), (Some(101), Some(format!("{l1}:101").as_str())));
+    let l2 = timeout(T, proxy.dropped.recv()).await.unwrap().unwrap();
+    assert_ne!(l2, l1);
+    // 租户只实扣 100；差额 1 单独一条 overage_pending，request_ref 跟 settle 一致
+    assert_eq!(srv.settles(&l1), vec![(100, format!("{l1}:101"))]);
+    assert_eq!(srv.overage(&l1), vec![(1, format!("{l1}:101"))]);
+    assert_eq!(srv.newest_lease().0, l2);
+
+    // Edge 没收到新租约，仍在 l1 上；重启后原样重放（不是 101 之外的任何别的数）
+    let ledger = edge.state.lease.clone();
+    edge.stop().await;
+    assert_eq!(ledger.lease_id().as_deref(), Some(l1.as_str()));
+    drop(ledger);
+
+    let edge = start_edge(home.path(), &proxy.url, &srv.device_token, Duration::from_millis(50));
+    let r2 = timeout(T, proxy.renews.recv()).await.unwrap().unwrap();
+    assert_eq!((r2["used_milli"].as_i64(), r2["op_id"].as_str()), (Some(101), r1["op_id"].as_str()));
+    wait_for(|| edge.state.lease.lease_id().as_deref() == Some(l2.as_str())).await;
+
+    // 重放不重复入账：settle 和 overage_pending 都仍然只有一条
+    assert_eq!(srv.settles(&l1), vec![(100, format!("{l1}:101"))]);
+    assert_eq!(srv.overage(&l1), vec![(1, format!("{l1}:101"))]);
+    // 新租约没有继承那 1：从零开始，额度是 Server 按余额重新算出来的
+    let (newest, budget, _) = srv.newest_lease();
+    assert_eq!(newest, l2);
+    let s = edge.state.lease.snapshot();
+    assert_eq!((s.used_milli, s.inflight_milli, s.lease.unwrap().budget_milli), (0, 0, budget));
     let st = edge.state.lease.status();
     assert_eq!((st["state"].as_str(), st["renew"]["pending"].as_bool()), (Some("active"), Some(false)));
     assert_eq!(st["renew"]["last_result"], "granted");

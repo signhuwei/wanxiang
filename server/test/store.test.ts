@@ -24,7 +24,14 @@ test('migrations persist version, WAL mode and independent tenant databases', as
     expect(db.system.all('SELECT user_id FROM platform_admins')).toEqual([{ user_id: a.userId }]);
     const first = db.tenant(a.tenantId);
     expect(first.get('PRAGMA journal_mode')).toEqual({ journal_mode: 'wal' });
-    expect(first.get('PRAGMA user_version')).toEqual({ user_version: 5 });
+    expect(first.get('PRAGMA user_version')).toEqual({ user_version: 6 });
+    // 006_lease_overage：整表重建后索引还在，CHECK 放开到包含 overage_pending 但仍拒绝别的字符串
+    expect(first.get("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'ledger_by_kind_and_at'"))
+      .toEqual({ name: 'ledger_by_kind_and_at' });
+    await db.tenant(a.tenantId).write((sql) => {
+      sql.run("INSERT INTO ledger (id, kind, amount_milli, at) VALUES ('led_x', 'overage_pending', 1, '2026-01-01T00:00:00.000Z')");
+      expect(() => sql.run("INSERT INTO ledger (id, kind, amount_milli, at) VALUES ('led_y', 'bogus', 1, '2026-01-01T00:00:00.000Z')")).toThrow();
+    });
     expect(db.tenant(b.tenantId).get('SELECT user_id FROM members')).toEqual({ user_id: b.userId });
     expect(() => first.get('SELECT 1')).toThrow();
     expect(db.tenant(a.tenantId).get('SELECT user_id FROM members')).toEqual({ user_id: a.userId });
