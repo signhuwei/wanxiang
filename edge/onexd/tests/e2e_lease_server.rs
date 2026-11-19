@@ -2,7 +2,7 @@
 //! 场景（magpie S1-E2 阻塞 2）：续租 Server 已提交 → 回包丢失 → 断线期间继续消费 → Edge 重启 → 回连。
 //! 期望：Edge 原样重放同一 op_id，Server 回缓存的新租约，不报 conflict；Server 流水只结算快照金额一次；
 //! 快照之后的消费记在新租约下。
-//! 没装 bun 时跳过。
+//! 运行需要 PATH 中的 Bun 和已安装的 server 依赖。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,9 +36,9 @@ struct Fixture {
     data_dir: PathBuf,
 }
 
-async fn start_server(dir: &Path) -> Option<Fixture> {
+async fn start_server(dir: &Path) -> Fixture {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut child = match Command::new("bun")
+    let mut child = Command::new("bun")
         .arg("tests/e2e/lease-server.ts")
         .arg(dir)
         // 本用例不经过 router，假上游地址只用来满足夹具参数
@@ -47,25 +47,19 @@ async fn start_server(dir: &Path) -> Option<Fixture> {
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("bun not available ({e}); skipped");
-            return None;
-        }
-    };
+        .expect("start the real lease test server (Bun must be installed and on PATH)");
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let line = timeout(T, lines.next_line()).await.expect("fixture start timeout").unwrap().expect("fixture exited");
     let v: Value = serde_json::from_str(&line).unwrap();
     let s = |k: &str| v[k].as_str().unwrap().to_string();
-    Some(Fixture {
+    Fixture {
         port: v["port"].as_u64().unwrap() as u16,
         tenant_id: s("tenant_id"),
         device_id: s("device_id"),
         device_token: s("device_token"),
         data_dir: PathBuf::from(s("data_dir")),
         _child: child,
-    })
+    }
 }
 
 impl Fixture {
@@ -213,10 +207,9 @@ async fn wait_for(mut f: impl FnMut() -> bool) {
 }
 
 #[tokio::test]
-#[ignore = "paused until MVP is running (docs/plan/mvp.md); not yet run"]
 async fn committed_renew_with_lost_reply_settles_once_across_restart() {
     let srv_dir = tempfile::tempdir().unwrap();
-    let Some(srv) = start_server(srv_dir.path()).await else { return };
+    let srv = start_server(srv_dir.path()).await;
     let mut proxy = start_proxy(srv.port).await;
     let home = tempfile::tempdir().unwrap();
 
