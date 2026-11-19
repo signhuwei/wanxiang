@@ -72,45 +72,52 @@ fn show_main(app: &tauri::AppHandle) {
 ///
 /// `onexd.exe` 是 Tauri externalBin sidecar，和 Desktop 的可执行文件装在同一个目录（见
 /// `tauri.conf.json` 的 `bundle.externalBin`），按同目录解析路径，不接受外部配置的路径。
-/// 先探测现有 IPC 入口：已经有一个 onexd 在跑（比如用户手工启动过，或赢了这次竞态的另一个探测）
-/// 就不重复拉起；`onexd` 自己的 `transport::bind()` 对同一个管道名互斥，就算两次探测都判定"没有"
-/// 并都尝试拉起，后一个进程的 `bind()` 会失败退出，不会有两个 daemon 同时跑。拉起后有界等待
-/// （最多 `MAX_WAIT` 次 `RETRY_INTERVAL` 间隔）它把管道绑出来，再返回；等不到也不让 Desktop 自己
-/// 崩溃退出——没有 daemon 只是功能不可用，不是致命错误，调用方按连不上处理。`DETACHED_PROCESS`
-/// 让 onexd 的生命周期不绑定 Desktop 这个父进程：关闭 Desktop 窗口（`hide_on_close`）或从托盘
-/// 退出，onexd 都应该继续跑，不随父进程退出而被杀。
+/// 用 DeviceInfo 确认 daemon 可以应答。注销后等待新设备密钥，旧 daemon 在退出前仍可能应答。
+/// 如果新进程因旧管道尚未关闭而退出，在有界等待期间重试。
 #[cfg(windows)]
-pub(crate) async fn ensure_onexd_running(socket: &std::path::Path) {
-    const MAX_WAIT: u32 = 20;
-    const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+pub(crate) async fn ensure_onexd_running(socket: &std::path::Path, retired_key: Option<&str>) {
+    use std::os::windows::process::CommandExt;
+    use std::time::Duration;
 
-    if onex_core::transport::connect(socket).await.is_ok() {
-        return;
-    }
-    let Ok(exe) = std::env::current_exe() else { return };
-    let Some(dir) = exe.parent() else { return };
-    let onexd = dir.join("onexd.exe");
-    if !onexd.is_file() {
-        tracing::warn!(path = %onexd.display(), "onexd.exe sidecar not found next to OneX Desktop.exe");
-        return;
-    }
+    const MAX_WAIT: u32 = 20;
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+    const RETRY_INTERVAL: Duration = Duration::from_millis(250);
     const DETACHED_PROCESS: u32 = 0x00000008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-    use std::os::windows::process::CommandExt;
-    if let Err(e) =
-        std::process::Command::new(&onexd).creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP).spawn()
-    {
-        tracing::warn!(error = %e, path = %onexd.display(), "failed to start onexd sidecar");
-        return;
-    }
+
+    let mut child: Option<std::process::Child> = None;
     for _ in 0..MAX_WAIT {
-        if onex_core::transport::connect(socket).await.is_ok() {
-            tracing::info!(path = %onexd.display(), "onexd sidecar is accepting connections");
-            return;
+        let probe = bridge::ipc_call_with(socket, &onex_core::ipc::Request::DeviceInfo);
+        if let Ok(Ok(info)) = tokio::time::timeout(PROBE_TIMEOUT, probe).await
+            && info["ok"] == true
+            && let Some(key) = info["public_key"].as_str()
+        {
+            if Some(key) != retired_key {
+                return;
+            }
+        } else if child.as_mut().is_none_or(|child| matches!(child.try_wait(), Ok(Some(_)))) {
+            let Ok(exe) = std::env::current_exe() else { return };
+            let (Some(dir), Some(home)) = (exe.parent(), socket.parent()) else { return };
+            let onexd = dir.join("onexd.exe");
+            if !onexd.is_file() {
+                tracing::warn!(path = %onexd.display(), "onexd.exe sidecar not found next to OneX Desktop.exe");
+                return;
+            }
+            match std::process::Command::new(&onexd)
+                .env("ONEX_HOME", home)
+                .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+                .spawn()
+            {
+                Ok(started) => child = Some(started),
+                Err(error) => {
+                    tracing::warn!(%error, path = %onexd.display(), "failed to start onexd sidecar");
+                    return;
+                }
+            }
         }
         tokio::time::sleep(RETRY_INTERVAL).await;
     }
-    tracing::warn!(path = %onexd.display(), "started onexd sidecar but it did not become reachable in time");
+    tracing::warn!("onexd sidecar did not become ready");
 }
 
 pub fn run() {
@@ -118,7 +125,7 @@ pub fn run() {
         .setup(|app| {
             let sock = socket_path();
             #[cfg(windows)]
-            tauri::async_runtime::block_on(ensure_onexd_running(&sock));
+            tauri::async_runtime::block_on(ensure_onexd_running(&sock, None));
             let bridge = Bridge::new(sock);
             app.manage(bridge);
             let config = &app.config().app.windows[0];

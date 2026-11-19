@@ -396,11 +396,7 @@ impl Bridge {
     /// 都复用现有 CLI 的 `Launch`/`LaunchDone` 流程，这里不再重复实现一遍启动和回收子进程的逻辑，
     /// 也不把 program/路径/环境经 IPC 从 WebView 传过来。
     async fn launch_claude_code(&self) -> Result<(), ErrorBody> {
-        let status = spawn_managed_cli().await;
-        match status {
-            Ok(s) if s.success() => Ok(()),
-            _ => Err(unavailable()),
-        }
+        spawn_managed_cli().await.map_err(|_| unavailable())
     }
 
     async fn settings(&self, hide_on_close: bool) -> Reply {
@@ -414,6 +410,13 @@ impl Bridge {
 
     async fn logout(&self) -> Reply {
         let was_logged_in = self.inner.lock().unwrap().phase == Phase::Ready;
+        #[cfg(windows)]
+        let retired_key = if was_logged_in {
+            let info = self.ipc_call(&Request::DeviceInfo).await.map_err(|_| unavailable())?;
+            Some(str_field(&info, "public_key")?)
+        } else {
+            None
+        };
         if was_logged_in {
             self.ipc_call(&Request::Logout).await.map_err(|_| unavailable())?;
         }
@@ -433,8 +436,8 @@ impl Bridge {
         // 把它重新拉起，否则这同一个窗口里马上再 SendCode/Login 就会因为连不上 daemon 直接失败，
         // 用户只能靠重启整个 Desktop 应用才能恢复，这不是"注销后能再登录"该有的体验。
         #[cfg(windows)]
-        if was_logged_in {
-            crate::ensure_onexd_running(&self.socket_path).await;
+        if let Some(retired_key) = retired_key.as_deref() {
+            crate::ensure_onexd_running(&self.socket_path, Some(retired_key)).await;
         }
         self.state().await
     }
@@ -535,7 +538,7 @@ fn same_device(status: &Value, inner: &Inner) -> bool {
         && inner.device_id.as_deref().is_some_and(|id| status["device_id"].as_str() == Some(id))
 }
 
-async fn ipc_call_with(socket_path: &std::path::Path, req: &Request) -> anyhow::Result<Value> {
+pub(crate) async fn ipc_call_with(socket_path: &std::path::Path, req: &Request) -> anyhow::Result<Value> {
     let stream = onex_core::transport::connect(socket_path).await?;
     let (r, mut w) = stream.into_split();
     let mut line = serde_json::to_string(req)?;
@@ -559,14 +562,18 @@ fn launch_script_path() -> Option<PathBuf> {
 /// macOS：打开一个新的 Terminal.app 窗口运行随包脚本，固定两个参数（目标 app 和脚本自身路径），
 /// 均来自本进程资源目录，不接受调用方输入。
 #[cfg(target_os = "macos")]
-async fn spawn_managed_cli() -> std::io::Result<std::process::ExitStatus> {
+async fn spawn_managed_cli() -> std::io::Result<()> {
     let script = launch_script_path()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "onex-run-claude.command not found"))?;
-    tokio::process::Command::new("/usr/bin/open")
+    let status = tokio::process::Command::new("/usr/bin/open")
         .args(["-a", "/System/Applications/Utilities/Terminal.app", "--"])
         .arg(&script)
         .status()
-        .await
+        .await?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!("Terminal.app launch failed: {status}")));
+    }
+    Ok(())
 }
 
 /// Windows：不经中间脚本，直接起装在 Desktop 同目录的 `onex.exe`（Tauri externalBin sidecar，
@@ -575,8 +582,7 @@ async fn spawn_managed_cli() -> std::io::Result<std::process::ExitStatus> {
 /// 运行——Claude Code 是 TUI，需要自己的控制台，不能继承 Desktop（没有控制台的 GUI 子系统进程）
 /// 不存在的控制台。
 #[cfg(windows)]
-async fn spawn_managed_cli() -> std::io::Result<std::process::ExitStatus> {
-    use std::os::windows::process::CommandExt;
+async fn spawn_managed_cli() -> std::io::Result<()> {
     const CREATE_NEW_CONSOLE: u32 = 0x00000010;
     let executable = std::env::current_exe()?;
     let onex = executable
@@ -586,11 +592,16 @@ async fn spawn_managed_cli() -> std::io::Result<std::process::ExitStatus> {
     if !onex.is_file() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "onex.exe sidecar not found"));
     }
-    tokio::process::Command::new(&onex)
+    let mut child = tokio::process::Command::new(&onex)
         .args(["run", "claude-code", "--managed"])
         .creation_flags(CREATE_NEW_CONSOLE)
-        .status()
-        .await
+        .spawn()?;
+    tokio::spawn(async move {
+        if let Err(error) = child.wait().await {
+            tracing::warn!(%error, "failed to wait for the OneX terminal process");
+        }
+    });
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
