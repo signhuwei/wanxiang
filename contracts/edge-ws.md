@@ -33,7 +33,7 @@ Server 回 `welcome`：
 
 | type | 字段 | 作用 |
 | --- | --- | --- |
-| `config` | `revision`、`routes[]`、`agents[]`、`rates[]` | 全量配置。Edge 原子替换，回 ack；revision 不大于当前值时忽略 |
+| `config` | `revision`、`routes[]`、`agents[]`、`rates[]` | 全量配置。Edge 原子替换，回 ack；revision 不大于当前值时忽略。route 字段：`model`（精确名、`前缀*` 或 `*`，按精确、最长前缀、`*` 的顺序匹配）、`model_id`（对应 rates）、`provider_id`、`protocol`、`base_url`、`upstream_model?`、`auth`（`x_api_key` 或 `bearer`）、`proxy?`（见下方“网络代理”） |
 | `secret` | `provider_id`、`ciphertext`、`nonce`、`key_id` | 加密的上游密钥。用设备注册时交换的 X25519 公钥加密（XChaCha20-Poly1305），只在内存解密 |
 | `lease` | `lease_id`、`expires_at`、`budget_milli`、`seq` | 额度租约。Edge 在 `expires_at` 前或已用 80% 时发 `lease_renew` |
 | `cutoff` | `reason`（`balance`、`disabled`、`contract`） | 立即断流：拒绝新请求，中断进行中的流 |
@@ -45,7 +45,7 @@ Server 回 `welcome`：
 | type | 字段 | 作用 |
 | --- | --- | --- |
 | `events` | `batch[]`：`{seq, session_id, kind, at, payload}` | 会话事件回流。`seq` 每台设备单调递增、无空洞。Server 持久化后回 `events_ack{ack_seq}` |
-| `usage` | `batch[]`：`{seq, request_id, session_id, provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_milli, at, status}` | 用量计量。与 events 共用 seq 空间 |
+| `usage` | `batch[]`：`{seq, request_id, session_id, provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_milli, at, status, complete}` | 用量计量。与 events 共用 seq 空间。`status`：`ok`、`upstream_<HTTP 状态码>`、`upstream_error`、`client_cancelled`。`complete=false` 表示流中断、用量不全，cost 按已收到的部分计算，Server 记为待结算，不当作零 |
 | `lease_renew` | `lease_id`、`used_milli` | 续租。Server 结算已用额度，签发新租约或回 `cutoff` |
 | `diag_result` | `diag_id`、`ok`、`detail` | 诊断结果 |
 | `agent_state` | `agent`、`session_id`、`state`（`started`、`exited`、`crashed`）、`exit_code` | Agent 生命周期 |
@@ -62,6 +62,16 @@ Server 回 `welcome`：
 | `session_end` | `reason` |
 
 Edge 通过比对同一会话前后两次请求的 `messages` 数组，只提取新增部分作为事件。具体规则在 Claude Code 适配规格确定后补充。
+
+## 确认与保留
+
+- `events_ack{ack_seq}` 是累计确认：seq ≤ ack_seq 的全部 events 和 usage 都已持久化。它是应答类消息，可带 `re`，不要求。
+- Edge 收到确认后不立即删除，保留已确认条目 72 小时（且总量不超过 200 MB，超出时先删最旧的）。
+- 如果 `welcome.ack_seq` 小于本地已确认的最大 seq，说明 Server 丢了数据。Edge 从 `ack_seq + 1` 重传仍保留的条目，并发一条 `diag_result`（`diag_id` 为 `"ack_regression"`），带本地已确认的 seq 和能重传的范围，同时写警告日志。
+
+## 网络代理
+
+Edge 连 Server 和上游时，默认使用环境变量中的代理设置（`HTTPS_PROXY`、`NO_PROXY`）。访问 `127.0.0.1` 和 `localhost` 一律不走代理。route 的 `proxy` 字段可以覆盖：`"none"` 表示直连，URL 表示指定代理。企业员工的电脑上常有公司代理，所以默认遵从代理。
 
 ## 离线
 
