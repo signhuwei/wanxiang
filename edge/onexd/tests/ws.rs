@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use onexd::lease::LeaseOptions;
 use onexd::outbox::{Kind, Outbox, now_ms};
 use onexd::pricing::format_ms;
 use onexd::state::{Phase, State};
@@ -150,9 +151,15 @@ fn start_edge(url: &str, token: Option<&str>) -> Edge {
 }
 
 fn start_edge_with(o: WsOptions, token: Option<&str>) -> Edge {
+    start_edge_full(o, token, LeaseOptions::default())
+}
+
+fn start_edge_full(o: WsOptions, token: Option<&str>, lo: LeaseOptions) -> Edge {
     let dir = tempfile::tempdir().unwrap();
     let outbox = Arc::new(Outbox::open(&dir.path().join("outbox.sqlite")).unwrap());
-    let state = Arc::new(State::default());
+    let lease = Arc::new(onexd::lease::Ledger::with_options(lo));
+    let state = Arc::new(State { lease: lease.clone(), ..Default::default() });
+    tokio::spawn(lease.run(CancellationToken::new()));
     state.token.send_replace(token.map(String::from));
     let cancel = CancellationToken::new();
     let task = tokio::spawn(ws::run(o, state.clone(), outbox.clone(), cancel.clone()));
@@ -482,12 +489,16 @@ async fn renew_sent_at_80_percent_and_new_lease_resets() {
     let m = recv_skip(&mut p, &["ping"]).await;
     assert_eq!(m["type"], "lease_renew");
     assert_eq!((m["lease_id"].as_str(), m["used_milli"].as_i64()), (Some("lse_1"), Some(80)));
+    assert_eq!(m["op_id"], "lse_1:80");
 
-    // 续租成功
-    p.send(lease_msg("s2", "lse_2", 2, 100, 600_000)).await;
+    // 续租成功：Server 用 re 指向续租消息
+    let mut l = lease_msg("s2", "lse_2", 2, 100, 600_000);
+    l["re"] = m["id"].clone();
+    p.send(l).await;
     assert_eq!(p.recv_skip_ping().await["re"], "s2");
     let s = edge.state.lease.snapshot();
     assert_eq!((s.lease.unwrap().lease_id.as_str(), s.used_milli), ("lse_2", 0));
+    assert_eq!(edge.state.lease.status()["renew"]["last_result"], "granted");
 }
 
 #[tokio::test]
@@ -501,17 +512,41 @@ async fn renew_failure_cutoff_blocks_and_renew_resent_after_reconnect() {
     edge.state.lease.admit(0).unwrap().finish(90);
     assert_eq!(recv_skip(&mut p, &["ping"]).await["type"], "lease_renew");
 
-    // Server 没回就断了：重连后重发同一个续租
+    // Server 没回就断了：记为不可达，重连后重发同一个续租（op_id 相同）
     drop(p);
+    wait_phase(&edge.state, Phase::Backoff).await;
+    assert_eq!(edge.state.lease.status()["renew"]["last_result"], "unreachable");
     let mut p = srv.accept().await;
     p.handshake(0, 15000).await;
     let m = recv_skip(&mut p, &["ping"]).await;
     assert_eq!((m["type"].as_str(), m["used_milli"].as_i64()), (Some("lease_renew"), Some(90)));
+    assert_eq!(m["op_id"], "lse_1:90");
 
     // 续租失败：Server 回 cutoff
-    p.send(json!({"type":"cutoff","id":"s3","reason":"balance"})).await;
+    p.send(json!({"type":"cutoff","id":"s3","re":m["id"],"reason":"balance"})).await;
     assert_eq!(p.recv_skip_ping().await, json!({"type":"ack","re":"s3","ok":true}));
     assert!(matches!(edge.state.lease.admit(0), Err(onexd::lease::Block::Cutoff(_))));
+    let st = edge.state.lease.status();
+    assert_eq!((st["state"].as_str(), st["renew"]["last_result"].as_str()), (Some("cutoff"), Some("rejected")));
+}
+
+#[tokio::test]
+async fn renew_retried_while_connected_without_response() {
+    let srv = FakeServer::start().await;
+    let lo = LeaseOptions { renew_retry: Duration::from_millis(100), ..Default::default() };
+    let edge = start_edge_full(opts(&srv.url), Some("t"), lo);
+    let mut p = srv.accept().await;
+    p.handshake(0, 15000).await;
+    p.send(lease_msg("s1", "lse_1", 1, 100, 600_000)).await;
+    p.recv_skip_ping().await;
+    edge.state.lease.admit(0).unwrap().finish(85);
+    let a = recv_skip(&mut p, &["ping"]).await;
+    // 不回应，0.5 秒（最小重发间隔）后重发
+    let b = recv_skip(&mut p, &["ping"]).await;
+    assert_eq!((a["type"].as_str(), b["type"].as_str()), (Some("lease_renew"), Some("lease_renew")));
+    assert_eq!(a["op_id"], b["op_id"]);
+    assert_ne!(a["id"], b["id"]);
+    assert_eq!(edge.state.lease.status()["renew"]["last_result"], "no_response");
 }
 
 #[tokio::test]

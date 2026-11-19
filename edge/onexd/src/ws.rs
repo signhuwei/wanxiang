@@ -81,7 +81,19 @@ pub async fn run(opts: WsOptions, state: Arc<State>, outbox: Arc<Outbox>, cancel
         };
 
         state.set_phase(Phase::Connecting);
-        let delay = match session(&opts, &state, &outbox, &token, &cancel).await {
+        let end = session(&opts, &state, &outbox, &token, &cancel).await;
+        // 控制连接断开不影响本机进行中的请求，只把等待中的续租记为不可达。
+        state.lease.on_disconnected();
+        let reason = match &end {
+            End::Cancelled => None,
+            End::Unauthenticated => Some("unauthenticated".to_string()),
+            End::Replaced => Some("replaced".to_string()),
+            End::Lost { reason, .. } => Some(format!("{reason:#}")),
+        };
+        if let Some(r) = reason {
+            state.conn.lock().unwrap().last_error = Some((r, crate::outbox::now_ms()));
+        }
+        let delay = match end {
             End::Cancelled => return,
             End::Unauthenticated => {
                 warn!("server rejected device token; waiting for a new login");
@@ -247,7 +259,7 @@ async fn connected(
         c.connects += 1;
     }
     info!(device_id = %welcome.device_id, ack_seq = welcome.ack_seq, "ws connected");
-    state.lease.set_server_time(&welcome.server_time);
+    state.lease.on_welcome(&welcome.server_time, &welcome.tenant_id);
 
     // welcome.ack_seq 之前的都已持久化，等同一次 events_ack。
     note_ack(outbox, welcome.ack_seq)?;
@@ -336,9 +348,10 @@ async fn connected(
 }
 
 async fn send_renew(state: &State, tx: &mut Tx) -> Result<()> {
-    if let Some((lease_id, used_milli)) = state.lease.take_renew() {
-        info!(%lease_id, used_milli, "lease_renew");
-        send(tx, &Msg::LeaseRenew(LeaseRenew { id: id::new("msg"), lease_id, used_milli })).await?;
+    if let Some(r) = state.lease.take_renew() {
+        info!(lease_id = %r.lease_id, used_milli = r.used_milli, op_id = %r.op_id, "lease_renew");
+        let m = LeaseRenew { id: id::new("msg"), op_id: r.op_id, lease_id: r.lease_id, used_milli: r.used_milli };
+        send(tx, &Msg::LeaseRenew(m)).await?;
     }
     Ok(())
 }

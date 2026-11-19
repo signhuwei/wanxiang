@@ -146,6 +146,9 @@ pub struct Secret {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Lease {
     pub id: String,
+    /// 回应 lease_renew 时指向它的 id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub re: Option<String>,
     pub lease_id: String,
     pub expires_at: String,
     pub budget_milli: i64,
@@ -155,6 +158,8 @@ pub struct Lease {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cutoff {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub re: Option<String>,
     pub reason: String,
 }
 
@@ -210,6 +215,7 @@ pub struct UsageItem {
     pub seq: u64,
     pub request_id: String,
     pub session_id: Option<String>,
+    pub lease_id: Option<String>,
     pub provider_id: String,
     pub model: String,
     pub input_tokens: u64,
@@ -223,17 +229,18 @@ pub struct UsageItem {
     pub status: String,
     /// false 表示流中断、用量不全，Server 记为待结算。
     pub complete: bool,
-    // CONTRACT-PENDING: 契约 usage 只有 `model`，Edge 另带 `model_id`（对应 rates）和 `lease_id`，便于 Server 结算。
+    // CONTRACT-PENDING: 契约 usage 只有 `model`，Edge 另带 `model_id`（对应 rates），便于 Server 按倍率核对。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lease_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LeaseRenew {
     pub id: String,
+    /// 幂等键：同一租约、同一用量的续租用同一个 op_id
+    pub op_id: String,
     pub lease_id: String,
+    /// 这个租约的累计已用额度（绝对值）
     pub used_milli: i64,
 }
 

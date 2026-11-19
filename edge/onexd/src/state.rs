@@ -37,6 +37,19 @@ pub struct Conn {
     pub user_id: Option<String>,
     pub tenant_id: Option<String>,
     pub connects: u64,
+    /// 最近一次断开的原因和时间（毫秒）
+    pub last_error: Option<(String, i64)>,
+}
+
+/// 本机 router 到上游的观测，和控制连接分开。
+#[derive(Debug, Clone, Default)]
+pub struct Upstream {
+    pub inflight: u64,
+    pub completed: u64,
+    /// 最近一次结束的请求：(outcome, request_id, 时间毫秒)
+    pub last: Option<(String, String, i64)>,
+    /// 最近一次上游出错（连接失败、中途断流）的请求
+    pub last_error: Option<(String, String, i64)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -56,6 +69,7 @@ pub struct State {
     pub secrets: RwLock<HashMap<String, String>>,
     /// 默认只在内存里；daemon 启动时换成落盘的。
     pub lease: Arc<Ledger>,
+    pub upstream: Mutex<Upstream>,
 }
 
 impl State {

@@ -284,6 +284,7 @@ fn grant(state: &State, id: &str, seq: u64, budget: i64, ttl_ms: i64) {
         .lease
         .grant(&Lease {
             id: format!("m_{id}"),
+            re: None,
             lease_id: id.into(),
             expires_at: format_ms(now_ms() + ttl_ms),
             budget_milli: budget,
@@ -540,9 +541,56 @@ async fn upstream_unreachable() {
     let r = e.req("", true).send().await.unwrap();
     assert_eq!(r.status(), 502);
     assert_eq!(r.json::<Value>().await.unwrap()["error"]["type"], "api_error");
-    let u = e.usage().await;
-    assert_eq!(u.outcome, Outcome::UpstreamError);
-    assert!(u.usage_final && u.cost_milli == 0);
+    // 连不上时重试一次；两次都没到上游，按零计
+    for _ in 0..2 {
+        let u = e.usage().await;
+        assert_eq!(u.outcome, Outcome::UpstreamError);
+        assert!(u.usage_final && u.cost_milli == 0);
+    }
+}
+
+#[tokio::test]
+async fn retries_once_when_no_response_headers_and_records_each_attempt() {
+    let mut e = env().await;
+    // 一个接受连接、读完请求后直接关闭、不回任何响应头的上游
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n = accepts.clone();
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            drop(s);
+        }
+    });
+    e.state.config.write().unwrap().routes[0].base_url = format!("http://{addr}");
+    let r = e.req("", true).send().await.unwrap();
+    assert_eq!(r.status(), 502);
+    assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // 两次尝试各一条 usage，请求可能已到上游，标待结算
+    let a = e.usage().await;
+    let b = e.usage().await;
+    assert_ne!(a.request_id, b.request_id);
+    for u in [&a, &b] {
+        assert_eq!(u.outcome, Outcome::UpstreamError);
+        assert!(!u.usage_final);
+        assert_eq!(u.lease_id.as_deref(), Some("lse_1"));
+    }
+    assert_eq!(e.state.upstream.lock().unwrap().inflight, 0);
+}
+
+#[tokio::test]
+async fn no_retry_after_response_headers() {
+    let mut e = env().await;
+    let text = e.req("cut", true).send().await.unwrap().text().await.unwrap();
+    assert_eq!(parse_sse(&text).last().unwrap().0, "error");
+    assert_eq!(e.usage().await.outcome, Outcome::UpstreamError);
+    // 只有一条 usage
+    assert!(timeout(Duration::from_millis(100), e.usage.recv()).await.is_err());
 }
 
 // ---- S1-E2 计价与租约 ----
@@ -682,12 +730,13 @@ async fn lease_expiry_interrupts_inflight_stream() {
 #[tokio::test]
 async fn end_frame_only_upstream_reserves_max_tokens() {
     let mut e = env().await;
-    // max_tokens=100 → 预留 200；额度 150，单个请求仍放行，但第二个并发请求被拒
+    // 预留 = max_tokens 100 × 2 + 估算输入（"user" + "hi" 共 6 字节 ≈ 2 token）× 1 = 202；
+    // 额度 150，单个请求仍放行，但第二个并发请求被拒
     grant(&e.state, "lse_2", 2, 150, 600_000);
     let resp = e.req("hang_zero", true).send().await.unwrap();
     let mut body = resp.bytes_stream();
     timeout(T, body.next()).await.unwrap().unwrap().unwrap();
-    assert_eq!(e.state.lease.snapshot().inflight_milli, 200);
+    assert_eq!(e.state.lease.snapshot().inflight_milli, 202);
     let r = e.req("", false).send().await.unwrap();
     expect_blocked(r, 402, "balance_exhausted").await;
     drop(body);
