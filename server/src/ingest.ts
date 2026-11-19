@@ -54,7 +54,8 @@ export function usageItems(value: unknown) {
       seq: int(row.seq, 'seq', 1), request: field(row.request_id, 'request_id'),
       session: row.session_id == null ? null : field(row.session_id, 'session_id'),
       lease: row.lease_id == null ? null : field(row.lease_id, 'lease_id'),
-      provider: field(row.provider_id, 'provider_id'), model: field(row.model_id ?? row.model, row.model_id == null ? 'model' : 'model_id'),
+      provider: field(row.provider_id, 'provider_id'), model: field(row.model, 'model'),
+      modelId: field(row.model_id ?? row.model, row.model_id == null ? 'model' : 'model_id'),
       input: int(row.input_tokens, 'input_tokens'), output: int(row.output_tokens, 'output_tokens'),
       cacheRead: int(row.cache_read_tokens, 'cache_read_tokens'), cacheWrite: int(row.cache_write_tokens, 'cache_write_tokens'),
       cost: int(row.cost_milli, 'cost_milli'), at: eventTime(row.at), complete: row.complete, status,
@@ -71,9 +72,9 @@ export function ingestUsage(store: Store, tenant: string, device: string, at: nu
       const lease = row.lease && sql.get<{ budget_milli: number }>('SELECT budget_milli FROM leases WHERE id = ? AND device_id = ?', [row.lease, device]);
       const leaseId = lease ? row.lease : null;
       const settlement = !row.complete ? 'pending' : leaseId ? 'pending' : 'unverified';
-      sql.run(`INSERT INTO usage (device_id, seq, request_id, session_id, lease_id, provider_id, model_id, input_tokens, output_tokens,
-        cache_read_tokens, cache_write_tokens, cost_milli, status, at, complete, settlement_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [device, row.seq, row.request, row.session, leaseId, row.provider, row.model, row.input, row.output, row.cacheRead,
+      sql.run(`INSERT INTO usage (device_id, seq, request_id, session_id, lease_id, provider_id, model_id, model, input_tokens, output_tokens,
+        cache_read_tokens, cache_write_tokens, cost_milli, status, at, complete, settlement_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [device, row.seq, row.request, row.session, leaseId, row.provider, row.modelId, row.model, row.input, row.output, row.cacheRead,
           row.cacheWrite, row.cost, row.status, row.at, Number(row.complete), settlement]);
       if (leaseId) leases.add(leaseId);
     }

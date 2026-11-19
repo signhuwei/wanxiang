@@ -7,6 +7,7 @@ import { deviceTtl } from './auth';
 import { initialLease, renewLease } from './billing';
 import { ackCursor, ingestUsage, usageItems } from './ingest';
 import { int } from './management';
+import type { PendingWork } from './pending';
 import { bearer, hash, iso, randomToken } from './credentials';
 import type { ConfigPublisher } from './edge-config';
 import type { Presence } from './presence';
@@ -16,8 +17,11 @@ const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.
 const isText = (value: unknown, max = 128): value is string => typeof value === 'string' && value.length > 0 && value.length <= max;
 const isSeq = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
-export function edgeGateway(app: Hono, store: Store, presence: Presence, now: () => number, heartbeatMs: number, config: ConfigPublisher) {
+export function edgeGateway(app: Hono, store: Store, presence: Presence, now: () => number, heartbeatMs: number, config: ConfigPublisher, pending: PendingWork) {
   const current = new Map<string, WSContext>();
+  const sockets = new Set<WSContext>();
+  let closing = false;
+  let allClosed: (() => void) | undefined;
   const ttl = heartbeatMs * 4;
   const activeTenant = (id: string) => store.system.get("SELECT 1 FROM tenants WHERE id = ? AND status = 'active'", [id]);
   const deviceQuery = `SELECT d.id, d.user_id, d.token_hash, d.token_expires_at, d.status FROM devices d JOIN members m ON m.user_id = d.user_id
@@ -74,20 +78,35 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
       timer = setTimeout(tick, heartbeatMs);
     };
 
+    if (closing) throw new ApiError('forbidden');
     return upgradeWebSocket(() => ({
       onOpen(_event, ws) {
         socket = ws;
+        sockets.add(ws);
+        if (closing) { ws.close(1001, 'server shutdown'); return; }
         const old = current.get(deviceId);
         current.set(deviceId, socket);
         old?.close(4001, 'replaced');
         timer = setTimeout(() => stop(1008, 'hello timeout'), ttl);
       },
-      async onMessage(event) {
+      onMessage(event) { return pending.track(onMessage(event.data)); },
+      onClose() {
+        state = 'closed';
+        config.disconnect(deviceId, subscription);
+        clearTimeout(timer);
+        if (current.get(deviceId) === socket) current.delete(deviceId);
+        void pending.track(presence.release(deviceId, connectionId).catch(() => {}));
+        sockets.delete(socket);
+        if (sockets.size === 0) allClosed?.();
+      },
+    }))(c, next);
+
+    async function onMessage(data: unknown) {
         if (!live()) return;
         let msg: Record<string, unknown> | null = null;
         try {
-          if (typeof event.data === 'string') {
-            try { msg = JSON.parse(event.data); } catch { /* Bad frame. */ }
+          if (typeof data === 'string') {
+            try { msg = JSON.parse(data); } catch { /* Bad frame. */ }
           }
           if (!msg || typeof msg !== 'object' || Array.isArray(msg)) { stop(1007, 'invalid JSON frame'); return; }
           if (state === 'hello') {
@@ -151,14 +170,12 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
           if (error instanceof ApiError && msg && isText(msg.id)) send({ type: 'ack', re: msg.id, ok: false, error: error.body() });
           else if (live()) stop(1011, 'gateway unavailable');
         }
-      },
-      onClose() {
-        state = 'closed';
-        config.disconnect(deviceId, subscription);
-        clearTimeout(timer);
-        if (current.get(deviceId) === socket) current.delete(deviceId);
-        void presence.release(deviceId, connectionId).catch(() => {});
-      },
-    }))(c, next);
+    }
   });
+  return function closeSockets() {
+    closing = true;
+    const done = sockets.size ? new Promise<void>((resolve) => { allClosed = resolve; }) : Promise.resolve();
+    for (const ws of sockets) ws.close(1001, 'server shutdown');
+    return done;
+  };
 }

@@ -31,21 +31,23 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
   const requirePlatform = (sql: Transaction, userId: string) => {
     if (!sql.get('SELECT 1 FROM platform_admins WHERE user_id = ?', [userId])) throw new ApiError('forbidden');
   };
-  function list(path: string, table: string, columns: string, search: string, order: string, action: typeof platformCreateActions[number]) {
+  function list(path: string, table: string, columns: string, search: string, order: string, action: typeof platformCreateActions[number], parent?: 'provider_id' | 'model_id') {
     app.get(path, (c) => {
       platformActor(store, c, opts.now());
       const p = pagination(c);
-      const where = `WHERE instr(lower(${search}), lower(?)) > 0`;
-      const { n } = store.system.get<{ n: number }>(`SELECT count(*) AS n FROM ${table} ${where}`, [p.query])!;
+      const filter = parent && c.req.query(parent);
+      const where = `WHERE instr(lower(${search}), lower(?)) > 0${filter ? ` AND ${parent} = ?` : ''}`;
+      const params = filter ? [p.query, field(filter, parent!)] : [p.query];
+      const { n } = store.system.get<{ n: number }>(`SELECT count(*) AS n FROM ${table} ${where}`, params)!;
       return c.json(p.page(store.system.all<RecordRow>(`SELECT ${columns} FROM ${table} ${where} ORDER BY ${order} LIMIT ? OFFSET ?`,
-        [p.query, p.limit, p.offset]).map(view), n, [action]));
+        [...params, p.limit, p.offset]).map(view), n, [action]));
     });
   }
 
   function register(entry: { path: string; table: string; columns: string; search: string; prefix: string; action: typeof platformCreateActions[number];
     parse: (input: Input, row: RecordRow | null, sql: Transaction) => Record<string, SQLQueryBindings> }) {
     const path = `/v1/platform/${entry.path}`;
-    list(path, entry.table, entry.columns, entry.search, 'id', entry.action);
+    list(path, entry.table, entry.columns, entry.search, 'id', entry.action, entry.table === 'models' ? 'provider_id' : undefined);
     // CONTRACT-PENDING: platform collection POST can also update by id; item PATCH aliases item POST.
     const write = async (c: Context) => {
       const body = await json(c);
@@ -106,7 +108,7 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
         url: urlField(value(body, row, 'url'), 'url'), sha256, size: number(body, row, 'size', 1), status: status(body, row) };
     } });
 
-  list('/v1/platform/rates', 'rates', '*', 'model_id', 'model_id, effective_from', 'create_rate');
+  list('/v1/platform/rates', 'rates', '*', 'model_id', 'model_id, effective_from', 'create_rate', 'model_id');
   app.post('/v1/platform/rates', async (c) => {
     const body = await json(c);
     const at = opts.now();
