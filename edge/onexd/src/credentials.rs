@@ -8,8 +8,11 @@
 //! 一台机器装多份 onexd 互不干扰）。单元测试一律用内存实现，不碰真实 Keychain；
 //! Keychain 后端本身只有一个被 `ONEX_TEST_KEYCHAIN=1` 显式打开的烟雾测试（见模块末尾）。
 
-use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
+use anyhow::Context;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
 use zeroize::Zeroizing;
 
 /// 完整的已登录设备身份。`device_key` 是 X25519 私钥的原始字节，等价于 `secret::DeviceKey::from_bytes`。
@@ -108,7 +111,7 @@ fn sec_err(e: security_framework::base::Error) -> anyhow::Error {
 }
 
 /// Windows：系统凭据存储用 Windows 凭据管理器（Credential Manager）的 generic credential，
-/// 范围是当前登录用户（`CRED_PERSIST_LOCAL_MACHINE` 会被其它本机用户看到，这里特意不用）。
+/// `CRED_PERSIST_LOCAL_MACHINE` 在本机跨登录保留，凭据仍属于当前 Windows 用户。
 /// target name 复用 `service_name()`，和 macOS Keychain 的 service 字符串按 `ONEX_HOME` 区分
 /// 是同一个目的。凭据 blob 存的是 `DeviceCredentials` 的 JSON 序列化字节，和 macOS 分支一致。
 #[cfg(windows)]
@@ -194,10 +197,15 @@ mod windows_credentials {
             }
             bail!("CredReadW failed with error {err}");
         }
+        anyhow::ensure!(!p_cred.is_null(), "CredReadW returned no credential");
         let result = (|| -> Result<DeviceCredentials> {
-            // SAFETY: `p_cred` 非空（`ok != 0`），`CredentialBlob`/`CredentialBlobSize` 由
-            // CredReadW 填好，描述一段系统拥有、我们只读的字节。
+            // SAFETY: Windows returned a non-null credential owned by CredFree.
             let cred = unsafe { &*p_cred };
+            anyhow::ensure!(
+                cred.CredentialBlobSize != 0 && !cred.CredentialBlob.is_null(),
+                "stored device credentials have no data"
+            );
+            // SAFETY: the checked buffer is initialized and remains live until CredFree below.
             let bytes = unsafe {
                 Zeroizing::new(
                     std::slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize).to_vec(),

@@ -1,10 +1,8 @@
 //! 本机 IPC 的传输层：Unix 用 socket 文件，Windows 用具名管道。两边都是同一套按行分隔的
 //! JSON 协议（见 `ipc` 模块），这里只封装"怎么建连接、怎么等下一个连接"，行协议本身不在这里。
 //!
-//! Windows 的具名管道默认创建者可读写，同机其它用户和远程机器都连不上（`\\.\pipe\` 命名空间
-//! 本身不跨网络），但要把 ACL 显式收紧到当前用户 SID（而不是默认的"创建者 + Everyone 读"之类
-//! 宽松继承），必须用 `CreateNamedPipeW` 的 `lpSecurityAttributes`。`ServerOptions` 提供了
-//! `create_with_security_attributes_raw` 正是为此设计。
+//! Windows 管道只允许当前进程 TokenUser 的 SID，并拒绝远程客户端。客户端在发送任何协议消息前
+//! 查询已打开管道的所有者，防止同名管道替代本机 daemon。
 
 use std::io;
 use std::path::Path;
@@ -68,6 +66,7 @@ mod unix_impl {
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
+    use std::os::windows::io::AsRawHandle;
     use std::pin::Pin;
     use std::task::{Context as TaskContext, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -128,7 +127,7 @@ mod windows_impl {
     /// `SECURITY_ATTRIBUTES`，用完立即丢，不让裸指针跨 await 点存活。
     pub struct Listener {
         pipe_name: String,
-        sd: Vec<u8>,
+        sd: Vec<u32>,
         next: tokio::sync::Mutex<Option<named_pipe::NamedPipeServer>>,
     }
 
@@ -151,7 +150,7 @@ mod windows_impl {
     /// 不给远程"。`sd` 是 `super::sddl::current_user_security_descriptor()` 生成的安全描述符字节；
     /// 每次调用都现场拼一份 `SECURITY_ATTRIBUTES` 指向它，调用结束后这份临时结构体立即失效，不保留
     /// 给下一次用（`SECURITY_ATTRIBUTES` 本身很小，重新拼的开销可忽略）。
-    fn create_instance(pipe_name: &str, sd: &[u8], first: bool) -> io::Result<named_pipe::NamedPipeServer> {
+    fn create_instance(pipe_name: &str, sd: &[u32], first: bool) -> io::Result<named_pipe::NamedPipeServer> {
         let sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
             // `sd` 外部不会再被改写（`Listener`/`bind` 之后只读），这里转成可变指针只是 Win32 API
@@ -206,13 +205,17 @@ mod windows_impl {
         }
     }
 
-    /// 客户端连接：按 Unix 的习惯把"连接失败"统一报成 `NotFound`，调用方据此提示"onexd 是否在跑"。
+    /// 连接并验证该实例的所有者，调用者拿到句柄之后才会发送请求。
     pub async fn connect(path: &Path) -> io::Result<Connection> {
         let name = pipe_name(path);
+        let owner_sid = super::sddl::current_user_sid()?;
         // 本机管道随 daemon 一起创建，短暂的 ERROR_PIPE_BUSY（所有实例都在服务别的客户端）重试几次。
         for attempt in 0..5 {
             match named_pipe::ClientOptions::new().open(&name) {
-                Ok(client) => return Ok(Connection::Client(client)),
+                Ok(client) => {
+                    super::sddl::verify_pipe_owner(client.as_raw_handle(), &owner_sid)?;
+                    return Ok(Connection::Client(client));
+                }
                 Err(e) if e.raw_os_error() == Some(231) && attempt < 4 => {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
@@ -231,42 +234,160 @@ mod windows_impl {
 
 #[cfg(windows)]
 mod sddl {
-    //! 用 SDDL 字符串构造安全描述符：`D:` 表示只给自定义 DACL（不继承），`(A;;GA;;;OW)` 表示
-    //! 允许（Allow）当前对象所有者（Owner，创建管道的那个用户）完全访问（Generic All）。
-    //! 不加任何其它 ACE，等价于"只有当前用户能连"；没有 `AI`（自动继承）标志，不会被容器策略放宽。
-    //!
-    //! 这里只返回安全描述符的原始字节（`Vec<u8>`，普通堆内存，`Send`，可以安全跨 `.await` 持有）；
-    //! 包这层字节的 `SECURITY_ATTRIBUTES`（含裸指针，非 `Send`）由调用方在每次 FFI 调用前现场拼，
-    //! 不作为长期持有的字段，见 `windows_impl::create_instance`。
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::LocalFree;
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr::{NonNull, null_mut};
+
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+        SE_KERNEL_OBJECT,
     };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, OWNER_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    const SDDL_OWNER_FULL_CONTROL_ONLY: &str = "D:(A;;GA;;;OW)";
+    /// Owns an allocation returned by the security APIs, which must be freed with LocalFree.
+    struct LocalAllocation(NonNull<c_void>);
 
-    pub(super) fn current_user_security_descriptor() -> anyhow::Result<Vec<u8>> {
-        let wide: Vec<u16> = OsStr::new(SDDL_OWNER_FULL_CONTROL_ONLY).encode_wide().chain(Some(0)).collect();
-        let mut sd_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut sd_len: u32 = 0;
-        // SAFETY: `wide` 是一个有效的、以 NUL 结尾的宽字符串；成功时系统在 `sd_ptr` 分配一块缓冲区，
-        // 大小写进 `sd_len`，所有权转给调用方，用 `LocalFree` 释放（这里转存成 `Vec<u8>` 后立即释放，
-        // 不保留原始指针）。
-        let ok = unsafe {
+    impl LocalAllocation {
+        fn new(ptr: *mut c_void) -> io::Result<Self> {
+            NonNull::new(ptr)
+                .map(Self)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing Windows security data"))
+        }
+    }
+
+    impl Drop for LocalAllocation {
+        fn drop(&mut self) {
+            // SAFETY: only successful allocating Windows security APIs provide this pointer.
+            unsafe {
+                LocalFree(self.0.as_ptr());
+            }
+        }
+    }
+
+    pub(super) fn current_user_sid() -> io::Result<String> {
+        let mut token = null_mut();
+        // SAFETY: GetCurrentProcess returns a pseudo-handle; OpenProcessToken initializes the out handle.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: OpenProcessToken transferred ownership of the returned real handle.
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let handle = token.as_raw_handle();
+        let mut required = 0;
+        // SAFETY: a null buffer with length zero asks Windows for the required size.
+        if unsafe { GetTokenInformation(handle, TokenUser, null_mut(), 0, &mut required) } != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected empty Windows token user data"));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+            return Err(error);
+        }
+        if (required as usize) < std::mem::size_of::<TOKEN_USER>() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "short Windows token user data"));
+        }
+        // TOKEN_USER contains a pointer, so preserve pointer alignment in the caller-owned buffer.
+        let mut buffer = vec![0usize; (required as usize).div_ceil(std::mem::size_of::<usize>())];
+        let mut returned = 0;
+        // SAFETY: buffer is aligned and has at least required writable bytes.
+        if unsafe { GetTokenInformation(handle, TokenUser, buffer.as_mut_ptr().cast(), required, &mut returned) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (returned as usize) < std::mem::size_of::<TOKEN_USER>() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "short Windows token user data"));
+        }
+        // SAFETY: Windows filled the TOKEN_USER and its SID; the buffer stays alive through conversion.
+        let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        sid_string(sid)
+    }
+
+    fn sid_string(sid: PSID) -> io::Result<String> {
+        if sid.is_null() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "missing Windows security identifier"));
+        }
+        let mut wide = null_mut();
+        // SAFETY: callers pass a Windows-provided SID valid for the entire call.
+        if unsafe { ConvertSidToStringSidW(sid, &mut wide) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _allocation = LocalAllocation::new(wide.cast())?;
+        // SAFETY: success returns a NUL-terminated UTF-16 SID string in that allocation.
+        let value = unsafe {
+            let mut len = 0;
+            while *wide.add(len) != 0 {
+                len += 1;
+            }
+            std::slice::from_raw_parts(wide, len)
+        };
+        String::from_utf16(value).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    pub(super) fn current_user_security_descriptor() -> io::Result<Vec<u32>> {
+        let sid = current_user_sid()?;
+        let wide: Vec<u16> = format!("O:{sid}D:P(A;;GA;;;{sid})").encode_utf16().chain(Some(0)).collect();
+        let mut descriptor = null_mut();
+        let mut len = 0;
+        // SAFETY: SDDL is a valid NUL-terminated string; Windows initializes descriptor and length on success.
+        if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 wide.as_ptr(),
                 SDDL_REVISION_1,
-                &mut sd_ptr,
-                &mut sd_len,
+                &mut descriptor,
+                &mut len,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let allocation = LocalAllocation::new(descriptor)?;
+        if len == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "empty Windows pipe security descriptor"));
+        }
+        // SDDL conversion returns a self-relative descriptor with DWORD offsets. Keep its alignment
+        // when copying it into Rust-owned data so no raw pointer lives across an await point.
+        let mut aligned = vec![0u32; (len as usize).div_ceil(std::mem::size_of::<u32>())];
+        // SAFETY: Windows initialized len bytes, and aligned has enough room for them.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                allocation.0.as_ptr().cast::<u8>(),
+                aligned.as_mut_ptr().cast::<u8>(),
+                len as usize,
+            );
+        }
+        Ok(aligned)
+    }
+
+    pub(super) fn verify_pipe_owner(handle: HANDLE, expected_sid: &str) -> io::Result<()> {
+        let mut owner = null_mut();
+        let mut descriptor = null_mut();
+        // SAFETY: the open named-pipe handle remains live; Windows supplies the owner within the
+        // allocated descriptor. Convert it before freeing the descriptor.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
             )
         };
-        anyhow::ensure!(ok != 0, "ConvertStringSecurityDescriptorToSecurityDescriptorW failed");
-        let sd = unsafe { std::slice::from_raw_parts(sd_ptr as *const u8, sd_len as usize).to_vec() };
-        // SAFETY: `sd_ptr` 是上面成功调用分配的、尚未释放的内存，`LocalFree` 的 HANDLE 参数
-        // （windows-sys 0.59 里是 `*mut c_void`）接受任何本地内存分配返回的指针。
-        unsafe { LocalFree(sd_ptr) };
-        Ok(sd)
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let _descriptor = LocalAllocation::new(descriptor)?;
+        if sid_string(owner)? != expected_sid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "onexd pipe owner is not the current Windows user",
+            ));
+        }
+        Ok(())
     }
 }

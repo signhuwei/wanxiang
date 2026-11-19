@@ -203,9 +203,9 @@ pub fn prepare(r: &Request) -> Result<Launch> {
     })
 }
 
-/// 结束一次启动：删除本次策略文件（含本机令牌）。
+/// 只接受本机生成的启动 ID，清除对应目录及其临时令牌。
 pub fn finish(home: &Path, launch_id: &str) -> Result<()> {
-    if launch_id.is_empty() || launch_id.contains(['/', '.']) {
+    if !is_generated_launch_id(launch_id) {
         bail!("bad launch id");
     }
     let dir = home.join("run").join(launch_id);
@@ -289,6 +289,15 @@ fn uuid_v4() -> String {
     format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
 }
 
+/// `id::new("lch")` 的形状：`lch_` 后面严格跟 26 个 Crockford base32 字符（大写字母和数字，
+/// 不含 I、L、O、U）。白名单匹配，不是去掉已知危险字符——任何不是这个形状的输入都拒绝，
+/// 不管它看起来像不像路径穿越。
+fn is_generated_launch_id(s: &str) -> bool {
+    const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let Some(rest) = s.strip_prefix("lch_") else { return false };
+    rest.len() == 26 && rest.bytes().all(|b| CROCKFORD.contains(&b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,7 +367,6 @@ mod tests {
 
         finish(home.path(), &l.launch_id).unwrap();
         assert!(!l.run_dir.exists());
-        assert!(finish(home.path(), "../x").is_err());
     }
 
     /// Windows 版 `prepares_isolated_launch`：路径和 `PASS_ENV` 都换成 Windows 的等价物
@@ -440,6 +448,23 @@ mod tests {
         std::fs::write(d.path().join(".claude.json"), "{broken").unwrap();
         assert!(init_claude_json(d.path(), "tok").is_err());
         assert_eq!(std::fs::read(d.path().join(".claude.json")).unwrap(), b"{broken");
+    }
+
+    /// `finish()` 的 `launch_id` 来自 IPC（`LaunchDone` 请求），平台无关：白名单必须在两个平台上
+    /// 都拒绝非生成形状的输入，尤其是只在 Windows 上成立的攻击形状（带盘符的绝对路径、裸反斜杠），
+    /// 这些都不含 `/` 或 `.`，旧的黑名单实现挡不住，必须单独测，不能靠 `#[cfg(unix)]` 的启动测试
+    /// 顺带盖到——那个测试在 Windows 上根本不会跑。
+    #[test]
+    fn finish_only_accepts_generated_launch_ids() {
+        let home = tempfile::tempdir().unwrap();
+        // 用真实生成器产出一个 id，而不是手写一个凭空数出来的固定长度字符串——长度数错一位
+        // 这种测试自身的 bug 不会被发现，用生成器就不存在这个风险。
+        let id = id::new("lch");
+        std::fs::create_dir_all(home.path().join("run").join(&id)).unwrap();
+        assert!(finish(home.path(), &id).is_ok());
+        for bad in ["../x", r"C:\not-a-launch", r"\not-a-launch", "lch_tooshort", "lch_", "not-even-close", ""] {
+            assert!(finish(home.path(), bad).is_err(), "{bad}");
+        }
     }
 
     #[cfg(unix)]

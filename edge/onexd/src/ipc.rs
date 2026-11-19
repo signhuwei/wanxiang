@@ -134,13 +134,14 @@ async fn dispatch(req: Request, ipc: &Ipc) -> (Value, bool) {
         ),
         Request::LaunchDone { launch_id, exit_code } => {
             let Some(ctx) = &ipc.launch else { return (err("invalid", "这个 onexd 不支持启动 Agent"), false) };
+            let Some(launch) = ctx.running.lock().unwrap().remove(&launch_id) else {
+                return (json!({"ok": true}), false);
+            };
             info!(%launch_id, ?exit_code, "agent exited");
-            if let Some(launch) = ctx.running.lock().unwrap().remove(&launch_id) {
-                ipc.state.launch_tokens.write().unwrap().remove(&launch.token);
-                *launch.code.lock().unwrap() = exit_code;
-                launch.stop.cancel();
-                ipc.state.active_session.write().unwrap().take_if(|s| *s == launch.session_id);
-            }
+            ipc.state.launch_tokens.write().unwrap().remove(&launch.token);
+            *launch.code.lock().unwrap() = exit_code;
+            launch.stop.cancel();
+            ipc.state.active_session.write().unwrap().take_if(|s| *s == launch.session_id);
             match crate::launch::finish(&ctx.home, &launch_id) {
                 Ok(()) => (json!({"ok": true}), false),
                 Err(e) => (err("invalid", &format!("{e:#}")), false),

@@ -146,7 +146,7 @@ async fn run(home: PathBuf, started_at: time::OffsetDateTime) -> Result<()> {
 
     tokio::select! {
         _ = shutdown.cancelled() => {}
-        _ = tokio::signal::ctrl_c() => { info!("received interrupt signal"); shutdown.cancel(); }
+        _ = interrupt_signal() => { info!("received interrupt signal"); shutdown.cancel(); }
         _ = terminate_signal() => { info!("received terminate signal"); shutdown.cancel(); }
     }
     if let Some(t) = ws_task {
@@ -186,6 +186,13 @@ fn restore_identity(
     Some((DeviceKey::from_bytes(creds.device_key), creds.device_token, creds.device_id))
 }
 
+async fn interrupt_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        warn!(%error, "unable to register an interrupt signal listener");
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Unix 的 SIGTERM；Windows 没有这个信号，等效的"外部要求退出"换成 Ctrl+C 之外的关闭事件
 /// （控制台窗口关闭、系统关机广播），见 `terminate_signal`。
 #[cfg(unix)]
@@ -198,8 +205,13 @@ async fn terminate_signal() {
 /// 不是用户主动 Ctrl+C。两个事件都等，谁先来就走谁。
 #[cfg(windows)]
 async fn terminate_signal() {
-    let mut close = tokio::signal::windows::ctrl_close().expect("ctrl_close handler");
-    let mut shutdown = tokio::signal::windows::ctrl_shutdown().expect("ctrl_shutdown handler");
+    let (Ok(mut close), Ok(mut shutdown)) =
+        (tokio::signal::windows::ctrl_close(), tokio::signal::windows::ctrl_shutdown())
+    else {
+        // An installed daemon may run without a console and still shuts down via IPC.
+        std::future::pending::<()>().await;
+        return;
+    };
     tokio::select! {
         _ = close.recv() => {}
         _ = shutdown.recv() => {}
