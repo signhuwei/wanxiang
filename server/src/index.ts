@@ -1,5 +1,4 @@
 import { randomToken } from './credentials';
-import { sweepExpiredJobs } from './diag';
 import { RustfsObjectStorage } from './object-storage';
 import { MemoryPresence, ValkeyPresence } from './presence';
 import { createServer } from './server';
@@ -38,13 +37,7 @@ try {
     heartbeatMs: 15_000, commit: env.ONEX_COMMIT ?? 'unknown', codeSecret, masterKey, presence, objectStorage,
     deliverCode: dev ? (target, code) => console.info(`[onex-dev] login code for ${target}: ${code}`) : undefined,
   });
-  // 七天保留届满后的真对象清理；下载接口已经按 expires_at 拒绝访问，这里把过期对象从 RustFS 删掉。
-  const sweep = setInterval(() => {
-    void sweepExpiredJobs(app.store, objectStorage, Date.now()).catch((error) => console.error('OneX diag sweep failed', error));
-  }, 3_600_000);
-  sweep.unref();
   const shutdown = () => {
-    clearInterval(sweep);
     void app.close().catch((error) => { console.error('OneX shutdown failed', error); process.exitCode = 1; });
   };
   process.once('SIGTERM', shutdown);
