@@ -27,7 +27,7 @@ Server 回 `welcome`：
 
 ## 心跳
 
-双方每 `heartbeat_ms` 发 `{"type":"ping","id":...}`，对方回 `pong`。连续 3 次没有回应就断开重连。Edge 重连用指数退避：1 s 起，上限 30 s，加 ±20% 随机抖动。
+双方每 `heartbeat_ms` 发 `{"type":"ping","id":"..."}`，对方回 `{"type":"pong","re":"<ping 的 id>"}`。应答类消息（`welcome`、`pong`、`ack`、`events_ack`）用 `re` 关联请求，不必带自己的 `id`。连续 3 次没有回应就断开重连。Edge 重连用指数退避：1 s 起，上限 30 s，加 ±20% 随机抖动。
 
 ## Server → Edge
 
