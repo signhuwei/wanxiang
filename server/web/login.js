@@ -116,24 +116,27 @@ export function renderLogin(host, { api, mockOn, setPendingToken, onSession }) {
   tabInvite.addEventListener('click', () => switchTab('invite'))
 
   // 用全局令牌换租户令牌，再取完整会话
+  let globalMe
+  let globalToken
   async function finishWithTenant(tenantEntry) {
     const res = await api.post('/auth/select-tenant', { tenant_id: tenantEntry.id })
     setPendingToken(res.token)
     const me = await api.get('/me')
-    return { token: res.token, user: me.user, tenant: me.tenant, role: me.role }
+    return { ...me, token: res.token, globalToken, globalActions: globalMe.actions || [], is_platform_admin: globalMe.is_platform_admin === true }
   }
 
   async function afterLogin(loginRes) {
     setPendingToken(loginRes.token)
-    const me = await api.get('/me')
+    const me = globalMe = await api.get('/me')
+    globalToken = loginRes.token
     if (me.tenant) {
       // 令牌已带租户（例如刚用邀请码加入）
       return { token: loginRes.token, user: me.user, tenant: me.tenant, role: me.role }
     }
     const tenants = loginRes.tenants || []
     if (tenants.length === 0) {
-      if (loginRes.user && loginRes.user.platform_admin) {
-        return { token: loginRes.token, user: loginRes.user, tenant: null, role: null }
+      if (me.is_platform_admin) {
+        return { ...me, globalActions: me.actions || [], token: globalToken, globalToken }
       }
       throw new Error('该账号不属于任何租户，请联系管理员获取邀请码')
     }

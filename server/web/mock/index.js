@@ -1,5 +1,5 @@
 // 假数据开关与 fetch 拦截：Server 接口就绪前，页面默认走这里的假实现。
-// 开关：URL 加 ?mock=1 开（并记住），?mock=0 关；默认开。Server 就绪后整个 mock/ 目录删除。
+// 显式 ?mock=1 为离线验收，默认请求同源 Server；?mock=0 退出离线模式。
 
 import { buildMockDb } from './data.js'
 
@@ -18,9 +18,9 @@ export function mockEnabled() {
     }
     stored = localStorage.getItem(FLAG)
   } catch {
-    return true
+    return false
   }
-  return stored === null ? true : stored === '1'
+  return stored === '1'
 }
 
 function json(body, status = 200) {
@@ -149,10 +149,11 @@ export function installMock() {
       const s = sessionOf(init)
       if (!s) return err(401, 'unauthenticated', '未登录或登录已过期，请重新登录')
       const user = db.users[s.target]
-      if (!s.tenantId) return json({ user, tenant: null, role: null, agents: [] })
+      const is_platform_admin = !!user.platform_admin
+      if (!s.tenantId) return json({ user, tenant: null, role: null, agents: [], is_platform_admin, actions: is_platform_admin ? ['create_provider','create_model','create_rate','topup'] : [] })
       const t = db.tenants.find(t => t.id === s.tenantId)
       const ms = db.memberships[s.target].find(m => m.tenant_id === s.tenantId)
-      return json({ user, tenant: t, role: ms ? ms.role : null, agents: [] })
+      return json({ user, tenant: t, role: ms?.role, agents: [], is_platform_admin, actions: ['owner','admin'].includes(ms?.role) ? ['create_group','create_invite'] : [] })
     }
 
     // ---- 成员与组（租户范围）----

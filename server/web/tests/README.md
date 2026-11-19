@@ -16,7 +16,7 @@ bun server/web/tests/browser-check.js .local/web-screenshots
 
 脚本分别在 1280×720、1440×900 检查登录、台账、左缩钻取、编辑布局并保存 PNG，检查外层无溢出、表格行高 32–40 px、页码可见；同时验证邀请码、租户选择、按 actions 显示按钮、查询分页、钻取返回、同级切换和会话过期。
 
-静态测试服务 `http://127.0.0.1:8123/?mock=1` 默认开启 mock。真实接口需由同源 Server 同时托管页面和 `/v1`，使用 `?mock=0`（不向静态测试服务发送真实凭据）。两个模式不共用登录存储。
+静态测试服务 `http://127.0.0.1:8123/?mock=1` 显式开启离线 mock，正常部署默认使用真实 API。`bun server/web/tests/workspace-check.js` 从临时 SQLite 数据库启动真实 Server，用 Playwright 验证写入；仅在旧版 `/me` 缺少 actions 时注入测试授权并标记假数据。真实接口需由同源 Server 同时托管页面和 `/v1`，使用 `?mock=0`（不向静态测试服务发送真实凭据）。两个模式不共用登录存储。
 
 - 模拟账号：`admin@onex.dev`（两个租户）、`demo@onex.dev`（一个租户）
 - 固定验证码 `246810`；邀请码 `ONEX2026` 可将模拟账号加入「示例制造」，不能代替验证码。

@@ -1,6 +1,8 @@
 // 成员台账：GET /v1/members，行点击钻取成员详情（右侧表单，查看/编辑同一布局）。
 
 import { createLedger } from './ledger.js'
+import { invitePanel } from './groups.js'
+import { detailPanel } from './panel.js'
 import { openDrill } from './drill.js'
 import { renderForm } from './form.js'
 import { formatMilli, formatDateTime, roleLabel, memberStatusLabel } from './format.js'
@@ -19,11 +21,11 @@ const ROLE_OPTIONS = [
   { value: 'member', label: '成员' }
 ]
 
-export function renderMembersPage(host, { api }) {
+export function renderMembersPage(host, { api, actions = [] }) {
   let ledger
+  const invite = detailPanel(host, () => ledger)
 
   async function fetchPage({ q, filters, cursor, limit, signal }) {
-    // CONTRACT-PENDING: role/status 筛选参数待契约确认（契约目前只定义 q/cursor/limit）
     return await api.get('/members', {
       params: { q, cursor, limit, role: filters.role, status: filters.status },
       signal
@@ -38,7 +40,7 @@ export function renderMembersPage(host, { api }) {
   function nameCell(item) {
     const frag = document.createDocumentFragment()
     frag.appendChild(el('span', 'row-title', item.name))
-    frag.appendChild(el('span', 'row-sub', item.target))
+    frag.appendChild(el('span', 'row-sub', item.email || item.phone || item.target))
     return frag
   }
 
@@ -145,6 +147,8 @@ export function renderMembersPage(host, { api }) {
         sections: [{ key: 'base', title: '', fields }],
         values: {
           ...member,
+          target: member.email || member.phone || member.target,
+          group_name: member.group_name || member.group_id,
           quota_eraser: member.quota_milli === null ? null : member.quota_milli / 1000
         },
         mode
@@ -220,6 +224,8 @@ export function renderMembersPage(host, { api }) {
 
   ledger = createLedger(host, {
     title: '成员',
+    createLabel: '生成邀请码',
+    onCreate: actions.includes('create_invite') ? () => invite('生成邀请码', pane => invitePanel(pane, api)) : null,
     rowKey: 'user_id',
     fetchPage,
     onOpen: openMember,
@@ -247,7 +253,7 @@ export function renderMembersPage(host, { api }) {
     columns: [
       { key: 'name', title: '成员', render: nameCell },
       { key: 'role', title: '角色', render: m => roleLabel(m.role) },
-      { key: 'group_name', title: '分组', render: m => m.group_name || '—' },
+      { key: 'group_name', title: '分组', render: m => m.group_name || m.group_id || '—' },
       { key: 'status', title: '状态', render: statusCell },
       { key: 'quota_milli', title: '橡皮配额', render: m => formatMilli(m.quota_milli) },
       { key: 'last_active_at', title: '最近活动', render: m => formatDateTime(m.last_active_at) }
