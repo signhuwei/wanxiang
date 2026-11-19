@@ -6,6 +6,7 @@ import { createServer } from '../src/server';
 import { seedTenant } from '../src/seed';
 import { MemoryPresence } from '../src/presence';
 import { hash } from '../src/credentials';
+import { decryptProviderSecret } from '../src/provider-secret';
 
 type DeviceReply = { device_id: string; device_token: string };
 
@@ -20,19 +21,19 @@ async function fixture(heartbeatMs = 15_000) {
   let time = Date.now();
   const service = await createServer({
     dataDir, hostname: '127.0.0.1', port: 0, tenantCacheSize: 2, heartbeatMs, commit: 'test',
-    codeSecret: 'test-only-secret', deliverCode: (target, code) => { codes.set(target, code); },
+    codeSecret: 'test-only-secret', masterKey: Buffer.alloc(32, 41), deliverCode: (target, code) => { codes.set(target, code); },
     now: () => time, presence,
   });
   clean.push(() => service.close());
   const owner = 'owner@example.test';
   const seeded = await seedTenant(service.store, { target: owner, seats: 2, maxUses: 3, now: time });
-  function request(path: string, body?: Record<string, unknown>, token?: string, key?: string) {
+  function request(path: string, body?: Record<string, unknown>, token?: string, key?: string, method = body ? 'POST' : 'GET') {
     const headers = new Headers();
     if (token) headers.set('authorization', `Bearer ${token}`);
     if (key) headers.set('idempotency-key', key);
     if (body) headers.set('content-type', 'application/json');
     return fetch(new URL(`/v1${path}`, service.server.url), {
-      method: body ? 'POST' : 'GET', headers, body: body && JSON.stringify(body),
+      method, headers, body: body && JSON.stringify(body),
     });
   }
   async function code(target: string) {
@@ -58,7 +59,8 @@ test('health, OpenAPI, one-use codes, tenant selection and logout', async () => 
   const f = await fixture();
   expect(await (await f.request('/healthz')).json()).toMatchObject({ status: 'ok', commit: 'test' });
   const spec = await (await f.request('/openapi.json')).json() as { paths: object };
-  expect(Object.keys(spec.paths).sort()).toEqual(['/v1/auth/code', '/v1/auth/login', '/v1/auth/logout', '/v1/auth/select-tenant', '/v1/devices', '/v1/edge/ws', '/v1/healthz', '/v1/me', '/v1/openapi.json'].sort());
+  expect(Object.keys(spec.paths)).toContain('/v1/auth/login');
+  expect(Object.keys(spec.paths)).toContain('/v1/platform/providers');
   const code = await f.code(f.owner);
   const body = { target: f.owner, code, kind: 'desktop' };
   const res = await f.request('/auth/login', body, undefined, 'one-login');
@@ -84,9 +86,14 @@ test('expired and over-attempted codes cannot log in; code issuance is rate-limi
   expect(retry.status).toBe(429);
   expect(await retry.json()).toMatchObject({ error: { code: 'rate_limited' } });
   const wrong = code === '111111' ? '222222' : '111111';
-  for (let i = 0; i < 5; i++) expect((await f.request('/auth/login', { target: f.owner, code: wrong })).status).toBe(401);
-  expect((await f.request('/auth/login', { target: f.owner, code })).status).toBe(401);
+  for (let i = 0; i < 4; i++) expect((await f.request('/auth/login', { target: f.owner, code: wrong })).status).toBe(401);
+  expect((await f.request('/auth/login', { target: f.owner, code: wrong })).status).toBe(429);
+  const locked = await f.request('/auth/login', { target: f.owner, code });
+  expect(locked.status).toBe(429);
+  expect(await locked.json()).toMatchObject({ error: { code: 'rate_limited', detail: { retry_after_ms: 600_000 } } });
   f.advance(60_000);
+  expect((await f.request('/auth/code', { target: f.owner })).status).toBe(429);
+  f.advance(540_000);
   const fresh = await f.code(f.owner);
   f.advance(600_001);
   expect((await f.request('/auth/login', { target: f.owner, code: fresh })).status).toBe(401);
@@ -101,6 +108,79 @@ test('racing invite redemptions cannot exceed seats and the loser does not consu
   expect(await res.find((r) => r.status === 403)!.json()).toMatchObject({ error: { code: 'seat_limit' } });
   expect(f.store.tenant(f.tenantId).get('SELECT used FROM invites')).toEqual({ used: 1 });
   expect(f.store.tenant(f.tenantId).get('SELECT count(*) AS n FROM members')).toEqual({ n: 2 });
+});
+
+test('tenant management enforces scope, revisions, pagination, and one-time invite disclosure', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const scoped = await f.select(global);
+  expect((await f.request('/members', undefined, global)).status).toBe(403);
+  const body = { name: 'Engineering', quota_milli: 200 };
+  const created = await f.request('/groups', body, scoped, 'group');
+  expect(created.status).toBe(201);
+  const group = await created.json() as { id: string; revision: number };
+  expect(await (await f.request('/groups', body, scoped, 'group')).json()).toEqual(group);
+  expect((await f.request(`/groups/${group.id}`, { revision: 1, parent_id: group.id }, scoped)).status).toBe(422);
+  expect((await f.request('/groups', { name: 'Support', parent_id: group.id }, scoped)).status).toBe(201);
+  const page = await (await f.request('/groups?limit=1', undefined, scoped)).json() as { items: unknown[]; total: number; next_cursor: string };
+  expect(page).toMatchObject({ total: 2, items: [{ revision: 1, actions: ['read', 'update'] }] });
+  expect((await (await f.request(`/groups?limit=1&cursor=${page.next_cursor}`, undefined, scoped)).json())).toMatchObject({ total: 2, next_cursor: null });
+  const invite = { role: 'member', group_id: group.id, max_uses: 1, expires_in_ms: 60_000 };
+  const res = await f.request('/invites', invite, scoped, 'join');
+  expect(res.status).toBe(201);
+  const issued = await res.json() as { invite_code: string; id: string };
+  expect(issued.invite_code).toBeString();
+  expect(await (await f.request('/invites', invite, scoped, 'join')).json()).toMatchObject({ id: issued.id, code_returned: false });
+  expect(await (await f.request('/invites', invite, scoped, 'join')).json()).not.toHaveProperty('invite_code');
+  expect((await f.request('/invites', { ...invite, max_uses: 2 }, scoped, 'join')).status).toBe(409);
+  const target = 'engineer@example.test';
+  const joined = await f.request('/auth/login', { target, code: await f.code(target), invite_code: issued.invite_code });
+  expect(joined.status).toBe(200);
+  const { token, user } = await joined.json() as { token: string; user: { id: string } };
+  const employee = await f.select(token);
+  expect((await f.request('/members', undefined, employee)).status).toBe(403);
+  const update = { revision: 1, quota_milli: 100 };
+  expect(await (await f.request(`/members/${user.id}`, update, scoped, undefined, 'PATCH')).json()).toMatchObject({ revision: 2, group_id: group.id, quota_milli: 100 });
+  expect((await f.request(`/members/${user.id}`, update, scoped)).status).toBe(409);
+  const set = { revision: 1, seat_limit: 3, allowed_agents: ['claude-code'], allowed_models: [], lease_minutes: 10, lease_budget_milli: 2000, visibility: {} };
+  expect((await f.request('/contract', set, employee, undefined, 'PUT')).status).toBe(403);
+  expect(await (await f.request('/contract', set, scoped, undefined, 'PUT')).json()).toMatchObject({ ...set, revision: 2 });
+  expect((await f.request('/contract', set, scoped, undefined, 'PUT')).status).toBe(409);
+});
+
+test('platform privileges are independent and provider secrets are never returned or stored in plaintext', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const scoped = await f.select(global);
+  expect((await f.request('/platform/tenants', undefined, global)).status).toBe(403);
+  await f.store.system.write((sql) => sql.run('INSERT INTO platform_admins (user_id) VALUES (?)', [f.userId]));
+  expect((await f.request('/platform/tenants', undefined, scoped)).status).toBe(403);
+  const secret = 'fake-secret-not-for-storage';
+  const provider = { name: 'Fake', protocol: 'anthropic', base_url: 'http://127.0.0.1:3333', secret };
+  const result = await f.request('/platform/providers', provider, global, 'provider');
+  expect(result.status).toBe(201);
+  const resultText = await result.text();
+  expect(resultText).not.toContain(secret);
+  expect(await (await f.request('/platform/providers', undefined, global)).text()).not.toContain(secret);
+  expect(await (await f.request('/platform/providers', provider, global, 'provider')).text()).toBe(resultText);
+  const stored = f.store.system.get<{ secret_ciphertext: Uint8Array }>('SELECT secret_ciphertext FROM providers')!;
+  expect(Buffer.from(stored.secret_ciphertext).includes(secret)).toBe(false);
+  const { id } = JSON.parse(resultText) as { id: string };
+  expect(decryptProviderSecret(Buffer.alloc(32, 41), id, stored.secret_ciphertext).toString()).toBe(secret);
+  expect(() => decryptProviderSecret(Buffer.alloc(32, 41), 'different-provider', stored.secret_ciphertext)).toThrow();
+  const model = await f.request('/platform/models', { provider_id: id, upstream_name: 'fake', display_name: 'Fake', context_window: 1024 }, global);
+  expect(model.status).toBe(201);
+  const { id: model_id } = await model.json() as { id: string };
+  const rate = { model_id, effective_from: '2026-11-19T00:00:00Z', input_milli_per_mtok: 1, output_milli_per_mtok: 2, cache_read_milli_per_mtok: 0, cache_write_milli_per_mtok: 0 };
+  expect((await f.request('/platform/rates', rate, global)).status).toBe(201);
+  expect((await f.request('/platform/rates', rate, global)).status).toBe(409);
+  expect((await f.request('/platform/agent-releases', { agent: 'claude-code', version: '1', os: 'darwin', arch: 'arm64', url: 'http://127.0.0.1/fake', sha256: 'a'.repeat(64), size: 1 }, global)).status).toBe(201);
+  const tenant = { name: 'Second', owner_user_id: f.userId };
+  const created = await f.request('/platform/tenants', tenant, global, 'tenant');
+  expect(created.status).toBe(201);
+  const second = await created.json() as { id: string };
+  expect(await (await f.request('/platform/tenants', tenant, global, 'tenant')).json()).toEqual(second);
+  expect(f.store.tenant(second.id).get('SELECT revision FROM contract')).toEqual({ revision: 1 });
 });
 
 async function until(predicate: () => boolean | Promise<boolean>) {

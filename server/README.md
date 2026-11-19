@@ -10,7 +10,7 @@ bun test server/test
 bun run --cwd server typecheck
 ```
 
-Seed prints one owner, tenant ID and invite code. Request a code with `POST /v1/auth/code`; read the six-digit code in the Server log. `POST /v1/auth/login` requires the code even when joining via invitation. Call `POST /v1/auth/select-tenant` to obtain the token used for `POST /v1/devices`. Device tokens authenticate `GET /v1/edge/ws` upgrades only. See `/v1/openapi.json` for request and response shapes.
+Seed prints one owner, tenant ID and invite code, and initializes the tenant contract. Append `--platform-admin` to the seed command to explicitly grant the seeded user platform administration; otherwise tenant ownership does not grant platform access. Use a global session token for `/v1/platform/*` and a tenant-scoped token for tenant management. Provider secret inputs are write-only and are encrypted at rest with AES-256-GCM. Request a code with `POST /v1/auth/code`; read the six-digit code in the Server log. `POST /v1/auth/login` requires the code even when joining via invitation. Call `POST /v1/auth/select-tenant` to obtain the token used for `POST /v1/devices`. Device tokens authenticate `GET /v1/edge/ws` upgrades only. See `/v1/openapi.json` for request and response shapes.
 
 | Environment variable | Default / use |
 | --- | --- |
@@ -20,6 +20,7 @@ Seed prints one owner, tenant ID and invite code. Request a code with `POST /v1/
 | `ONEX_TENANT_CACHE_SIZE` | `16` idle/active tenant database handles; pending writes can temporarily exceed it |
 | `ONEX_COMMIT` | `unknown`; set the build SHA to surface it in `/v1/healthz` |
 | `ONEX_AUTH_SECRET` | At least 32 characters; if unset in development, generated per process |
+| `ONEX_MASTER_KEY` | 32 random bytes encoded in standard base64; required for provider secret writes and production. Keep it stable and store it separately from SQLite. |
 | `ONEX_VALKEY_URL` | `redis://127.0.0.1:6379` if running local Valkey; otherwise dev/test use in-memory presence |
 
 Bun's built-in `RedisClient` avoids another dependency and supports the RESP commands needed here. Valkey stores one TTL-bound connection ID per device. Refresh and release only affect that connection's own record. Set `ONEX_TEST_VALKEY_URL` to an isolated Valkey instance to enable the optional test in `server/test/presence.test.ts`. `NODE_ENV=production` requires explicit Valkey and auth secret configuration and disables code issuance: email/SMS delivery is not part of S0. Do not expose the development code logger to an untrusted network.

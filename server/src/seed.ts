@@ -22,7 +22,12 @@ export function ensureUser(sql: Transaction, target: NonNullable<ReturnType<type
   return user;
 }
 
-export async function seedTenant(store: Store, opts: { target: string; name?: string; seats?: number; maxUses?: number; now?: number }) {
+export function insertInitialContract(sql: Transaction, owner: string, seats: number, now: number) {
+  sql.run(`INSERT INTO contract (revision, seat_limit, allowed_agents_json, allowed_models_json, visibility_json, updated_by, updated_at)
+    VALUES (1, ?, '["claude-code"]', '[]', '{}', ?, ?)`, [seats, owner, iso(now)]);
+}
+
+export async function seedTenant(store: Store, opts: { target: string; name?: string; seats?: number; maxUses?: number; now?: number; platformAdmin?: boolean }) {
   const target = normalizedTarget(opts.target);
   const seats = opts.seats ?? 10;
   const maxUses = opts.maxUses ?? 10;
@@ -35,27 +40,29 @@ export async function seedTenant(store: Store, opts: { target: string; name?: st
   const member = { user_id: user.id, role: 'owner', status: 'active' };
   await store.tenant(tenantId, true).write((sql) => {
     sql.run('INSERT INTO members (user_id, role, status) VALUES (?, ?, ?)', [user.id, member.role, member.status]);
-    sql.run(`INSERT INTO contract (revision, seat_limit, allowed_agents_json, allowed_models_json, visibility_json, updated_by, updated_at)
-      VALUES (1, ?, '["claude-code"]', '[]', '{}', ?, ?)`, [seats, user.id, iso(now)]);
-    sql.run(`INSERT INTO invites (code_hash, role, max_uses, expires_at, created_by) VALUES (?, 'member', ?, ?, ?)`,
-      [inviteHash, maxUses, iso(now + 7 * day), user.id]);
+    insertInitialContract(sql, user.id, seats, now);
+    sql.run(`INSERT INTO invites (id, code_hash, role, max_uses, expires_at, created_by) VALUES (?, ?, 'member', ?, ?, ?)`,
+      [`inv_${ulid()}`, inviteHash, maxUses, iso(now + 7 * day), user.id]);
   });
   await store.system.write((sql) => {
     sql.run(`INSERT INTO tenants (id, name, owner_user_id, status, db_file, created_at) VALUES (?, ?, ?, 'active', ?, ?)`,
       [tenantId, opts.name ?? 'OneX Dev', user.id, `tenant-${tenantId}.sqlite`, iso(now)]);
     indexMember(sql, tenantId, member);
     indexInvite(sql, tenantId, inviteHash);
+    if (opts.platformAdmin) sql.run('INSERT OR IGNORE INTO platform_admins (user_id) VALUES (?)', [user.id]);
   });
   return { tenantId, userId: user.id, inviteCode, inviteHash };
 }
 
 if (import.meta.main) {
   if (process.env.NODE_ENV === 'production') throw new Error('Development seed is disabled in production');
-  const [target, seats, name] = Bun.argv.slice(2);
-  if (!target) throw new Error('Usage: bun run seed <owner-email-or-phone> [seat-limit] [tenant-name]');
+  const args = Bun.argv.slice(2);
+  const platformAdmin = args.includes('--platform-admin');
+  const [target, seats, name] = args.filter((arg) => arg !== '--platform-admin');
+  if (!target) throw new Error('Usage: bun run seed <owner-email-or-phone> [seat-limit] [tenant-name] [--platform-admin]');
   const store = new Store(process.env.ONEX_DATA_DIR ?? '.local', 2);
   try {
-    const { tenantId, userId, inviteCode } = await seedTenant(store, { target, name, seats: seats === undefined ? undefined : Number(seats) });
+    const { tenantId, userId, inviteCode } = await seedTenant(store, { target, name, seats: seats === undefined ? undefined : Number(seats), platformAdmin });
     console.log(JSON.stringify({ tenant_id: tenantId, owner_user_id: userId, invite_code: inviteCode }));
   } finally {
     store.close();
