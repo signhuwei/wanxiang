@@ -42,6 +42,9 @@ export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthoriz
     }
 
     if (res.status === 401) {
+      if (path === '/auth/login') {
+        throw new ApiError({ status: 401, code: 'unauthenticated', message: '账号或验证码无效，请重新获取验证码' })
+      }
       onUnauthorized()
       throw new ApiError({ status: 401, code: 'unauthenticated', message: '登录已过期，请重新登录' })
     }

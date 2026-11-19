@@ -65,6 +65,15 @@ test('401 triggers onUnauthorized and throws unauthenticated', async () => {
   expect(err.message).toBe('登录已过期，请重新登录')
 })
 
+test('a rejected login stays on the form and explains the invalid credentials', async () => {
+  const fetchImpl = fakeFetch([{ ok: false, status: 401 }])
+  let kicked = 0
+  const api = createApi({ fetchImpl, onUnauthorized: () => kicked++ })
+  const err = await api.post('/auth/login', {}).catch(e => e)
+  expect(err.message).toContain('验证码')
+  expect(kicked).toBe(0)
+})
+
 test('network failure maps to a Chinese network error', async () => {
   const fetchImpl = fakeFetch([{ networkError: true }])
   const api = createApi({ fetchImpl })
