@@ -7,6 +7,14 @@ import { int, pagination, tenantActor } from './management';
 import type { Store } from './store';
 import { visibility } from './visibility';
 
+const shanghaiOffset = 8 * 60 * 60_000;
+function monthBounds(now: number) {
+  const local = new Date(now + shanghaiOffset);
+  const year = local.getUTCFullYear();
+  const month = local.getUTCMonth();
+  return [iso(Date.UTC(year, month, 1) - shanghaiOffset), iso(Date.UTC(year, month + 1, 1) - shanghaiOffset)];
+}
+
 const groupFilter = `group_id IN (WITH RECURSIVE subtree(id) AS (VALUES (?) UNION
   SELECT g.id FROM groups g JOIN subtree s ON g.parent_id = s.id) SELECT id FROM subtree)`;
 const encoder = new TextEncoder();
@@ -57,13 +65,15 @@ export function observationRoutes(app: Hono, store: Store, now: () => number) {
     const params = [...scope.params, ...(p.query ? [JSON.stringify(profiles.map(({ id }) => id))] : [])];
     const where = `WHERE 1 ${scope.sql} ${match}`;
     const { n } = db.get<{ n: number }>(`SELECT count(*) AS n FROM members m ${where}`, params)!;
-    const rows = db.all<{ user_id: string; revision: number; session_count: number; cost_milli: number; last_active_at: string | null }>(`
+    const rows = db.all<{ user_id: string; revision: number; session_count: number; cost_milli: number; month_cost_milli: number; last_active_at: string | null }>(`
       SELECT m.user_id, m.revision + coalesce((SELECT sum(s.revision) FROM agent_sessions s WHERE s.user_id = m.user_id), 0) AS revision,
         (SELECT count(*) FROM agent_sessions s WHERE s.user_id = m.user_id) AS session_count,
         (SELECT total(u.cost_milli) FROM usage u JOIN devices d ON d.id = u.device_id WHERE d.user_id = m.user_id) AS cost_milli,
+        (SELECT total(u.cost_milli) FROM usage u JOIN devices d ON d.id = u.device_id WHERE d.user_id = m.user_id
+          AND u.at >= ? AND u.at < ?) AS month_cost_milli,
         max(coalesce((SELECT max(coalesce(s.last_event_at, s.started_at)) FROM agent_sessions s WHERE s.user_id = m.user_id), ''),
           coalesce((SELECT max(u.at) FROM usage u JOIN devices d ON d.id = u.device_id WHERE d.user_id = m.user_id), '')) AS last_active_at
-      FROM members m ${where} ORDER BY last_active_at DESC, m.user_id LIMIT ? OFFSET ?`, [...params, p.limit, p.offset]);
+      FROM members m ${where} ORDER BY last_active_at DESC, m.user_id LIMIT ? OFFSET ?`, [...monthBounds(now()), ...params, p.limit, p.offset]);
     return c.json(p.page(rows.map((row) => ({ ...row, last_active_at: row.last_active_at || null,
       name: store.system.get<{ name: string }>('SELECT name FROM platform_users WHERE id = ?', [row.user_id])?.name ?? row.user_id,
       actions: readable })), n));
@@ -81,7 +91,11 @@ export function observationRoutes(app: Hono, store: Store, now: () => number) {
     const rows = db.all<Record<string, unknown>>(`WITH page AS (SELECT s.id, s.device_id, s.user_id, s.agent, s.agent_version,
       s.model, s.started_at, s.ended_at, s.event_count, s.revision FROM agent_sessions s ${where}
       ORDER BY s.started_at DESC, s.id LIMIT ? OFFSET ?)
-      SELECT p.*, total(u.cost_milli) AS cost_milli, total(u.input_tokens) AS input_tokens, total(u.output_tokens) AS output_tokens,
+      SELECT p.*, (SELECT count(*) FROM session_events e WHERE e.session_id = p.id AND e.kind = 'user_message'
+        AND coalesce(json_extract(e.payload_json, '$.sidechain'), 0) = 0
+        AND json_extract(e.payload_json, '$.agent_id') IS NULL
+        AND coalesce(json_extract(e.payload_json, '$.system_injected'), 0) = 0) AS turn_count,
+        total(u.cost_milli) AS cost_milli, total(u.input_tokens) AS input_tokens, total(u.output_tokens) AS output_tokens,
         total(u.cache_read_tokens) AS cache_read_tokens, total(u.cache_write_tokens) AS cache_write_tokens,
         count(CASE WHEN u.settlement_status = 'pending' OR u.settlement_status = 'unverified' THEN 1 END) AS pending_usage_count
       FROM page p LEFT JOIN usage u ON u.device_id = p.device_id AND u.session_id = p.id GROUP BY p.id
