@@ -234,12 +234,69 @@ fn upstream_response(scenario: &str, drop_tx: Option<oneshot::Sender<()>>) -> Re
             let evs = stream_events("eof");
             sse_response(futures_util::stream::iter(evs[..3].iter().cloned().map(Ok).collect::<Vec<_>>()))
         }
+        "error_event" => {
+            // HTTP 200 的 SSE，中途一个真实的业务 error 事件，之后连接正常关闭。
+            let evs = vec![
+                stream_events("x").remove(0),
+                sse("error", json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}})),
+            ];
+            sse_response(futures_util::stream::iter(evs.into_iter().map(Ok)))
+        }
+        "stop_then_error_same_chunk" => {
+            // message_stop 和一个之后多余的 error 事件在同一个网络块里到达：
+            // 协议上 message_stop 先到，就是这次请求的终态，后面那个 error 不该再改变结局。
+            let mut all: Vec<u8> = stream_events("same-chunk").concat();
+            all.extend_from_slice(
+                &sse("error", json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}})),
+            );
+            sse_response(futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(all))]))
+        }
+        "error_then_stop_same_chunk" => {
+            let mut all = stream_events("same-chunk")[0].to_vec();
+            all.extend_from_slice(
+                &sse("error", json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}})),
+            );
+            all.extend_from_slice(&sse("message_stop", json!({"type":"message_stop"})));
+            sse_response(futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from(all))]))
+        }
+        "stop_then_hang" => {
+            // message_stop 已发，但连接不关闭（有的上游在终态后还保持连接）。
+            let guard = DropSignal(drop_tx);
+            let evs = stream_events("stop-then-hang");
+            let s = futures_util::stream::iter(evs).chain(futures_util::stream::pending()).map(move |x| {
+                let _g = &guard;
+                Ok::<_, std::io::Error>(x)
+            });
+            sse_response(s)
+        }
+        "business_error_200" => (
+            [("content-type", "application/json")],
+            json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}).to_string(),
+        )
+            .into_response(),
         "overloaded" => (
             StatusCode::from_u16(529).unwrap(),
             [("content-type", "application/json")],
             json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}).to_string(),
         )
             .into_response(),
+        "redirect" => {
+            // 上游用 3xx 重定向把客户端指向别处；router 不能自己跟过去。
+            (StatusCode::FOUND, [("location", "http://127.0.0.1:1/elsewhere")]).into_response()
+        }
+        "oversized_line" => {
+            // message_start 之后一行超大的 data，始终没有换行：router 必须结束而不是无限攒内存。
+            let guard = DropSignal(drop_tx);
+            let first = stream_events("x").remove(0);
+            let huge = Bytes::from(format!("event: content_block_delta\ndata: {}", "y".repeat(2 * 1024 * 1024)));
+            let s = futures_util::stream::iter(vec![first, huge]).chain(futures_util::stream::pending()).map(
+                move |x| {
+                    let _g = &guard;
+                    Ok::<_, std::io::Error>(x)
+                },
+            );
+            sse_response(s)
+        }
         _ => (
             [("content-type", "application/json"), ("request-id", "req_upstream_2")],
             json!({"id":"msg_up_2","type":"message","role":"assistant","model":"claude-up","content":[{"type":"text","text":"hi"}],
@@ -475,6 +532,141 @@ async fn upstream_eof_without_message_stop_is_error() {
     let text = e.req("eof", true).send().await.unwrap().text().await.unwrap();
     assert_eq!(parse_sse(&text).last().unwrap().0, "error");
     assert_eq!(e.usage().await.outcome, Outcome::UpstreamError);
+}
+
+#[tokio::test]
+async fn upstream_business_error_event_ends_once_without_doubled_error() {
+    let mut e = env().await;
+    let text = e.req("error_event", true).send().await.unwrap().text().await.unwrap();
+    let evs = parse_sse(&text);
+    let names: Vec<&str> = evs.iter().map(|(n, _)| n.as_str()).collect();
+    // 上游自己的 error 原样转发一次，不会再被追加一个通用截断错误。
+    assert_eq!(names, ["message_start", "error"]);
+    assert_eq!(evs[1].1["error"]["type"], "overloaded_error");
+
+    let u = e.usage().await;
+    assert_eq!(u.outcome, Outcome::UpstreamError);
+    assert!(!u.usage_final);
+}
+
+#[tokio::test]
+async fn message_stop_ends_stream_without_waiting_for_upstream_eof() {
+    let mut e = env().await;
+    let dropped = e.upstream.on_drop();
+    let started = Instant::now();
+    let text = timeout(T, async { e.req("stop_then_hang", true).send().await.unwrap().text().await.unwrap() })
+        .await
+        .expect("response body did not end after message_stop");
+    let elapsed = started.elapsed();
+    assert_eq!(parse_sse(&text).last().unwrap().0, "message_stop");
+    // 上游在 message_stop 后挂住连接；router 必须在终态后就收尾，不能一直等 EOF。
+    timeout(T, dropped).await.expect("upstream connection was not closed after message_stop").unwrap();
+    assert!(elapsed < T, "{elapsed:?}");
+
+    let u = e.usage().await;
+    assert_eq!(u.outcome, Outcome::Ok);
+    assert!(u.usage_final);
+}
+
+#[tokio::test]
+async fn message_stop_wins_over_a_later_error_in_the_same_chunk() {
+    let mut e = env().await;
+    let text = e.req("stop_then_error_same_chunk", true).send().await.unwrap().text().await.unwrap();
+    // 原样转发至首个终态；随后同批到达的 error 不传给客户端。
+    let evs = parse_sse(&text);
+    let names: Vec<&str> = evs.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "message_start",
+            "content_block_start",
+            "ping",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop"
+        ]
+    );
+
+    let u = e.usage().await;
+    assert_eq!(u.outcome, Outcome::Ok, "first terminal event (message_stop) must win");
+    assert!(u.usage_final);
+}
+
+#[tokio::test]
+async fn upstream_error_wins_over_a_later_stop_in_the_same_chunk() {
+    let mut e = env().await;
+    let text = e.req("error_then_stop_same_chunk", true).send().await.unwrap().text().await.unwrap();
+    let evs = parse_sse(&text);
+    let names: Vec<&str> = evs.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["message_start", "error"]);
+    assert_eq!(evs[1].1["error"]["type"], "overloaded_error");
+    let u = e.usage().await;
+    assert_eq!(u.outcome, Outcome::UpstreamError);
+    assert!(!u.usage_final);
+}
+
+#[tokio::test]
+async fn oversized_sse_line_ends_the_stream_cleanly() {
+    let mut e = env().await;
+    let dropped = e.upstream.on_drop();
+    let text = timeout(T, async { e.req("oversized_line", true).send().await.unwrap().text().await.unwrap() })
+        .await
+        .expect("response body did not end after the oversized line");
+    let evs = parse_sse(&text);
+    let names: Vec<&str> = evs.iter().map(|(n, _)| n.as_str()).collect();
+    // 完整收到 message_start，超限的那行从没组成完整事件，不会被转发；收尾是一个正常的 error 事件。
+    assert_eq!(names, ["message_start", "error"]);
+    assert_eq!(evs[1].1["error"]["type"], "api_error");
+    // 超限必须释放上游连接，不能一直攒内存等换行。
+    timeout(T, dropped).await.expect("upstream not cancelled").unwrap();
+
+    let u = e.usage().await;
+    assert_eq!(u.outcome, Outcome::UpstreamError);
+    assert!(!u.usage_final);
+}
+
+#[tokio::test]
+async fn upstream_redirect_is_not_followed() {
+    let mut e = env().await;
+    // 测试客户端自己也不能跟过去，否则看到的是跟随后的结果，不是 router 原样转发的 302。
+    let no_redirect =
+        reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let r = no_redirect
+        .post(&e.url)
+        .header("x-api-key", LOCAL)
+        .header("x-test-scenario", "redirect")
+        .json(&json!({"model":"claude-sonnet-5-5","max_tokens":1,"messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    // reqwest 默认会跟到 location 指向的地址；这里必须原样把 302 和 location 还给客户端。
+    assert_eq!(r.status(), 302);
+    assert_eq!(r.headers()["location"], "http://127.0.0.1:1/elsewhere");
+    assert_eq!(e.calls(), 1);
+    let u = e.usage().await;
+    assert_eq!(u.outcome, Outcome::UpstreamStatus(302));
+    assert_eq!(u.tokens, Tokens::default());
+}
+
+#[tokio::test]
+async fn business_error_with_200_status_is_not_recorded_as_ok() {
+    let mut e = env().await;
+    let r = e.req("business_error_200", false).send().await.unwrap();
+    // 下游状态码和响应体原样转发：客户端仍按 Anthropic 的 error 体识别，Edge 不改写成别的状态码。
+    assert_eq!(r.status(), 200);
+    let text = r.text().await.unwrap();
+    assert_eq!(text, json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}).to_string());
+
+    let u = e.usage().await;
+    // 内部计量：不算成功终态，已知这次没有消费（不是"未知待结算"），不拿预留充数。
+    assert_eq!(u.outcome, Outcome::UpstreamStatus(200));
+    assert_eq!(u.tokens, Tokens::default());
+    assert_eq!(u.cost_milli, 0);
+    assert!(u.usage_final, "zero usage here is a known fact, not pending reconciliation");
+    let item = u.to_item();
+    assert_eq!((item["status"].as_str(), item["complete"].as_bool()), (Some("upstream_200"), Some(true)));
+    assert_eq!(e.ledger(), (0, 0));
 }
 
 #[tokio::test]

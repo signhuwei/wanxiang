@@ -148,6 +148,11 @@ fn usage_complete(u: &Value) -> bool {
     ["input_tokens", "output_tokens"].iter().all(|k| u.get(*k).is_some_and(Value::is_u64))
 }
 
+/// HTTP 状态是 2xx，但响应体本身是 Anthropic 的 `{"type":"error",...}`：上游把业务错误裹在了 200 里。
+fn is_business_error_body(v: &Value) -> bool {
+    v["type"] == "error"
+}
+
 pub struct Router {
     state: Arc<State>,
     local_token: String,
@@ -207,8 +212,10 @@ impl Router {
 }
 
 /// 上游只设连接超时：流式响应可能持续很久，读超时由 Agent 自己判断。
+/// 不跟随重定向：router 只能看到已选中路由的那次请求结果，3xx 要原样交给客户端处理，
+/// 不能让 reqwest 在背后换地址重发，那样既绕过了租约的同路重试限制，也无法计量中间那次尝试。
 pub fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().connect_timeout(Duration::from_secs(10))
+    reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).redirect(reqwest::redirect::Policy::none())
 }
 
 /// 精确匹配优先，然后是最长前缀（`claude-*`），最后是 `*`。
@@ -417,9 +424,15 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         Ok(x) => x,
         Err(r) => return r,
     };
-    if status.is_success() {
+    let parsed = serde_json::from_slice::<Value>(&bytes).ok();
+    if status.is_success() && parsed.as_ref().is_some_and(is_business_error_body) {
+        // HTTP 200 却裹着业务错误体：不算成功终态，也不计 token。
+        warn!(request_id = %req.rec.request_id, "upstream returned a business error body with a 2xx status");
+        req.rec.outcome = Outcome::UpstreamStatus(status.as_u16());
+        req.rec.usage_final = true;
+    } else if status.is_success() {
         req.rec.outcome = Outcome::Ok;
-        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+        if let Some(v) = &parsed {
             req.rec.message_id = v.get("id").and_then(Value::as_str).map(str::to_owned);
             if let Some(u) = v.get("usage") {
                 apply_usage(&mut req.meter.tokens, u);
@@ -612,15 +625,20 @@ async fn chat_response(req: Req, resp: reqwest::Response, status: StatusCode, is
 /// 把一整段 Chat SSE 译完，聚合成一个 Anthropic message。
 fn collect_chat_sse(bytes: &[u8], client_model: &str) -> Result<(Value, bool), String> {
     let mut split = Splitter::default();
-    let (_, mut events) = split.push(bytes);
-    events.extend(split.push(b"\n\n").1);
     let mut tr = chat::StreamTranslator::new(client_model);
     let mut out = Vec::new();
     let mut step = chat::Step::Continue;
-    for ev in &events {
-        step = tr.push(ev, &mut out);
-        if step != chat::Step::Continue {
-            break;
+    // Some providers close the body without sending the final event separator.
+    'input: for chunk in [bytes, b"\n\n"] {
+        let batch = split.push_framed(chunk);
+        for (_, event) in &batch.events {
+            step = tr.push(event, &mut out);
+            if step != chat::Step::Continue {
+                break 'input;
+            }
+        }
+        if batch.oversized {
+            return Err("上游的流式响应单行或单个事件超过了字节上限。".to_string());
         }
     }
     if step == chat::Step::Continue {
@@ -696,8 +714,15 @@ async fn pump(
                     observe(&mut req.rec, &mut req.meter, &mut stopped, ev);
                 }
                 if step == chat::Step::Done {
-                    let _ = tx.send(Ok(chat::encode(&translated))).await;
-                    break Outcome::Ok;
+                    if let Err(b) = req.ticket.update(req.meter.seen_cost()) {
+                        break Outcome::Stopped(b);
+                    }
+                    break tokio::select! {
+                        r = tx.send(Ok(chat::encode(&translated))) => {
+                            if r.is_ok() { Outcome::Ok } else { Outcome::ClientCancelled }
+                        }
+                        b = req.ticket.stopped() => Outcome::Stopped(b),
+                    };
                 }
                 warn!(request_id = %req.rec.request_id, "chat upstream ended without finish_reason");
                 break Outcome::UpstreamError;
@@ -706,42 +731,37 @@ async fn pump(
         };
         match chunk {
             Ok(Some(c)) => {
-                let (raw, mut events) = split.push(&c);
-                let mut out = raw;
-                if let Some(t) = tr.as_mut() {
+                let batch = split.push_framed(&c);
+                let mut upstream_errored = false;
+                let out = if let Some(t) = tr.as_mut() {
                     translated.clear();
-                    let mut step = chat::Step::Continue;
-                    for ev in &events {
-                        step = t.push(ev, &mut translated);
+                    for (_, ev) in &batch.events {
+                        let step = t.push(ev, &mut translated);
                         if step != chat::Step::Continue {
+                            upstream_errored = step == chat::Step::UpstreamError;
                             break;
                         }
                     }
-                    events = std::mem::take(&mut translated);
-                    out = chat::encode(&events);
-                    match step {
-                        chat::Step::UpstreamError => {
-                            warn!(request_id = %req.rec.request_id, "chat upstream reported an error mid-stream");
-                            let _ = tx.send(Ok(out)).await;
-                            reported = true;
-                            break Outcome::UpstreamError;
-                        }
-                        // 见到 [DONE] 就结束，不等上游关连接
-                        chat::Step::Done => {
-                            for ev in &events {
-                                observe(&mut req.rec, &mut req.meter, &mut stopped, ev);
-                            }
-                            let _ = tx.send(Ok(out)).await;
-                            break Outcome::Ok;
-                        }
-                        _ => {}
+                    for ev in &translated {
+                        observe(&mut req.rec, &mut req.meter, &mut stopped, ev);
                     }
-                }
-                for ev in &events {
-                    observe(&mut req.rec, &mut req.meter, &mut stopped, ev);
-                }
+                    chat::encode(&translated)
+                } else {
+                    let mut end = batch.raw.len();
+                    for (event_end, ev) in &batch.events {
+                        upstream_errored = is_upstream_error_event(ev);
+                        if !upstream_errored {
+                            observe(&mut req.rec, &mut req.meter, &mut stopped, ev);
+                        }
+                        if upstream_errored || stopped {
+                            end = *event_end;
+                            break;
+                        }
+                    }
+                    batch.raw.slice(..end)
+                };
                 // 先计价再转发：越过额度的那批字节不发给客户端。
-                if !events.is_empty() {
+                if !batch.events.is_empty() {
                     if let Err(b) = req.ticket.update(req.meter.seen_cost()) {
                         break Outcome::Stopped(b);
                     }
@@ -755,6 +775,19 @@ async fn pump(
                     if !sent {
                         break Outcome::ClientCancelled;
                     }
+                }
+                if upstream_errored {
+                    warn!(request_id = %req.rec.request_id, "upstream reported an error event mid-stream");
+                    reported = true;
+                    break Outcome::UpstreamError;
+                }
+                // message_stop 已经是协议终态，不依赖上游之后再 EOF 或关连接。
+                if stopped {
+                    break Outcome::Ok;
+                }
+                if batch.oversized {
+                    warn!(request_id = %req.rec.request_id, "upstream SSE line or event exceeded the byte limit");
+                    break Outcome::UpstreamError;
                 }
             }
             Ok(None) if stopped => break Outcome::Ok,
@@ -799,6 +832,12 @@ async fn pump(
     }
     req.rec.outcome = outcome;
     req.finish();
+}
+
+/// Anthropic 原生上游在流中途报的真实错误：`event: error`，`data.type == "error"`。
+/// 和路由自己补发的截断错误用同一事件名，靠事件名判不出来，所以看 payload 的 `type`。
+fn is_upstream_error_event(ev: &Event) -> bool {
+    ev.event.as_deref() == Some("error") && serde_json::from_str::<Value>(&ev.data).is_ok_and(|v| v["type"] == "error")
 }
 
 fn observe(rec: &mut UsageRecord, m: &mut Meter, stopped: &mut bool, ev: &Event) {
