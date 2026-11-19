@@ -61,7 +61,8 @@ async fn run(home: PathBuf) -> Result<()> {
     let (usage_tx, mut usage_rx) = mpsc::unbounded_channel::<UsageRecord>();
     // 默认客户端遵从 HTTPS_PROXY / NO_PROXY。
     let http = router::client_builder().build()?;
-    let app = Router::new(state.clone(), local_token, http, usage_tx).app();
+    let app = Router::new(state.clone(), local_token.clone(), http, usage_tx).app();
+    onexd::launch::clean_stale(&home);
     let sd = shutdown.clone();
     let router_task =
         tokio::spawn(
@@ -84,6 +85,7 @@ async fn run(home: PathBuf) -> Result<()> {
         outbox: outbox.clone(),
         router_addr: Some(router_addr.to_string()),
         server_url: server.as_deref().and_then(onex_core::ipc::http_base),
+        launch: Some(ipc::LaunchCtx { home: home.clone(), local_token }),
         shutdown: shutdown.clone(),
     });
     let ipc_task = tokio::spawn(ipc::serve(listener, sock_path, ipc));

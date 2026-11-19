@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! onex login <邮箱或手机号> [--invite <邀请码>] [--tenant <租户名或 id>] [--server <https://...>] [--name <设备名>]
+//! onex run claude-code [--model <模型>]   在当前目录受管启动 PATH 里的 Claude Code
 //! onex status
 //! onex token <device_token>    调试用：直接交给 onexd 一个已有的 device_token
 //! onex shutdown
@@ -9,6 +10,7 @@
 
 mod login;
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
@@ -20,6 +22,7 @@ use tokio::net::UnixStream;
 
 const USAGE: &str = "usage:
   onex login <邮箱或手机号> [--invite <邀请码>] [--tenant <租户>] [--server <地址>] [--name <设备名>]
+  onex run claude-code [--model <模型>]
   onex status
   onex token <device_token>
   onex shutdown";
@@ -32,6 +35,7 @@ async fn main() -> Result<()> {
         Some("status") if args.len() == 1 => print_reply(call(&Request::Status).await?),
         Some("token") if args.len() == 2 => print_reply(call(&Request::Login { token: args[1].clone() }).await?),
         Some("shutdown") if args.len() == 1 => print_reply(call(&Request::Shutdown).await?),
+        Some("run") if args.get(1).map(String::as_str) == Some("claude-code") => cmd_run(&args[2..]).await,
         _ => bail!("{USAGE}"),
     }
 }
@@ -74,6 +78,71 @@ async fn cmd_login(args: &[String]) -> Result<()> {
         r.tenant_name, r.device_id
     );
     Ok(())
+}
+
+/// 用 PATH 里的 claude，在当前目录前台启动（MVP 不做下载和校验）。环境完全按 onexd 给的来。
+async fn cmd_run(args: &[String]) -> Result<()> {
+    let model = match args {
+        [] => None,
+        [f, m] if f == "--model" => Some(m.clone()),
+        _ => bail!("{USAGE}"),
+    };
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let program = find_on_path("claude", env.get("PATH").map(String::as_str).unwrap_or(""))
+        .context("PATH 里找不到 claude。请先安装 Claude Code（https://claude.com/claude-code）")?;
+    let version = std::process::Command::new(&program)
+        .arg("--version")
+        .env_clear()
+        .env("PATH", env.get("PATH").cloned().unwrap_or_default())
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let cwd = std::env::current_dir()?;
+    let req = Request::Launch {
+        agent: "claude-code".into(),
+        program: program.to_string_lossy().into(),
+        cwd: cwd.to_string_lossy().into(),
+        env,
+        model,
+        agent_version: version.clone(),
+    };
+    let l = call(&req).await?;
+    if l["ok"] != Value::Bool(true) {
+        return print_reply(l);
+    }
+    let launch_id = l["launch_id"].as_str().context("no launch_id")?.to_string();
+    eprintln!(
+        "OneX：用 {} 启动 Claude Code{}，模型 {}，会话 {}",
+        program.display(),
+        version.map(|v| format!(" {v}")).unwrap_or_default(),
+        l["model"].as_str().unwrap_or(""),
+        l["session_id"].as_str().unwrap_or("")
+    );
+    let mut cmd = std::process::Command::new(l["program"].as_str().context("no program")?);
+    cmd.env_clear().current_dir(l["cwd"].as_str().context("no cwd")?);
+    for a in l["args"].as_array().context("no args")? {
+        cmd.arg(a.as_str().context("bad arg")?);
+    }
+    for (k, v) in l["env"].as_object().context("no env")? {
+        cmd.env(k, v.as_str().context("bad env")?);
+    }
+    // Ctrl+C 交给前台的 Claude Code；这里只等它退出
+    let status = cmd.status().context("启动 claude 失败");
+    let code = status.as_ref().ok().and_then(|s| s.code());
+    let done = call(&Request::LaunchDone { launch_id, exit_code: code }).await;
+    let status = status?;
+    if let Err(e) = done {
+        eprintln!("OneX：通知 onexd 结束时出错：{e:#}");
+    }
+    std::process::exit(code.unwrap_or(if status.success() { 0 } else { 1 }));
+}
+
+fn find_on_path(name: &str, path: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(name))
+        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 
 fn prompt(p: &str) -> Result<String> {

@@ -21,6 +21,28 @@ pub enum Request {
     },
     /// 注册设备用的信息：`{public_key, server_url}`。`server_url` 是 Server 的 HTTP 根地址，onexd 没配置 Server 时为 null。
     DeviceInfo,
+    /// 准备一次受管启动。onexd 建好目录和策略文件，回 `{launch_id, session_id, program, args, env, cwd, model}`，
+    /// 由调用方在自己的终端里用这份 env（清空后设置）前台启动。
+    Launch {
+        agent: String,
+        /// claude 的绝对路径
+        program: String,
+        cwd: String,
+        /// 调用方终端的环境，onexd 只取终端相关的几项和 PATH
+        env: std::collections::BTreeMap<String, String>,
+        /// 不填用第一个获准模型
+        #[serde(default)]
+        model: Option<String>,
+        /// `claude --version` 的输出，记日志
+        #[serde(default)]
+        agent_version: Option<String>,
+    },
+    /// Agent 退出：删除本次策略文件
+    LaunchDone {
+        launch_id: String,
+        #[serde(default)]
+        exit_code: Option<i32>,
+    },
     Shutdown,
 }
 

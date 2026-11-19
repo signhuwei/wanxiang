@@ -164,6 +164,7 @@ async fn env() -> Env {
         outbox: outbox.clone(),
         router_addr: None,
         server_url: None,
+        launch: None,
         shutdown: cancel.clone(),
     });
     tokio::spawn(ipc::serve(listener, sock.clone(), srv));

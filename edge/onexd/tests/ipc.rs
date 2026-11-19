@@ -52,6 +52,7 @@ async fn status_login_shutdown() {
         outbox,
         router_addr: Some("127.0.0.1:1".into()),
         server_url: Some("http://127.0.0.1:2".into()),
+        launch: Some(ipc::LaunchCtx { home: dir.path().to_path_buf(), local_token: "localtok".into() }),
         shutdown: shutdown.clone(),
     });
     let task = tokio::spawn(ipc::serve(listener, path.clone(), srv));
@@ -77,6 +78,28 @@ async fn status_login_shutdown() {
     assert_eq!(d["server_url"], "http://127.0.0.1:2");
     assert_eq!(d.as_object().unwrap().len(), 3);
 
+    // 受管启动：只用 Server 下发的精确模型名
+    let cwd = dir.path().to_string_lossy().to_string();
+    let launch = |model: Option<&str>| {
+        json!({"cmd":"launch","agent":"claude-code","program":"/bin/echo","cwd":cwd,"env":{"PATH":"/usr/bin","SECRET":"x"},"model":model})
+            .to_string()
+    };
+    assert_eq!(c.call(&launch(None)).await["error"]["code"], "model_not_allowed");
+    state.config.write().unwrap().routes = vec![route("*"), route("Qwen3.8-27B")];
+    assert_eq!(c.call(&launch(Some("claude-opus-5-5"))).await["error"]["code"], "model_not_allowed");
+    let l = c.call(&launch(None)).await;
+    assert_eq!((l["ok"].as_bool(), l["model"].as_str()), (Some(true), Some("Qwen3.8-27B")));
+    assert_eq!(l["env"]["ANTHROPIC_API_KEY"], "localtok");
+    assert_eq!(l["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:1");
+    assert!(l["env"].get("SECRET").is_none());
+    let run_dir = dir.path().join("run").join(l["launch_id"].as_str().unwrap());
+    assert!(run_dir.join("settings.json").exists());
+    let done = json!({"cmd":"launch_done","launch_id":l["launch_id"],"exit_code":0}).to_string();
+    assert_eq!(c.call(&done).await, json!({"ok": true}));
+    assert!(!run_dir.exists());
+    let bad = json!({"cmd":"launch","agent":"codex","program":"/bin/echo","cwd":cwd,"env":{}}).to_string();
+    assert_eq!(c.call(&bad).await["error"]["code"], "agent_not_allowed");
+
     let r = c.call("not json").await;
     assert_eq!((r["ok"].as_bool(), r["error"]["code"].as_str()), (Some(false), Some("invalid")));
     let r = c.call(r#"{"cmd":"rm -rf"}"#).await;
@@ -86,6 +109,19 @@ async fn status_login_shutdown() {
     assert!(shutdown.is_cancelled());
     timeout(T, task).await.unwrap().unwrap();
     assert!(!path.exists());
+}
+
+fn route(model: &str) -> onex_core::ws::Route {
+    onex_core::ws::Route {
+        model: model.into(),
+        model_id: "mod_1".into(),
+        provider_id: "prv_1".into(),
+        protocol: "openai_chat".into(),
+        base_url: "http://up/v1".into(),
+        upstream_model: None,
+        auth: onex_core::ws::UpstreamAuth::Bearer,
+        proxy: None,
+    }
 }
 
 #[tokio::test]

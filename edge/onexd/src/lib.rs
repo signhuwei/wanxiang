@@ -2,6 +2,7 @@ pub mod chat;
 pub mod id;
 pub mod ipc;
 pub mod lastgood;
+pub mod launch;
 pub mod lease;
 pub mod outbox;
 pub mod pricing;
