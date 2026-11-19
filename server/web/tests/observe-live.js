@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { day, hash, iso, randomToken } from '../../src/credentials.ts'
 import { indexDevice } from '../../src/store.ts'
 
-export async function checkLiveObservation({app, seed, page, target, capture}) {
+export async function checkLiveObservation({app, seed, page, target, capture, summaryOnly}) {
   const { tenantId, userId } = seed
   const device = 'dev_'+crypto.randomUUID(), session = 'ses_'+crypto.randomUUID(), token = randomToken()
   const db = app.store.tenant(tenantId)
@@ -29,6 +29,18 @@ export async function checkLiveObservation({app, seed, page, target, capture}) {
     await page.getByRole('link',{name:'监察',exact:true}).click()
     await page.getByText('实时更新已连接',{exact:true}).waitFor()
     await page.locator('tr.clickable').filter({hasText:target}).click()
+    if (summaryOnly) {
+      const sessionsRow=page.locator('tr').filter({has:page.getByText('integration-model',{exact:true})})
+      let bodyRequests=0
+      page.on('request',req=>{if(new URL(req.url()).pathname.endsWith('/events'))bodyRequests++})
+      await sessionsRow.getByText('无正文查看权限，可请户主开放',{exact:true}).waitFor()
+      assert.equal(await sessionsRow.getByRole('button').count(),0)
+      await sessionsRow.click()
+      assert.equal(await page.locator('.conversation').count(),0)
+      assert.equal(bodyRequests,0)
+      assert.equal(db.get("SELECT count(*) AS n FROM audit WHERE action='observe.events.read' AND target=?",[session]).n,0)
+      console.log('仅摘要：无正文入口，点击会话未请求正文');return
+    }
     await page.getByText('integration-model',{exact:true}).click()
     await page.getByText('采集缺口',{exact:true}).waitFor()
     const marker='回流联调 · '+crypto.randomUUID().slice(0,8)
