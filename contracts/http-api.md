@@ -1,0 +1,58 @@
+# HTTP API v0
+
+前缀 `/v1`。认证用 `Authorization: Bearer <token>`。管理端、Desktop 和外部 Agent 使用同一套 API；Web 页面不得调用页面专用接口。
+
+列表接口统一：`?q=&cursor=&limit=`（limit 默认 50，最大 200），返回 `{"items": [...], "next_cursor": "..." | null, "total": n}`。
+
+每个对象返回 `actions` 数组，列出当前调用者对它能执行的操作（例如 `["read","update","disable"]`）。页面按 `actions` 显示按钮，不自己推导权限。
+
+## 登录与设备
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/auth/code` | `{target}`，发送验证码（S0 开发环境把验证码打印到 Server 日志） |
+| POST | `/auth/login` | `{target, code}` 或 `{invite_code, target, code}`，返回 `{token, user, tenants[]}` |
+| POST | `/auth/select-tenant` | `{tenant_id}`，返回租户范围的令牌 |
+| POST | `/auth/logout` | |
+| GET | `/me` | 当前用户、租户、角色、可用 Agent |
+| POST | `/devices` | `{name, os, arch, public_key}`，返回 `{device_id, device_token}` |
+
+## 租户管理
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET/POST | `/members`，`/members/:id` | 成员台账与详情 |
+| GET/POST | `/groups`，`/groups/:id` | 组 |
+| POST | `/invites` | `{role, group_id, max_uses, expires_in_ms}`，返回邀请码（只返回一次） |
+| GET/PUT | `/contract` | 当前租户合约 |
+| GET | `/balance` | 余额、已预留、本月消耗 |
+| GET | `/ledger` | 橡皮流水 |
+| POST | `/ledger/topup` | 管理员手工加分（平台管理员） |
+| GET | `/devices`，`/devices/:id` | 设备台账 |
+| POST | `/devices/:id/diag` | `{kind}`，返回 `diag_id` |
+| GET | `/diag/:id` | 状态和日志包下载地址 |
+| GET | `/audit` | 审计 |
+
+## 监察
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/observe/people` | 人员台账：会话数、费用、最近活动 |
+| GET | `/observe/sessions` | `?user_id=`，会话台账 |
+| GET | `/observe/sessions/:id/events` | `?after_seq=`，对话事件；每次读取写审计 |
+| GET | `/observe/stream` | SSE，推送新会话和新事件的摘要 |
+
+## 平台
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET/POST | `/platform/tenants` | 租户 |
+| GET/POST | `/platform/providers`，`/platform/models`，`/platform/rates` | Provider、模型、倍率 |
+| GET/POST | `/platform/agent-releases` | Agent 发行目录 |
+
+## 运维
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/healthz` | 健康，含版本和提交 |
+| GET | `/openapi.json` | 机器可读接口描述，供 Agent 调用 |
