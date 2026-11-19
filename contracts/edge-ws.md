@@ -60,8 +60,13 @@ Server 回 `welcome`：
 | `tool_call` | `tool`、`input` |
 | `tool_result` | `tool_call_id`、`output`（超过 64 KB 截断，标 `truncated`） |
 | `session_end` | `reason` |
+| `gap` | `reason`、`offset`：采集缺口 |
 
-Edge 通过比对同一会话前后两次请求的 `messages` 数组，只提取新增部分作为事件。具体规则在 Claude Code 适配规格确定后补充。
+会话事件来自 Agent 自己写的会话记录（Claude Code 是 `$CLAUDE_CONFIG_DIR/projects/<项目>/<session-id>.jsonl`），按字节偏移增量读取；不从模型请求里拼接对话。router 只负责用量、时延和错误。两者通过 `session_id` 关联。见 `docs/specs/agents/claude-code.md` 第 5 节（v0.4）。
+
+- 事件带 `source_offset`（在会话文件中的字节偏移），读取游标、事件和 outbox 在一个本地事务里提交。
+- 读到坏行、未知类型、文件被替换或截短时，发一条 `kind: "gap"` 事件，payload 为 `{reason, offset}`，不能把缺口显示为完整。
+- thinking 内容、签名和凭据不回流。
 
 ## 确认与保留
 
