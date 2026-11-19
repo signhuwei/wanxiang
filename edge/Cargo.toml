@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["onex-core", "onexd", "onex-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+onex-core = { path = "onex-core" }
+anyhow = "1"
+bytes = "1"
+futures-util = "0.3"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

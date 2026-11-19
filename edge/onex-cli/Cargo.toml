@@ -1,0 +1,14 @@
+[package]
+name = "onex-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "onex"
+path = "src/main.rs"
+
+[dependencies]
+onex-core.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
