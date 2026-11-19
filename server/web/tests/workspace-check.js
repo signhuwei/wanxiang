@@ -1,4 +1,4 @@
-// 真实租户 API 测试：临时库、本地端口、一次性开发验证码；缺失的 /me 投影单独注入。
+// 真实 API 测试：临时库、本地端口、一次性开发验证码。
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -25,12 +25,6 @@ try {
     const path = new URL(route.request().url()).pathname
     if (path.startsWith('/v1/')) {
       const res = await route.fetch()
-      if (path === '/v1/me') {
-        const me = await res.json()
-        if (res.ok() && !Array.isArray(me.actions)) {
-          return route.fulfill({ response: res, json: { ...me, is_platform_admin: true, actions: me.tenant ? ['create_group', 'create_invite'] : ['create_provider','create_model','create_rate','topup'], mock_actions: true } })
-        }
-      }
       return route.fulfill({ response: res })
     }
     const file = Bun.file(new URL('..' + (path === '/' ? '/index.html' : path), import.meta.url))
@@ -46,6 +40,11 @@ try {
   await page.getByPlaceholder('6 位验证码').fill(code)
   await button('登录').click()
   await page.locator('tr.clickable').waitFor()
+  await page.getByRole('combobox',{name:'状态'}).selectOption('disabled')
+  await page.getByText('没有成员',{exact:true}).waitFor()
+  await page.getByRole('combobox',{name:'状态'}).selectOption('')
+  await page.getByRole('combobox',{name:'角色'}).selectOption('member')
+  await page.getByText('没有成员',{exact:true}).waitFor()
   await link('分组').click()
   await button('新建分组').click()
   await field('name').fill('研发组')
@@ -87,8 +86,13 @@ try {
   await button('租约').click()
   await button('保存').click()
   await page.getByText('19', { exact: true }).waitFor()
+  await link('橡皮').click()
+  await button('充值').click()
+  await field('amount').fill('2.075')
+  await button('确认充值').click()
+  await page.getByText('2.075', {exact:true}).first().waitFor()
   assert.deepEqual(errors, [])
-  console.log('真实 Server：验证码登录、空列表新建组、邀请码一次性展示通过')
+  console.log('真实 Server：登录、成员筛选、分组、邀请码、平台目录、倍率、租户合约和充值通过')
 } finally {
   await browser.close()
   app.close()
