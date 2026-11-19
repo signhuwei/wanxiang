@@ -20,6 +20,10 @@ case "$service" in
     export RUSTFS_ADDRESS=127.0.0.1:$ONEX_RUSTFS_PORT RUSTFS_CONSOLE_ENABLE=false
     exec "$bin/rustfs" "$home/data/rustfs";;
   server)
+    if [[ ${NODE_ENV:-development} != production && $ONEX_HOST != 127.0.0.1 ]]; then
+      if [[ ${ONEX_ALLOW_LAN_DEV:-0} != 1 ]]; then echo 'Refusing non-loopback development bind' >&2; exit 2; fi
+      printf '\n*** WARNING: 开发模式验证码登录已对局域网开放（验证码只写日志）：%s:%s ***\n\n' "$ONEX_HOST" "$ONEX_PORT" >&2
+    fi
     ONEX_MASTER_KEY=$(<"$home/secrets/master.key")
     ONEX_AUTH_SECRET=$(<"$home/secrets/auth.key")
     export ONEX_MASTER_KEY ONEX_AUTH_SECRET

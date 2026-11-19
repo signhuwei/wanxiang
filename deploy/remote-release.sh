@@ -44,12 +44,13 @@ activate() {
 }
 
 check_health() {
-  local response port=${ONEX_PORT:-18700}
+  local response address=${ONEX_HOST:-127.0.0.1} port=${ONEX_PORT:-18700}
   if [[ -f $home/service.env ]]; then
-    port=$(source "$home/service.env"; printf '%s' "${ONEX_PORT:-18700}")
+    read -r address port < <(source "$home/service.env"; printf '%s %s\n' "${ONEX_HOST:-127.0.0.1}" "${ONEX_PORT:-18700}") || return 1
   fi
-  [[ $port =~ ^[1-9][0-9]{0,4}$ && $port -le 65535 ]] || return 1
-  response=$(curl -fsS --max-time 3 "http://127.0.0.1:$port/v1/healthz") || return 1
+  [[ $address =~ ^[a-zA-Z0-9.:_-]+$ && $port =~ ^[1-9][0-9]{0,4}$ && $port -le 65535 ]] || return 1
+  case "$address" in 0.0.0.0) address=127.0.0.1;; ::) address='[::1]';; *:*) address="[$address]";; esac
+  response=$(curl --noproxy '*' -fsS --max-time 3 "http://$address:$port/v1/healthz") || return 1
   "$home/deps/bin/bun" --no-env-file -e 'const row=JSON.parse(process.argv[1]); if(row.status!=="ok" || row.commit!==process.argv[2]) process.exit(1);' -- "$response" "$1"
 }
 

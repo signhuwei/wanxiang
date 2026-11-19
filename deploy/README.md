@@ -47,4 +47,19 @@ bash "$ONEX_HOME/current/deploy/onex.sh" logs server
 
 Use distinct test identities. Rerunning with the same identities returns the existing IDs without recharging. The owner also holds the explicit platform-admin grant. The employee can log in without an invite. The command creates one tenant with 1,000 prepaid rubbers and a `Qwen3.8-27B` OpenAI Chat route. Its wildcard is limited to this tenant’s one authorized model and maps every request model name to `Qwen3.8-27B` upstream. No command here probes or calls the upstream. The provider only holds an encrypted placeholder token.
 
-The default binds are `127.0.0.1:18700` (Server), `127.0.0.1:18701` (Valkey) and `127.0.0.1:18702` (RustFS; console disabled). To override ports, put `ONEX_PORT`, `ONEX_VALKEY_PORT` and `ONEX_RUSTFS_PORT` assignments in the operator-owned `$ONEX_HOME/service.env`. MVP OTPs are printed only in development mode; the launcher refuses non-loopback development binds. For an operator laptop to access the remote MVP without exposing this login flow, use an SSH tunnel such as `ssh -N -L 18700:127.0.0.1:18700 root@192.168.3.211`, and use `http://127.0.0.1:18700` locally for both Web and Edge.
+The default binds are `127.0.0.1:18700` (Server), `127.0.0.1:18701` (Valkey) and `127.0.0.1:18702` (RustFS; console disabled). To override ports, put `ONEX_PORT`, `ONEX_VALKEY_PORT` and `ONEX_RUSTFS_PORT` assignments in the operator-owned `$ONEX_HOME/service.env`.
+
+## Temporary LAN access for the MVP
+
+On 211, add these lines to `~/apps/onex/service.env` before starting or deploying the release:
+
+```sh
+NODE_ENV=development
+ONEX_HOST=192.168.3.211
+ONEX_PORT=18700
+ONEX_ALLOW_LAN_DEV=1
+```
+
+Only OneX Server binds the selected private address. Valkey and RustFS still listen on `127.0.0.1`. The startup warning appears in the Server log. Verification codes are written only to that log; never share access to it. Web and Edge can use `http://192.168.3.211:18700` directly. HTTP and WebSocket traffic are unencrypted in this setup: restrict access to the trusted MVP network or test Macs with the host firewall and do not expose the port outside the LAN.
+
+To disable LAN development, set `ONEX_HOST=127.0.0.1` and remove `ONEX_ALLOW_LAN_DEV` (or set it to `0`), then run `bash ~/apps/onex/current/deploy/onex.sh stop` followed by `bash ~/apps/onex/current/deploy/onex.sh start`.
