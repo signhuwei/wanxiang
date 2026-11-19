@@ -69,6 +69,7 @@ Server 回 `welcome`：
 
 - 事件带 `source_offset`（在会话文件中的字节偏移），读取游标、事件和 outbox 在一个本地事务里提交。
 - 读到坏行、未知类型、文件被替换或截短时，发一条 `kind: "gap"` 事件，payload 为 `{reason, offset}`，不能把缺口显示为完整。
+- 一个 `session_id` 只属于第一次上报它的那台设备。其他设备用同一个 `session_id` 上报，Server 拒绝整批（`conflict`）并记日志，不记正文。员工换电脑后 resume 会产生新的会话。
 - thinking 内容、签名和凭据不回流。会话文件中的 `api-request`、`api-request-blob` 行含完整模型请求，也不回流。
 
 ## 密钥下发（v0.7）
