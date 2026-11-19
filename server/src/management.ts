@@ -57,9 +57,9 @@ export function pagination(c: Context) {
   }
   return {
     query, limit, offset,
-    page<T>(items: T[], total: number) {
+    page<T>(items: T[], total: number, actions: readonly string[] = []) {
       const next = offset + items.length;
-      return { items, total, next_cursor: items.length && next < total ? Buffer.from(String(next)).toString('base64url') : null };
+      return { items, total, next_cursor: items.length && next < total ? Buffer.from(String(next)).toString('base64url') : null, actions };
     },
   };
 }

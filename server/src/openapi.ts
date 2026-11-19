@@ -23,8 +23,8 @@ const listParams = [
 ];
 const idPath = { name: 'id', in: 'path', required: true, schema: text };
 const managed = (properties: Record<string, unknown>) => object({ ...properties, revision, actions });
-const listOf = (schema: object) => ({ security: bearer, parameters: listParams, responses: { 200: response('分页结果',
-  object({ items: { type: 'array', items: schema }, total: sequence, next_cursor: nullableText })), 401: status[401], 403: status[403], 422: status[422] } });
+const listOf = (schema: object, parameters: object[] = []) => ({ security: bearer, parameters: [...listParams, ...parameters], responses: { 200: response('分页结果',
+  object({ items: { type: 'array', items: schema }, total: sequence, next_cursor: nullableText, actions })), 401: status[401], 403: status[403], 422: status[422] } });
 const detailOf = (schema: object, hasId = true) => ({ security: bearer, ...(hasId && { parameters: [idPath] }),
   responses: { 200: response('详情', schema), 401: status[401], 403: status[403], 404: error('对象不存在') } });
 const write = (input: object, output: object, mode: 'create' | 'update' | 'upsert', hasId = false) => ({
@@ -62,6 +62,11 @@ function platformPaths(path: string, fields: Record<string, unknown>, required: 
   };
 }
 
+const ledger = managed({ id: text, kind: text, amount_milli: { type: 'integer' }, user_id: nullableText, lease_id: nullableText,
+  request_ref: nullableText, by: nullableText, at: text, note: nullableText });
+const staleLease = managed({ id: text, device_id: text, user_id: text, budget_milli: sequence, used_milli: sequence,
+  expires_at: text, status: text, seq: sequence, last_seen_at: nullableText });
+
 export const openapi = {
   openapi: '3.1.0',
   info: { title: 'OneX Server', version: pkg.version },
@@ -80,13 +85,14 @@ export const openapi = {
       responses: { 204: response('退出成功'), 401: status[401], 422: status[422], 500: status[500] } } },
     '/v1/me': { get: { summary: '当前用户与权限范围', security: bearer, responses: {
       200: response('用户与当前租户', object({ user: ref('User'), tenant: { anyOf: [ref('Tenant'), { type: 'null' }] },
-        role: { anyOf: [role, { type: 'null' }] }, agents: { type: 'array', items: text } })), 401: status[401], 403: status[403], 500: status[500],
+        role: { anyOf: [role, { type: 'null' }] }, agents: { type: 'array', items: text }, is_platform_admin: { type: 'boolean' }, actions })), 401: status[401], 403: status[403], 500: status[500],
     } } },
     '/v1/devices': { post: { summary: '注册设备，需要租户令牌', security: bearer, parameters: headers,
       requestBody: requestBody(object({ name: { ...text, maxLength: 128 }, os: { ...text, maxLength: 32 }, arch: { ...text, maxLength: 32 },
         public_key: { ...text, contentEncoding: 'base64', description: '32 字节 X25519 公钥' } })),
       responses: { 201: response('设备令牌', object({ device_id: text, device_token: token })), ...status } } },
-    '/v1/members': { get: listOf(member), post: write(object(memberInput, ['user_id']), member, 'create') },
+    '/v1/members': { get: listOf(member, [{ name: 'role', in: 'query', schema: role },
+      { name: 'status', in: 'query', schema: { type: 'string', enum: ['active', 'disabled'] } }]), post: write(object(memberInput, ['user_id']), member, 'create') },
     '/v1/members/{id}': { get: detailOf(member), ...Object.fromEntries(['post', 'patch'].map((method) =>
       [method, write(object({ ...memberInput, revision }, ['revision']), member, 'update', true)])) },
     '/v1/groups': { get: listOf(group), post: write(object(groupInput, ['name']), group, 'create') },
@@ -95,6 +101,11 @@ export const openapi = {
     '/v1/invites': { post: { ...write(object(inviteInput, ['role', 'max_uses', 'expires_in_ms']), invite, 'create'),
       description: '首次成功返回邀请码；幂等重放返回 code_returned:false 且不再披露邀请码。' } },
     '/v1/contract': { get: detailOf(contract, false), put: write(object({ ...contractInput, revision: sequence }), contract, 'update') },
+    '/v1/balance': { get: detailOf(managed({ balance_milli: sequence, reserved_milli: sequence, month_used_milli: sequence }), false) },
+    '/v1/ledger': { get: listOf(ledger) },
+    '/v1/platform/ledger/topup': { post: write(object({ tenant_id: tenantId, amount_milli: { ...sequence, minimum: 1 }, note: text },
+      ['tenant_id', 'amount_milli']), { allOf: [ledger, object({ tenant_id: tenantId })] }, 'create') },
+    '/v1/observe/stale-leases': { get: { ...listOf(staleLease), description: '超过 24 小时未回连，仍保留预留额度的过期租约。' } },
     ...platformPaths('/v1/platform/tenants', tenantFields, ['name', 'owner_user_id'], { seat_limit: sequence }, { created_at: text }),
     ...platformPaths('/v1/platform/providers', providers, ['name', 'protocol', 'base_url', 'secret'], { secret: { ...text, writeOnly: true } }),
     ...platformPaths('/v1/platform/models', models, ['provider_id', 'upstream_name', 'display_name', 'context_window']),

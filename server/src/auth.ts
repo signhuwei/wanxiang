@@ -2,6 +2,7 @@ import { randomInt, timingSafeEqual } from 'node:crypto';
 import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
 import { ApiError, field, invalid, json, operation } from './api';
+import { platformCreateActions, tenantActions } from './actions';
 import { bearer, day, hash, hmac, iso, normalizedTarget } from './credentials';
 import { ensureUser, findUser, type User } from './seed';
 import { indexDevice, indexMember, type Member, type Store, type Transaction } from './store';
@@ -201,10 +202,13 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
   app.get('/v1/me', async (c) => {
     const s = session(tokenOf(c), now());
     const u = user(s.user_id)!;
-    if (!s.tenant_id) return c.json({ user: publicUser(u), tenant: null, role: null, agents: [] });
+    const is_platform_admin = !!store.system.get('SELECT 1 FROM platform_admins WHERE user_id = ?', [s.user_id]);
+    if (!s.tenant_id) return c.json({ user: publicUser(u), tenant: null, role: null, agents: [], is_platform_admin,
+      actions: is_platform_admin ? platformCreateActions : [] });
     const { t, m } = await requireMember(s.tenant_id, s.user_id);
     const contract = store.tenant(t.id).get<{ allowed_agents_json: string }>('SELECT allowed_agents_json FROM contract ORDER BY revision DESC LIMIT 1');
-    return c.json({ user: publicUser(u), tenant: publicTenant(t, m), role: m.role, agents: contract ? JSON.parse(contract.allowed_agents_json) : [] });
+    return c.json({ user: publicUser(u), tenant: publicTenant(t, m), role: m.role, agents: contract ? JSON.parse(contract.allowed_agents_json) : [], is_platform_admin,
+      actions: tenantActions(m.role) });
   });
 
   app.post('/v1/devices', async (c) => {

@@ -5,6 +5,7 @@ import { ulid } from 'ulid';
 import pkg from '../package.json';
 import { ApiError } from './api';
 import { authRoutes } from './auth';
+import { billingRoutes } from './billing';
 import { edgeGateway } from './edge';
 import { openapi } from './openapi';
 import { platformRoutes } from './platform-management';
@@ -49,6 +50,7 @@ export async function createServer(opts: Options) {
     authRoutes(app, store, { ...opts, now });
     tenantRoutes(app, store, { ...opts, now });
     platformRoutes(app, store, { ...opts, now });
+    billingRoutes(app, store, { ...opts, now });
     edgeGateway(app, store, opts.presence, now, opts.heartbeatMs);
     const server = Bun.serve({ hostname: opts.hostname, port: opts.port,
       fetch: app.fetch, websocket: { ...websocket, maxPayloadLength: 64 * 1024, idleTimeout: 0, sendPings: false },

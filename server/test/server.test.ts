@@ -115,6 +115,13 @@ test('tenant management enforces scope, revisions, pagination, and one-time invi
   const global = await f.login();
   const scoped = await f.select(global);
   expect((await f.request('/members', undefined, global)).status).toBe(403);
+  expect(await (await f.request('/me', undefined, scoped)).json()).toMatchObject({
+    actions: ['create_member', 'create_group', 'create_invite', 'update_contract'],
+  });
+  expect(await (await f.request('/members?role=member&status=disabled', undefined, scoped)).json()).toMatchObject({
+    items: [], total: 0, actions: ['create_member'],
+  });
+  expect(await (await f.request('/groups', undefined, scoped)).json()).toMatchObject({ items: [], actions: ['create_group'] });
   const body = { name: 'Engineering', quota_milli: 200 };
   const created = await f.request('/groups', body, scoped, 'group');
   expect(created.status).toBe(201);
@@ -154,6 +161,9 @@ test('platform privileges are independent and provider secrets are never returne
   const scoped = await f.select(global);
   expect((await f.request('/platform/tenants', undefined, global)).status).toBe(403);
   await f.store.system.write((sql) => sql.run('INSERT INTO platform_admins (user_id) VALUES (?)', [f.userId]));
+  expect(await (await f.request('/me', undefined, global)).json()).toMatchObject({ is_platform_admin: true,
+    actions: expect.arrayContaining(['topup', 'create_provider']) });
+  expect(await (await f.request('/platform/providers', undefined, global)).json()).toMatchObject({ items: [], actions: ['create_provider'] });
   expect((await f.request('/platform/tenants', undefined, scoped)).status).toBe(403);
   const secret = 'fake-secret-not-for-storage';
   const provider = { name: 'Fake', protocol: 'anthropic', base_url: 'http://127.0.0.1:3333', secret };
@@ -208,7 +218,7 @@ function connect(f: Awaited<ReturnType<typeof fixture>>, token: string, version 
     return queue.shift();
   }
   function send(message: unknown) { ws.send(JSON.stringify(message)); }
-  function hello() { send({ type: 'hello', id: 'edge-hello', edge_version: version, os: 'darwin', arch: 'arm64', config_revision: 0, outbox_last_seq: 0 }); }
+  function hello(leaseId?: string, outboxLastSeq = 0) { send({ type: 'hello', id: 'edge-hello', edge_version: version, os: 'darwin', arch: 'arm64', config_revision: 0, outbox_last_seq: outboxLastSeq, lease_id: leaseId }); }
   return { ws, opened, closed, next, send, hello };
 }
 
@@ -250,6 +260,7 @@ test('new device connection replaces old; heartbeat is correlated and closes aft
   expect(await current.opened).toBe(true);
   current.hello();
   expect(await current.next()).toMatchObject({ type: 'welcome', heartbeat_ms: 70 });
+  expect(await current.next()).toMatchObject({ type: 'cutoff', reason: 'balance' });
   expect((await old.closed).code).toBe(4001);
   expect(await f.presence.get(device_id)).toBeTruthy();
   current.send({ type: 'ping', id: 'client-ping' });
@@ -260,4 +271,74 @@ test('new device connection replaces old; heartbeat is correlated and closes aft
   for (let i = 0; i < 3; i++) expect((await current.next()).type).toBe('ping');
   expect((await current.closed).code).toBe(1008);
   await until(async () => await f.presence.get(device_id) === null);
+});
+
+async function fund(f: Awaited<ReturnType<typeof fixture>>, token: string, amount: number) {
+  await f.store.system.write((sql) => sql.run('INSERT OR IGNORE INTO platform_admins VALUES (?)', [f.userId]));
+  const body = { tenant_id: f.tenantId, amount_milli: amount };
+  const res = await f.request('/platform/ledger/topup', body, token, 'fund');
+  expect(res.status).toBe(201);
+  const row = await res.json();
+  expect(await (await f.request('/platform/ledger/topup', body, token, 'fund')).json()).toEqual(row);
+}
+
+async function linkedEdge(f: Awaited<ReturnType<typeof fixture>>, scoped: string) {
+  const token = await (await f.request('/devices', f.device, scoped)).json() as DeviceReply;
+  const edge = connect(f, token.device_token);
+  expect(await edge.opened).toBe(true);
+  edge.hello();
+  expect(await edge.next()).toMatchObject({ type: 'welcome' });
+  return { ...edge, ...token };
+}
+
+test('concurrent renewals stay inside tenant funds and a replay settles only once', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const scoped = await f.select(global);
+  expect((await f.request('/platform/ledger/topup', { tenant_id: f.tenantId, amount_milli: 1 }, global)).status).toBe(403);
+  await fund(f, global, 2);
+  const [a, b] = await Promise.all([linkedEdge(f, scoped), linkedEdge(f, scoped)]);
+  const [la, lb] = await Promise.all([a.next(), b.next()]);
+  expect(la).toMatchObject({ type: 'lease', budget_milli: 1, seq: 1 });
+  expect(lb).toMatchObject({ type: 'lease', budget_milli: 1, seq: 1 });
+  const msg = { type: 'lease_renew', id: 'renew-a', op_id: 'once', lease_id: la.lease_id, used_milli: 1 };
+  a.send(msg);
+  a.send({ ...msg, id: 'renew-a-retry' });
+  b.send({ ...msg, id: 'renew-b', lease_id: lb.lease_id });
+  expect(await a.next()).toMatchObject({ type: 'cutoff', reason: 'balance', re: 'renew-a' });
+  expect(await a.next()).toMatchObject({ type: 'cutoff', reason: 'balance', re: 'renew-a-retry' });
+  expect(await b.next()).toMatchObject({ type: 'cutoff', reason: 'balance' });
+  const balance = await f.request('/balance', undefined, scoped);
+  expect(await balance.json()).toMatchObject({ balance_milli: 0, reserved_milli: 0, month_used_milli: 2 });
+  expect(f.store.tenant(f.tenantId).get("SELECT count(*) AS n FROM ledger WHERE kind = 'settle'")).toEqual({ n: 2 });
+});
+
+test('an offline lease is settled on return and late usage reconciles without a second debit', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const scoped = await f.select(global);
+  await fund(f, global, 100);
+  const a = await linkedEdge(f, scoped);
+  const lease = await a.next();
+  expect(lease).toMatchObject({ type: 'lease', budget_milli: 5 });
+  a.ws.close();
+  await a.closed;
+  f.advance(11 * 60_000);
+  expect(await (await f.request('/balance', undefined, scoped)).json()).toMatchObject({ balance_milli: 95, reserved_milli: 5 });
+  f.advance(24 * 60 * 60_000);
+  expect(await (await f.request('/observe/stale-leases', undefined, scoped)).json()).toMatchObject({ total: 1, items: [{ id: lease.lease_id, status: 'active' }] });
+  const b = connect(f, a.device_token);
+  expect(await b.opened).toBe(true);
+  b.hello(lease.lease_id);
+  expect(await b.next()).toMatchObject({ type: 'welcome' });
+  b.send({ type: 'lease_renew', id: 'offline-renew', lease_id: lease.lease_id, used_milli: 3 });
+  expect(await b.next()).toMatchObject({ type: 'lease', seq: 2 });
+  const usage = { request_id: 'req_1', lease_id: lease.lease_id, session_id: null, provider_id: 'prv_fake', model: 'fake',
+    input_tokens: 5, output_tokens: 2, cache_read_tokens: 0, cache_write_tokens: 0, at: new Date(f.now()).toISOString(), status: 'ok' };
+  b.send({ type: 'usage', id: 'offline-batch', batch: [{ ...usage, seq: 1, complete: true, cost_milli: 3 },
+    { ...usage, request_id: 'req_2', seq: 2, complete: false, cost_milli: 2 }] });
+  expect(await b.next()).toMatchObject({ type: 'events_ack', ack_seq: 2 });
+  const rows = f.store.tenant(f.tenantId).all('SELECT cost_milli, settlement_status FROM usage ORDER BY seq');
+  expect(rows).toEqual([{ cost_milli: 3, settlement_status: 'reconciled' }, { cost_milli: 2, settlement_status: 'pending' }]);
+  expect(await (await f.request('/balance', undefined, scoped)).json()).toMatchObject({ month_used_milli: 3 });
 });
