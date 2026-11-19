@@ -4,6 +4,9 @@
 import { createApi } from './api.js'
 import { createSessionStore } from './session.js'
 import { showToast } from './toast.js'
+import { catalog } from './catalog.js'
+import { contractPage } from './contract.js'
+import { groupsPage } from './groups.js'
 import { renderLogin } from './login.js'
 import { renderMembersPage } from './members.js'
 import { mockEnabled, installMock } from './mock/index.js'
@@ -52,8 +55,14 @@ function renderTop(hash) {
     tenantLink.href = '#/tenant/members'
     tenantLink.classList.toggle('selected', hash.startsWith('#/tenant'))
     domains.appendChild(tenantLink)
-    // CONTRACT-PENDING: /me 是否返回平台管理员标识（mock 用 user.platform_admin）
-    if (session.user && session.user.platform_admin) {
+    if (session.tenant && hash.startsWith('#/tenant')) {
+      for (const [path, label] of [['members','成员'], ['groups','分组'], ['contract','合约']]) {
+        const link = el('a', hash === '#/tenant/' + path ? 'selected' : '', label)
+        link.href = '#/tenant/' + path
+        domains.append(link)
+      }
+    }
+    if (session.is_platform_admin) {
       const platformLink = el('a', null, '平台')
       platformLink.href = '#/platform'
       platformLink.classList.toggle('selected', hash.startsWith('#/platform'))
@@ -62,7 +71,7 @@ function renderTop(hash) {
     top.appendChild(domains)
 
     const tools = el('div', 'top-tools')
-    if (mockOn) tools.appendChild(el('span', 'mock-badge', '假数据'))
+    if (mockOn || session.mock_actions) tools.appendChild(el('span', 'mock-badge', mockOn ? '假数据' : '权限：假数据'))
     if (session.tenant) {
       const tn = el('span', 'tenant-name muted', session.tenant.name)
       tools.appendChild(tn)
@@ -70,10 +79,15 @@ function renderTop(hash) {
     if (session.user && session.user.name) tools.appendChild(el('span', null, session.user.name))
     const logout = el('button', 'link', '退出')
     logout.addEventListener('click', async () => {
+      const globalToken = session?.globalToken
+      const scopedToken = session?.token
       try {
         await api.post('/auth/logout')
       } catch {
         // 登出失败也清本地会话
+      }
+      if (globalToken && globalToken !== scopedToken) {
+        await createApi({ getToken: () => globalToken }).post('/auth/logout').catch(() => {})
       }
       session = null
       sessionStore.clear()
@@ -134,11 +148,11 @@ function route() {
   }
 
   if (hash.startsWith('#/platform')) {
-    if (!(session.user && session.user.platform_admin)) {
+    if (!(session.is_platform_admin)) {
       location.replace(defaultHash())
       return
     }
-    renderPlatformPlaceholder(ws)
+    catalog(ws, createApi({getToken: () => session?.globalToken, onUnauthorized: () => { sessionStore.clear(); session = null; location.hash = '#/login' }}), session.globalActions || [])
     return
   }
 
@@ -147,7 +161,9 @@ function route() {
       location.replace(defaultHash())
       return
     }
-    renderMembersPage(ws, { api })
+    if (hash === '#/tenant/groups') groupsPage(ws, api, session.actions || [])
+    else if (hash === '#/tenant/contract') contractPage(ws, api)
+    else renderMembersPage(ws, { api, actions: session.actions || [] })
     return
   }
 
