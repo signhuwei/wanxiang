@@ -327,7 +327,7 @@ async fn connected(
                         send(tx, &reply).await?;
                     }
                     Msg::Cutoff(c) => {
-                        // 落盘失败也已经断流了，照样确认。
+                        // 落盘失败也已经断流了，照样确认。cutoff 不清续租快照，见 lease::Ledger::cutoff。
                         if let Err(e) = state.lease.cutoff(&c.reason) {
                             warn!(error = %format!("{e:#}"), "persist cutoff");
                         }

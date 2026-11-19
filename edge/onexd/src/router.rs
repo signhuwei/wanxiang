@@ -55,7 +55,7 @@ impl Outcome {
             Outcome::UpstreamError => "upstream_error".into(),
             Outcome::ClientCancelled => "client_cancelled".into(),
             // CONTRACT-PENDING: 契约的 status 取值里没有 Edge 主动断流，这是 Edge 的提议。
-            Outcome::Stopped(Block::Exhausted) => "lease_exhausted".into(),
+            Outcome::Stopped(Block::Exhausted | Block::TooLarge { .. }) => "lease_exhausted".into(),
             Outcome::Stopped(Block::Expired | Block::NoLease) => "lease_expired".into(),
             Outcome::Stopped(Block::Cutoff(_)) => "cutoff".into(),
         }
@@ -109,14 +109,14 @@ impl UsageRecord {
     }
 }
 
-/// 一次请求的实时计量。
+/// 一次请求的计量。预留只用于放行，不参与任何花费计算。
 struct Meter {
     rate: Rate,
     tokens: Tokens,
     /// 从 content_block_delta 估算的输出 token
     est_output: u64,
-    /// 上游在 message_start 报了用量，之后按实际数字计价；否则一直按预留计
-    metered: bool,
+    /// 上游报过输入侧用量（`input_tokens` 是数字）
+    input_reported: bool,
     reservation: i64,
 }
 
@@ -124,28 +124,27 @@ impl Meter {
     /// 预留 = max_tokens × 输出单价 + 估算输入 × 输入单价（sprint-1 范围决定）。
     fn new(rate: Rate, max_tokens: u64, est_input: u64) -> Self {
         let reservation = cost_milli(&rate, &Tokens { input: est_input, output: max_tokens, ..Default::default() });
-        Self { rate, tokens: Tokens::default(), est_output: 0, metered: false, reservation }
+        Self { rate, tokens: Tokens::default(), est_output: 0, input_reported: false, reservation }
     }
 
     fn seen(&self) -> Tokens {
         Tokens { output: self.tokens.output.max(self.est_output), ..self.tokens }
     }
 
-    /// 已见用量的花费，越过租约额度就中断流。
+    /// 已见用量（含输出字节估算）的花费，越过租约额度就中断流。
     fn seen_cost(&self) -> i64 {
         cost_milli(&self.rate, &self.seen())
     }
 
-    /// 计入放行判断的花费：上游还没报用量时不低于预留。
-    fn live(&self) -> i64 {
-        let c = self.seen_cost();
-        if self.metered { c } else { c.max(self.reservation) }
-    }
-
-    /// 结束时的花费：拿到终帧用量按实际，否则按已见部分。
+    /// 结束时的用量：拿到最终用量按实际，否则按已见部分。
     fn final_tokens(&self, usage_final: bool) -> Tokens {
         if usage_final { self.tokens } else { self.seen() }
     }
+}
+
+/// Anthropic usage 是否是完整的最终用量：输入、输出都是数字。
+fn usage_complete(u: &Value) -> bool {
+    ["input_tokens", "output_tokens"].iter().all(|k| u.get(*k).is_some_and(Value::is_u64))
 }
 
 pub struct Router {
@@ -319,7 +318,7 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
     let ticket = match rt.state.lease.admit(meter.reservation) {
         Ok(t) => t,
         Err(b) => {
-            info!(model = %model, reason = ?b, "request blocked by lease");
+            info!(model = %model, reason = ?b, reservation_milli = meter.reservation, "request blocked by lease");
             return block_response(b);
         }
     };
@@ -417,13 +416,17 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
             req.rec.message_id = v.get("id").and_then(Value::as_str).map(str::to_owned);
             if let Some(u) = v.get("usage") {
                 apply_usage(&mut req.meter.tokens, u);
-                req.rec.usage_final = true;
+                req.rec.usage_final = usage_complete(u);
             }
         }
         if !req.rec.usage_final {
-            // 2xx 却没有 usage：按预留计，标待结算。
-            warn!(request_id = %req.rec.request_id, "upstream response has no usage");
+            // 2xx 却没有完整 usage：只按已见部分计（可能是 0），标待结算，不拿预留充数。
+            warn!(request_id = %req.rec.request_id, "upstream response has no complete usage");
         }
+        req = match req.check_budget() {
+            Ok(r) => r,
+            Err(r) => return *r,
+        };
     } else {
         req.rec.outcome = Outcome::UpstreamStatus(status.as_u16());
         // 上游 4xx/5xx 不计 token。
@@ -496,17 +499,22 @@ impl Req {
         let _ = self.rt.usage_tx.send(rec);
     }
 
+    /// 非流式响应读完后按实际花费检查额度，和流式一样：越过额度的内容不发给客户端。
+    /// 越过时已结算并返回给客户端的错误响应。
+    fn check_budget(mut self) -> Result<Req, Box<Response>> {
+        let cost = cost_milli(&self.meter.rate, &self.meter.final_tokens(self.rec.usage_final));
+        let Err(b) = self.ticket.update(cost) else { return Ok(self) };
+        warn!(request_id = %self.rec.request_id, cost_milli = cost, "response over lease budget; withheld");
+        self.rec.outcome = Outcome::Stopped(b);
+        self.finish();
+        Err(Box::new(block_response(b)))
+    }
+
     fn finish(self) {
         let Req { rt, mut rec, meter, ticket, started } = self;
+        // 用量不完整时只按已见部分计价，标 complete=false，预留绝不当作已发生的花费。
         rec.tokens = meter.final_tokens(rec.usage_final);
-        rec.cost_milli = if rec.usage_final {
-            cost_milli(&meter.rate, &rec.tokens)
-        } else if matches!(rec.outcome, Outcome::Ok) {
-            // 正常结束却没有用量（非流式 2xx 无 usage）：没有任何依据，按预留计
-            meter.live()
-        } else {
-            cost_milli(&meter.rate, &rec.tokens)
-        };
+        rec.cost_milli = cost_milli(&meter.rate, &rec.tokens);
         rec.lease_id = ticket.finish(rec.cost_milli);
         rec.duration_ms = started.elapsed().as_millis() as u64;
         info!(
@@ -579,6 +587,10 @@ async fn chat_response(req: Req, resp: reqwest::Response, status: StatusCode, is
             }
             req.rec.usage_final = has_usage;
             req.rec.outcome = Outcome::Ok;
+            let req = match req.check_budget() {
+                Ok(r) => r,
+                Err(r) => return *r,
+            };
             req.finish();
             axum::Json(msg).into_response()
         }
@@ -723,7 +735,7 @@ async fn pump(
                 }
                 // 先计价再转发：越过额度的那批字节不发给客户端。
                 if !events.is_empty() {
-                    if let Err(b) = req.ticket.update(req.meter.live(), req.meter.seen_cost()) {
+                    if let Err(b) = req.ticket.update(req.meter.seen_cost()) {
                         break Outcome::Stopped(b);
                     }
                 }
@@ -793,10 +805,9 @@ fn observe(rec: &mut UsageRecord, m: &mut Meter, stopped: &mut bool, ev: &Event)
             let msg = &v["message"];
             rec.message_id = msg.get("id").and_then(Value::as_str).map(str::to_owned);
             if let Some(u) = msg.get("usage") {
+                // 有的兼容上游在 message_start 里全给 0，只在终帧报真实数字；0 不算报过输入。
                 apply_usage(&mut m.tokens, u);
-                // 兼容上游有的在 message_start 里全给 0，只在终帧报真实数字，这种继续按预留计。
-                let t = &m.tokens;
-                m.metered = t.input + t.cache_read + t.cache_write > 0;
+                m.input_reported = u.get("input_tokens").and_then(Value::as_u64).is_some_and(|n| n > 0);
             }
         }
         "content_block_delta" => {
@@ -810,10 +821,13 @@ fn observe(rec: &mut UsageRecord, m: &mut Meter, stopped: &mut bool, ev: &Event)
         }
         "message_delta" => {
             // message_delta 里的 usage 是累计值，出现就覆盖。
+            // 只有 output_tokens 是数字、且输入侧已知（这里或 message_start 报过）才算最终用量；
+            // 空对象或缺字段的 usage 不能冒充完整计量。
             if let Some(u) = v.get("usage") {
                 apply_usage(&mut m.tokens, u);
-                rec.usage_final = true;
-                m.metered = true;
+                let input_here = u.get("input_tokens").is_some_and(Value::is_u64);
+                m.input_reported |= input_here;
+                rec.usage_final = u.get("output_tokens").is_some_and(Value::is_u64) && m.input_reported;
             }
         }
         _ => *stopped = true,
@@ -855,6 +869,12 @@ fn block_error(b: Block) -> (StatusCode, &'static str, &'static str, &'static st
             "billing_error",
             "balance_exhausted",
             "OneX 本机额度已用完，正在向服务器续约。请稍后重试；如果持续出现，请联系管理员充值橡皮。",
+        ),
+        Block::TooLarge { .. } => (
+            PAY,
+            "billing_error",
+            "balance_exhausted",
+            "这次请求按 max_tokens 预估的花费超过了 OneX 单个额度租约的上限。请调小 max_tokens 或缩短上下文后重试；如果需要更大的单次请求，请联系管理员调高租约额度。",
         ),
         Block::Cutoff(CutoffReason::Balance) => {
             (PAY, "billing_error", "balance_exhausted", "OneX 橡皮余额已用完，请联系管理员充值。")
@@ -1027,7 +1047,7 @@ mod tests {
             ),
         );
         assert_eq!(m.tokens, Tokens { input: 10, output: 1, cache_read: 100, cache_write: 20 });
-        assert!(m.metered && !rec.usage_final);
+        assert!(m.input_reported && !rec.usage_final);
         observe(
             &mut rec,
             &mut m,
@@ -1062,22 +1082,22 @@ mod tests {
     }
 
     #[test]
-    fn live_cost_uses_reservation_until_usage_known() {
+    fn seen_cost_never_includes_reservation() {
         let mut rec = rec();
-        // 预留 = 1000 × 15000 / 1e6 = 15
+        // 预留 = 1000 × 15000 / 1e6 = 15，只用于放行
         let mut m = Meter::new(rate(), 1000, 0);
-        assert_eq!(m.live(), 15);
+        assert_eq!(m.reservation, 15);
+        assert_eq!(m.seen_cost(), 0);
         let mut s = false;
-        // message_start 全是 0：继续按预留
         observe(
             &mut rec,
             &mut m,
             &mut s,
             &ev("message_start", json!({"message":{"usage":{"input_tokens":0,"output_tokens":0}}})),
         );
-        assert!(!m.metered);
-        assert_eq!(m.live(), 15);
-        // 估算的输出超过预留时取较大者：3000 字节 ≈ 1000 token ≈ 15，再多就超过
+        assert!(!m.input_reported);
+        assert_eq!(m.seen_cost(), 0);
+        // 6000 字节 ≈ 2000 token ≈ 30
         let text = "x".repeat(6000);
         observe(
             &mut rec,
@@ -1086,9 +1106,32 @@ mod tests {
             &ev("content_block_delta", json!({"delta":{"type":"text_delta","text":text}})),
         );
         assert_eq!(m.est_output, 2000);
-        assert_eq!(m.live(), 30);
+        assert_eq!(m.seen_cost(), 30);
         // 中断时按已见部分计
         assert_eq!(m.final_tokens(false).output, 2000);
+    }
+
+    #[test]
+    fn incomplete_delta_usage_is_not_final() {
+        let mut m = Meter::new(rate(), 1000, 0);
+        let mut s = false;
+        // 空对象、缺 output_tokens、output_tokens 不是数字：都不算最终用量
+        for u in [json!({}), json!({"input_tokens": 5}), json!({"output_tokens": "7"}), json!({"output_tokens": null})]
+        {
+            let mut r = rec();
+            observe(&mut r, &mut m, &mut s, &ev("message_delta", json!({"usage": u})));
+            assert!(!r.usage_final, "{u}");
+        }
+        // 有输出数字，但输入侧从没报过（message_start 只有 0 占位）：仍不完整
+        let mut r = rec();
+        observe(&mut r, &mut m, &mut s, &ev("message_start", json!({"message":{"usage":{"input_tokens":0}}})));
+        observe(&mut r, &mut m, &mut s, &ev("message_delta", json!({"usage":{"output_tokens":7}})));
+        assert!(!r.usage_final);
+        // 终帧同时报了输入和输出：完整
+        observe(&mut r, &mut m, &mut s, &ev("message_delta", json!({"usage":{"input_tokens":3,"output_tokens":7}})));
+        assert!(r.usage_final);
+        assert!(usage_complete(&json!({"input_tokens":0,"output_tokens":0})));
+        assert!(!usage_complete(&json!({"output_tokens":3})));
     }
 
     #[test]
@@ -1103,7 +1146,7 @@ mod tests {
             &ev("message_start", json!({"message":{"usage":{"input_tokens":1_000_000,"output_tokens":1}}})),
         );
         // 输入 1M × 3000 = 3000，输出 1 token 向上取整后并入
-        assert_eq!(m.live(), 3_000 + 1);
+        assert_eq!(m.seen_cost(), 3_000 + 1);
         observe(
             &mut rec,
             &mut m,
@@ -1111,7 +1154,7 @@ mod tests {
             &ev("content_block_delta", json!({"delta":{"type":"input_json_delta","partial_json":"x".repeat(300_000)}})),
         );
         // 100_000 token × 15000 / 1e6 = 1500
-        assert_eq!(m.live(), 4_500);
+        assert_eq!(m.seen_cost(), 4_500);
     }
 
     #[test]
