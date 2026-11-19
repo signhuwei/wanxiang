@@ -524,6 +524,69 @@ test('concurrent renewals stay inside tenant funds and a replay settles only onc
   expect(f.store.tenant(f.tenantId).get("SELECT count(*) AS n FROM ledger WHERE kind = 'settle'")).toEqual({ n: 2 });
 });
 
+test('renewal reporting usage over the lease budget charges only the budget and parks the rest as overage_pending', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const scoped = await f.select(global);
+  await fund(f, global, 100);
+  const a = await linkedEdge(f, scoped);
+  const lease = await a.nextOf('lease');
+  expect(lease).toMatchObject({ type: 'lease', budget_milli: 5 });
+  // 实际花费 6，超出这份额度 1（尾部花费在发出预留之后才计出，Edge 诚实上报）
+  a.send({ type: 'lease_renew', id: 'over-budget', op_id: 'op-over', lease_id: lease.lease_id, used_milli: 6 });
+  const next = await a.nextOf('lease');
+  expect(next).toMatchObject({ type: 'lease', seq: 2 });
+  // 租户只按额度 5 实扣；lease_operations 和 usage 之外的真实快照不在这张表里，这里只看租户记账
+  expect(f.store.tenant(f.tenantId).get('SELECT status, used_milli FROM leases WHERE id = ?', [lease.lease_id]))
+    .toEqual({ status: 'settled', used_milli: 5 });
+  expect(f.store.tenant(f.tenantId).get("SELECT amount_milli, request_ref, note FROM ledger WHERE kind = 'settle' AND lease_id = ?", [lease.lease_id]))
+    .toEqual({ amount_milli: 5, request_ref: 'op-over', note: null });
+  expect(f.store.tenant(f.tenantId).get("SELECT count(*) AS n FROM ledger WHERE kind = 'release' AND lease_id = ?", [lease.lease_id]))
+    .toEqual({ n: 0 });
+  // 差额 1 单独一条 overage_pending，request_ref 和 settle 一致，不计余额、消费或预留
+  expect(f.store.tenant(f.tenantId).get("SELECT amount_milli, request_ref, note FROM ledger WHERE kind = 'overage_pending' AND lease_id = ?", [lease.lease_id]))
+    .toEqual({ amount_milli: 1, request_ref: 'op-over', note: '超租约差额待核对' });
+  expect(await (await f.request('/balance', undefined, scoped)).json()).toMatchObject({ month_used_milli: 5 });
+  // lease_operations 保留 Edge 实报的原始快照（6），不是裁剪后的租户实扣
+  expect(f.store.tenant(f.tenantId).get('SELECT used_milli FROM lease_operations WHERE device_id = ? AND op_id = ?', [a.device_id, 'op-over']))
+    .toEqual({ used_milli: 6 });
+  // 新租约没有继承这笔超支：额度和占用都从零开始
+  expect(f.store.tenant(f.tenantId).get('SELECT used_milli FROM leases WHERE id = ?', [next.lease_id])).toEqual({ used_milli: 0 });
+
+  // 重复同一 op_id：原样返回第一次的结果，不重复入账
+  a.send({ type: 'lease_renew', id: 'replay', op_id: 'op-over', lease_id: lease.lease_id, used_milli: 6 });
+  const replay = await a.nextOf('lease');
+  expect(replay).toEqual({ ...next, re: 'replay' });
+  expect(f.store.tenant(f.tenantId).get("SELECT count(*) AS n FROM ledger WHERE kind = 'settle' AND lease_id = ?", [lease.lease_id])).toEqual({ n: 1 });
+  expect(f.store.tenant(f.tenantId).get("SELECT count(*) AS n FROM ledger WHERE kind = 'overage_pending' AND lease_id = ?", [lease.lease_id])).toEqual({ n: 1 });
+
+  // 换一个 op_id 想再结算同一份已 settled 的租约：拒绝，不产生第二笔账
+  a.send({ type: 'lease_renew', id: 'again', op_id: 'op-again', lease_id: lease.lease_id, used_milli: 6 });
+  expect(await a.nextOf('ack')).toMatchObject({ type: 'ack', re: 'again', ok: false, error: { code: 'conflict' } });
+  expect(f.store.tenant(f.tenantId).get("SELECT count(*) AS n FROM ledger WHERE kind = 'settle' AND lease_id = ?", [lease.lease_id])).toEqual({ n: 1 });
+  expect(f.store.tenant(f.tenantId).get("SELECT count(*) AS n FROM ledger WHERE kind = 'overage_pending' AND lease_id = ?", [lease.lease_id])).toEqual({ n: 1 });
+});
+
+test('an over-budget renewal does not drain extra balance; exhaustion still comes from the budget alone', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const scoped = await f.select(global);
+  await fund(f, global, 1);
+  const a = await linkedEdge(f, scoped);
+  const lease = await a.nextOf('lease');
+  expect(lease).toMatchObject({ type: 'lease', budget_milli: 1 });
+  // 实报 50，远超这份额度 1；overage_pending 不计余额，不应该把余额往下多扣一分
+  a.send({ type: 'lease_renew', id: 'over-budget-drained', lease_id: lease.lease_id, used_milli: 50 });
+  expect(await a.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'balance', re: 'over-budget-drained' });
+  // 租户只按额度 1 实扣，不是实报的 50
+  expect(f.store.tenant(f.tenantId).get('SELECT status, used_milli FROM leases WHERE id = ?', [lease.lease_id]))
+    .toEqual({ status: 'settled', used_milli: 1 });
+  expect(f.store.tenant(f.tenantId).get("SELECT amount_milli FROM ledger WHERE kind = 'overage_pending' AND lease_id = ?", [lease.lease_id]))
+    .toEqual({ amount_milli: 49 });
+  // 余额耗尽只是因为额度本身用完（1/1），不是被 49 的差额打空的
+  expect(await (await f.request('/balance', undefined, scoped)).json()).toMatchObject({ balance_milli: 0, reserved_milli: 0, month_used_milli: 1 });
+});
+
 test('lost renewal response replays the same lease and device-level usage can span renewals', async () => {
   const f = await fixture();
   const global = await f.login();
