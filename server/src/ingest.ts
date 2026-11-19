@@ -66,7 +66,7 @@ export function usageItems(value: unknown) {
 export function ingestUsage(store: Store, tenant: string, device: string, at: number, live: () => boolean, items: ReturnType<typeof usageItems>) {
   return store.tenant(tenant).write((sql) => {
     if (!live() || !deviceAllowed(store, sql, tenant, device, at)) throw new ApiError('forbidden');
-    const leases = new Set<string>();
+    let reconcile = false;
     for (const row of items) {
       if (!markSequence(sql, device, row.seq)) continue;
       const lease = row.lease && sql.get<{ budget_milli: number }>('SELECT budget_milli FROM leases WHERE id = ? AND device_id = ?', [row.lease, device]);
@@ -76,9 +76,9 @@ export function ingestUsage(store: Store, tenant: string, device: string, at: nu
         cache_read_tokens, cache_write_tokens, cost_milli, status, at, complete, settlement_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [device, row.seq, row.request, row.session, leaseId, row.provider, row.modelId, row.model, row.input, row.output, row.cacheRead,
           row.cacheWrite, row.cost, row.status, row.at, Number(row.complete), settlement]);
-      if (leaseId) leases.add(leaseId);
+      if (leaseId && row.complete) reconcile = true;
     }
-    for (const id of leases) reconcileUsage(sql, id);
+    if (reconcile) reconcileUsage(sql, device);
     return advanceCursor(sql, device);
   });
 }
