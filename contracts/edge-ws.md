@@ -57,16 +57,19 @@ Server 回 `welcome`：
 | `session_start` | `agent`、`agent_version`、`cwd_hash`、`model` |
 | `user_message` | `content`（本轮新增的用户输入，不含重发的历史上下文） |
 | `assistant_message` | `content`、`model`、`stop_reason` |
-| `tool_call` | `tool`、`input` |
+| `tool_call` | `tool_call_id`、`tool`、`input` |
 | `tool_result` | `tool_call_id`、`output`（超过 64 KB 截断，标 `truncated`） |
 | `session_end` | `reason` |
 | `gap` | `reason`、`offset`：采集缺口 |
+| `compact` | `summary`：上下文压缩产生的摘要，不是用户输入，也不是模型回答 |
+
+所有会话事件的 payload 另带原始行的 `uuid`、`parentUuid`，以及 `sidechain`（布尔）和 `agent_id`（子 Agent 的标识，主会话为 null）。图片只回元数据 `{type:"image", media_type, bytes}`，不回原图（S1）。
 
 会话事件来自 Agent 自己写的会话记录（Claude Code 是 `$CLAUDE_CONFIG_DIR/projects/<项目>/<session-id>.jsonl`），按字节偏移增量读取；不从模型请求里拼接对话。router 只负责用量、时延和错误。两者通过 `session_id` 关联。见 `docs/specs/agents/claude-code.md` 第 5 节（v0.4）。
 
 - 事件带 `source_offset`（在会话文件中的字节偏移），读取游标、事件和 outbox 在一个本地事务里提交。
 - 读到坏行、未知类型、文件被替换或截短时，发一条 `kind: "gap"` 事件，payload 为 `{reason, offset}`，不能把缺口显示为完整。
-- thinking 内容、签名和凭据不回流。
+- thinking 内容、签名和凭据不回流。会话文件中的 `api-request`、`api-request-blob` 行含完整模型请求，也不回流。
 
 ## 密钥下发（v0.7）
 
