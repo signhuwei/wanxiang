@@ -415,6 +415,36 @@ test('concurrent renewals stay inside tenant funds and a replay settles only onc
   expect(f.store.tenant(f.tenantId).get("SELECT count(*) AS n FROM ledger WHERE kind = 'settle'")).toEqual({ n: 2 });
 });
 
+test('lost renewal response replays the same lease and device-level usage can span renewals', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const scoped = await f.select(global);
+  await fund(f, global, 100);
+  const a = await linkedEdge(f, scoped);
+  const original = await a.nextOf('lease');
+  const op = { type: 'lease_renew', id: 'before-loss', op_id: `${original.lease_id}:2`, lease_id: original.lease_id, used_milli: 2 };
+  a.send(op);
+  const first = await a.nextOf('lease');
+  a.ws.close();
+  await a.closed;
+  const b = connect(f, a.device_token);
+  expect(await b.opened).toBe(true);
+  b.hello(original.lease_id);
+  await b.nextOf('welcome');
+  b.send({ ...op, id: 'after-loss' });
+  const replay = await b.nextOf('lease');
+  expect(replay).toEqual({ ...first, re: 'after-loss' });
+  expect(await (await f.request('/balance', undefined, scoped)).json()).toMatchObject({ month_used_milli: 2 });
+  b.send({ type: 'lease_renew', id: 'next', lease_id: first.lease_id, used_milli: 3 });
+  await b.nextOf('lease');
+  b.send({ type: 'usage', id: 'spanning-usage', batch: [{ seq: 1, request_id: 'req_spanning', lease_id: original.lease_id,
+    provider_id: 'prv_fake', model: 'fake', model_id: 'mod_fake', input_tokens: 5, output_tokens: 2,
+    cache_read_tokens: 0, cache_write_tokens: 0, at: new Date(f.now()).toISOString(), status: 'ok', complete: true, cost_milli: 5 }] });
+  expect(await b.nextOf('events_ack')).toMatchObject({ ack_seq: 1 });
+  expect(f.store.tenant(f.tenantId).get('SELECT settlement_status FROM usage')).toEqual({ settlement_status: 'reconciled' });
+  expect(await (await f.request('/balance', undefined, scoped)).json()).toMatchObject({ month_used_milli: 5 });
+});
+
 test('an offline lease is settled on return and late usage reconciles without a second debit', async () => {
   const f = await fixture();
   const global = await f.login();

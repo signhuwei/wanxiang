@@ -67,13 +67,14 @@ export function initialLease(store: Store, tenantId: string, deviceId: string, u
   });
 }
 
-export function reconcileUsage(sql: Transaction, leaseId: string) {
-  const lease = sql.get<LeaseRow>("SELECT * FROM leases WHERE id = ? AND status = 'settled'", [leaseId]);
-  if (!lease) return;
-  // total() cannot overflow if a device submits an excessive sum; valid amounts remain exactly representable.
-  const { reported } = sql.get<{ reported: number }>('SELECT total(cost_milli) AS reported FROM usage WHERE lease_id = ? AND complete = 1', [leaseId])!;
-  const status = reported === lease.used_milli ? 'reconciled' : reported > lease.used_milli ? 'unverified' : 'pending';
-  sql.run('UPDATE usage SET settlement_status = ? WHERE lease_id = ? AND complete = 1 AND settlement_status <> ?', [status, leaseId, status]);
+export function reconcileUsage(sql: Transaction, deviceId: string) {
+  const { settled } = sql.get<{ settled: number }>("SELECT coalesce(sum(used_milli), 0) AS settled FROM leases WHERE device_id = ? AND status = 'settled'", [deviceId])!;
+  // A stream can finish on a later lease but keep its original lease_id in usage.
+  const { reported } = sql.get<{ reported: number }>(`SELECT total(cost_milli) AS reported FROM usage
+    WHERE device_id = ? AND lease_id IS NOT NULL AND complete = 1`, [deviceId])!;
+  const status = reported === settled ? 'reconciled' : 'pending';
+  sql.run(`UPDATE usage SET settlement_status = ? WHERE device_id = ? AND lease_id IS NOT NULL
+    AND complete = 1 AND settlement_status <> ?`, [status, deviceId, status]);
 }
 
 export function renewLease(store: Store, tenantId: string, deviceId: string, userId: string, at: number, live: () => boolean,
@@ -93,7 +94,7 @@ export function renewLease(store: Store, tenantId: string, deviceId: string, use
     sql.run("UPDATE leases SET used_milli = ?, status = 'settled', revision = revision + 1 WHERE id = ?", [used, leaseId]);
     if (used) entry(sql, 'settle', used, at, { lease, requestRef: opId });
     if (used < lease.budget_milli) entry(sql, 'release', lease.budget_milli - used, at, { lease, requestRef: opId });
-    reconcileUsage(sql, leaseId);
+    reconcileUsage(sql, deviceId);
     const response = issue(sql, deviceId, userId, at);
     sql.run('INSERT INTO lease_operations (device_id, op_id, lease_id, used_milli, result_json) VALUES (?, ?, ?, ?, ?)',
       [deviceId, opId, leaseId, used, JSON.stringify(response)]);
