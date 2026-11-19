@@ -8,7 +8,7 @@ export function topupMilli(value) {
   if (!Number.isSafeInteger(n) || n <= 0) throw new Error('请输入正数，最多保留三位小数')
   return n
 }
-const kinds = {topup:'充值',reserve:'预留',settle:'结算',release:'释放',adjust:'调整'}
+export const kinds = {topup:'充值',reserve:'预留',settle:'结算',release:'释放',adjust:'调整',overage_pending:'超租约差额待核对'}
 export function billingPage(host, api, platformApi, session) {
   const summary = el('section','balance-summary'), table = el('div','page')
   host.classList.add('page'); host.append(summary,table)
