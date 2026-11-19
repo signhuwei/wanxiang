@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use onexd::outbox::{Kind, Outbox};
+use onexd::outbox::{Kind, Outbox, now_ms};
+use onexd::pricing::format_ms;
 use onexd::state::{Phase, State};
 use onexd::ws::{self, WsOptions};
 use serde_json::{Value, json};
@@ -97,7 +98,7 @@ impl Peer {
         let hello = self.recv().await;
         assert_eq!(hello["type"], "hello");
         self.send(json!({"type":"welcome","re":hello["id"],"device_id":"dev_1","user_id":"usr_1","tenant_id":"ten_1",
-            "server_time":"2026-11-19T08:00:00Z","ack_seq":ack_seq,"heartbeat_ms":heartbeat_ms}))
+            "server_time":format_ms(now_ms()),"ack_seq":ack_seq,"heartbeat_ms":heartbeat_ms}))
             .await;
         hello
     }
@@ -323,7 +324,7 @@ async fn resends_unacked_after_reconnect_from_welcome_ack_seq() {
     p.send(json!({"type":"ping","id":"sync"})).await;
     assert_eq!(p.recv_skip_ping().await["type"], "pong");
     assert_eq!(edge.outbox.ack_seq().unwrap(), 6);
-    assert!(edge.outbox.pending(0, 10).unwrap().is_empty());
+    assert_eq!(edge.outbox.unacked_bytes().unwrap(), 0);
     p.expect_no_data(Duration::from_millis(100)).await;
 }
 
@@ -370,11 +371,13 @@ async fn config_applied_and_acked_and_stale_ignored() {
     let edge = start_edge(&srv.url, Some("t"));
     let mut p = srv.accept().await;
     p.handshake(0, 15000).await;
-    let route = json!({"model":"claude-*","provider_id":"prv_1","protocol":"anthropic","base_url":"http://up"});
-    p.send(json!({"type":"config","id":"c1","revision":5,"routes":[route],"agents":[],"rates":[]})).await;
+    let route = json!({"model":"claude-*","model_id":"mdl_1","provider_id":"prv_1","protocol":"anthropic","base_url":"http://up"});
+    let rate = json!({"model_id":"mdl_1","input_milli_per_mtok":1,"output_milli_per_mtok":2,"cache_read_milli_per_mtok":0,"cache_write_milli_per_mtok":0});
+    p.send(json!({"type":"config","id":"c1","revision":5,"routes":[route],"agents":[],"rates":[rate]})).await;
     let a = p.recv_skip_ping().await;
     assert_eq!(a, json!({"type":"ack","re":"c1","ok":true}));
     assert_eq!(edge.state.config_revision(), 5);
+    assert_eq!(edge.state.config.read().unwrap().rates[0].output_milli_per_mtok, 2);
 
     p.send(json!({"type":"config","id":"c2","revision":4,"routes":[]})).await;
     assert_eq!(p.recv_skip_ping().await["re"], "c2");
@@ -429,6 +432,140 @@ async fn replaced_close_still_reconnects() {
     let mut p = srv.accept().await;
     p.handshake(0, 15000).await;
     wait_phase(&edge.state, Phase::Connected).await;
+}
+
+fn lease_msg(id: &str, lease_id: &str, seq: u64, budget: i64, ttl_ms: i64) -> Value {
+    json!({"type":"lease","id":id,"lease_id":lease_id,"expires_at":format_ms(now_ms() + ttl_ms),"budget_milli":budget,"seq":seq})
+}
+
+/// 跳过 ping 和 ack，取下一条别的消息。
+async fn recv_skip(p: &mut Peer, skip: &[&str]) -> Value {
+    loop {
+        let m = p.recv().await;
+        if !skip.contains(&m["type"].as_str().unwrap()) {
+            return m;
+        }
+    }
+}
+
+#[tokio::test]
+async fn lease_is_applied_acked_and_sent_in_hello() {
+    let srv = FakeServer::start().await;
+    let edge = start_edge(&srv.url, Some("t"));
+    let mut p = srv.accept().await;
+    assert_eq!(p.handshake(0, 15000).await["lease_id"], Value::Null);
+    p.send(lease_msg("s1", "lse_1", 1, 1000, 600_000)).await;
+    assert_eq!(p.recv_skip_ping().await, json!({"type":"ack","re":"s1","ok":true}));
+    assert_eq!(edge.state.lease.lease_id().as_deref(), Some("lse_1"));
+    assert!(edge.state.lease.admit(0).is_ok());
+
+    // 坏租约回错误
+    p.send(json!({"type":"lease","id":"s2","lease_id":"lse_2","expires_at":"later","budget_milli":1,"seq":2})).await;
+    let a = p.recv_skip_ping().await;
+    assert_eq!((a["re"].as_str(), a["ok"].as_bool()), (Some("s2"), Some(false)));
+
+    drop(p);
+    let mut p = srv.accept().await;
+    assert_eq!(p.handshake(0, 15000).await["lease_id"], "lse_1");
+}
+
+#[tokio::test]
+async fn renew_sent_at_80_percent_and_new_lease_resets() {
+    let srv = FakeServer::start().await;
+    let edge = start_edge(&srv.url, Some("t"));
+    let mut p = srv.accept().await;
+    p.handshake(0, 15000).await;
+    p.send(lease_msg("s1", "lse_1", 1, 100, 600_000)).await;
+    p.recv_skip_ping().await;
+
+    edge.state.lease.admit(0).unwrap().finish(80);
+    let m = recv_skip(&mut p, &["ping"]).await;
+    assert_eq!(m["type"], "lease_renew");
+    assert_eq!((m["lease_id"].as_str(), m["used_milli"].as_i64()), (Some("lse_1"), Some(80)));
+
+    // 续租成功
+    p.send(lease_msg("s2", "lse_2", 2, 100, 600_000)).await;
+    assert_eq!(p.recv_skip_ping().await["re"], "s2");
+    let s = edge.state.lease.snapshot();
+    assert_eq!((s.lease.unwrap().lease_id.as_str(), s.used_milli), ("lse_2", 0));
+}
+
+#[tokio::test]
+async fn renew_failure_cutoff_blocks_and_renew_resent_after_reconnect() {
+    let srv = FakeServer::start().await;
+    let edge = start_edge(&srv.url, Some("t"));
+    let mut p = srv.accept().await;
+    p.handshake(0, 15000).await;
+    p.send(lease_msg("s1", "lse_1", 1, 100, 600_000)).await;
+    p.recv_skip_ping().await;
+    edge.state.lease.admit(0).unwrap().finish(90);
+    assert_eq!(recv_skip(&mut p, &["ping"]).await["type"], "lease_renew");
+
+    // Server 没回就断了：重连后重发同一个续租
+    drop(p);
+    let mut p = srv.accept().await;
+    p.handshake(0, 15000).await;
+    let m = recv_skip(&mut p, &["ping"]).await;
+    assert_eq!((m["type"].as_str(), m["used_milli"].as_i64()), (Some("lease_renew"), Some(90)));
+
+    // 续租失败：Server 回 cutoff
+    p.send(json!({"type":"cutoff","id":"s3","reason":"balance"})).await;
+    assert_eq!(p.recv_skip_ping().await, json!({"type":"ack","re":"s3","ok":true}));
+    assert!(matches!(edge.state.lease.admit(0), Err(onexd::lease::Block::Cutoff(_))));
+}
+
+#[tokio::test]
+async fn offline_uses_current_lease_until_exhausted() {
+    let srv = FakeServer::start().await;
+    let edge = start_edge(&srv.url, Some("t"));
+    let mut p = srv.accept().await;
+    p.handshake(0, 15000).await;
+    p.send(lease_msg("s1", "lse_1", 1, 100, 600_000)).await;
+    p.recv_skip_ping().await;
+    drop(p);
+    wait_phase(&edge.state, Phase::Backoff).await;
+
+    // 断线期间照常放行，直到额度用完
+    for _ in 0..4 {
+        edge.state.lease.admit(0).unwrap().finish(25);
+    }
+    assert_eq!(edge.state.lease.admit(0).err(), Some(onexd::lease::Block::Exhausted));
+
+    // 重连后马上续租，带上离线期间的用量
+    let mut p = srv.accept().await;
+    p.handshake(0, 15000).await;
+    let m = recv_skip(&mut p, &["ping"]).await;
+    assert_eq!((m["type"].as_str(), m["used_milli"].as_i64()), (Some("lease_renew"), Some(100)));
+}
+
+#[tokio::test]
+async fn ack_regression_resends_retained_and_reports() {
+    let srv = FakeServer::start().await;
+    let edge = start_edge(&srv.url, Some("t"));
+    for i in 1..=5 {
+        edge.outbox.append(Kind::Events, event(i)).unwrap();
+    }
+    let mut p = srv.accept().await;
+    p.handshake(0, 15000).await;
+    assert_eq!(p.recv_seqs(5).await, [1, 2, 3, 4, 5]);
+    p.send(json!({"type":"events_ack","ack_seq":5})).await;
+    p.send(json!({"type":"ping","id":"sync"})).await;
+    assert_eq!(p.recv_skip_ping().await["type"], "pong");
+    drop(p);
+
+    // Server 丢了数据，只记到 2
+    let mut p = srv.accept().await;
+    p.handshake(2, 15000).await;
+    let d = p.recv_skip_ping().await;
+    assert_eq!((d["type"].as_str(), d["diag_id"].as_str()), (Some("diag_result"), Some("ack_regression")));
+    assert_eq!(d["detail"]["local_ack_seq"], 5);
+    assert_eq!(d["detail"]["resend_from"], 3);
+    assert_eq!(d["detail"]["lost"], Value::Null);
+    assert_eq!(p.recv_seqs(3).await, [3, 4, 5]);
+    // 本地 ack_seq 不倒退
+    assert_eq!(edge.outbox.ack_seq().unwrap(), 5);
+    p.send(json!({"type":"events_ack","ack_seq":5})).await;
+    p.expect_no_data(Duration::from_millis(100)).await;
 }
 
 #[tokio::test]

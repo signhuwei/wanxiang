@@ -1,6 +1,9 @@
 pub mod id;
 pub mod ipc;
+pub mod lastgood;
+pub mod lease;
 pub mod outbox;
+pub mod pricing;
 pub mod router;
 pub mod sse;
 pub mod state;

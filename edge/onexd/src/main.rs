@@ -15,8 +15,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use onex_core::ipc::SOCKET_NAME;
 use onexd::ipc::{self, Ipc};
-use onexd::outbox::Outbox;
-use onexd::router::Router;
+use onexd::lease::{LeaseOptions, Ledger};
+use onexd::outbox::{Kind, Outbox};
+use onexd::router::{self, Router, UsageRecord};
 use onexd::state::State;
 use onexd::{id, ws};
 use tokio::sync::mpsc;
@@ -39,8 +40,10 @@ async fn main() -> Result<()> {
 async fn run(home: PathBuf) -> Result<()> {
     info!(version = env!("CARGO_PKG_VERSION"), home = %home.display(), "onexd starting");
     let shutdown = CancellationToken::new();
-    let state = Arc::new(State::default());
     let outbox = Arc::new(Outbox::open(&home.join("outbox.sqlite"))?);
+    let lease = Arc::new(Ledger::open(home.join("lease.json"), LeaseOptions::default(), &outbox)?);
+    let state = Arc::new(State { lease: lease.clone(), ..Default::default() });
+    tokio::spawn(lease.run(shutdown.clone()));
 
     let sock_path = home.join(SOCKET_NAME);
     let listener = ipc::bind(&sock_path).await?;
@@ -55,17 +58,25 @@ async fn run(home: PathBuf) -> Result<()> {
     std::fs::write(home.join("router.addr"), router_addr.to_string())?;
     info!(%router_addr, "router listening");
 
-    let (usage_tx, mut usage_rx) = mpsc::unbounded_channel();
-    // 上游只设连接超时：流式响应可能持续很久，读超时由 Agent 自己判断。
-    let http = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(10)).build()?;
+    let (usage_tx, mut usage_rx) = mpsc::unbounded_channel::<UsageRecord>();
+    // 默认客户端遵从 HTTPS_PROXY / NO_PROXY。
+    let http = router::client_builder().build()?;
     let app = Router::new(state.clone(), local_token, http, usage_tx).app();
     let sd = shutdown.clone();
     let router_task =
         tokio::spawn(
             async move { axum::serve(tcp, app).with_graceful_shutdown(async move { sd.cancelled().await }).await },
         );
-    // TODO(S1-E2): 计价后写 outbox 的 usage。
-    tokio::spawn(async move { while usage_rx.recv().await.is_some() {} });
+    let ob = outbox.clone();
+    tokio::spawn(async move {
+        while let Some(rec) = usage_rx.recv().await {
+            let ob = ob.clone();
+            let r = tokio::task::spawn_blocking(move || ob.append(Kind::Usage, rec.to_item())).await;
+            if let Ok(Err(e)) | Err(e) = r.map_err(anyhow::Error::from) {
+                error!(error = %format!("{e:#}"), "write usage to outbox");
+            }
+        }
+    });
 
     let ipc = Arc::new(Ipc {
         state: state.clone(),

@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use onex_core::ws::{Ack, Config, ErrorBody, Hello, Msg, PROTOCOL_VERSION, Welcome};
+use onex_core::ws::{Ack, Config, DiagResult, ErrorBody, Hello, LeaseRenew, Msg, PROTOCOL_VERSION, Welcome};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, interval_at, sleep, timeout};
@@ -201,8 +201,7 @@ async fn handshake(opts: &WsOptions, state: &State, outbox: &Outbox, tx: &mut Tx
             os: os_name().into(),
             arch: std::env::consts::ARCH.into(),
             config_revision: state.config_revision(),
-            // TODO(S1-E2): 租约
-            lease_id: None,
+            lease_id: state.lease.lease_id(),
             outbox_last_seq: outbox.last_seq(),
         }),
     )
@@ -248,13 +247,16 @@ async fn connected(
         c.connects += 1;
     }
     info!(device_id = %welcome.device_id, ack_seq = welcome.ack_seq, "ws connected");
+    state.lease.set_server_time(&welcome.server_time);
 
     // welcome.ack_seq 之前的都已持久化，等同一次 events_ack。
     note_ack(outbox, welcome.ack_seq)?;
-    let mut acked = outbox.ack_seq()?;
-    if welcome.ack_seq < acked {
-        // Server 丢了已确认的数据，本地已删，补不回来。
-        warn!(server = welcome.ack_seq, local = acked, "server ack_seq is behind local ack_seq");
+    let local_acked = outbox.ack_seq()?;
+    // `acked` 是这条连接上 Server 确认到的位置，补传从它之后开始。
+    let mut acked = local_acked;
+    if welcome.ack_seq < local_acked {
+        acked = welcome.ack_seq;
+        report_ack_regression(outbox, tx, welcome.ack_seq, local_acked).await?;
     }
     let mut sent = acked;
 
@@ -262,6 +264,9 @@ async fn connected(
     let mut ticker = interval_at(Instant::now() + hb, hb);
     let mut missed: u32 = 0;
     let mut outbox_rx = outbox.subscribe();
+    let mut renew_rx = state.lease.subscribe_renew();
+    state.lease.on_connected();
+    send_renew(state, tx).await?;
 
     flush(opts, outbox, tx, &mut sent, acked).await?;
     loop {
@@ -278,6 +283,10 @@ async fn connected(
                 r.context("outbox closed")?;
                 flush(opts, outbox, tx, &mut sent, acked).await?;
             }
+            r = renew_rx.changed() => {
+                r.context("lease closed")?;
+                send_renew(state, tx).await?;
+            }
             m = recv(rx) => {
                 missed = 0;
                 match m? {
@@ -285,7 +294,7 @@ async fn connected(
                     Msg::Pong { .. } => {}
                     Msg::EventsAck(a) => {
                         note_ack(outbox, a.ack_seq)?;
-                        acked = outbox.ack_seq()?;
+                        acked = acked.max(a.ack_seq.min(outbox.last_seq()));
                         // 重连时可能还有更早发出的确认，sent 不能落到 acked 之后。
                         sent = sent.max(acked);
                         flush(opts, outbox, tx, &mut sent, acked).await?;
@@ -295,13 +304,30 @@ async fn connected(
                         apply_config(state, c);
                         send(tx, &ack_ok(id)).await?;
                     }
+                    Msg::Lease(l) => {
+                        let reply = match state.lease.grant(&l) {
+                            Ok(_) => ack_ok(l.id),
+                            Err(e) => {
+                                warn!(error = %format!("{e:#}"), lease_id = %l.lease_id, "lease rejected");
+                                ack_err(l.id, "invalid", "租约无法使用")
+                            }
+                        };
+                        send(tx, &reply).await?;
+                    }
+                    Msg::Cutoff(c) => {
+                        // 落盘失败也已经断流了，照样确认。
+                        if let Err(e) = state.lease.cutoff(&c.reason) {
+                            warn!(error = %format!("{e:#}"), "persist cutoff");
+                        }
+                        send(tx, &ack_ok(c.id)).await?;
+                    }
                     Msg::Secret(s) => {
                         // TODO(S1-E2): X25519 + XChaCha20-Poly1305 解密，等设备注册交换公钥后实现。
                         warn!(provider_id = %s.provider_id, "secret decryption not implemented");
                         send(tx, &ack_err(s.id, "internal", "Edge 暂不支持解密上游密钥")).await?;
                     }
                     Msg::Ack(Ack { re, ok: false, error }) => warn!(%re, ?error, "server rejected message"),
-                    // TODO(S1-E2, S1-E5): lease、cutoff、diag、agent_cmd
+                    // TODO(S1-E5): diag、agent_cmd
                     other => debug!(?other, "ignored"),
                 }
             }
@@ -309,12 +335,37 @@ async fn connected(
     }
 }
 
+async fn send_renew(state: &State, tx: &mut Tx) -> Result<()> {
+    if let Some((lease_id, used_milli)) = state.lease.take_renew() {
+        info!(%lease_id, used_milli, "lease_renew");
+        send(tx, &Msg::LeaseRenew(LeaseRenew { id: id::new("msg"), lease_id, used_milli })).await?;
+    }
+    Ok(())
+}
+
+/// Server 的 ack_seq 比本地已确认的小，说明 Server 丢了数据。从 server_ack + 1 重传仍保留的条目，并上报。
+async fn report_ack_regression(outbox: &Outbox, tx: &mut Tx, server_ack: u64, local_ack: u64) -> Result<()> {
+    let first = outbox.first_seq()?.unwrap_or(local_ack + 1);
+    let resend_from = first.max(server_ack + 1);
+    warn!(server_ack, local_ack, resend_from, "server ack_seq is behind local ack_seq; resending retained entries");
+    let detail = json!({
+        "server_ack_seq": server_ack,
+        "local_ack_seq": local_ack,
+        "resend_from": resend_from,
+        "resend_to": local_ack,
+        // 已过保留期删掉、补不回来的区间
+        "lost": if resend_from > server_ack + 1 { json!([server_ack + 1, resend_from - 1]) } else { Value::Null },
+    });
+    send(tx, &Msg::DiagResult(DiagResult { id: id::new("msg"), diag_id: "ack_regression".into(), ok: false, detail }))
+        .await
+}
+
 /// 原子替换；revision 不大于当前值时忽略。
 fn apply_config(state: &State, c: Config) {
     let mut cur = state.config.write().unwrap();
     if c.revision > cur.revision {
-        info!(revision = c.revision, routes = c.routes.len(), "config applied");
-        *cur = ConfigSnapshot { revision: c.revision, routes: c.routes };
+        info!(revision = c.revision, routes = c.routes.len(), rates = c.rates.len(), "config applied");
+        *cur = ConfigSnapshot { revision: c.revision, routes: c.routes, rates: c.rates };
     }
 }
 

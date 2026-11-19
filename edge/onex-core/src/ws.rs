@@ -14,7 +14,6 @@ pub enum Msg {
     Ping {
         id: String,
     },
-    // CONTRACT-PENDING: 契约没写 pong 的字段，这里用 `re` 指向 ping 的 id。
     Pong {
         #[serde(default)]
         re: Option<String>,
@@ -89,14 +88,15 @@ pub struct Config {
     #[serde(default)]
     pub agents: Vec<Value>,
     #[serde(default)]
-    pub rates: Vec<Value>,
+    pub rates: Vec<Rate>,
 }
 
-// CONTRACT-PENDING: 契约只写了 `routes[]`，字段是 Edge 的提议，等 gateway.md 定稿后对齐。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Route {
     /// Agent 请求里的模型名。以 `*` 结尾时按前缀匹配，单独一个 `*` 匹配全部。
     pub model: String,
+    /// 对应 `rates[].model_id`
+    pub model_id: String,
     pub provider_id: String,
     /// 上游协议，S1 只支持 `anthropic`。
     pub protocol: String,
@@ -107,6 +107,21 @@ pub struct Route {
     pub upstream_model: Option<String>,
     #[serde(default)]
     pub auth: UpstreamAuth,
+    /// `"none"` 直连，URL 用指定代理；不填时遵从环境变量代理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+}
+
+/// 单价，单位毫橡皮每百万 token。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rate {
+    pub model_id: String,
+    pub input_milli_per_mtok: u64,
+    pub output_milli_per_mtok: u64,
+    pub cache_read_milli_per_mtok: u64,
+    pub cache_write_milli_per_mtok: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,8 +174,7 @@ pub struct AgentCmd {
     pub action: String,
 }
 
-// CONTRACT-PENDING: 契约写的是 `events_ack{ack_seq}`，没说带 `id` 还是 `re`，两个都接受。
-// 这里把它当作累计确认：所有 seq ≤ ack_seq 的 events 和 usage 都已持久化。
+/// 累计确认：所有 seq ≤ ack_seq 的 events 和 usage 都已持久化。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventsAck {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,7 +218,16 @@ pub struct UsageItem {
     pub cache_write_tokens: u64,
     pub cost_milli: i64,
     pub at: String,
+    /// `ok`、`upstream_<HTTP 状态码>`、`upstream_error`、`client_cancelled`，
+    /// 以及 Edge 断流的 `lease_exhausted`、`cutoff`（CONTRACT-PENDING）。
     pub status: String,
+    /// false 表示流中断、用量不全，Server 记为待结算。
+    pub complete: bool,
+    // CONTRACT-PENDING: 契约 usage 只有 `model`，Edge 另带 `model_id`（对应 rates）和 `lease_id`，便于 Server 结算。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -272,10 +295,21 @@ mod tests {
 
     #[test]
     fn route_defaults() {
-        let r: Route = serde_json::from_value(json!({"model":"claude-*","provider_id":"prv_1","protocol":"anthropic",
-            "base_url":"https://example.invalid"}))
+        let r: Route = serde_json::from_value(json!({"model":"claude-*","model_id":"mdl_1","provider_id":"prv_1",
+            "protocol":"anthropic","base_url":"https://example.invalid"}))
         .unwrap();
         assert_eq!(r.auth, UpstreamAuth::XApiKey);
         assert_eq!(r.upstream_model, None);
+        assert_eq!(r.proxy, None);
+    }
+
+    #[test]
+    fn config_with_rates() {
+        let m: Msg = serde_json::from_value(json!({"type":"config","id":"c1","revision":3,"routes":[],"agents":[],
+            "rates":[{"model_id":"mdl_1","input_milli_per_mtok":3000,"output_milli_per_mtok":15000,
+            "cache_read_milli_per_mtok":300,"cache_write_milli_per_mtok":3750,"effective_from":"2026-11-01T00:00:00Z"}]}))
+        .unwrap();
+        let Msg::Config(c) = m else { panic!() };
+        assert_eq!(c.rates[0].output_milli_per_mtok, 15000);
     }
 }

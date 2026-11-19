@@ -1,10 +1,12 @@
 //! daemon 各部分共享的运行状态。
 
 use std::collections::HashMap;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
-use onex_core::ws::Route;
+use onex_core::ws::{Rate, Route};
 use tokio::sync::watch;
+
+use crate::lease::Ledger;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Phase {
@@ -41,6 +43,7 @@ pub struct Conn {
 pub struct ConfigSnapshot {
     pub revision: i64,
     pub routes: Vec<Route>,
+    pub rates: Vec<Rate>,
 }
 
 #[derive(Default)]
@@ -51,6 +54,8 @@ pub struct State {
     pub config: RwLock<ConfigSnapshot>,
     /// provider_id → 上游密钥明文。只在内存里，不写日志。
     pub secrets: RwLock<HashMap<String, String>>,
+    /// 默认只在内存里；daemon 启动时换成落盘的。
+    pub lease: Arc<Ledger>,
 }
 
 impl State {
