@@ -11,7 +11,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::StreamExt;
-use onex_core::ws::{Route, UpstreamAuth};
+use onex_core::ws::{Lease, Rate, Route, UpstreamAuth};
+use onexd::lease::{Block, CutoffReason};
+use onexd::outbox::now_ms;
+use onexd::pricing::format_ms;
 use onexd::router::{Outcome, Router, Tokens, UsageRecord};
 use onexd::state::{ConfigSnapshot, State};
 use serde_json::{Value, json};
@@ -161,6 +164,50 @@ fn upstream_response(scenario: &str, drop_tx: Option<oneshot::Sender<()>>) -> Re
             });
             sse_response(futures_util::stream::iter(chunks).chain(boom))
         }
+        "long" => {
+            // message_start 之后 40 个各 300 字节的 delta，每个约 100 token
+            let guard = DropSignal(drop_tx);
+            let evs = stream_events("x");
+            let delta = sse(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"y".repeat(300)}}),
+            );
+            let mut all = vec![evs[0].clone(), evs[1].clone()];
+            all.extend(std::iter::repeat_n(delta, 40));
+            all.extend(evs[4..].iter().cloned());
+            let s = futures_util::stream::iter(all).then(move |b| {
+                let _g = &guard;
+                async move {
+                    sleep(Duration::from_millis(10)).await;
+                    Ok::<_, std::io::Error>(b)
+                }
+            });
+            sse_response(s)
+        }
+        "hang_zero" => {
+            // 只在终帧报用量的上游：message_start 全是 0，然后挂住
+            let guard = DropSignal(drop_tx);
+            let first = sse(
+                "message_start",
+                json!({"type":"message_start","message":{"id":"msg_z","usage":{"input_tokens":0,"output_tokens":0}}}),
+            );
+            let s = futures_util::stream::once(async move { Ok::<_, std::io::Error>(first) })
+                .chain(futures_util::stream::pending())
+                .map(move |x| {
+                    let _g = &guard;
+                    x
+                });
+            sse_response(s)
+        }
+        "late_usage" => {
+            let s = vec![
+                sse("message_start", json!({"type":"message_start","message":{"id":"msg_l","usage":{"input_tokens":0,"output_tokens":0}}})),
+                sse("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}})),
+                sse("message_delta", json!({"type":"message_delta","usage":{"input_tokens":100,"output_tokens":10}})),
+                sse("message_stop", json!({"type":"message_stop"})),
+            ];
+            sse_response(futures_util::stream::iter(s.into_iter().map(Ok)))
+        }
         "eof" => {
             // 干净地结束，但没有 message_stop。
             let evs = stream_events("eof");
@@ -197,20 +244,52 @@ async fn env_with(auth: UpstreamAuth, upstream_model: Option<&str>) -> Env {
         revision: 1,
         routes: vec![Route {
             model: "claude-*".into(),
+            model_id: "mdl_sonnet".into(),
             provider_id: "prv_1".into(),
             protocol: "anthropic".into(),
             base_url: format!("http://{}/", upstream.addr),
             upstream_model: upstream_model.map(String::from),
             auth,
+            proxy: None,
         }],
+        rates: vec![rate()],
     };
     state.secrets.write().unwrap().insert("prv_1".into(), KEY.into());
+    grant(&state, "lse_1", 1, 1_000_000, 600_000);
     let (tx, usage) = mpsc::unbounded_channel();
     let app = Router::new(state.clone(), LOCAL.into(), direct_client(), tx).app();
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/v1/messages", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
     Env { url, upstream, usage, state, http: direct_client() }
+}
+
+/// 每 token：输入 1、输出 2、缓存读 0.1、缓存写 1.25 毫橡皮。
+fn rate() -> Rate {
+    Rate {
+        model_id: "mdl_sonnet".into(),
+        input_milli_per_mtok: 1_000_000,
+        output_milli_per_mtok: 2_000_000,
+        cache_read_milli_per_mtok: 100_000,
+        cache_write_milli_per_mtok: 1_250_000,
+        effective_from: None,
+    }
+}
+
+/// stream_events 的用量：12 + 57×2 + 3000×0.1 + 200×1.25
+const STREAM_COST: i64 = 12 + 114 + 300 + 250;
+
+fn grant(state: &State, id: &str, seq: u64, budget: i64, ttl_ms: i64) {
+    state
+        .lease
+        .grant(&Lease {
+            id: format!("m_{id}"),
+            lease_id: id.into(),
+            expires_at: format_ms(now_ms() + ttl_ms),
+            budget_milli: budget,
+            seq,
+        })
+        .unwrap();
 }
 
 /// 环境里可能配了 HTTP 代理，测试只走回环地址，不经代理。
@@ -461,5 +540,191 @@ async fn upstream_unreachable() {
     let r = e.req("", true).send().await.unwrap();
     assert_eq!(r.status(), 502);
     assert_eq!(r.json::<Value>().await.unwrap()["error"]["type"], "api_error");
-    assert_eq!(e.usage().await.outcome, Outcome::UpstreamError);
+    let u = e.usage().await;
+    assert_eq!(u.outcome, Outcome::UpstreamError);
+    assert!(u.usage_final && u.cost_milli == 0);
+}
+
+// ---- S1-E2 计价与租约 ----
+
+async fn expect_blocked(r: reqwest::Response, status: u16, code: &str) -> Value {
+    assert_eq!(r.status().as_u16(), status);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["error"]["code"], code);
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("OneX"), "message should be Chinese and actionable: {msg}");
+    v
+}
+
+#[tokio::test]
+async fn streaming_cost_is_priced_and_charged_to_lease() {
+    let mut e = env().await;
+    e.req("stream", true).send().await.unwrap().text().await.unwrap();
+    let u = e.usage().await;
+    assert_eq!(u.cost_milli, STREAM_COST);
+    assert_eq!(u.lease_id.as_deref(), Some("lse_1"));
+    assert_eq!(u.model_id, "mdl_sonnet");
+    let item = u.to_item();
+    assert_eq!((item["status"].as_str(), item["complete"].as_bool()), (Some("ok"), Some(true)));
+    assert_eq!(item["cost_milli"], STREAM_COST);
+    assert_eq!(e.state.lease.snapshot().used_milli, STREAM_COST);
+}
+
+#[tokio::test]
+async fn non_streaming_cost() {
+    let mut e = env().await;
+    e.req("", false).send().await.unwrap();
+    // 20 + 5×2 + 7×0.1 = 30.7 → 31
+    assert_eq!(e.usage().await.cost_milli, 31);
+}
+
+#[tokio::test]
+async fn no_lease_rejects_before_upstream() {
+    let e = env().await;
+    e.state.lease.cutoff("balance").unwrap();
+    let r = e.req("stream", true).send().await.unwrap();
+    expect_blocked(r, 402, "balance_exhausted").await;
+    assert!(e.upstream.seen.lock().unwrap().headers.is_none());
+}
+
+#[tokio::test]
+async fn expired_lease_rejects_new_requests() {
+    let e = env().await;
+    grant(&e.state, "lse_2", 2, 1_000_000, -1);
+    let r = e.req("", false).send().await.unwrap();
+    let v = expect_blocked(r, 402, "lease_expired").await;
+    assert_eq!(v["error"]["type"], "billing_error");
+    assert!(e.upstream.seen.lock().unwrap().headers.is_none());
+}
+
+#[tokio::test]
+async fn budget_used_up_rejects_next_request() {
+    let mut e = env().await;
+    grant(&e.state, "lse_2", 2, STREAM_COST, 600_000);
+    e.req("stream", true).send().await.unwrap().text().await.unwrap();
+    assert_eq!(e.usage().await.outcome, Outcome::Ok);
+    let r = e.req("stream", true).send().await.unwrap();
+    expect_blocked(r, 402, "balance_exhausted").await;
+}
+
+#[tokio::test]
+async fn budget_exhausted_mid_stream_cuts_stream() {
+    let mut e = env().await;
+    // message_start 时已花 12 + 2 + 300 + 250 = 564；之后每个 delta 约 100 token = 200 毫橡皮
+    grant(&e.state, "lse_2", 2, 1_000, 600_000);
+    let dropped = e.upstream.on_drop();
+    let text = e.req("long", true).send().await.unwrap().text().await.unwrap();
+    let evs = parse_sse(&text);
+    let (name, err) = evs.last().unwrap();
+    assert_eq!(name, "error");
+    assert_eq!(err["error"]["code"], "balance_exhausted");
+    assert!(err["error"]["message"].as_str().unwrap().contains("中断"));
+    // 只转发了额度以内的 delta
+    let deltas = evs.iter().filter(|(n, _)| n == "content_block_delta").count();
+    assert!((1..=3).contains(&deltas), "{deltas} deltas forwarded");
+    assert!(!evs.iter().any(|(n, _)| n == "message_stop"));
+    timeout(T, dropped).await.expect("upstream not cancelled").unwrap();
+
+    let u = e.usage().await;
+    assert_eq!(u.outcome, Outcome::Stopped(Block::Exhausted));
+    let item = u.to_item();
+    assert_eq!((item["status"].as_str(), item["complete"].as_bool()), (Some("lease_exhausted"), Some(false)));
+    // 按已见部分计价，越过额度的那个 delta 也算
+    assert!(u.cost_milli > 1_000, "{}", u.cost_milli);
+    let r = e.req("", false).send().await.unwrap();
+    expect_blocked(r, 402, "balance_exhausted").await;
+}
+
+#[tokio::test]
+async fn cutoff_interrupts_inflight_stream() {
+    let mut e = env().await;
+    let dropped = e.upstream.on_drop();
+    let resp = e.req("hang", true).send().await.unwrap();
+    let mut body = resp.bytes_stream();
+    let first = timeout(T, body.next()).await.unwrap().unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("message_start"));
+
+    e.state.lease.cutoff("disabled").unwrap();
+    let mut rest = Vec::new();
+    while let Some(c) = timeout(T, body.next()).await.unwrap() {
+        rest.extend_from_slice(&c.unwrap());
+    }
+    let evs = parse_sse(&String::from_utf8(rest).unwrap());
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0].1["error"]["type"], "permission_error");
+    assert_eq!(evs[0].1["error"]["code"], "forbidden");
+    timeout(T, dropped).await.expect("upstream not cancelled").unwrap();
+
+    let u = e.usage().await;
+    assert_eq!(u.outcome, Outcome::Stopped(Block::Cutoff(CutoffReason::Disabled)));
+    assert!(!u.usage_final);
+    // 按 message_start 已见部分计
+    assert_eq!(u.cost_milli, 12 + 2 + 300 + 250);
+
+    let r = e.req("", false).send().await.unwrap();
+    expect_blocked(r, 403, "forbidden").await;
+}
+
+#[tokio::test]
+async fn lease_expiry_interrupts_inflight_stream() {
+    let mut e = env().await;
+    tokio::spawn(e.state.lease.clone().run(tokio_util::sync::CancellationToken::new()));
+    grant(&e.state, "lse_2", 2, 1_000_000, 300);
+    let resp = e.req("hang", true).send().await.unwrap();
+    let text = timeout(T, resp.text()).await.unwrap().unwrap();
+    let (name, err) = parse_sse(&text).pop().unwrap();
+    assert_eq!(name, "error");
+    assert_eq!(err["error"]["code"], "lease_expired");
+    assert_eq!(e.usage().await.outcome, Outcome::Stopped(Block::Expired));
+}
+
+#[tokio::test]
+async fn end_frame_only_upstream_reserves_max_tokens() {
+    let mut e = env().await;
+    // max_tokens=100 → 预留 200；额度 150，单个请求仍放行，但第二个并发请求被拒
+    grant(&e.state, "lse_2", 2, 150, 600_000);
+    let resp = e.req("hang_zero", true).send().await.unwrap();
+    let mut body = resp.bytes_stream();
+    timeout(T, body.next()).await.unwrap().unwrap().unwrap();
+    assert_eq!(e.state.lease.snapshot().inflight_milli, 200);
+    let r = e.req("", false).send().await.unwrap();
+    expect_blocked(r, 402, "balance_exhausted").await;
+    drop(body);
+    let u = e.usage().await;
+    assert_eq!(u.outcome, Outcome::ClientCancelled);
+    // 断开时没有任何用量：按已见的 0 计，标待结算，释放预留
+    assert_eq!((u.cost_milli, u.usage_final), (0, false));
+    assert_eq!(e.state.lease.snapshot().inflight_milli, 0);
+}
+
+#[tokio::test]
+async fn end_frame_usage_settles_reservation() {
+    let mut e = env().await;
+    e.req("late_usage", true).send().await.unwrap().text().await.unwrap();
+    let u = e.usage().await;
+    assert!(u.usage_final);
+    assert_eq!(u.tokens, Tokens { input: 100, output: 10, ..Default::default() });
+    assert_eq!(u.cost_milli, 120);
+    assert_eq!(e.state.lease.snapshot().used_milli, 120);
+}
+
+#[tokio::test]
+async fn missing_rate_rejects() {
+    let e = env().await;
+    e.state.config.write().unwrap().rates.clear();
+    let r = e.req("", false).send().await.unwrap();
+    assert_eq!(r.status(), 503);
+    assert!(r.json::<Value>().await.unwrap()["error"]["message"].as_str().unwrap().contains("计价"));
+    assert!(e.upstream.seen.lock().unwrap().headers.is_none());
+}
+
+#[tokio::test]
+async fn route_proxy_is_ignored_for_loopback() {
+    let e = env().await;
+    // 回环地址不论 proxy 怎么写都直连
+    e.state.config.write().unwrap().routes[0].proxy = Some("http://127.0.0.1:1".into());
+    assert_eq!(e.req("", false).send().await.unwrap().status(), 200);
+    e.state.config.write().unwrap().routes[0].proxy = Some("none".into());
+    assert_eq!(e.req("", false).send().await.unwrap().status(), 200);
 }

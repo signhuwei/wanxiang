@@ -1,15 +1,22 @@
 //! 本地 outbox：events 和 usage 共用一个 seq 空间，单调递增、无空洞。
 //!
 //! `meta.last_seq` 记录已分配的最大 seq，`meta.ack_seq` 记录 Server 已确认的最大 seq。
-//! 确认过的行直接删除；seq 从 meta 继续分配，所以删行和进程重启都不会让 seq 回退。
+//! 确认过的行保留 72 小时（总量不超过 200 MB，超出先删最旧的），供 Server 丢数据时重传。
+//! seq 从 meta 继续分配，所以删行和进程重启都不会让 seq 回退。
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use tokio::sync::watch;
+
+pub const RETAIN_MS: i64 = 72 * 3600 * 1000;
+pub const RETAIN_BYTES: u64 = 200 * 1024 * 1024;
+/// 按总量清理要扫全表，最多每分钟做一次。
+const SIZE_PRUNE_EVERY_MS: i64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -54,10 +61,17 @@ pub enum AckOutcome {
 pub struct Outbox {
     conn: Mutex<Connection>,
     last_seq_tx: watch::Sender<u64>,
+    retain_ms: i64,
+    retain_bytes: u64,
+    last_size_prune: Mutex<i64>,
 }
 
 impl Outbox {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, RETAIN_MS, RETAIN_BYTES)
+    }
+
+    pub fn open_with(path: &Path, retain_ms: i64, retain_bytes: u64) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open outbox {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // 一次 fsync 换掉电不丢：events 和 usage 写入频率低，代价可以接受。
@@ -72,8 +86,25 @@ impl Outbox {
                  item TEXT NOT NULL
              );",
         )?;
+        // 第一批的表没有 acked_at，补上。
+        let has_acked_at: bool =
+            conn.query_row("SELECT count(*) FROM pragma_table_info('outbox') WHERE name = 'acked_at'", [], |r| {
+                r.get::<_, i64>(0)
+            })? > 0;
+        if !has_acked_at {
+            conn.execute_batch(
+                "ALTER TABLE outbox ADD COLUMN acked_at INTEGER;
+                 CREATE INDEX IF NOT EXISTS outbox_acked_at ON outbox (acked_at) WHERE acked_at IS NOT NULL;",
+            )?;
+        }
         let last = meta(&conn, "last_seq")?;
-        Ok(Self { conn: Mutex::new(conn), last_seq_tx: watch::Sender::new(last) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            last_seq_tx: watch::Sender::new(last),
+            retain_ms,
+            retain_bytes,
+            last_size_prune: Mutex::new(i64::MIN),
+        })
     }
 
     /// 分配下一个 seq 并写入。`item` 必须是 JSON 对象，`seq` 字段由这里填。
@@ -96,21 +127,66 @@ impl Outbox {
 
     /// 处理累计确认：所有 seq ≤ ack_seq 的条目都已被 Server 持久化。
     pub fn ack(&self, ack_seq: u64) -> Result<AckOutcome> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = meta(&tx, "ack_seq")?;
-        if ack_seq <= current {
-            return Ok(AckOutcome::Stale);
-        }
-        let last = meta(&tx, "last_seq")?;
-        let (ack, outcome) = if ack_seq > last { (last, AckOutcome::Clamped) } else { (ack_seq, AckOutcome::Advanced) };
-        tx.execute("UPDATE meta SET v = ?1 WHERE k = 'ack_seq'", [ack as i64])?;
-        tx.execute("DELETE FROM outbox WHERE seq <= ?1", [ack as i64])?;
-        tx.commit()?;
+        self.ack_at(ack_seq, now_ms())
+    }
+
+    pub fn ack_at(&self, ack_seq: u64, now: i64) -> Result<AckOutcome> {
+        let outcome = {
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = meta(&tx, "ack_seq")?;
+            if ack_seq <= current {
+                return Ok(AckOutcome::Stale);
+            }
+            let last = meta(&tx, "last_seq")?;
+            let (ack, outcome) =
+                if ack_seq > last { (last, AckOutcome::Clamped) } else { (ack_seq, AckOutcome::Advanced) };
+            tx.execute("UPDATE meta SET v = ?1 WHERE k = 'ack_seq'", [ack as i64])?;
+            tx.execute(
+                "UPDATE outbox SET acked_at = ?1 WHERE seq > ?2 AND seq <= ?3",
+                params![now, current as i64, ack as i64],
+            )?;
+            tx.commit()?;
+            outcome
+        };
+        self.prune(now)?;
         Ok(outcome)
     }
 
-    /// seq > `after` 的未确认条目，按 seq 升序，最多 `limit` 条。
+    /// 删掉超过保留期的已确认条目；总量超限时再从最旧的已确认条目删起。未确认的条目永远不删。
+    pub fn prune(&self, now: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM outbox WHERE acked_at IS NOT NULL AND acked_at < ?1", [now - self.retain_ms])?;
+        let mut last = self.last_size_prune.lock().unwrap();
+        if now.saturating_sub(*last) < SIZE_PRUNE_EVERY_MS {
+            return Ok(());
+        }
+        *last = now;
+        let total: i64 = conn.query_row("SELECT coalesce(sum(length(item)), 0) FROM outbox", [], |r| r.get(0))?;
+        let mut excess = total - self.retain_bytes as i64;
+        if excess <= 0 {
+            return Ok(());
+        }
+        let mut cut = None;
+        {
+            let mut stmt =
+                conn.prepare("SELECT seq, length(item) FROM outbox WHERE acked_at IS NOT NULL ORDER BY seq")?;
+            let mut rows = stmt.query([])?;
+            while let Some(r) = rows.next()? {
+                cut = Some(r.get::<_, i64>(0)?);
+                excess -= r.get::<_, i64>(1)?;
+                if excess <= 0 {
+                    break;
+                }
+            }
+        }
+        if let Some(seq) = cut {
+            conn.execute("DELETE FROM outbox WHERE acked_at IS NOT NULL AND seq <= ?1", [seq])?;
+        }
+        Ok(())
+    }
+
+    /// seq > `after` 的条目（含仍保留的已确认条目），按 seq 升序，最多 `limit` 条。
     pub fn pending(&self, after: u64, limit: usize) -> Result<Vec<Row>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt =
@@ -123,6 +199,35 @@ impl Outbox {
             Ok(Row { seq: seq as u64, kind: Kind::parse(&kind)?, item: serde_json::from_str(&item)? })
         })
         .collect()
+    }
+
+    /// 仍保留的最小 seq。
+    pub fn first_seq(&self) -> Result<Option<u64>> {
+        let conn = self.conn.lock().unwrap();
+        let v: Option<i64> = conn.query_row("SELECT min(seq) FROM outbox", [], |r| r.get(0))?;
+        Ok(v.map(|v| v as u64))
+    }
+
+    /// 未确认条目的总字节数。
+    pub fn unacked_bytes(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let v: i64 =
+            conn.query_row("SELECT coalesce(sum(length(item)), 0) FROM outbox WHERE acked_at IS NULL", [], |r| {
+                r.get(0)
+            })?;
+        Ok(v as u64)
+    }
+
+    /// 某个租约下所有 usage 的 cost_milli 之和。重启后用它恢复租约已用额度。
+    pub fn usage_cost_for_lease(&self, lease_id: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let v: i64 = conn.query_row(
+            "SELECT coalesce(sum(json_extract(item, '$.cost_milli')), 0) FROM outbox
+             WHERE kind = 'usage' AND json_extract(item, '$.lease_id') = ?1",
+            [lease_id],
+            |r| r.get(0),
+        )?;
+        Ok(v)
     }
 
     pub fn last_seq(&self) -> u64 {
@@ -144,6 +249,10 @@ fn meta(conn: &Connection, k: &str) -> Result<u64> {
     Ok(v.context("outbox meta missing")? as u64)
 }
 
+pub fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +261,10 @@ mod tests {
 
     fn ev(n: u64) -> Value {
         json!({"session_id": "ses_1", "kind": "user_message", "at": "2026-11-19T08:00:00Z", "payload": {"n": n}})
+    }
+
+    fn seqs(ob: &Outbox, after: u64) -> Vec<u64> {
+        ob.pending(after, 100).unwrap().iter().map(|r| r.seq).collect()
     }
 
     #[test]
@@ -169,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn seq_continues_after_restart_and_prune() {
+    fn seq_continues_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("o.sqlite");
         {
@@ -177,9 +290,10 @@ mod tests {
             for i in 0..3 {
                 ob.append(Kind::Events, ev(i)).unwrap();
             }
-            // 全部确认后表为空，seq 仍须从 meta 继续。
             assert_eq!(ob.ack(3).unwrap(), AckOutcome::Advanced);
-            assert!(ob.pending(0, 10).unwrap().is_empty());
+            // 已确认的条目仍保留
+            assert_eq!(seqs(&ob, 0), [1, 2, 3]);
+            assert_eq!(seqs(&ob, 3), Vec::<u64>::new());
         }
         let ob = Outbox::open(&path).unwrap();
         assert_eq!(ob.last_seq(), 3);
@@ -188,18 +302,64 @@ mod tests {
     }
 
     #[test]
-    fn unacked_rows_survive_restart() {
+    fn acked_rows_are_kept_for_retention_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::open(&dir.path().join("o.sqlite")).unwrap();
+        for i in 0..5 {
+            ob.append(Kind::Events, ev(i)).unwrap();
+        }
+        let t0 = 1_000_000_000_000;
+        ob.ack_at(2, t0).unwrap();
+        ob.ack_at(4, t0 + 1000).unwrap();
+        ob.prune(t0 + RETAIN_MS - 1).unwrap();
+        assert_eq!(seqs(&ob, 0), [1, 2, 3, 4, 5]);
+        ob.prune(t0 + RETAIN_MS + 1).unwrap();
+        assert_eq!(seqs(&ob, 0), [3, 4, 5]);
+        ob.prune(t0 + RETAIN_MS + 1001).unwrap();
+        // 未确认的 5 永远不删
+        assert_eq!(seqs(&ob, 0), [5]);
+        assert_eq!(ob.first_seq().unwrap(), Some(5));
+    }
+
+    #[test]
+    fn size_cap_drops_oldest_acked_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "x".repeat(1000);
+        let ob = Outbox::open_with(&dir.path().join("o.sqlite"), RETAIN_MS, 3500).unwrap();
+        for _ in 0..5 {
+            ob.append(Kind::Events, json!({"p": big})).unwrap();
+        }
+        // 共约 5 KB，超出约 1.5 KB，要删 2 条最旧的已确认条目
+        ob.ack_at(3, 1_000).unwrap();
+        assert_eq!(seqs(&ob, 0), [3, 4, 5]);
+        // 未确认的条目即使超限也不删
+        let ob2 = Outbox::open_with(&dir.path().join("o2.sqlite"), RETAIN_MS, 10).unwrap();
+        ob2.append(Kind::Events, json!({"p": big})).unwrap();
+        ob2.prune(1_000).unwrap();
+        assert_eq!(seqs(&ob2, 0), [1]);
+        assert!(ob2.unacked_bytes().unwrap() > 1000);
+    }
+
+    #[test]
+    fn upgrades_first_batch_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("o.sqlite");
         {
-            let ob = Outbox::open(&path).unwrap();
-            for i in 0..5 {
-                ob.append(Kind::Events, ev(i)).unwrap();
-            }
-            ob.ack(2).unwrap();
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
+                 INSERT INTO meta VALUES ('last_seq', 2), ('ack_seq', 1);
+                 CREATE TABLE outbox (seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, item TEXT NOT NULL);
+                 INSERT INTO outbox VALUES (2, 'events', '{\"seq\":2}');",
+            )
+            .unwrap();
         }
         let ob = Outbox::open(&path).unwrap();
-        assert_eq!(ob.pending(0, 10).unwrap().iter().map(|r| r.seq).collect::<Vec<_>>(), [3, 4, 5]);
+        assert_eq!(seqs(&ob, 0), [2]);
+        ob.ack(2).unwrap();
+        assert_eq!(ob.append(Kind::Events, ev(3)).unwrap(), 3);
+        drop(ob);
+        Outbox::open(&path).unwrap();
     }
 
     #[test]
@@ -213,9 +373,9 @@ mod tests {
         assert_eq!(ob.ack(3).unwrap(), AckOutcome::Stale);
         assert_eq!(ob.ack(1).unwrap(), AckOutcome::Stale);
         assert_eq!(ob.ack_seq().unwrap(), 3);
-        assert_eq!(ob.pending(0, 10).unwrap().iter().map(|r| r.seq).collect::<Vec<_>>(), [4, 5]);
+        assert_eq!(seqs(&ob, 3), [4, 5]);
         assert_eq!(ob.ack(5).unwrap(), AckOutcome::Advanced);
-        assert!(ob.pending(0, 10).unwrap().is_empty());
+        assert_eq!(ob.unacked_bytes().unwrap(), 0);
     }
 
     #[test]
@@ -226,7 +386,20 @@ mod tests {
         assert_eq!(ob.ack(100).unwrap(), AckOutcome::Clamped);
         assert_eq!(ob.ack_seq().unwrap(), 1);
         assert_eq!(ob.append(Kind::Events, ev(2)).unwrap(), 2);
-        assert_eq!(ob.pending(0, 10).unwrap().len(), 1);
+        assert_eq!(seqs(&ob, 1), [2]);
+    }
+
+    #[test]
+    fn usage_cost_by_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::open(&dir.path().join("o.sqlite")).unwrap();
+        ob.append(Kind::Usage, json!({"lease_id": "l1", "cost_milli": 10})).unwrap();
+        ob.append(Kind::Usage, json!({"lease_id": "l2", "cost_milli": 99})).unwrap();
+        ob.append(Kind::Events, json!({"lease_id": "l1", "cost_milli": 1000})).unwrap();
+        ob.append(Kind::Usage, json!({"lease_id": "l1", "cost_milli": 5})).unwrap();
+        ob.ack(4).unwrap();
+        assert_eq!(ob.usage_cost_for_lease("l1").unwrap(), 15);
+        assert_eq!(ob.usage_cost_for_lease("nope").unwrap(), 0);
     }
 
     #[test]
