@@ -4,6 +4,9 @@ import type { WSContext } from 'hono/ws';
 import { ulid } from 'ulid';
 import { ApiError } from './api';
 import { deviceTtl } from './auth';
+import { initialLease, renewLease } from './billing';
+import { ackCursor, ingestUsage, usageItems } from './ingest';
+import { int } from './management';
 import { bearer, hash, iso, randomToken } from './credentials';
 import type { Presence } from './presence';
 import type { Device, Store } from './store';
@@ -79,8 +82,8 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
       },
       async onMessage(event) {
         if (!live()) return;
+        let msg: Record<string, unknown> | null = null;
         try {
-          let msg: Record<string, unknown> | null = null;
           if (typeof event.data === 'string') {
             try { msg = JSON.parse(event.data); } catch { /* Bad frame. */ }
           }
@@ -98,8 +101,9 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             clearTimeout(timer);
             state = 'ready';
             send({ type: 'welcome', re: msg.id, device_id: deviceId, user_id: userId, tenant_id: tenantId,
-              server_time: iso(now()), ack_seq: 0, heartbeat_ms: heartbeatMs });
+              server_time: iso(now()), ack_seq: ackCursor(store.tenant(tenantId), deviceId), heartbeat_ms: heartbeatMs });
             timer = setTimeout(tick, heartbeatMs);
+            if (msg.lease_id == null) send(await initialLease(store, tenantId, deviceId, userId, now(), live));
             return;
           }
           if (state === 'starting') { stop(1008, 'welcome pending'); return; }
@@ -122,13 +126,27 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             return;
           }
           if (msg.type === 'pong') return;
+          if (msg.type === 'lease_renew' && isText(msg.id)) {
+            if (!isText(msg.lease_id)) throw new ApiError('invalid', { fields: ['lease_id'] });
+            const opId = msg.op_id ?? msg.id;
+            if (!isText(opId)) throw new ApiError('invalid', { fields: ['op_id'] });
+            const used = int(msg.used_milli, 'used_milli');
+            send({ ...await renewLease(store, tenantId, deviceId, userId, now(), live, msg.lease_id, used, opId), re: msg.id });
+            return;
+          }
+          if (msg.type === 'usage' && isText(msg.id)) {
+            const ack_seq = await ingestUsage(store, tenantId, deviceId, now(), live, usageItems(msg.batch));
+            send({ type: 'events_ack', re: msg.id, ack_seq });
+            return;
+          }
           if (isText(msg.id)) {
             send({ type: 'ack', re: msg.id, ok: false, error: new ApiError('invalid', { fields: ['type'] }).body() });
           } else {
             stop(1008, 'invalid message');
           }
-        } catch {
-          if (live()) stop(1011, 'gateway unavailable');
+        } catch (error) {
+          if (error instanceof ApiError && msg && isText(msg.id)) send({ type: 'ack', re: msg.id, ok: false, error: error.body() });
+          else if (live()) stop(1011, 'gateway unavailable');
         }
       },
       onClose() {
