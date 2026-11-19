@@ -12,8 +12,8 @@ import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
 
 type DeviceReply = { device_id: string; device_token: string };
 
-const clean: (() => void)[] = [];
-afterEach(() => { for (const dispose of clean.splice(0).reverse()) dispose(); });
+const clean: (() => void | Promise<void>)[] = [];
+afterEach(async () => { for (const dispose of clean.splice(0).reverse()) await dispose(); });
 
 async function fixture(heartbeatMs = 15_000) {
   const dataDir = mkdtempSync(join(tmpdir(), 'onex-server-'));
@@ -56,6 +56,18 @@ async function fixture(heartbeatMs = 15_000) {
   const device = { name: 'Mac', os: 'darwin', arch: 'arm64', public_key: publicKey };
   return { ...service, ...seeded, owner, device, presence, request, code, login, select, advance: (ms: number) => { time += ms; }, now: () => time };
 }
+
+test('server shutdown drains accepted writes and can be awaited concurrently', async () => {
+  const f = await fixture();
+  const owner = await f.select(await f.login());
+  const edge = await linkedEdge(f, owner);
+  await edge.nextOf('cutoff');
+  const write = f.store.tenant(f.tenantId).write((sql) => sql.run("INSERT INTO groups (id, name) VALUES ('closing', 'persisted')"));
+  await Promise.all([f.close(), f.close()]);
+  expect(await write).toMatchObject({ changes: 1 });
+  await edge.closed;
+  expect(await f.presence.get(edge.device_id)).toBeNull();
+});
 
 test('health, OpenAPI, one-use codes, tenant selection and logout', async () => {
   const f = await fixture();
@@ -118,7 +130,7 @@ test('tenant management enforces scope, revisions, pagination, and one-time invi
   const scoped = await f.select(global);
   expect((await f.request('/members', undefined, global)).status).toBe(403);
   expect(await (await f.request('/me', undefined, scoped)).json()).toMatchObject({
-    actions: ['create_member', 'create_group', 'create_invite', 'update_contract'],
+    actions: ['create_member', 'create_group', 'create_invite', 'update_contract', 'assign_role:admin', 'assign_role:group_admin', 'assign_role:member'],
   });
   expect(await (await f.request('/members?role=member&status=disabled', undefined, scoped)).json()).toMatchObject({
     items: [], total: 0, actions: ['create_member'],
@@ -157,6 +169,19 @@ test('tenant management enforces scope, revisions, pagination, and one-time invi
   expect((await f.request('/contract', set, scoped, undefined, 'PUT')).status).toBe(409);
 });
 
+test('admin may manage ordinary members but cannot grant privileged roles', async () => {
+  const f = await fixture();
+  const owner = await f.select(await f.login());
+  const created = await (await f.request('/invites', { role: 'admin', max_uses: 1, expires_in_ms: 60_000 }, owner)).json() as { invite_code: string };
+  const target = 'manager@example.test';
+  const login = await f.request('/auth/login', { target, code: await f.code(target), invite_code: created.invite_code });
+  expect(login.status).toBe(200);
+  const admin = await f.select((await login.json() as { token: string }).token);
+  expect(await (await f.request('/me', undefined, admin)).json()).toMatchObject({ role: 'admin',
+    actions: ['create_member', 'create_group', 'create_invite', 'assign_role:member'] });
+  expect((await f.request('/invites', { role: 'admin', max_uses: 1, expires_in_ms: 60_000 }, admin)).status).toBe(403);
+});
+
 test('platform privileges are independent and provider secrets are never returned or stored in plaintext', async () => {
   const f = await fixture();
   const global = await f.login();
@@ -186,6 +211,14 @@ test('platform privileges are independent and provider secrets are never returne
   const rate = { model_id, effective_from: '2026-11-19T00:00:00Z', input_milli_per_mtok: 1, output_milli_per_mtok: 2, cache_read_milli_per_mtok: 0, cache_write_milli_per_mtok: 0 };
   expect((await f.request('/platform/rates', rate, global)).status).toBe(201);
   expect((await f.request('/platform/rates', rate, global)).status).toBe(409);
+  const other = await (await f.request('/platform/providers', { ...provider, name: 'Other' }, global)).json() as { id: string };
+  const otherModel = await (await f.request('/platform/models', { provider_id: other.id, upstream_name: 'other',
+    display_name: 'Other', context_window: 1024 }, global)).json() as { id: string };
+  expect((await f.request('/platform/rates', { ...rate, model_id: otherModel.id }, global)).status).toBe(201);
+  expect(await (await f.request(`/platform/models?provider_id=${id}&limit=1`, undefined, global)).json())
+    .toMatchObject({ total: 1, next_cursor: null, items: [{ id: model_id }] });
+  expect(await (await f.request(`/platform/rates?model_id=${model_id}&limit=1`, undefined, global)).json())
+    .toMatchObject({ total: 1, next_cursor: null, items: [{ model_id }] });
   expect((await f.request('/platform/agent-releases', { agent: 'claude-code', version: '1', os: 'darwin', arch: 'arm64', url: 'http://127.0.0.1/fake', sha256: 'a'.repeat(64), size: 1 }, global)).status).toBe(201);
   const tenant = { name: 'Second', owner_user_id: f.userId };
   const created = await f.request('/platform/tenants', tenant, global, 'tenant');
@@ -402,12 +435,13 @@ test('an offline lease is settled on return and late usage reconciles without a 
   expect(await b.next()).toMatchObject({ type: 'welcome' });
   b.send({ type: 'lease_renew', id: 'offline-renew', lease_id: lease.lease_id, used_milli: 3 });
   expect(await b.nextOf('lease')).toMatchObject({ type: 'lease', seq: 2 });
-  const usage = { request_id: 'req_1', lease_id: lease.lease_id, session_id: null, provider_id: 'prv_fake', model: 'fake',
+  const usage = { request_id: 'req_1', lease_id: lease.lease_id, session_id: null, provider_id: 'prv_fake', model: 'fake', model_id: 'mod_fake',
     input_tokens: 5, output_tokens: 2, cache_read_tokens: 0, cache_write_tokens: 0, at: new Date(f.now()).toISOString(), status: 'ok' };
   b.send({ type: 'usage', id: 'offline-batch', batch: [{ ...usage, seq: 1, complete: true, cost_milli: 3 },
     { ...usage, request_id: 'req_2', seq: 2, complete: false, cost_milli: 2 }] });
   expect(await b.next()).toMatchObject({ type: 'events_ack', ack_seq: 2 });
-  const rows = f.store.tenant(f.tenantId).all('SELECT cost_milli, settlement_status FROM usage ORDER BY seq');
-  expect(rows).toEqual([{ cost_milli: 3, settlement_status: 'reconciled' }, { cost_milli: 2, settlement_status: 'pending' }]);
+  const rows = f.store.tenant(f.tenantId).all('SELECT model, model_id, cost_milli, settlement_status FROM usage ORDER BY seq');
+  expect(rows).toEqual([{ model: 'fake', model_id: 'mod_fake', cost_milli: 3, settlement_status: 'reconciled' },
+    { model: 'fake', model_id: 'mod_fake', cost_milli: 2, settlement_status: 'pending' }]);
   expect(await (await f.request('/balance', undefined, scoped)).json()).toMatchObject({ month_used_milli: 3 });
 });

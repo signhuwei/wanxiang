@@ -57,7 +57,7 @@ function platformPaths(path: string, fields: Record<string, unknown>, required: 
   const input = { ...fields, ...additionalInput, revision };
   const item = write(object(input, ['revision']), result, 'update', true);
   return {
-    [path]: { get: listOf(result), post: { ...write({ oneOf: [{ ...object(input, required), not: { required: ['id'] } }, object(input, ['id', 'revision'])] }, result, 'upsert'),
+    [path]: { get: listOf(result, path.endsWith('/models') ? [{ name: 'provider_id', in: 'query', schema: text }] : []), post: { ...write({ oneOf: [{ ...object(input, required), not: { required: ['id'] } }, object(input, ['id', 'revision'])] }, result, 'upsert'),
       description: '新建时不传 id；更新已有对象时传 id 和 revision。' } },
     [`${path}/{id}`]: { post: item, patch: item },
   };
@@ -111,7 +111,7 @@ export const openapi = {
     ...platformPaths('/v1/platform/providers', providers, ['name', 'protocol', 'base_url', 'secret'], { secret: { ...text, writeOnly: true } }),
     ...platformPaths('/v1/platform/models', models, ['provider_id', 'upstream_name', 'display_name', 'context_window']),
     ...platformPaths('/v1/platform/agent-releases', releases, ['agent', 'version', 'os', 'arch', 'url', 'sha256', 'size']),
-    '/v1/platform/rates': { get: listOf(managed(rates)), post: write(object({ ...rates, revision }, Object.keys(rates)), managed(rates), 'upsert') },
+    '/v1/platform/rates': { get: listOf(managed(rates), [{ name: 'model_id', in: 'query', schema: text }]), post: write(object({ ...rates, revision }, Object.keys(rates)), managed(rates), 'upsert') },
     '/v1/edge/ws': { get: { summary: 'Edge WebSocket 握手', description: '升级后先发送 hello，收到 welcome 后进行 ping/pong。',
       security: [{ DeviceToken: [] }], parameters: [
         { name: 'OneX-Edge-Version', in: 'header', required: true, schema: text },

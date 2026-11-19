@@ -26,6 +26,11 @@ try {
     heartbeatMs: 15_000, commit: env.ONEX_COMMIT ?? 'unknown', codeSecret, masterKey, presence,
     deliverCode: dev ? (target, code) => console.info(`[onex-dev] login code for ${target}: ${code}`) : undefined,
   });
+  const shutdown = () => {
+    void app.close().catch((error) => { console.error('OneX shutdown failed', error); process.exitCode = 1; });
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
   console.info(`OneX Server listening on ${app.server.url}`);
 } catch (error) {
   presence.close();

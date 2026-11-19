@@ -9,6 +9,7 @@ import { billingRoutes } from './billing';
 import { edgeGateway } from './edge';
 import { configPublisher } from './edge-config';
 import { openapi } from './openapi';
+import { PendingWork } from './pending';
 import { platformRoutes } from './platform-management';
 import { tenantRoutes } from './tenant-management';
 import type { Presence } from './presence';
@@ -48,22 +49,33 @@ export async function createServer(opts: Options) {
     app.notFound((c) => c.json({ error: new ApiError('not_found').body() }, 404));
     app.get('/v1/healthz', (c) => c.json({ status: 'ok', version: pkg.version, commit: opts.commit }));
     app.get('/v1/openapi.json', (c) => c.json(openapi));
+    const pending = new PendingWork();
     const config = configPublisher(store, now, opts.masterKey);
-    const management = { ...opts, now, onConfigChange: config.changed };
+    const management = { ...opts, now, onConfigChange: (id?: string) => { void pending.track(config.changed(id)); } };
     authRoutes(app, store, management);
     tenantRoutes(app, store, management);
     platformRoutes(app, store, management);
     billingRoutes(app, store, management);
-    edgeGateway(app, store, opts.presence, now, opts.heartbeatMs, config);
+    const closeSockets = edgeGateway(app, store, opts.presence, now, opts.heartbeatMs, config, pending);
+    let shuttingDown = false;
     const server = Bun.serve({ hostname: opts.hostname, port: opts.port,
-      fetch: app.fetch, websocket: { ...websocket, maxPayloadLength: 64 * 1024, idleTimeout: 0, sendPings: false },
+      fetch: (request, server) => shuttingDown ? new Response(null, { status: 503 }) : pending.track(Promise.resolve(app.fetch(request, server))),
+      websocket: { ...websocket, maxPayloadLength: 64 * 1024, idleTimeout: 0, sendPings: false },
     });
+    let closing: Promise<void> | undefined;
     return {
       server, store,
       close() {
-        void server.stop(true);
-        opts.presence.close?.();
-        store.close();
+        return closing ??= (async () => {
+          shuttingDown = true;
+          // Bun 1.3.5 can retain the WS count after a server-initiated close.
+          void server.stop().catch(() => {});
+          await closeSockets();
+          await pending.drain();
+          await store.drain();
+          opts.presence.close?.();
+          store.close();
+        })();
       },
     };
   } catch (error) {

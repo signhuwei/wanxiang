@@ -15,6 +15,7 @@ export class QueuedDatabase implements Reader {
   private readonly tx: Transaction;
   private jobs: Job[] = [];
   private timer?: ReturnType<typeof setTimeout>;
+  private readonly drained = new Set<() => void>();
 
   constructor(file: string, kind: 'system' | 'tenant', private readonly idle: () => void = () => {}) {
     this.db = new Database(file, { create: true, strict: true });
@@ -49,6 +50,7 @@ export class QueuedDatabase implements Reader {
   get<T>(sql: string, params?: Params) { return this.tx.get<T>(sql, params); }
   all<T>(sql: string, params?: Params) { return this.tx.all<T>(sql, params); }
   get busy() { return this.jobs.length !== 0; }
+  drain() { return this.busy ? new Promise<void>((resolve) => this.drained.add(resolve)) : Promise.resolve(); }
 
   write<T>(execute: (sql: Transaction) => T extends PromiseLike<unknown> ? never : T): Promise<T> {
     return new Promise<T>((resolve, reject) => {
@@ -75,6 +77,8 @@ export class QueuedDatabase implements Reader {
     } catch (error) {
       for (const job of batch) job.reject(error);
     } finally {
+      for (const resolve of this.drained) resolve();
+      this.drained.clear();
       this.idle();
     }
   }
@@ -196,6 +200,12 @@ export class Store {
     return this.lookup('device_directory', 'token_hash', hash,
       (id) => this.tenant(id).get<Device>('SELECT id, user_id, token_hash, token_expires_at, status FROM devices WHERE token_hash = ?', [hash]),
       indexDevice);
+  }
+
+  async drain() {
+    while (this.system.busy || [...this.tenants.values()].some((db) => db.busy)) {
+      await Promise.all([this.system, ...this.tenants.values()].map((db) => db.drain()));
+    }
   }
 
   close() {

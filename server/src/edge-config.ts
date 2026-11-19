@@ -86,7 +86,9 @@ export function configPublisher(store: Store, now: () => number, masterKey?: Uin
   return {
     connect(device: string, sub: Subscription) { online.set(device, sub); return send(device, sub); },
     disconnect(device: string, sub: Subscription) { if (online.get(device) === sub) online.delete(device); },
-    changed(tenant?: string) { for (const [device, sub] of online) if (!tenant || sub.tenant === tenant) void send(device, sub); },
+    async changed(tenant?: string) {
+      await Promise.all([...online].filter(([, sub]) => !tenant || sub.tenant === tenant).map(([device, sub]) => send(device, sub)));
+    },
   };
 }
 
