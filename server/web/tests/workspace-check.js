@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { chromium } from 'playwright'
+import { checkLiveObservation } from './observe-live.js'
 import { createServer } from '../../src/server.ts'
 import { seedTenant } from '../../src/seed.ts'
 import { MemoryPresence } from '../../src/presence.ts'
@@ -16,7 +17,7 @@ const app = await createServer({ dataDir: dir, hostname: '127.0.0.1', port: 0, h
   deliverCode: (_, value) => { code = value } })
 const browser = await chromium.launch({ channel: 'chrome', args: ['--disable-gpu'] })
 try {
-  await seedTenant(app.store, { target, name: '联调租户', platformAdmin: true })
+  const seed = await seedTenant(app.store, { target, name: '联调租户', platformAdmin: true })
   const page = await browser.newPage({ baseURL:app.server.url.href, viewport: { width: 1280, height: 720 } })
   page.setDefaultTimeout(3500)
   const shots = process.argv[2]
@@ -34,10 +35,7 @@ try {
   page.on('pageerror', e => errors.push(e.message))
   await page.route('**/*', async route => {
     const path = new URL(route.request().url()).pathname
-    if (path.startsWith('/v1/')) {
-      const res = await route.fetch()
-      return route.fulfill({ response: res })
-    }
+    if (path.startsWith('/v1/')) return route.continue()
     const file = Bun.file(new URL('..' + (path === '/' ? '/index.html' : path), import.meta.url))
     return route.fulfill({ status: await file.exists() ? 200 : 404, contentType: file.type, body: await file.exists() ? await file.text() : '' })
   })
@@ -151,10 +149,11 @@ try {
   assert.equal(await page.locator('output[data-field=group_admin_summary]').innerText(),'不可见')
   assert.equal(await button('编辑').count(),0)
   assert.equal(await field('admin_content').count(),0)
+  await checkLiveObservation({app,seed,page,target,capture})
   assert.deepEqual(errors, [])
   console.log('真实 Server：登录、成员筛选、分组、邀请码、平台目录、倍率、租户合约和充值通过')
 } finally {
   await browser.close()
-  app.close()
+  await app.close()
   await rm(dir, { recursive: true, force: true })
 }

@@ -1,7 +1,6 @@
 import { createLedger } from './ledger.js'
 import { detailPanel, el, button } from './panel.js'
 import { formatMilli, formatDateTime } from './format.js'
-import { observationFixture } from './mock/observation.js'
 
 export async function readStream(body, receive) {
   const reader=body.pipeThrough(new TextDecoderStream()).getReader()
@@ -22,35 +21,40 @@ export async function readStream(body, receive) {
   } finally {reader.releaseLock()}
 }
 const names={user_message:'用户',assistant_message:'助手',tool_call:'工具调用',tool_result:'工具结果',session_start:'会话开始',session_end:'会话结束',gap:'采集缺口'}
-export async function observePage(host,api,session,signal,mockOnly=false) {
+function usageText(s) {
+  return `输入 ${s.input_tokens} · 输出 ${s.output_tokens} · 缓存读取 ${s.cache_read_tokens} · 缓存写入 ${s.cache_write_tokens} token · ${formatMilli(s.cost_milli)} 橡皮` +
+    (s.pending_usage_count ? ` · ${s.pending_usage_count} 笔待结算` : '')
+}
+export async function observePage(host,api,session,signal) {
   host.classList.add('page')
   const status=el('div','observe-status'), peopleHost=el('div','page'); host.append(status,peopleHost)
-  let source=api, fixture, first, sessions, reading, timer
-  try {
-    if (mockOnly) throw Object.assign(Error(),{status:404})
-    first=await api.get('/observe/people',{params:{limit:50},signal})
-  } catch(e) {
-    if(signal.aborted) return
-    if(e.status!==404) {status.textContent=e.message;return}
-    fixture=source=observationFixture()
-  }
+  let first, sessions, reading, timer
+  try { first=await api.get('/observe/people',{params:{limit:50},signal}) }
+  catch(e) {if(!signal.aborted)status.textContent=e.message;return}
   if(signal.aborted) return
-  const live=el('span', 'muted'); if(fixture) status.append(el('span','mock-badge','监察：假数据'))
+  const live=el('span','muted')
   status.append(live)
   const openPerson=detailPanel(peopleHost,()=>people)
   const people=createLedger(peopleHost,{title:'监察人员',rowKey:'user_id',columns:[{key:'name',title:'人员'},{key:'session_count',title:'会话数'},
     {key:'cost_milli',title:'橡皮',render:p=>formatMilli(p.cost_milli)},{key:'last_active_at',title:'最近活动',render:p=>formatDateTime(p.last_active_at)}],
-    fetchPage:({q,cursor,limit})=>{if(first&&!q&&!cursor){const data=first;first=null;return data}return source.get('/observe/people',{params:{q,cursor,limit},signal})},
+    fetchPage:({q,cursor,limit})=>{if(first&&!q&&!cursor){const data=first;first=null;return data}return api.get('/observe/people',{params:{q,cursor,limit},signal})},
     onOpen:p=>openPerson(p.name,pane=>{
       pane.body.classList.add('child-ledger'); reading=null
       let list
       const open=detailPanel(pane.body,()=>list)
       sessions={host:pane.body,list:list=createLedger(pane.body,{title:'会话',rowKey:'id',columns:[{key:'agent',title:'Agent'},{key:'model',title:'模型'},
         {key:'input_tokens',title:'输入 token'},{key:'output_tokens',title:'输出 token'},{key:'cost_milli',title:'橡皮',render:s=>formatMilli(s.cost_milli)}],
-        fetchPage:({q,cursor,limit})=>source.get('/observe/sessions',{params:{user_id:p.user_id,q,cursor,limit},signal}),
+        fetchPage:async ({q,cursor,limit,signal:listSignal})=>{
+          const data=await api.get('/observe/sessions',{params:{user_id:p.user_id,q,cursor,limit},signal:listSignal})
+          if (!listSignal.aborted && reading?.node.isConnected) {
+            const row=data.items.find(s=>s.id===reading.id)
+            if (row) reading.summary.textContent=usageText(row)
+          }
+          return data
+        },
         onOpen:s=>open(s.agent+' / '+s.model,view=>{
           const node=view.body;node.classList.add('conversation')
-          const summary=el('div','muted',`输入 ${s.input_tokens ?? '—'} · 输出 ${s.output_tokens ?? '—'} token · ${formatMilli(s.cost_milli)} 橡皮`)
+          const summary=el('div','muted',usageText(s))
           node.append(summary)
           let seq=0,loading=false,pending=false
           const more=button('读取更多',()=>load());view.foot.append(more)
@@ -59,7 +63,7 @@ export async function observePage(host,api,session,signal,mockOnly=false) {
             if(loading){pending=true;return}
             loading=true;more.disabled=true
             try {
-              const data=await source.get('/observe/sessions/'+encodeURIComponent(s.id)+'/events',{params:{after_seq:seq,limit:50},signal})
+              const data=await api.get('/observe/sessions/'+encodeURIComponent(s.id)+'/events',{params:{after_seq:seq,limit:50},signal})
               if(!node.isConnected||signal.aborted)return
               for(const e of data.items) {
                 if(e.seq<=seq)continue
@@ -73,19 +77,19 @@ export async function observePage(host,api,session,signal,mockOnly=false) {
               more.hidden=!data.next_cursor && data.items.length<50
             } catch(e){if(!signal.aborted){live.textContent=e.message;more.hidden=false}} finally {loading=false;more.disabled=false;if(pending){pending=false;load()}}
           }
-          reading={id:s.id,node,load};load()
+          reading={id:s.id,node,load,summary};load()
         })})}
     })})
   function refresh(summary) {
     if(reading?.node.isConnected && (!summary.session_id || summary.session_id===reading.id)) reading.load()
-    clearTimeout(timer);timer=setTimeout(()=>{if(!signal.aborted){people.reload();if(sessions?.host.isConnected)sessions.list.reload()}},200)
+    if (!timer) timer=setTimeout(()=>{timer=null;if(!signal.aborted){people.reload();if(sessions?.host.isConnected)sessions.list.reload()}},200)
   }
   let retry
   async function connect() {
     try {
-      const res=fixture ? fixture.stream(signal) : await fetch('/v1/observe/stream',{headers:{Authorization:'Bearer '+session.token,Accept:'text/event-stream'},signal})
+      const res=await fetch('/v1/observe/stream',{headers:{Authorization:'Bearer '+session.token,Accept:'text/event-stream'},signal})
       if(!res.ok || !res.headers.get('content-type')?.includes('text/event-stream')) throw Error('实时订阅不可用')
-      live.textContent='实时更新已连接'; await readStream(res.body, refresh)
+      live.textContent='实时更新已连接'; refresh({}); await readStream(res.body, refresh)
     } catch { /* 页面离开时一并取消 */ }
     if(!signal.aborted){live.textContent='实时更新已断开，稍后重连';retry=setTimeout(()=>{refresh({});connect()},3000)}
   }

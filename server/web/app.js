@@ -172,7 +172,7 @@ function route() {
     }
     if (hash === '#/tenant/groups') groupsPage(ws, api, session.actions || [])
     else if (hash === '#/tenant/devices') devicesPage(ws, api, lifecycle.signal, mockOn)
-    else if (hash === '#/tenant/observe') observePage(ws, api, session, lifecycle.signal, mockOn)
+    else if (hash === '#/tenant/observe') observePage(ws, api, session, lifecycle.signal)
     else if (hash === '#/tenant/billing') billingPage(ws, api, platformApi, session)
     else if (hash === '#/tenant/contract') contractPage(ws, api)
     else renderMembersPage(ws, { api, actions: session.actions || [] })
