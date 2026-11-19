@@ -20,7 +20,42 @@ export async function readStream(body, receive) {
     }
   } finally {reader.releaseLock()}
 }
-const names={user_message:'用户',assistant_message:'助手',tool_call:'工具调用',tool_result:'工具结果',session_start:'会话开始',session_end:'会话结束',gap:'采集缺口'}
+const names={user_message:'用户',assistant_message:'助手',tool_call:'工具调用',tool_result:'工具结果',session_start:'会话开始',session_end:'会话结束',gap:'采集缺口',compact:'上下文摘要'}
+const agentName = agent => agent === 'claude-code' ? 'Claude Code' : agent || '未知 Agent'
+function contentText(value) {
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) return value.map(contentText).filter(Boolean).join('\n')
+  if (value?.type === 'text' && typeof value.text === 'string') return value.text
+  if (value?.type === 'image') return `[图片 · ${value.media_type || '未知格式'}${Number.isInteger(value.bytes) ? ` · ${value.bytes} 字节` : ''}]`
+  return ''
+}
+export function eventText(e) {
+  const p=e.payload || {}
+  switch(e.kind) {
+    case 'session_start': return `${[agentName(p.agent),p.agent_version].filter(Boolean).join(' ')} · 模型 ${p.model || '未知'} · 开始于 ${formatDateTime(e.at)}`
+    case 'user_message': case 'assistant_message': return contentText(p.content) || '无可展示的正文'
+    case 'tool_call': return p.tool || '未命名工具'
+    case 'tool_result': return (contentText(p.output) || '无可展示的输出') + (p.truncated ? '\n（结果已截断）' : '')
+    case 'compact': return contentText(p.summary) || '无摘要'
+    case 'session_end': return p.reason || '会话已结束'
+    case 'gap': return `${p.reason || '内容缺失'} · 偏移 ${p.offset ?? '未知'}`
+    default: return '不支持展示此事件'
+  }
+}
+function eventRow(e) {
+  const row=el('article',e.kind==='gap'?'message gap':e.kind==='user_message'?'message user-message':'message')
+  if(e.kind==='session_start') { row.append(el('span',null,eventText(e))); return row }
+  row.append(el('strong',null,names[e.kind] || '其他事件'),el('small',null,' · '+formatDateTime(e.at)),el('pre',null,eventText(e)))
+  if(e.kind==='tool_call' && e.payload?.input != null) {
+    const details=el('details');details.append(el('summary',null,'查看工具输入'),el('pre',null,JSON.stringify(e.payload.input,null,2)));row.append(details)
+  }
+  return row
+}
+function compactCell(title,stats) {
+  const cell=el('div','observe-identity');cell.append(el('span',null,title),el('small','observe-stats',stats));return cell
+}
+const monthCost=p=>p.month_cost_milli == null ? '未提供' : formatMilli(p.month_cost_milli)+' 橡皮'
+const turns=s=>s.turn_count == null ? '轮数未提供' : s.turn_count+' 轮'
 function usageText(s) {
   return `输入 ${s.input_tokens} · 输出 ${s.output_tokens} · 缓存读取 ${s.cache_read_tokens} · 缓存写入 ${s.cache_write_tokens} token · ${formatMilli(s.cost_milli)} 橡皮` +
     (s.pending_usage_count ? ` · ${s.pending_usage_count} 笔待结算` : '')
@@ -35,15 +70,15 @@ export async function observePage(host,api,session,signal) {
   const live=el('span','muted')
   status.append(live)
   const openPerson=detailPanel(peopleHost,()=>people)
-  const people=createLedger(peopleHost,{title:'监察人员',rowKey:'user_id',columns:[{key:'name',title:'人员'},{key:'session_count',title:'会话数'},
-    {key:'cost_milli',title:'橡皮',render:p=>formatMilli(p.cost_milli)},{key:'last_active_at',title:'最近活动',render:p=>formatDateTime(p.last_active_at)}],
+  const people=createLedger(peopleHost,{title:'监察人员',rowKey:'user_id',columns:[{key:'name',title:'人员',render:p=>compactCell(p.name+' · '+formatDateTime(p.last_active_at),`${p.session_count} 个会话 · 本月 ${monthCost(p)}`)},{key:'session_count',title:'会话数'},
+    {key:'month_cost_milli',title:'本月费用',render:monthCost},{key:'last_active_at',title:'最近活动',render:p=>formatDateTime(p.last_active_at)}],
     fetchPage:({q,cursor,limit})=>{if(first&&!q&&!cursor){const data=first;first=null;return data}return api.get('/observe/people',{params:{q,cursor,limit},signal})},
     onOpen:p=>openPerson(p.name,pane=>{
       pane.body.classList.add('child-ledger'); reading=null
       let list
       const open=detailPanel(pane.body,()=>list)
-      sessions={host:pane.body,list:list=createLedger(pane.body,{title:'会话',rowKey:'id',columns:[{key:'agent',title:'Agent'},{key:'model',title:'模型'},
-        {key:'input_tokens',title:'输入 token'},{key:'output_tokens',title:'输出 token'},{key:'cost_milli',title:'橡皮',render:s=>formatMilli(s.cost_milli)}],
+      sessions={host:pane.body,list:list=createLedger(pane.body,{title:'会话',rowKey:'id',columns:[{key:'agent',title:'会话',render:s=>compactCell(agentName(s.agent)+' · '+formatDateTime(s.started_at),`${turns(s)} · ${formatMilli(s.cost_milli)} 橡皮`)},{key:'model',title:'模型'},
+        {key:'started_at',title:'开始时间 ↓',render:s=>formatDateTime(s.started_at)},{key:'turn_count',title:'轮数',render:turns},{key:'input_tokens',title:'输入 token'},{key:'output_tokens',title:'输出 token'},{key:'cost_milli',title:'橡皮',render:s=>formatMilli(s.cost_milli)}],
         fetchPage:async ({q,cursor,limit,signal:listSignal})=>{
           const data=await api.get('/observe/sessions',{params:{user_id:p.user_id,q,cursor,limit},signal:listSignal})
           if (!listSignal.aborted && reading?.node.isConnected) {
@@ -68,11 +103,7 @@ export async function observePage(host,api,session,signal) {
               for(const e of data.items) {
                 if(e.seq<=seq)continue
                 seq=e.seq
-                const row=el('article',e.kind==='gap'?'message gap':e.kind==='user_message'?'message user-message':'message')
-                const payload=e.payload||{}
-                row.append(el('strong',null,names[e.kind]||e.kind),el('small',null,' · '+formatDateTime(e.at)),el('pre',null,
-                  e.kind==='gap' ? `${payload.reason || '内容缺失'} · 偏移 ${payload.offset ?? '未知'}` : typeof payload.content==='string' ? payload.content : JSON.stringify(payload,null,2)))
-                node.append(row)
+                node.append(eventRow(e))
               }
               more.hidden=!data.next_cursor && data.items.length<50
             } catch(e){if(!signal.aborted){live.textContent=e.message;more.hidden=false}} finally {loading=false;more.disabled=false;if(pending){pending=false;load()}}

@@ -44,6 +44,13 @@ export async function checkLiveObservation({app, seed, page, target, capture}) {
     await page.locator('.conversation').getByText(/缓存读取 11.*缓存写入 13.*0\.042 橡皮.*待结算/).waitFor()
     assert.equal(await message.count(),1)
     assert(db.get("SELECT count(*) AS n FROM audit WHERE action='observe.events.read' AND target=? AND actor!=?",[session,userId]).n>0)
+    await page.locator('.conversation').getByText(/Claude Code · 模型 integration-model · 开始于/).waitFor()
+    send({type:'events',id:'tool',batch:[event(5,'tool_call',{tool:'Read',tool_call_id:'test-tool',input:{file:'example.txt'}})]})
+    const toggle=page.getByText('查看工具输入',{exact:true})
+    await toggle.waitFor()
+    const input=page.locator('.conversation details pre')
+    assert.equal(await input.isVisible(),false)
+    await toggle.click();assert((await input.innerText()).includes('example.txt'));await toggle.click()
     await capture('observe-real')
   } finally {ws.close()}
 }
