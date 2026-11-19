@@ -72,6 +72,8 @@ pub struct State {
     /// 默认只在内存里；daemon 启动时换成落盘的。
     pub lease: Arc<Ledger>,
     pub upstream: Mutex<Upstream>,
+    /// 当前受管 Agent 的会话，router 把 usage 记到它名下
+    pub active_session: RwLock<Option<String>>,
 }
 
 impl Default for State {
@@ -84,6 +86,7 @@ impl Default for State {
             secrets: Default::default(),
             lease: Default::default(),
             upstream: Default::default(),
+            active_session: Default::default(),
         }
     }
 }
