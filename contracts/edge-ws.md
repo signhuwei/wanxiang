@@ -34,7 +34,7 @@ Server 回 `welcome`：
 | type | 字段 | 作用 |
 | --- | --- | --- |
 | `config` | `revision`、`routes[]`、`agents[]`、`rates[]` | 全量配置。Edge 原子替换，回 ack；revision 不大于当前值时忽略。route 字段：`model`（精确名、`前缀*` 或 `*`，按精确、最长前缀、`*` 的顺序匹配）、`model_id`（对应 rates）、`provider_id`、`protocol`、`base_url`、`upstream_model?`、`auth`（`x_api_key` 或 `bearer`）、`proxy?`（见下方“网络代理”） |
-| `secret` | `provider_id`、`ciphertext`、`nonce`、`key_id` | 加密的上游密钥。用设备注册时交换的 X25519 公钥加密（XChaCha20-Poly1305），只在内存解密 |
+| `secret` | `provider_id`、`ciphertext`、`nonce`、`key_id` | 加密的上游密钥，只在内存解密。算法见下方“密钥下发” |
 | `lease` | `lease_id`、`expires_at`、`budget_milli`、`seq` | 额度租约。Edge 在 `expires_at` 前或已用 80% 时发 `lease_renew` |
 | `cutoff` | `reason`（`balance`、`disabled`、`contract`） | 立即断流：拒绝新请求，中断进行中的流 |
 | `diag` | `diag_id`、`kind`（`logs`、`status`）、`upload_url` | 诊断指令。`logs` 打包日志上传到 `upload_url`（预签名 PUT）；`status` 直接回 `diag_result` |
@@ -45,8 +45,8 @@ Server 回 `welcome`：
 | type | 字段 | 作用 |
 | --- | --- | --- |
 | `events` | `batch[]`：`{seq, session_id, kind, at, payload}` | 会话事件回流。`seq` 每台设备单调递增、无空洞。Server 持久化后回 `events_ack{ack_seq}` |
-| `usage` | `batch[]`：`{seq, request_id, session_id, lease_id, provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_milli, at, status, complete}` | 用量计量。与 events 共用 seq 空间。`status`：`ok`、`upstream_<HTTP 状态码>`、`upstream_error`、`client_cancelled`。`complete=false` 表示流中断、用量不全，cost 按已收到的部分计算，Server 记为待结算，不当作零 |
-| `lease_renew` | `lease_id`、`used_milli` | 续租。Server 结算已用额度，签发新租约或回 `cutoff` |
+| `usage` | `batch[]`：`{seq, request_id, session_id, lease_id, provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_milli, at, status, complete}` | 用量计量。与 events 共用 seq 空间。`status`：`ok`、`upstream_<HTTP 状态码>`、`upstream_error`、`client_cancelled`，以及 Edge 主动断流的 `lease_exhausted`、`lease_expired`、`cutoff`。条目带 `model_id`。`complete=false` 表示流中断、用量不全，cost 按已收到的部分计算，Server 记为待结算，不当作零 |
+| `lease_renew` | `lease_id`、`used_milli`、`op_id` | 续租。`used_milli` 是该租约从签发起累计的绝对值（不是增量），Server 据此幂等结算。签发新租约或回 `cutoff` |
 | `diag_result` | `diag_id`、`ok`、`detail` | 诊断结果 |
 | `agent_state` | `agent`、`session_id`、`state`（`started`、`exited`、`crashed`）、`exit_code` | Agent 生命周期 |
 
@@ -67,6 +67,14 @@ Server 回 `welcome`：
 - 事件带 `source_offset`（在会话文件中的字节偏移），读取游标、事件和 outbox 在一个本地事务里提交。
 - 读到坏行、未知类型、文件被替换或截短时，发一条 `kind: "gap"` 事件，payload 为 `{reason, offset}`，不能把缺口显示为完整。
 - thinking 内容、签名和凭据不回流。
+
+## 密钥下发（v0.7）
+
+- 设备注册时提交 32 字节 X25519 公钥（标准 base64）。没有公钥的设备不下发 secret。
+- 每条 `secret` 由 Server 新生成一对临时 X25519 密钥。`key_id` 是临时公钥（32 字节，标准 base64）。
+- 共享密钥经 HKDF-SHA256 派生：不加 salt，info 为 UTF-8 的 `onex-edge-secret-v1`，输出 32 字节。
+- 用 XChaCha20-Poly1305 加密，`nonce` 为 24 字节；AAD 为 UTF-8 的 `provider_id`；`ciphertext` 是密文后接 16 字节 tag。所有二进制字段都用标准 base64。
+- 只下发当前合约允许的模型所用的 Provider。
 
 ## 确认与保留
 

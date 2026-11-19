@@ -113,9 +113,19 @@ tmux -L onex attach -r -t onex     # 只读观看
 - 开发进程不调用真实模型；端到端测试用 `tests/e2e/` 的假上游。真实模型调用由总督协调，事先告知用户。
 - 不能确定的判断交给总督，总督汇总后提给用户裁决。
 
-## 7. 待用户裁决
+## 7. 用户裁决（2026-11-19）
 
-1. **模型分工**：上表是我的假设，你可以调整。
-2. **S1 是否包含 Desktop**：验收标准要求“装好并登录 OneX Desktop”，所以 S1 包含一个最小的 Tauri Desktop（登录、Agent 列表、启动按钮、托盘）。如果你希望 S1 先用命令行登录、把 Desktop 放到 S2，开发量会小不少。
-3. **S1 的开发部署环境**：Server 部署到哪台机器？SIMA 用的是 211。S1 的验收需要一台员工 Mac 能访问到的 Server。
-4. **S1 的真实上游**：用哪个 Provider 跑 2 小时验收？我建议用 OpenRouter 上的一个 Anthropic 模型，因为 Claude Code 原生走 Anthropic 协议，无需转换。
+| 问题 | 决定 |
+| --- | --- |
+| 依赖安装 | 用一致的安装脚本，本机（macOS）和 Ubuntu 服务器都能自安装（Valkey、RustFS、Bun 等），不依赖手工步骤 |
+| 分析员 | 两个调研完成后转为验收监督员 |
+| S1 范围 | 包括 Tauri Desktop |
+| 部署 | Server 部署在 `192.168.3.211`（Ubuntu 22.04），用户 root，本机证书直连 ssh，目录 `~/apps/onex` |
+| 真机验收上游 | local qwen：`http://192.168.3.212:11516/v1`，模型 `Qwen3.8-27B`，免 API Key，vLLM，只有 OpenAI 兼容接口 |
+| 模型分工 | Kimi K3 限流严重，原分给 K3 的 sima 和 web 改用 GPT-6.2 Astra |
+
+由此带来的计划变化：
+
+- **S1 需要 Anthropic → OpenAI Chat 协议转换。** local qwen 没有 `/v1/messages`（实测 404），Claude Code 只说 Anthropic 协议。原计划放在 S2 的转换提前到 S1，用 magpie 已写好的 `docs/specs/magpie/anthropic-to-chat-test-cases.md` 作为验收用例。
+- **211 的根分区已用 95%（剩 20 GB）。** OneX 的数据目录要设容量告警，日志按天滚动并限总量；回流数据量在 S1 实测后再定是否另挂磁盘。
+- 211 上已有 SIMA（`sima.service`）、端口 30000、18000 等服务在跑。OneX 用独立的 systemd 服务名 `onex-*` 和独立端口，不碰 SIMA。
