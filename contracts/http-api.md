@@ -18,7 +18,7 @@
 | POST | `/auth/login` | `{target, code, invite_code?, kind?}`，`kind` 为 `web`（默认）或 `desktop`。返回全局令牌 `{token, user, tenants[]}` |
 | POST | `/auth/select-tenant` | `{tenant_id, kind?}`，`kind` 不传时继承当前令牌。返回新的租户范围令牌 |
 | POST | `/auth/logout` | 204 |
-| GET | `/me` | `{user, tenant, role, agents}`；未选租户时 `tenant`、`role` 为 null |
+| GET | `/me` | `{user, tenant, role, agents, is_platform_admin}`；未选租户时 `tenant`、`role` 为 null |
 | POST | `/devices` | `{name, os, arch, public_key}`，201，返回 `{device_id, device_token}` |
 
 ## 写入与角色（v0.3）
