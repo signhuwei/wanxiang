@@ -1,6 +1,7 @@
 //! OneX Desktop 原生桥：Tauri 2 应用的业务逻辑，独立于 `tauri::Builder` 便于测试。
 pub mod bridge;
 mod profile;
+mod tray;
 
 use std::path::PathBuf;
 
@@ -43,6 +44,14 @@ fn socket_path() -> PathBuf {
     PathBuf::from(home).join("Library/Application Support/OneX").join(onex_core::ipc::SOCKET_NAME)
 }
 
+fn show_main(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -53,6 +62,9 @@ pub fn run() {
                 .on_navigation(local_page)
                 .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
                 .build()?;
+            if let Err(e) = tray::build(app.handle()) {
+                tracing::warn!(error = %e, "failed to create the tray icon");
+            }
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let bridge = handle.state::<Bridge>();
@@ -73,11 +85,8 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { has_visible_windows: false, .. } = event
-                && let Some(window) = app.get_webview_window("main")
-            {
-                let _ = window.show();
-                let _ = window.set_focus();
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_main(app);
             }
         });
 }
