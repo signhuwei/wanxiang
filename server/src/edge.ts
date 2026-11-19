@@ -8,6 +8,7 @@ import { initialLease, renewLease } from './billing';
 import { ackCursor, ingestUsage, usageItems } from './ingest';
 import { int } from './management';
 import { bearer, hash, iso, randomToken } from './credentials';
+import type { ConfigPublisher } from './edge-config';
 import type { Presence } from './presence';
 import type { Device, Store } from './store';
 
@@ -15,7 +16,7 @@ const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.
 const isText = (value: unknown, max = 128): value is string => typeof value === 'string' && value.length > 0 && value.length <= max;
 const isSeq = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
-export function edgeGateway(app: Hono, store: Store, presence: Presence, now: () => number, heartbeatMs: number) {
+export function edgeGateway(app: Hono, store: Store, presence: Presence, now: () => number, heartbeatMs: number, config: ConfigPublisher) {
   const current = new Map<string, WSContext>();
   const ttl = heartbeatMs * 4;
   const activeTenant = (id: string) => store.system.get("SELECT 1 FROM tenants WHERE id = ? AND status = 'active'", [id]);
@@ -47,6 +48,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
 
     const live = () => state !== 'closed' && current.get(deviceId) === socket;
     const send = (msg: Record<string, unknown>) => { if (live()) socket.send(JSON.stringify(msg)); };
+    const subscription = { tenant: tenantId, live, send };
     const stop = (code: number, reason: string) => {
       state = 'closed';
       clearTimeout(timer);
@@ -104,6 +106,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
               server_time: iso(now()), ack_seq: ackCursor(store.tenant(tenantId), deviceId), heartbeat_ms: heartbeatMs });
             timer = setTimeout(tick, heartbeatMs);
             if (msg.lease_id == null) send(await initialLease(store, tenantId, deviceId, userId, now(), live));
+            if (live()) await config.connect(deviceId, subscription);
             return;
           }
           if (state === 'starting') { stop(1008, 'welcome pending'); return; }
@@ -125,7 +128,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             } finally { heartbeatBusy = false; }
             return;
           }
-          if (msg.type === 'pong') return;
+          if (msg.type === 'pong' || (msg.type === 'ack' && isText(msg.re) && typeof msg.ok === 'boolean')) return;
           if (msg.type === 'lease_renew' && isText(msg.id)) {
             if (!isText(msg.lease_id)) throw new ApiError('invalid', { fields: ['lease_id'] });
             const opId = msg.op_id ?? msg.id;
@@ -151,6 +154,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
       },
       onClose() {
         state = 'closed';
+        config.disconnect(deviceId, subscription);
         clearTimeout(timer);
         if (current.get(deviceId) === socket) current.delete(deviceId);
         void presence.release(deviceId, connectionId).catch(() => {});

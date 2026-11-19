@@ -7,6 +7,7 @@ import { ApiError } from './api';
 import { authRoutes } from './auth';
 import { billingRoutes } from './billing';
 import { edgeGateway } from './edge';
+import { configPublisher } from './edge-config';
 import { openapi } from './openapi';
 import { platformRoutes } from './platform-management';
 import { tenantRoutes } from './tenant-management';
@@ -47,11 +48,13 @@ export async function createServer(opts: Options) {
     app.notFound((c) => c.json({ error: new ApiError('not_found').body() }, 404));
     app.get('/v1/healthz', (c) => c.json({ status: 'ok', version: pkg.version, commit: opts.commit }));
     app.get('/v1/openapi.json', (c) => c.json(openapi));
-    authRoutes(app, store, { ...opts, now });
-    tenantRoutes(app, store, { ...opts, now });
-    platformRoutes(app, store, { ...opts, now });
-    billingRoutes(app, store, { ...opts, now });
-    edgeGateway(app, store, opts.presence, now, opts.heartbeatMs);
+    const config = configPublisher(store, now, opts.masterKey);
+    const management = { ...opts, now, onConfigChange: config.changed };
+    authRoutes(app, store, management);
+    tenantRoutes(app, store, management);
+    platformRoutes(app, store, management);
+    billingRoutes(app, store, management);
+    edgeGateway(app, store, opts.presence, now, opts.heartbeatMs, config);
     const server = Bun.serve({ hostname: opts.hostname, port: opts.port,
       fetch: app.fetch, websocket: { ...websocket, maxPayloadLength: 64 * 1024, idleTimeout: 0, sendPings: false },
     });

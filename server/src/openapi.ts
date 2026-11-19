@@ -33,8 +33,9 @@ const write = (input: object, output: object, mode: 'create' | 'update' | 'upser
     404: error('对象不存在'), ...status,
   },
 });
-const models = { id: text, provider_id: text, upstream_name: text, display_name: text, context_window: sequence, status: text };
-const providers = { id: text, name: text, protocol: { type: 'string', enum: ['anthropic', 'openai_chat', 'openai_responses'] }, base_url: text, status: text };
+const models = { id: text, provider_id: text, upstream_name: text, route_model: nullableText, display_name: text, context_window: sequence, status: text };
+const providers = { id: text, name: text, protocol: { type: 'string', enum: ['anthropic', 'openai_chat', 'openai_responses'] }, base_url: text,
+  status: text, auth: { enum: ['x_api_key', 'bearer', null] }, proxy: nullableText };
 const releases = { id: text, agent: text, version: text, os: text, arch: text, url: text, sha256: text, size: sequence, status: text };
 const tenantFields = { id: tenantId, name: text, owner_user_id: text, status: { type: 'string', enum: ['active', 'suspended'] } };
 const rates = { model_id: text, effective_from: { ...text, format: 'date-time' }, input_milli_per_mtok: sequence,
@@ -89,7 +90,7 @@ export const openapi = {
     } } },
     '/v1/devices': { post: { summary: '注册设备，需要租户令牌', security: bearer, parameters: headers,
       requestBody: requestBody(object({ name: { ...text, maxLength: 128 }, os: { ...text, maxLength: 32 }, arch: { ...text, maxLength: 32 },
-        public_key: { ...text, contentEncoding: 'base64', description: '32 字节 X25519 公钥' } })),
+        public_key: { ...nullableText, contentEncoding: 'base64', description: '32 字节 X25519 公钥，缺少公钥时不下发密钥' } }, ['name', 'os', 'arch'])),
       responses: { 201: response('设备令牌', object({ device_id: text, device_token: token })), ...status } } },
     '/v1/members': { get: listOf(member, [{ name: 'role', in: 'query', schema: role },
       { name: 'status', in: 'query', schema: { type: 'string', enum: ['active', 'disabled'] } }]), post: write(object(memberInput, ['user_id']), member, 'create') },

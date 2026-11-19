@@ -222,10 +222,9 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
     const name = field(body.name, 'name');
     const os = field(body.os, 'os', 32);
     const arch = field(body.arch, 'arch', 32);
-    const key = field(body.public_key, 'public_key', 44);
-    // CONTRACT-PENDING: X25519 public_key is a 32-byte RFC 4648 base64 string.
+    const key = body.public_key == null ? '' : field(body.public_key, 'public_key', 44);
     const decoded = Buffer.from(key, 'base64');
-    if (!/^[A-Za-z0-9+/]{43}=$/.test(key) || decoded.length !== 32 || decoded.toString('base64') !== key || !decoded.some(Boolean)) invalid('public_key');
+    if (key && (!/^[A-Za-z0-9+/]{43}=$/.test(key) || decoded.length !== 32 || decoded.toString('base64') !== key || !decoded.some(Boolean))) invalid('public_key');
     const op = operation(c, codeSecret, at, token, [name, os, arch, key]);
     const tokenHash = hash(op.token);
     const deviceId = `dev_${ulid()}`;

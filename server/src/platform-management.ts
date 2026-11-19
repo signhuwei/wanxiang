@@ -77,14 +77,25 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
     app.on(['POST', 'PATCH'], `${path}/:id`, write);
   }
 
-  register({ path: 'providers', table: 'providers', columns: 'id, name, protocol, base_url, status, revision', search: 'name', prefix: 'prv', action: 'create_provider',
-    parse: (body, row) => ({ name: text(body, row, 'name'), protocol: enumField(value(body, row, 'protocol'), 'protocol', protocols),
-      base_url: urlField(value(body, row, 'base_url'), 'base_url'), status: status(body, row) }) });
+  register({ path: 'providers', table: 'providers', columns: 'id, name, protocol, base_url, status, revision, auth, proxy', search: 'name', prefix: 'prv', action: 'create_provider',
+    parse: (body, row) => {
+      const auth = value(body, row, 'auth');
+      const proxy = value(body, row, 'proxy');
+      return { name: text(body, row, 'name'), protocol: enumField(value(body, row, 'protocol'), 'protocol', protocols),
+        base_url: urlField(value(body, row, 'base_url'), 'base_url'), status: status(body, row),
+        auth: auth == null ? null : enumField(auth, 'auth', ['x_api_key', 'bearer']),
+        proxy: proxy == null || proxy === 'none' ? proxy ?? null : urlField(proxy, 'proxy') };
+    } });
   register({ path: 'models', table: 'models', columns: '*', search: "display_name || ' ' || upstream_name", prefix: 'mod', action: 'create_model',
     parse: (body, row, sql) => {
       const provider_id = text(body, row, 'provider_id');
       if (!sql.get('SELECT 1 FROM providers WHERE id = ?', [provider_id])) invalid('provider_id');
-      return { provider_id, upstream_name: text(body, row, 'upstream_name'), display_name: text(body, row, 'display_name'),
+      const upstream_name = text(body, row, 'upstream_name');
+      if (upstream_name.includes('*')) invalid('upstream_name');
+      const rawPattern = value(body, row, 'route_model');
+      const route_model = rawPattern == null ? null : field(rawPattern, 'route_model');
+      if (route_model && !/^[^*]*\*?$/.test(route_model)) invalid('route_model');
+      return { provider_id, upstream_name, route_model, display_name: text(body, row, 'display_name'),
         context_window: number(body, row, 'context_window', 1), status: status(body, row) };
     } });
   register({ path: 'agent-releases', table: 'agent_releases', columns: '*', search: "agent || ' ' || version", prefix: 'rel', action: 'create_agent_release',
