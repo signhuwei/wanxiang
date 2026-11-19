@@ -1,14 +1,22 @@
 //! 额度租约：放行、实时累计、断流、续租、落盘。
 //!
-//! 记账口径：`used` 是当前租约下已结束请求的花费，进行中的请求各自有一个实时花费，
-//! 总花费 = used + Σ 实时花费。实际花费越过 `budget_milli` 时中断那条流，之后的新请求被拒绝。
-//! usage 记在请求放行时的租约名下（`Ticket::lease_id`），Server 按 lease 汇总 usage 结算。
+//! 三种金额分开记：
+//! - `used`：当前租约下已结束请求的实际花费（按上游报的用量计价）。续租只上报它。
+//! - 预留：请求开始时的上限估计，只占放行额度，结束时释放，绝不进 `used`。
+//! - 实时花费：进行中的流按已见用量和输出字节估算，只用来判断是否越过额度、中断流。
 //!
-//! 续租：总花费到 80% 或剩余租期不足 2 分钟时发 `lease_renew{used_milli=总花费}`，记下快照。
-//! 新租约到来时 `used -= 快照`，快照之后进行中的请求继续花的钱在本机算到新租约上（偏保守）。
-//! `op_id` 由 lease_id 和 used_milli 决定。快照落盘，收到回应（lease 或 cutoff）之前，
-//! 重连、重发、重启都原样重放同一份，Server 按第一次的结果回。
+//! 放行：`used + Σ max(预留, 实时花费) + 本次预留 ≤ budget`。本次预留大于整个租约额度时直接拒绝。
+//! 断流：`used + Σ 实时花费 > budget` 时中断那条流。
+//! usage 记在请求放行时的租约名下（`Ticket::lease_id`）；结算以 `lease_renew.used_milli` 为准。
+//!
+//! 续租：实时花费到 80%、放行因额度被拒且已有花费、或剩余租期不足 2 分钟时发 `lease_renew`，
+//! `used_milli` 取当时的 `used`（快照）。快照落盘，收到回应（lease 或 cutoff）之前，
+//! 重连、重发、重启都原样重放同一份（同一 `op_id`），Server 按第一次的结果回。
+//! 新租约到来时 `used -= 快照`，即快照之后才结束的请求记到新租约，不会为负。
 //! 没有回应时按 `renew_retry` 重发，等待不超过剩余租期的一半。
+//!
+//! cutoff：立即拒绝新请求、中断进行中的流。如果它回应的是续租，旧租约已结算，丢弃；
+//! 如果是 Server 主动发的，旧租约还没结算，保留它，等进行中的流结束后发一次续租报最终用量。
 //!
 //! 时间：剩余租期用单调时钟算。收到租约时按 Server 时间换算出剩余时长，之后本机挂钟跳变不影响。
 //! 重启后只能从落盘的本机时间恢复，等下一次 welcome 再用 Server 时间校正（只会提前，不会延后）。
@@ -59,6 +67,11 @@ pub enum Block {
     NoLease,
     Expired,
     Exhausted,
+    /// 单个请求的预留比整个租约额度还大，续租也放不进去
+    TooLarge {
+        reserve: i64,
+        budget: i64,
+    },
     Cutoff(CutoffReason),
 }
 
@@ -122,9 +135,16 @@ struct Saved {
     cutoff: Option<String>,
     /// 见过的最大租约 seq，小于等于它的租约是过时的
     lease_seq: u64,
-    /// 已发出、还没收到回应的续租的 used_milli。Server 可能已经提交，回应之前只重放这一份。
+    /// 已发出、还没收到回应的续租。Server 可能已经提交，回应之前只原样重放这一份。
     #[serde(default)]
-    renew_used: Option<i64>,
+    renew: Option<PendingRenew>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingRenew {
+    op_id: String,
+    lease_id: String,
+    used_milli: i64,
 }
 
 const VERSION: u32 = 1;
@@ -136,7 +156,9 @@ fn parse_saved(b: &[u8]) -> Option<Saved> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub lease: Option<Grant>,
+    /// 已结束请求的实际花费
     pub used_milli: i64,
+    /// 进行中请求占用的放行额度（预留与实时花费取大）
     pub inflight_milli: i64,
     pub cutoff: Option<String>,
 }
@@ -164,11 +186,17 @@ impl StopSlot {
 }
 
 struct Flight {
-    /// 计入放行判断的花费：已见花费与预留取大
-    live: i64,
-    /// 已见的实际花费，只用它判断是否越过额度、中断流
-    seen: i64,
+    /// 请求开始时的预留，只占放行额度
+    reserve: i64,
+    /// 实时花费（含输出字节估算），只用来判断是否越过额度
+    gate: i64,
     stop: Arc<StopSlot>,
+}
+
+impl Flight {
+    fn hold(&self) -> i64 {
+        self.reserve.max(self.gate)
+    }
 }
 
 #[derive(Default)]
@@ -177,6 +205,10 @@ struct Renew {
     sent_at: Option<Instant>,
     sent: u64,
     last_result: Option<(RenewResult, i64)>,
+    /// 放行因额度被拒，且已有花费可以结算
+    wanted: bool,
+    /// 续租等来的是 cutoff：这条连接上不再重放，下次连上再试
+    parked: bool,
 }
 
 struct Inner {
@@ -196,12 +228,14 @@ struct Inner {
 }
 
 impl Inner {
-    fn total(&self) -> i64 {
-        self.saved.used_milli + self.inflight.values().map(|f| f.live).sum::<i64>()
+    /// 已占用的放行额度
+    fn committed(&self) -> i64 {
+        self.saved.used_milli + self.inflight.values().map(Flight::hold).sum::<i64>()
     }
 
-    fn total_seen(&self) -> i64 {
-        self.saved.used_milli + self.inflight.values().map(|f| f.seen).sum::<i64>()
+    /// 已结束的实际花费加进行中的实时花费
+    fn gate_total(&self) -> i64 {
+        self.saved.used_milli + self.inflight.values().map(|f| f.gate).sum::<i64>()
     }
 
     fn remaining(&self, now: Instant) -> Duration {
@@ -216,7 +250,7 @@ impl Inner {
         if self.remaining(now).is_zero() {
             return Some(Block::Expired);
         }
-        if self.total() >= g.budget_milli {
+        if self.committed() >= g.budget_milli {
             return Some(Block::Exhausted);
         }
         None
@@ -316,7 +350,7 @@ impl Ledger {
         Snapshot {
             lease: i.saved.lease.clone(),
             used_milli: i.saved.used_milli,
-            inflight_milli: i.total() - i.saved.used_milli,
+            inflight_milli: i.committed() - i.saved.used_milli,
             cutoff: i.saved.cutoff.clone(),
         }
     }
@@ -333,7 +367,7 @@ impl Ledger {
             None => "active",
             Some(Block::NoLease) => "none",
             Some(Block::Expired) => "expired",
-            Some(Block::Exhausted) => "exhausted",
+            Some(Block::Exhausted | Block::TooLarge { .. }) => "exhausted",
             Some(Block::Cutoff(_)) => "cutoff",
         };
         let g = i.saved.lease.as_ref();
@@ -343,11 +377,11 @@ impl Ledger {
             "lease_id": g.map(|g| &g.lease_id),
             "budget_milli": g.map(|g| g.budget_milli),
             "used_milli": i.saved.used_milli,
-            "inflight_milli": i.total() - i.saved.used_milli,
+            "inflight_milli": i.committed() - i.saved.used_milli,
             "expires_at": g.map(|g| &g.expires_at),
             "remaining_ms": g.map(|_| i.remaining(now).as_millis() as u64),
             "renew": {
-                "pending": i.saved.renew_used.is_some(),
+                "pending": i.saved.renew.is_some(),
                 "sent": i.renew.sent,
                 "last_result": i.renew.last_result.map(|(r, _)| r.as_str()),
                 "last_result_at": i.renew.last_result.map(|(_, at)| format_ms(at)),
@@ -355,41 +389,65 @@ impl Ledger {
         })
     }
 
-    /// 放行一个新请求。`initial` 是请求开始时的预留，不要求剩余额度覆盖它。
-    pub fn admit(self: &Arc<Self>, initial: i64) -> Result<Ticket, Block> {
+    /// 放行一个新请求。剩余额度必须覆盖本次预留 `reserve`。
+    pub fn admit(self: &Arc<Self>, reserve: i64) -> Result<Ticket, Block> {
         let now = Instant::now();
         let mut i = self.inner.lock().unwrap();
-        if let Some(b) = i.block(now) {
+        let blocked = i.block(now).or_else(|| {
+            let budget = i.saved.lease.as_ref().map_or(0, |g| g.budget_milli);
+            if reserve > budget {
+                Some(Block::TooLarge { reserve, budget })
+            } else if i.committed() + reserve > budget {
+                Some(Block::Exhausted)
+            } else {
+                None
+            }
+        });
+        if let Some(b) = blocked {
+            // 已结束的花费可以结算掉，腾出额度；只有在途预留时续租也腾不出来
+            if b == Block::Exhausted && i.saved.used_milli > 0 {
+                i.renew.wanted = true;
+            }
             self.check_renew(&i, now);
             return Err(b);
         }
         let id = i.next_ticket;
         i.next_ticket += 1;
         let stop = Arc::new(StopSlot { token: CancellationToken::new(), reason: Mutex::new(None) });
-        i.inflight.insert(id, Flight { live: initial, seen: 0, stop: stop.clone() });
+        i.inflight.insert(id, Flight { reserve, gate: 0, stop: stop.clone() });
         let lease_id = i.saved.lease.as_ref().map(|g| g.lease_id.clone());
-        self.check_renew(&i, now);
-        Ok(Ticket { id, ledger: self.clone(), stop, lease_id, live: initial, done: false })
+        Ok(Ticket { id, ledger: self.clone(), stop, lease_id, seen: 0, done: false })
     }
 
     /// 处理 Server 的 `lease`。返回 false 表示是过时的租约，已忽略。
+    /// 已结算的部分（续租快照）从 used 里扣掉，其余的花费记到新租约，包括 cutoff 之后才结束的请求。
     pub fn grant(&self, l: &Lease) -> Result<bool> {
         let expires = parse_ms(&l.expires_at).with_context(|| format!("bad expires_at {:?}", l.expires_at))?;
         let mut i = self.inner.lock().unwrap();
-        if l.seq <= i.saved.lease_seq && i.saved.lease.is_some() {
+        if l.seq <= i.saved.lease_seq {
+            // Server 重发当前租约（设备恢复后 Server 返回仍有效的同一份）：只解除 cutoff，不结算
+            let same = i.saved.lease.as_ref().is_some_and(|g| g.seq == l.seq && g.lease_id == l.lease_id);
+            if same && i.saved.cutoff.is_some() {
+                let mut next = i.saved.clone();
+                next.cutoff = None;
+                self.persist(&next)?;
+                i.saved = next;
+                i.renew.parked = false;
+                info!(lease_id = %l.lease_id, "current lease reaffirmed; cutoff cleared");
+                self.check_renew(&i, Instant::now());
+                return Ok(true);
+            }
             return Ok(false);
         }
         let remaining_ms = expires - i.server_now_ms();
-        let carried = match i.saved.renew_used {
-            Some(u) => {
-                i.set_result(RenewResult::Granted);
-                i.saved.used_milli - u
-            }
-            None => 0,
-        };
-        i.renew.sent_at = None;
+        let settled = i.saved.renew.as_ref().map(|p| p.used_milli);
+        if settled.is_some() {
+            i.set_result(RenewResult::Granted);
+        }
+        let settled = settled.unwrap_or(0);
+        let carried = i.saved.used_milli - settled;
         let mut next = i.saved.clone();
-        next.renew_used = None;
+        next.renew = None;
         next.lease = Some(Grant {
             lease_id: l.lease_id.clone(),
             expires_at: l.expires_at.clone(),
@@ -401,36 +459,41 @@ impl Ledger {
         next.lease_seq = next.lease_seq.max(l.seq);
         next.used_milli = carried;
         next.cutoff = None;
+        // 落盘失败时不改内存状态，等待中的续租快照保留，下次重放
         self.persist(&next)?;
         i.saved = next;
+        i.renew.sent_at = None;
+        i.renew.wanted = false;
+        i.renew.parked = false;
         i.deadline = Some(Instant::now() + Duration::from_millis(remaining_ms.max(0) as u64));
         i.deadline_from_wall = false;
         i.expiry_handled = false;
-        info!(lease_id = %l.lease_id, budget_milli = l.budget_milli, expires_at = %l.expires_at, remaining_ms, carried_milli = carried, "lease granted");
+        info!(lease_id = %l.lease_id, budget_milli = l.budget_milli, expires_at = %l.expires_at, remaining_ms, settled_milli = settled, carried_milli = carried, "lease granted");
         self.check_renew(&i, Instant::now());
         drop(i);
         self.changed.notify_one();
         Ok(true)
     }
 
-    /// 处理 Server 的 `cutoff`：丢弃租约，拒绝新请求，中断进行中的流。
+    /// 处理 Server 的 `cutoff`：拒绝新请求，中断进行中的流。
+    /// 租约、已用额度和续租快照都不动：cutoff 不能说明旧租约已结算（Server 停用设备时不看续租就回 cutoff），
+    /// 新租约（seq 更大）到来才说明已结算。等待中的续租在下次连上时再重放；
+    /// 没有等待中的续租时，等流都结束后发一次续租报最终用量。
     pub fn cutoff(&self, reason: &str) -> Result<()> {
         let mut i = self.inner.lock().unwrap();
         // 先中断再落盘：落盘失败也不能让流继续花钱。
         i.stop_all(Block::Cutoff(CutoffReason::parse(reason)));
-        if i.saved.renew_used.is_some() {
+        if i.saved.renew.is_some() {
             i.set_result(RenewResult::Rejected);
+            i.renew.parked = true;
         }
         i.renew.sent_at = None;
+        i.renew.wanted = false;
         let mut next = i.saved.clone();
         next.cutoff = Some(reason.to_string());
-        next.lease = None;
-        next.used_milli = 0;
-        next.renew_used = None;
         let r = self.persist(&next);
         i.saved = next;
-        i.deadline = None;
-        warn!(reason, inflight = i.inflight.len(), "cutoff");
+        warn!(reason, inflight = i.inflight.len(), unsettled_milli = i.saved.used_milli, "cutoff");
         drop(i);
         self.changed.notify_one();
         r
@@ -451,7 +514,7 @@ impl Ledger {
             let mut next = i.saved.clone();
             next.lease = None;
             next.used_milli = 0;
-            next.renew_used = None;
+            next.renew = None;
             if let Err(e) = self.persist(&next) {
                 error!(error = %format!("{e:#}"), "persist lease state");
             }
@@ -475,20 +538,21 @@ impl Ledger {
     pub fn on_connected(&self) {
         let mut i = self.inner.lock().unwrap();
         i.renew.sent_at = None;
+        i.renew.parked = false;
         self.check_renew(&i, Instant::now());
     }
 
     /// 控制连接断开：等待中的续租记为网络不可达。不影响进行中的请求。
     pub fn on_disconnected(&self) {
         let mut i = self.inner.lock().unwrap();
-        if i.renew.sent_at.take().is_some() && i.saved.renew_used.is_some() {
+        if i.renew.sent_at.take().is_some() && i.saved.renew.is_some() {
             i.set_result(RenewResult::Unreachable);
         }
     }
 
-    /// 需要续租时返回续租请求，并记为已发送。
-    /// 已有发出但没收到回应的续租时，原样重放它（同一 used_milli、同一 op_id），
-    /// 因为 Server 可能已经提交，换一份会被当作冲突。
+    /// 需要续租时返回续租请求，并记为已发送。`used_milli` 只含已结束请求的实际花费。
+    /// 已有发出但没收到回应的续租时，原样重放它（同一 op_id、同一金额），
+    /// 因为 Server 可能已经提交，换一份会被当作冲突。快照先落盘再发，落盘失败就不发。
     pub fn take_renew(&self) -> Option<RenewRequest> {
         let now = Instant::now();
         let mut i = self.inner.lock().unwrap();
@@ -498,19 +562,20 @@ impl Ledger {
         if i.renew.sent_at.is_some() {
             i.set_result(RenewResult::NoResponse);
         }
-        let lease_id = i.saved.lease.as_ref()?.lease_id.clone();
-        let used = match i.saved.renew_used {
-            Some(u) => u,
+        let p = match &i.saved.renew {
+            Some(p) => p.clone(),
             None => {
-                let u = i.total();
+                let lease_id = i.saved.lease.as_ref()?.lease_id.clone();
+                let used = i.saved.used_milli;
+                let p = PendingRenew { op_id: format!("{lease_id}:{used}"), lease_id, used_milli: used };
                 let mut next = i.saved.clone();
-                next.renew_used = Some(u);
-                // 落盘失败也照样发：最坏情况是重启后换一份 used，被 Server 拒绝后等新租约。
+                next.renew = Some(p.clone());
                 if let Err(e) = self.persist(&next) {
-                    error!(error = %format!("{e:#}"), "persist lease state");
+                    error!(error = %format!("{e:#}"), "persist renew snapshot; not sending lease_renew");
+                    return None;
                 }
                 i.saved = next;
-                u
+                p
             }
         };
         i.renew.sent_at = Some(now);
@@ -518,8 +583,7 @@ impl Ledger {
         drop(i);
         // 让定时任务按重发时间重新排程
         self.changed.notify_one();
-        let op_id = format!("{lease_id}:{used}");
-        Some(RenewRequest { lease_id, used_milli: used, op_id })
+        Some(RenewRequest { lease_id: p.lease_id, used_milli: p.used_milli, op_id: p.op_id })
     }
 
     pub fn subscribe_renew(&self) -> watch::Receiver<u64> {
@@ -571,12 +635,19 @@ impl Ledger {
     }
 
     fn renew_due(&self, i: &Inner, now: Instant) -> bool {
-        if i.saved.cutoff.is_some() {
+        let Some(g) = &i.saved.lease else { return false };
+        if i.renew.parked {
             return false;
         }
-        let Some(g) = &i.saved.lease else { return false };
-        i.saved.renew_used.is_some()
-            || i.total() * 100 >= g.budget_milli * self.opts.renew_at_pct
+        if i.saved.renew.is_some() {
+            return true;
+        }
+        if i.saved.cutoff.is_some() {
+            // 被主动 cutoff 的租约：流都结束后报一次最终用量
+            return i.inflight.is_empty() && i.saved.used_milli > 0;
+        }
+        i.renew.wanted
+            || i.gate_total() * 100 >= g.budget_milli * self.opts.renew_at_pct
             || i.remaining(now) <= self.opts.renew_before
     }
 
@@ -596,21 +667,20 @@ impl Ledger {
         lastgood::write(p, &data, |b| parse_saved(b).is_some())
     }
 
-    fn update(&self, id: u64, live: i64, seen: i64) -> Result<(), Block> {
+    fn update(&self, id: u64, gate: i64) -> Result<(), Block> {
         let mut i = self.inner.lock().unwrap();
         if let Some(f) = i.inflight.get_mut(&id) {
-            f.live = live.max(seen);
-            f.seen = seen;
+            f.gate = gate;
         }
-        let over = i.saved.lease.as_ref().is_some_and(|g| i.total_seen() > g.budget_milli);
-        self.check_renew(&i, Instant::now());
+        let over = i.saved.lease.as_ref().is_some_and(|g| i.gate_total() > g.budget_milli);
         if over {
+            i.renew.wanted = true;
             if let Some(f) = i.inflight.get(&id) {
                 f.stop.stop(Block::Exhausted);
             }
-            return Err(Block::Exhausted);
         }
-        Ok(())
+        self.check_renew(&i, Instant::now());
+        if over { Err(Block::Exhausted) } else { Ok(()) }
     }
 
     fn release(&self, id: u64, cost: i64) {
@@ -635,19 +705,20 @@ pub struct Ticket {
     ledger: Arc<Ledger>,
     stop: Arc<StopSlot>,
     lease_id: Option<String>,
-    live: i64,
+    /// 已见花费；没调 finish 就丢弃时按它结算
+    seen: i64,
     done: bool,
 }
 
 impl Ticket {
-    /// 报告实时花费：`live` 含预留，计入放行判断；`seen` 是已见的实际花费。
-    /// 实际花费越过租约额度时返回 `Exhausted`，调用方应中断这条流。
-    pub fn update(&mut self, live: i64, seen: i64) -> Result<(), Block> {
-        self.live = seen;
+    /// 报告进行中的实时花费（已见用量加输出字节估算，不含预留）。
+    /// 越过租约额度时返回 `Exhausted`，调用方应中断这条流。
+    pub fn update(&mut self, gate: i64) -> Result<(), Block> {
+        self.seen = gate;
         if let Some(b) = *self.stop.reason.lock().unwrap() {
             return Err(b);
         }
-        self.ledger.update(self.id, live, seen)
+        self.ledger.update(self.id, gate)
     }
 
     /// 放行时的租约 id，usage 记在它名下。
@@ -663,7 +734,6 @@ impl Ticket {
 
     /// 结束请求，记最终花费，返回放行时的租约 id。
     pub fn finish(mut self, cost: i64) -> Option<String> {
-        self.live = cost;
         self.done = true;
         self.ledger.release(self.id, cost);
         self.lease_id.take()
@@ -673,7 +743,7 @@ impl Ticket {
 impl Drop for Ticket {
     fn drop(&mut self) {
         if !self.done {
-            self.ledger.release(self.id, self.live);
+            self.ledger.release(self.id, self.seen);
         }
     }
 }
@@ -729,13 +799,13 @@ mod tests {
         l.grant(&lease("l1", 1, 100, 600_000)).unwrap();
         let mut a = l.admit(0).unwrap();
         let mut b = l.admit(0).unwrap();
-        a.update(50, 50).unwrap();
-        b.update(50, 50).unwrap();
+        a.update(50).unwrap();
+        b.update(50).unwrap();
         // 正好用完不算越过
         assert_eq!(l.admit(0).err(), Some(Block::Exhausted));
-        assert_eq!(b.update(51, 51), Err(Block::Exhausted));
+        assert_eq!(b.update(51), Err(Block::Exhausted));
         // a 的下一次更新也会失败，因为总额已越过
-        assert_eq!(a.update(50, 50), Err(Block::Exhausted));
+        assert_eq!(a.update(50), Err(Block::Exhausted));
         drop(a);
         b.finish(51);
         assert_eq!(l.snapshot().used_milli, 101);
@@ -743,19 +813,60 @@ mod tests {
     }
 
     #[test]
-    fn reservation_counts_but_does_not_gate_itself() {
+    fn reservation_must_fit_remaining_budget() {
         let l = ledger();
         l.grant(&lease("l1", 1, 100, 600_000)).unwrap();
-        // 预留超过剩余额度仍放行，也不因预留本身被中断
-        let mut t = l.admit(500).unwrap();
-        assert_eq!(l.admit(0).err(), Some(Block::Exhausted));
-        t.update(500, 0).unwrap();
-        t.update(500, 90).unwrap();
-        // 已见的实际花费越过额度才中断
-        assert_eq!(t.update(500, 101), Err(Block::Exhausted));
-        // 实际只花 10，释放多余部分
-        t.finish(10);
-        assert!(l.admit(0).is_ok());
+        // 比整个租约还大：续租也放不进去
+        assert_eq!(l.admit(101).err(), Some(Block::TooLarge { reserve: 101, budget: 100 }));
+        let mut a = l.admit(60).unwrap();
+        // 60 + 50 > 100；只有在途预留，续租腾不出额度，不触发续租
+        assert_eq!(l.admit(50).err(), Some(Block::Exhausted));
+        assert!(l.take_renew().is_none());
+        // 正好用满可以
+        let b = l.admit(40).unwrap();
+        assert_eq!(l.snapshot().used_milli, 0);
+        assert_eq!(l.snapshot().inflight_milli, 100);
+        // 实时花费超过预留时按实时花费占放行额度；断流只看实时花费（70 + 0 ≤ 100）
+        a.update(70).unwrap();
+        assert_eq!(l.snapshot().inflight_milli, 110);
+        drop(b);
+        // 实际只花 10：预留释放，used 只含 10
+        a.finish(10);
+        assert_eq!((l.snapshot().used_milli, l.snapshot().inflight_milli), (10, 0));
+        assert!(l.admit(90).is_ok());
+    }
+
+    #[test]
+    fn renew_reports_only_finished_cost_never_reservation() {
+        // magpie 阻塞 1 的算例：额度 100，已完成 70，在途预留 20，最后实际只用 5
+        let l = ledger();
+        l.grant(&lease("l1", 1, 100, 600_000)).unwrap();
+        l.admit(0).unwrap().finish(70);
+        let t = l.admit(20).unwrap();
+        // 90 的放行占用到了 80%，但实时花费只有 70，还不续租
+        assert!(l.take_renew().is_none());
+        // 下一单放不进去，触发续租；上报 70，不含预留
+        assert_eq!(l.admit(20).err(), Some(Block::Exhausted));
+        let r = l.take_renew().unwrap();
+        assert_eq!((r.used_milli, r.op_id.as_str()), (70, "l1:70"));
+        l.grant(&lease("l2", 2, 100, 600_000)).unwrap();
+        assert_eq!(l.snapshot().used_milli, 0);
+        assert_eq!(t.finish(5).as_deref(), Some("l1"));
+        // 快照之后结束的 5 记到新租约，不会为负
+        assert_eq!(l.snapshot().used_milli, 5);
+        assert_eq!(l.snapshot().inflight_milli, 0);
+    }
+
+    #[test]
+    fn reservation_alone_cannot_exceed_budget_in_renew() {
+        // magpie 阻塞 1 的另一算例：额度 150，预留 200，实际 0。现在预留放不进去，不会出站。
+        let l = ledger();
+        l.grant(&lease("l1", 1, 150, 600_000)).unwrap();
+        assert!(matches!(l.admit(200), Err(Block::TooLarge { .. })));
+        let t = l.admit(150).unwrap();
+        drop(t);
+        assert_eq!(l.snapshot().used_milli, 0);
+        assert!(l.take_renew().is_none());
     }
 
     #[tokio::test]
@@ -782,20 +893,19 @@ mod tests {
         l.admit(0).unwrap().finish(70);
         assert!(l.take_renew().is_none());
         let mut t = l.admit(0).unwrap();
-        t.update(15, 15).unwrap();
+        t.update(15).unwrap();
         assert!(rx.has_changed().unwrap());
+        // 实时花费到 85% 触发续租，但只上报已结束的 70
         let r = l.take_renew().unwrap();
-        assert_eq!((r.lease_id.as_str(), r.used_milli, r.op_id.as_str()), ("l1", 85, "l1:85"));
+        assert_eq!((r.lease_id.as_str(), r.used_milli, r.op_id.as_str()), ("l1", 70, "l1:70"));
         // 没到重发时间不再发
         assert!(l.take_renew().is_none());
-        // 续租期间流继续花了 5
-        t.update(20, 20).unwrap();
+        t.update(20).unwrap();
         l.grant(&lease("l2", 2, 100, 600_000)).unwrap();
         assert_eq!(l.status()["renew"]["last_result"], "granted");
-        // 新租约：已结束的 70 和快照里的 15 都算旧租约，流后来多花的 5 算新租约
-        // usage 仍记在放行时的租约名下
+        // 快照之后才结束的流记到新租约；usage 仍记在放行时的租约名下
         assert_eq!(t.finish(20).as_deref(), Some("l1"));
-        assert_eq!(l.snapshot().used_milli, 5);
+        assert_eq!(l.snapshot().used_milli, 20);
         assert_eq!(l.lease_id().as_deref(), Some("l2"));
     }
 
@@ -973,8 +1083,44 @@ mod tests {
             assert!(l.take_renew().is_some());
             l.cutoff("disabled").unwrap();
             assert_eq!(l.status()["renew"]["last_result"], "rejected");
+            // 这条连接上不再重放
+            assert!(l.take_renew().is_none());
         }
         let l = Arc::new(Ledger::open(path, LeaseOptions::default(), &ob).unwrap());
         assert_eq!(l.admit(0).err(), Some(Block::Cutoff(CutoffReason::Disabled)));
+        // cutoff 不能证明已结算：重启后仍重放同一份续租
+        let r = l.take_renew().unwrap();
+        assert_eq!((r.used_milli, r.op_id.as_str()), (90, "l1:90"));
+    }
+
+    #[test]
+    fn unsolicited_cutoff_reports_final_usage_after_streams_end() {
+        let l = ledger();
+        l.grant(&lease("l1", 1, 1000, 600_000)).unwrap();
+        l.admit(0).unwrap().finish(30);
+        let mut t = l.admit(0).unwrap();
+        t.update(10).unwrap();
+        l.cutoff("contract").unwrap();
+        // 流还没结束，先不报
+        assert!(l.take_renew().is_none());
+        drop(t);
+        // 中断时已见 10：最终 40 记在旧租约下上报
+        let r = l.take_renew().unwrap();
+        assert_eq!((r.lease_id.as_str(), r.used_milli), ("l1", 40));
+        assert_eq!(l.admit(0).err(), Some(Block::Cutoff(CutoffReason::Contract)));
+    }
+
+    #[test]
+    fn reaffirmed_lease_clears_cutoff_without_settling() {
+        // 设备停用后恢复：Server 在连接时重发同一份仍有效的租约
+        let l = ledger();
+        let g = lease("l1", 1, 1000, 600_000);
+        l.grant(&g).unwrap();
+        l.admit(0).unwrap().finish(30);
+        l.cutoff("disabled").unwrap();
+        l.on_connected();
+        assert!(l.grant(&g).unwrap());
+        assert!(l.admit(0).is_ok());
+        assert_eq!(l.snapshot().used_milli, 30);
     }
 }

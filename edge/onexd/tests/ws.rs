@@ -531,6 +531,35 @@ async fn renew_failure_cutoff_blocks_and_renew_resent_after_reconnect() {
 }
 
 #[tokio::test]
+async fn committed_renew_with_lost_reply_is_replayed_unchanged_after_more_spend() {
+    // magpie 阻塞 2：额度 100、已用 80 触发续租；Server 已提交但回包丢失；之后又花了 5；回连
+    let srv = FakeServer::start().await;
+    let edge = start_edge(&srv.url, Some("t"));
+    let mut p = srv.accept().await;
+    p.handshake(0, 15000).await;
+    p.send(lease_msg("s1", "lse_1", 1, 100, 600_000)).await;
+    p.recv_skip_ping().await;
+    edge.state.lease.admit(0).unwrap().finish(80);
+    let first = recv_skip(&mut p, &["ping"]).await;
+    assert_eq!((first["used_milli"].as_i64(), first["op_id"].as_str()), (Some(80), Some("lse_1:80")));
+    drop(p);
+    wait_phase(&edge.state, Phase::Backoff).await;
+    edge.state.lease.admit(0).unwrap().finish(5);
+
+    let mut p = srv.accept().await;
+    p.handshake(0, 15000).await;
+    let again = recv_skip(&mut p, &["ping"]).await;
+    // 原样重放：同一 op_id、同一金额，Server 按缓存的结果回
+    assert_eq!((again["used_milli"].as_i64(), again["op_id"].as_str()), (Some(80), Some("lse_1:80")));
+    p.send(json!({"type":"lease","id":"s2","re":again["id"],"lease_id":"lse_2","expires_at":format_ms(now_ms() + 600_000),"budget_milli":100,"seq":2})).await;
+    assert_eq!(p.recv_skip_ping().await["re"], "s2");
+    // 快照之后的 5 记到新租约
+    let s = edge.state.lease.snapshot();
+    assert_eq!((s.lease.unwrap().lease_id.as_str(), s.used_milli), ("lse_2", 5));
+    assert_eq!(edge.state.lease.status()["renew"]["pending"], false);
+}
+
+#[tokio::test]
 async fn renew_retried_while_connected_without_response() {
     let srv = FakeServer::start().await;
     let lo = LeaseOptions { renew_retry: Duration::from_millis(100), ..Default::default() };
