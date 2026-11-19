@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { randomToken, hash, day, iso } from '../../server/src/credentials';
-import { MemoryPresence } from '../../server/src/presence';
+import { MemoryPresence, ValkeyPresence } from '../../server/src/presence';
 import { seedTenant } from '../../server/src/seed';
 import { createServer } from '../../server/src/server';
 import { indexDevice } from '../../server/src/store';
@@ -13,6 +13,9 @@ const duration = Number(Bun.argv[2] ?? 60);
 if (!Number.isInteger(duration) || duration < 1 || duration > 600) throw new Error('Usage: bun tests/e2e/ingest-load.ts [seconds:1–600]');
 const clients = 50;
 const rate = 20;
+const valkeyUrl = process.env.ONEX_TEST_VALKEY_URL;
+const presence = valkeyUrl ? new ValkeyPresence(valkeyUrl, `onex:test:ingest:${randomUUID()}:`) : new MemoryPresence();
+let serverOwnsPresence = false;
 const dir = mkdtempSync(join(tmpdir(), 'onex-ingest-load-'));
 const latencies: number[] = [];
 const sockets: WebSocket[] = [];
@@ -23,8 +26,10 @@ console.error = (...args) => {
   reportError(...args);
 };
 try {
+  if (presence instanceof ValkeyPresence) await presence.connect();
   const app = await createServer({ dataDir: dir, hostname: '127.0.0.1', port: 0, tenantCacheSize: 1,
-    heartbeatMs: 15_000, commit: 'ingest-load', codeSecret: randomToken(), presence: new MemoryPresence() });
+    heartbeatMs: 15_000, commit: 'ingest-load', codeSecret: randomToken(), presence });
+  serverOwnsPresence = true;
   try {
     const { tenantId, userId } = await seedTenant(app.store, { target: 'ingest@example.test' });
     const devices = Array.from({ length: clients }, () => ({ id: `load_${randomUUID()}`, token: randomToken(), session: randomUUID() }));
@@ -89,7 +94,8 @@ try {
     if (persisted !== clients * total || latencies.length !== persisted) throw new Error(`Expected ${clients * total} events; persisted ${persisted}, acknowledged ${latencies.length}`);
     latencies.sort((a, b) => a - b);
     const percentile = (fraction: number) => Number(latencies[Math.ceil(latencies.length * fraction) - 1].toFixed(3));
-    console.log(JSON.stringify({ clients, events_per_client_per_second: rate, seconds: duration, events: persisted,
+    console.log(JSON.stringify({ presence: valkeyUrl ? 'valkey' : 'memory', clients,
+      events_per_client_per_second: rate, seconds: duration, events: persisted,
       p50_ack_ms: percentile(0.50), p99_ack_ms: percentile(0.99), sqlite_busy: sqliteBusy }, null, 2));
     if (sqliteBusy) process.exitCode = 1;
   } finally {
@@ -100,6 +106,7 @@ try {
   reportError('Ingest load failed', { sqlite_busy: sqliteBusy, error });
   process.exitCode = 1;
 } finally {
+  if (!serverOwnsPresence) presence.close();
   console.error = reportError;
   rmSync(dir, { recursive: true, force: true });
 }
