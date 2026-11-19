@@ -5,6 +5,7 @@ import { ulid } from 'ulid';
 import { ApiError } from './api';
 import { deviceTtl } from './auth';
 import { initialLease, renewLease } from './billing';
+import type { DiagChannel } from './diag';
 import { ackCursor, eventItems, ingestEvents, ingestUsage, usageItems, type PublishSummary } from './ingest';
 import { int } from './management';
 import type { PendingWork } from './pending';
@@ -18,7 +19,7 @@ const isText = (value: unknown, max = 128): value is string => typeof value === 
 const isSeq = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
 export function edgeGateway(app: Hono, store: Store, presence: Presence, now: () => number, heartbeatMs: number,
-  config: ConfigPublisher, pending: PendingWork, publish: PublishSummary) {
+  config: ConfigPublisher, pending: PendingWork, publish: PublishSummary, diag: DiagChannel) {
   const current = new Map<string, WSContext>();
   const sockets = new Set<WSContext>();
   let closing = false;
@@ -94,6 +95,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
       onClose() {
         state = 'closed';
         config.disconnect(deviceId, subscription);
+        diag.disconnect(deviceId, send);
         clearTimeout(timer);
         if (current.get(deviceId) === socket) current.delete(deviceId);
         void pending.track(presence.release(deviceId, connectionId).catch(() => {}));
@@ -126,7 +128,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
               server_time: iso(now()), ack_seq: ackCursor(store.tenant(tenantId), deviceId), heartbeat_ms: heartbeatMs });
             timer = setTimeout(tick, heartbeatMs);
             if (msg.lease_id == null) send(await initialLease(store, tenantId, deviceId, userId, now(), live));
-            if (live()) await config.connect(deviceId, subscription);
+            if (live()) { await config.connect(deviceId, subscription); diag.connect(deviceId, tenantId, send, live); }
             return;
           }
           if (state === 'starting') { stop(1008, 'welcome pending'); return; }
@@ -165,6 +167,12 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
           if (msg.type === 'events' && isText(msg.id)) {
             const ack_seq = await ingestEvents(store, tenantId, deviceId, userId, now(), live, eventItems(msg.batch), publish);
             send({ type: 'events_ack', re: msg.id, ack_seq });
+            return;
+          }
+          if (msg.type === 'diag_result' && isText(msg.id)) {
+            if (!isText(msg.diag_id) || typeof msg.ok !== 'boolean') throw new ApiError('invalid', { fields: ['diag_id', 'ok'] });
+            await diag.result(tenantId, deviceId, msg.diag_id, msg.ok, msg.detail, live);
+            send({ type: 'ack', re: msg.id, ok: true });
             return;
           }
           if (isText(msg.id)) {

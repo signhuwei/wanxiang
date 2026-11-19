@@ -67,6 +67,11 @@ const ledger = managed({ id: text, kind: text, amount_milli: { type: 'integer' }
   request_ref: nullableText, by: nullableText, at: text, note: nullableText });
 const staleLease = managed({ id: text, device_id: text, user_id: text, budget_milli: sequence, used_milli: sequence,
   expires_at: text, status: text, seq: sequence, last_seen_at: nullableText });
+const device = managed({ id: text, user_id: text, name: text, os: text, arch: text, edge_version: nullableText,
+  status: text, last_seen_at: nullableText, online: { type: 'boolean' } });
+const diagJob = managed({ id: text, device_id: text, kind: { type: 'string', enum: ['logs', 'status'] },
+  status: { type: 'string', enum: ['pending', 'ready', 'failed', 'expired'] }, requested_by: text, at: text,
+  expires_at: nullableText, download_url: nullableText });
 
 export const openapi = {
   openapi: '3.1.0',
@@ -91,7 +96,22 @@ export const openapi = {
     '/v1/devices': { post: { summary: '注册设备，需要租户令牌', security: bearer, parameters: headers,
       requestBody: requestBody(object({ name: { ...text, maxLength: 128 }, os: { ...text, maxLength: 32 }, arch: { ...text, maxLength: 32 },
         public_key: { ...nullableText, contentEncoding: 'base64', description: '32 字节 X25519 公钥，缺少公钥时不下发密钥' } }, ['name', 'os', 'arch'])),
-      responses: { 201: response('设备令牌', object({ device_id: text, device_token: token })), ...status } } },
+      responses: { 201: response('设备令牌', object({ device_id: text, device_token: token })), ...status } },
+      get: { ...listOf(device), summary: '设备台账，仅 owner/admin 可见' } },
+    '/v1/devices/{id}': { get: { ...detailOf(device), summary: '设备详情' } },
+    '/v1/devices/{id}/diag': { post: { summary: '对指定设备下发诊断指令', security: bearer, parameters: [idPath, ...headers],
+      requestBody: requestBody(object({ kind: { type: 'string', enum: ['logs', 'status'] } }, ['kind'])),
+      responses: { 201: response('已创建诊断任务', diagJob), 404: error('设备不存在'), 429: error('同设备十分钟内已有一次诊断任务'), ...status },
+      description: '仅 owner、admin 或平台管理员可调用；设备离线时任务立即标记失败。' } },
+    '/v1/diag/{id}': { get: { summary: '诊断任务状态与下载地址', security: bearer, parameters: [idPath],
+      responses: { 200: response('任务状态', diagJob), 401: status[401], 403: status[403], 404: error('任务不存在或无权查看') } } },
+    '/v1/diag/{id}/upload': { put: { summary: 'Edge 回传日志包', security: [{ DeviceToken: [] }], parameters: [idPath],
+      requestBody: { required: true, content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
+      responses: { 204: response('已存档'), 401: status[401], 404: error('任务不存在或不是待上传状态'), 500: status[500] },
+      description: '不是预签名 URL：Edge 用设备令牌直接 PUT 到这个同源路径，Server 代为写入 RustFS。' } },
+    '/v1/diag/{id}/download': { get: { summary: '下载诊断日志包', security: bearer, parameters: [idPath],
+      responses: { 200: { description: '日志包二进制', content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
+        401: status[401], 403: status[403], 404: error('任务未完成、无权查看或保留期已过') } } },
     '/v1/members': { get: listOf(member, [{ name: 'role', in: 'query', schema: role },
       { name: 'status', in: 'query', schema: { type: 'string', enum: ['active', 'disabled'] } }]), post: write(object(memberInput, ['user_id']), member, 'create') },
     '/v1/members/{id}': { get: detailOf(member), ...Object.fromEntries(['post', 'patch'].map((method) =>

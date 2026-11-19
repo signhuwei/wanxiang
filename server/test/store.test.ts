@@ -24,7 +24,7 @@ test('migrations persist version, WAL mode and independent tenant databases', as
     expect(db.system.all('SELECT user_id FROM platform_admins')).toEqual([{ user_id: a.userId }]);
     const first = db.tenant(a.tenantId);
     expect(first.get('PRAGMA journal_mode')).toEqual({ journal_mode: 'wal' });
-    expect(first.get('PRAGMA user_version')).toEqual({ user_version: 6 });
+    expect(first.get('PRAGMA user_version')).toEqual({ user_version: 7 });
     // 006_lease_overage：整表重建后索引还在，CHECK 放开到包含 overage_pending 但仍拒绝别的字符串
     expect(first.get("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'ledger_by_kind_and_at'"))
       .toEqual({ name: 'ledger_by_kind_and_at' });

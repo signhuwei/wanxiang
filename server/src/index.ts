@@ -1,4 +1,6 @@
 import { randomToken } from './credentials';
+import { sweepExpiredJobs } from './diag';
+import { RustfsObjectStorage } from './object-storage';
 import { MemoryPresence, ValkeyPresence } from './presence';
 import { createServer } from './server';
 import { masterKeyFromEnv } from './provider-secret';
@@ -17,16 +19,32 @@ const masterKey = masterKeyFromEnv(env.ONEX_MASTER_KEY);
 if (!dev && (!configuredSecret || !env.ONEX_VALKEY_URL || !masterKey)) throw new Error('Production requires ONEX_AUTH_SECRET, ONEX_VALKEY_URL and ONEX_MASTER_KEY');
 const codeSecret = configuredSecret ?? randomToken();
 const presence = env.ONEX_VALKEY_URL ? new ValkeyPresence(env.ONEX_VALKEY_URL) : new MemoryPresence();
+// RustFS 只绑回环，Server 和它同机：诊断日志的实际字节都经本进程转发，见 diag.ts 顶部注释。
+// deploy/run-service.sh 从既有的 secrets/rustfs.key 读取访问凭据注入这三个变量，不打印明文。
+const objectStorage = env.ONEX_RUSTFS_ENDPOINT && env.ONEX_RUSTFS_ACCESS_KEY && env.ONEX_RUSTFS_SECRET_KEY
+  ? new RustfsObjectStorage({ endpoint: env.ONEX_RUSTFS_ENDPOINT, bucket: env.ONEX_RUSTFS_BUCKET ?? 'onex-diag',
+    accessKeyId: env.ONEX_RUSTFS_ACCESS_KEY, secretAccessKey: env.ONEX_RUSTFS_SECRET_KEY })
+  : undefined;
+// CONTRACT-PENDING: diagnostics is new; unlike Valkey/the master key this is not yet a hard production
+// requirement so an existing deployment without RustFS env vars still starts. Diag requests fail with
+// `internal` (see diag.ts) until ONEX_RUSTFS_* is set.
+if (!objectStorage) console.warn('OneX: no RustFS configured; device diagnostics will report an internal error');
 try {
   if (presence instanceof ValkeyPresence) await presence.connect();
   else console.warn('OneX: development-only in-memory presence; set ONEX_VALKEY_URL for Valkey');
   const app = await createServer({
     dataDir: env.ONEX_DATA_DIR ?? '.local', hostname: env.ONEX_HOST ?? '127.0.0.1',
     port: integer('ONEX_PORT', 3000, 0, 65_535), tenantCacheSize: integer('ONEX_TENANT_CACHE_SIZE', 16, 1, 1_000),
-    heartbeatMs: 15_000, commit: env.ONEX_COMMIT ?? 'unknown', codeSecret, masterKey, presence,
+    heartbeatMs: 15_000, commit: env.ONEX_COMMIT ?? 'unknown', codeSecret, masterKey, presence, objectStorage,
     deliverCode: dev ? (target, code) => console.info(`[onex-dev] login code for ${target}: ${code}`) : undefined,
   });
+  // 七天保留届满后的真对象清理；下载接口已经按 expires_at 拒绝访问，这里把过期对象从 RustFS 删掉。
+  const sweep = setInterval(() => {
+    void sweepExpiredJobs(app.store, objectStorage, Date.now()).catch((error) => console.error('OneX diag sweep failed', error));
+  }, 3_600_000);
+  sweep.unref();
   const shutdown = () => {
+    clearInterval(sweep);
     void app.close().catch((error) => { console.error('OneX shutdown failed', error); process.exitCode = 1; });
   };
   process.once('SIGTERM', shutdown);
