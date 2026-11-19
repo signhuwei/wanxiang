@@ -69,7 +69,10 @@ export async function ingestEvents(store: Store, tenant: string, device: string,
     for (const row of items) {
       if (!markSequence(sql, device, row.seq)) continue;
       const existing = sql.get<{ device_id: string }>('SELECT device_id FROM agent_sessions WHERE id = ?', [row.session]);
-      if (existing && existing.device_id !== device) throw new ApiError('conflict');
+      if (existing && existing.device_id !== device) {
+        console.warn('OneX rejected cross-device session event', { tenant_id: tenant, device_id: device, session_id: row.session });
+        throw new ApiError('conflict');
+      }
       if (!existing) {
         sql.run(`INSERT INTO agent_sessions (id, device_id, user_id, agent, agent_version, started_at, last_event_at)
           VALUES (?, ?, ?, 'unknown', '', ?, ?)`, [row.session, device, user, row.at, row.at]);

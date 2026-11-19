@@ -16,12 +16,12 @@ type DeviceReply = { device_id: string; device_token: string };
 const clean: (() => void | Promise<void>)[] = [];
 afterEach(async () => { for (const dispose of clean.splice(0).reverse()) await dispose(); });
 
-async function fixture(heartbeatMs = 15_000) {
+async function fixture(heartbeatMs = 15_000, testTime?: number) {
   const dataDir = mkdtempSync(join(tmpdir(), 'onex-server-'));
   clean.push(() => rmSync(dataDir, { recursive: true, force: true }));
   const codes = new Map<string, string>();
   const presence = new MemoryPresence();
-  let time = Date.now();
+  let time = testTime ?? Date.now();
   const service = await createServer({
     dataDir, hostname: '127.0.0.1', port: 0, tenantCacheSize: 2, heartbeatMs, commit: 'test',
     codeSecret: 'test-only-secret', masterKey: Buffer.alloc(32, 41), deliverCode: (target, code) => { codes.set(target, code); },
@@ -379,7 +379,7 @@ test('configuration scopes model routes and encrypts provider secrets to the reg
 });
 
 test('event and usage acknowledgments share a durable cursor, and observation is scoped and audited', async () => {
-  const f = await fixture();
+  const f = await fixture(15_000, Date.parse('2027-01-31T15:55:00.000Z'));
   const scoped = await f.select(await f.login());
   const a = await linkedEdge(f, scoped);
   await a.nextOf('cutoff');
@@ -406,11 +406,26 @@ test('event and usage acknowledgments share a durable cursor, and observation is
     expect(await a.nextOf('events_ack')).toMatchObject({ ack_seq: 3 });
     a.send({ type: 'events', id: 'gap', batch: [{ seq: 4, session_id, kind: 'gap', at, payload: { reason: 'bad_line', offset: 55 } }] });
     expect(await a.nextOf('events_ack')).toMatchObject({ ack_seq: 4 });
-    expect(await (await f.request('/observe/people', undefined, scoped)).json()).toMatchObject({ items: [{ user_id: f.userId, session_count: 1, cost_milli: 3 }] });
-    expect(await (await f.request('/observe/sessions', undefined, scoped)).json()).toMatchObject({ items: [{ id: session_id, event_count: 3,
-      cost_milli: 3, pending_usage_count: 1, input_tokens: 5, output_tokens: 2 }] });
+    a.send({ type: 'events', id: 'non-turns', batch: [
+      { ...input, seq: 5, payload: { content: 'subagent', sidechain: true, agent_id: 'sub' } },
+      { ...input, seq: 6, payload: { content: 'injection', system_injected: true } },
+    ] });
+    expect(await a.nextOf('events_ack')).toMatchObject({ ack_seq: 6 });
+    const usageBase = { request_id: 'month-test', session_id, provider_id: 'prv_test', model: 'fake', model_id: 'mod_test',
+      input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, complete: true, status: 'ok' };
+    f.advance(Date.parse('2027-01-31T16:30:00.000Z') - f.now());
+    a.send({ type: 'usage', id: 'month-boundary', batch: [
+      { ...usageBase, seq: 7, at: '2027-01-31T15:59:59.999Z', cost_milli: 7 },
+      { ...usageBase, seq: 8, at: '2027-01-31T16:00:00.000Z', cost_milli: 11 },
+    ] });
+    expect(await a.nextOf('events_ack')).toMatchObject({ ack_seq: 8 });
+    expect(await (await f.request('/observe/people', undefined, scoped)).json()).toMatchObject({
+      items: [{ user_id: f.userId, session_count: 1, cost_milli: 21, month_cost_milli: 11 }],
+    });
+    expect(await (await f.request('/observe/sessions', undefined, scoped)).json()).toMatchObject({ items: [{ id: session_id, event_count: 5,
+      turn_count: 1, cost_milli: 21, pending_usage_count: 3, input_tokens: 5, output_tokens: 2 }] });
     expect(await (await f.request(`/observe/sessions/${session_id}/events?after_seq=1`, undefined, scoped)).json()).toMatchObject({
-      items: [{ seq: 3, source_offset: 50, payload: input.payload }, { seq: 4, kind: 'gap' }], total: 2 });
+      items: [{ seq: 3, source_offset: 50, payload: input.payload }, { seq: 4, kind: 'gap' }, { seq: 5 }, { seq: 6 }], total: 4 });
     expect(f.store.tenant(f.tenantId).all('SELECT actor, action, target FROM audit ORDER BY rowid')).toEqual([
       { actor: f.userId, action: 'observe.events.read', target: session_id },
       { actor: f.userId, action: 'observe.events.read', target: session_id },
@@ -420,8 +435,8 @@ test('event and usage acknowledgments share a durable cursor, and observation is
   await a.closed;
   const b = connect(f, a.device_token);
   expect(await b.opened).toBe(true);
-  b.hello(undefined, 4);
-  expect(await b.next()).toMatchObject({ type: 'welcome', ack_seq: 4 });
+  b.hello(undefined, 8);
+  expect(await b.next()).toMatchObject({ type: 'welcome', ack_seq: 8 });
   const unrelated = await linkedEdge(f, scoped);
   await unrelated.nextOf('cutoff');
   unrelated.send({ type: 'events', id: 'cross-device', batch: [{ ...input, seq: 1 }] });
