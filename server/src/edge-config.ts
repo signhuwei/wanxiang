@@ -54,11 +54,11 @@ export function configPublisher(store: Store, now: () => number, masterKey?: Uin
     const at = iso(now());
     const candidates = store.system.all<RouteRow>(`SELECT m.id AS model_id, m.route_model, m.upstream_name AS upstream_model,
       p.id AS provider_id, p.protocol, p.base_url, p.auth, p.proxy FROM models m JOIN providers p ON p.id = m.provider_id
-      WHERE m.status = 'active' AND p.status = 'active' AND p.protocol = 'anthropic'
+      WHERE m.status = 'active' AND p.status = 'active' AND p.protocol IN ('anthropic', 'openai_chat')
       AND m.id IN (SELECT value FROM json_each(?))
       AND EXISTS (SELECT 1 FROM rates r WHERE r.model_id = m.id AND r.effective_from <= ?) ORDER BY m.id`, [allowedModels, at]);
     const routes = candidates.map(({ route_model, auth, proxy, ...row }) => ({ ...row, model: route_model ?? row.upstream_model,
-      auth: auth ?? 'x_api_key', ...(proxy && { proxy }) }));
+      auth: auth ?? (row.protocol === 'anthropic' ? 'x_api_key' : 'bearer'), ...(proxy && { proxy }) }));
     const rates = routes.map(({ model_id }) => store.system.get(`SELECT model_id, input_milli_per_mtok, output_milli_per_mtok,
       cache_read_milli_per_mtok, cache_write_milli_per_mtok, effective_from FROM rates WHERE model_id = ? AND effective_from <= ?
       ORDER BY effective_from DESC LIMIT 1`, [model_id, at])!);

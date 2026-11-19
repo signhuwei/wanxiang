@@ -47,8 +47,15 @@ asset() {
   if [[ -f $cache/$file && $(sha "$cache/$file") == "$hash" ]]; then return; fi
   if [[ $mode == --offline ]]; then echo "Missing or invalid checked asset: $file" >&2; return 1; fi
   tmp=$(mktemp "$cache/.download.XXXXXXXX")
-  if ! curl --fail --silent --show-error --location --retry 2 --proto '=https' --proto-redir '=https' --output "$tmp" "$url" || [[ $(sha "$tmp") != "$hash" ]]; then
-    rm -f -- "$tmp"; echo "Could not download or verify $file" >&2; return 1
+  if ! curl --fail --silent --show-error --location --retry 2 --proto '=https' --proto-redir '=https' --output "$tmp" "$url"; then
+    rm -f -- "$tmp"
+    echo "Could not download $file. If your network requires a proxy, set HTTPS_PROXY." >&2
+    return 1
+  fi
+  if [[ $(sha "$tmp") != "$hash" ]]; then
+    rm -f -- "$tmp"
+    echo "SHA-256 verification failed for $file" >&2
+    return 1
   fi
   mv -f -- "$tmp" "$cache/$file"
 }

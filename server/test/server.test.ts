@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from '../src/server';
 import { seedTenant } from '../src/seed';
+import { seedMvp } from '../src/seed-mvp';
 import { MemoryPresence } from '../src/presence';
 import { hash } from '../src/credentials';
 import { decryptProviderSecret } from '../src/provider-secret';
@@ -428,7 +429,7 @@ test('event and usage acknowledgments share a durable cursor, and observation is
       items: [{ user_id: f.userId, session_count: 1, cost_milli: 21, month_cost_milli: 11 }],
     });
     expect(await (await f.request('/observe/sessions', undefined, scoped)).json()).toMatchObject({ items: [{ id: session_id, event_count: 5,
-      turn_count: 1, cost_milli: 21, pending_usage_count: 3, input_tokens: 5, output_tokens: 2 }] });
+      turn_count: 1, cost_milli: 21, pending_usage_count: 3, input_tokens: 5, output_tokens: 2, actions: ['read', 'read_content'] }] });
     expect(await (await f.request(`/observe/sessions/${session_id}/events?after_seq=1`, undefined, scoped)).json()).toMatchObject({
       items: [{ seq: 3, source_offset: 50, payload: input.payload }, { seq: 4, kind: 'gap' }, { seq: 5 }, { seq: 6 }], total: 4 });
     expect(f.store.tenant(f.tenantId).all('SELECT actor, action, target FROM audit ORDER BY rowid')).toEqual([
@@ -451,12 +452,34 @@ test('event and usage acknowledgments share a durable cursor, and observation is
   const login = await f.request('/auth/login', { target, code: await f.code(target), invite_code: invite.invite_code });
   const admin = await f.select((await login.json() as { token: string }).token);
   expect(await (await f.request('/observe/people', undefined, admin)).json()).toMatchObject({ total: 2 });
+  expect(await (await f.request('/observe/sessions', undefined, admin)).json()).toMatchObject({ items: [{ id: session_id, actions: ['read'] }] });
   expect((await f.request(`/observe/sessions/${session_id}/events`, undefined, admin)).status).toBe(404);
   const contract = await (await f.request('/contract', undefined, scoped)).json() as Record<string, unknown>;
   const grants = { admin: { summary: true, content: true }, group_admin: { summary: true, content: false } };
   expect((await f.request('/contract', { ...contract, visibility: grants }, scoped, undefined, 'PUT')).status).toBe(200);
+  expect(await (await f.request('/observe/sessions', undefined, admin)).json()).toMatchObject({ items: [{ id: session_id, actions: ['read', 'read_content'] }] });
   expect((await f.request(`/observe/sessions/${session_id}/events`, undefined, admin)).status).toBe(200);
   expect(f.store.tenant(f.tenantId).get("SELECT actor FROM audit WHERE action = 'contract.visibility.update'")).toEqual({ actor: f.userId });
+});
+
+test('MVP seed provisions OTP users, an OpenAI Chat route, and a prepaid lease', async () => {
+  const f = await fixture();
+  const seeded = await seedMvp(f.store, { owner: 'mvp-owner@example.test', employee: 'mvp-employee@example.test', masterKey: Buffer.alloc(32, 41), now: f.now() });
+  const repeat = await seedMvp(f.store, { owner: 'mvp-owner@example.test', employee: 'mvp-employee@example.test', masterKey: Buffer.alloc(32, 41), now: f.now() });
+  expect(repeat).toEqual(seeded);
+  const owner = await f.login(seeded.owner_target);
+  expect((await f.request('/platform/providers', undefined, owner)).status).toBe(200);
+  const employee = await f.login(seeded.employee_target);
+  const selected = await f.request('/auth/select-tenant', { tenant_id: seeded.tenant_id }, employee);
+  expect(selected.status).toBe(200);
+  const { token } = await selected.json() as { token: string };
+  const edge = await linkedEdge(f, token);
+  expect(await edge.nextOf('lease')).toMatchObject({ budget_milli: 2000 });
+  expect(await edge.next()).toMatchObject({ type: 'config', routes: [{ model: '*', protocol: 'openai_chat',
+    base_url: 'http://192.168.3.212:11516/v1', upstream_model: 'Qwen3.8-27B', auth: 'bearer' }],
+    rates: [{ model_id: seeded.model_id, input_milli_per_mtok: 1000, output_milli_per_mtok: 4000 }] });
+  expect(await edge.next()).toMatchObject({ type: 'secret', provider_id: seeded.provider_id });
+  expect(f.store.tenant(seeded.tenant_id).get('SELECT sum(amount_milli) AS n FROM ledger WHERE kind = ?', ['topup'])).toEqual({ n: 1_000_000 });
 });
 
 async function fund(f: Awaited<ReturnType<typeof fixture>>, token: string, amount: number) {
