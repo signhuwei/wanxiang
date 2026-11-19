@@ -107,18 +107,47 @@ fn sec_err(e: security_framework::base::Error) -> anyhow::Error {
     anyhow::anyhow!("macOS Keychain error {}: {}", e.code(), e)
 }
 
-/// 非 macOS：没有等价的系统凭据存储，身份只在内存里（和此前所有平台的行为一致）。
-#[cfg(not(target_os = "macos"))]
+/// Windows：系统凭据存储用 Windows 凭据管理器（Credential Manager）的 generic credential，
+/// 范围是当前登录用户（`CRED_PERSIST_LOCAL_MACHINE` 会被其它本机用户看到，这里特意不用）。
+/// target name 复用 `service_name()`，和 macOS Keychain 的 service 字符串按 `ONEX_HOME` 区分
+/// 是同一个目的。凭据 blob 存的是 `DeviceCredentials` 的 JSON 序列化字节，和 macOS 分支一致。
+#[cfg(windows)]
+pub struct KeychainStore {
+    target: String,
+}
+
+#[cfg(windows)]
+impl KeychainStore {
+    pub fn new(service: String) -> Self {
+        Self { target: service }
+    }
+}
+
+#[cfg(windows)]
+impl CredentialStore for KeychainStore {
+    fn load(&self) -> Result<Option<DeviceCredentials>> {
+        windows_credentials::load(&self.target)
+    }
+    fn save(&self, creds: &DeviceCredentials) -> Result<()> {
+        windows_credentials::save(&self.target, creds)
+    }
+    fn clear(&self) -> Result<()> {
+        windows_credentials::clear(&self.target)
+    }
+}
+
+/// 非 macOS、非 Windows：没有等价的系统凭据存储，身份只在内存里（和此前所有平台的行为一致）。
+#[cfg(not(any(target_os = "macos", windows)))]
 pub struct KeychainStore;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 impl KeychainStore {
     pub fn new(_service: String) -> Self {
         Self
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 impl CredentialStore for KeychainStore {
     fn load(&self) -> Result<Option<DeviceCredentials>> {
         Ok(None)
@@ -127,6 +156,100 @@ impl CredentialStore for KeychainStore {
         Ok(())
     }
     fn clear(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+mod windows_credentials {
+    //! `CredWriteW`/`CredReadW`/`CredDeleteW` 的窄封装，只处理 `CRED_TYPE_GENERIC`。
+    //! 所有宽字符串转换和裸指针操作集中在这里，调用方（`KeychainStore`）只打交道
+    //! `DeviceCredentials` 和 `anyhow::Result`。
+
+    use super::DeviceCredentials;
+    use anyhow::{Context, Result, bail};
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
+    use windows_sys::Win32::Security::Credentials::{
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredFree, CredReadW, CredWriteW,
+    };
+    use zeroize::Zeroizing;
+
+    fn wide(s: &str) -> Vec<u16> {
+        OsStr::new(s).encode_wide().chain(Some(0)).collect()
+    }
+
+    pub(super) fn load(target: &str) -> Result<Option<DeviceCredentials>> {
+        let target_w = wide(target);
+        let mut p_cred: *mut CREDENTIALW = std::ptr::null_mut();
+        // SAFETY: `target_w` 是有效的、以 NUL 结尾的宽字符串；成功时系统分配好一份 `CREDENTIALW`
+        // 并把指针写进 `p_cred`，用 `CredFree` 释放。失败且错误码是 ERROR_NOT_FOUND 时不是异常，
+        // 是"从没存过"。
+        let ok = unsafe { CredReadW(target_w.as_ptr(), CRED_TYPE_GENERIC, 0, &mut p_cred) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_NOT_FOUND {
+                return Ok(None);
+            }
+            bail!("CredReadW failed with error {err}");
+        }
+        let result = (|| -> Result<DeviceCredentials> {
+            // SAFETY: `p_cred` 非空（`ok != 0`），`CredentialBlob`/`CredentialBlobSize` 由
+            // CredReadW 填好，描述一段系统拥有、我们只读的字节。
+            let cred = unsafe { &*p_cred };
+            let bytes = unsafe {
+                Zeroizing::new(
+                    std::slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize).to_vec(),
+                )
+            };
+            serde_json::from_slice(&bytes).context("stored device credentials are not valid JSON")
+        })();
+        unsafe { CredFree(p_cred as *const _) };
+        result.map(Some)
+    }
+
+    pub(super) fn save(target: &str, creds: &DeviceCredentials) -> Result<()> {
+        let target_w = wide(target);
+        let mut comment_w = wide("OneX Edge device identity");
+        let mut blob = Zeroizing::new(serde_json::to_vec(creds).context("serialize device credentials")?);
+        // `CRED_PERSIST_LOCAL_MACHINE`：persists across logons for this Windows user account only
+        // (Windows partitions Credential Manager storage per user; this is not machine-wide).
+        // `CRED_PERSIST_SESSION` would be lost on every daemon restart, which defeats the point.
+        let cred = CREDENTIALW {
+            Flags: 0,
+            Type: CRED_TYPE_GENERIC,
+            TargetName: target_w.as_ptr() as *mut u16,
+            Comment: comment_w.as_mut_ptr(),
+            LastWritten: unsafe { std::mem::zeroed() },
+            CredentialBlobSize: blob.len() as u32,
+            CredentialBlob: blob.as_mut_ptr(),
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            AttributeCount: 0,
+            Attributes: std::ptr::null_mut(),
+            TargetAlias: std::ptr::null_mut(),
+            UserName: std::ptr::null_mut(),
+        };
+        // SAFETY: 所有指针字段指向本函数栈上活到调用结束的缓冲区（`target_w`、`comment_w`、`blob`）。
+        let ok = unsafe { CredWriteW(&cred, 0) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            bail!("CredWriteW failed with error {err}");
+        }
+        Ok(())
+    }
+
+    pub(super) fn clear(target: &str) -> Result<()> {
+        let target_w = wide(target);
+        // SAFETY: `target_w` 是有效的、以 NUL 结尾的宽字符串。
+        let ok = unsafe { CredDeleteW(target_w.as_ptr(), CRED_TYPE_GENERIC, 0) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_NOT_FOUND {
+                return Ok(());
+            }
+            bail!("CredDeleteW failed with error {err}");
+        }
         Ok(())
     }
 }
@@ -205,16 +328,16 @@ mod tests {
         assert!(!dbg.contains("s3cr3t-token-value"));
     }
 
-    /// 真实 Keychain 的烟雾测试：会实际写入/删除本机登录 Keychain 的一个条目。
-    /// 默认跳过；本机人工验收时设置 `ONEX_TEST_KEYCHAIN=1` 单独运行。
+    /// 真实系统凭据存储的烟雾测试（macOS Keychain 或 Windows 凭据管理器）：会实际写入/删除
+    /// 本机登录账户下的一个条目。默认跳过；本机人工验收时设置 `ONEX_TEST_KEYCHAIN=1` 单独运行。
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore)]
-    fn keychain_roundtrips_on_macos() {
+    #[cfg_attr(not(any(target_os = "macos", windows)), ignore)]
+    fn keychain_roundtrips_on_native_store() {
         if std::env::var("ONEX_TEST_KEYCHAIN").is_err() {
-            eprintln!("skipping: set ONEX_TEST_KEYCHAIN=1 to exercise the real macOS Keychain");
+            eprintln!("skipping: set ONEX_TEST_KEYCHAIN=1 to exercise the real system credential store");
             return;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             let svc = format!("OneX Edge Device Credentials: test-{}", id_for_test());
             let store = KeychainStore::new(svc);
@@ -231,7 +354,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     fn id_for_test() -> u128 {
         let mut b = [0u8; 16];
         b.copy_from_slice(&rand::random::<[u8; 16]>());

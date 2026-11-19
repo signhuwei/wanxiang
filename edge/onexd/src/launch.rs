@@ -9,7 +9,6 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -17,7 +16,11 @@ use serde_json::{Value, json};
 
 use crate::id;
 
-/// 从员工环境里只带过来这些（终端和区域设置），其余一律不继承。
+/// 从员工环境里只带过来这些（终端和区域设置），其余一律不继承。Windows 的终端和区域设置
+/// 走不同的变量：`ComSpec`（cmd.exe 路径）、`SystemRoot`（部分工具会用来找系统 DLL）、
+/// `PROMPT`（cmd 的提示符样式）、`WT_SESSION`/`WT_PROFILE_ID`（Windows Terminal 自报身份）、
+/// `USERNAME`（Windows 下等价于 Unix 的 `USER`）。
+#[cfg(unix)]
 const PASS_ENV: &[&str] = &[
     "TERM",
     "COLORTERM",
@@ -30,6 +33,32 @@ const PASS_ENV: &[&str] = &[
     "LOGNAME",
     "SHELL",
 ];
+
+#[cfg(windows)]
+const PASS_ENV: &[&str] = &[
+    "ComSpec",
+    "SystemRoot",
+    "PROMPT",
+    "WT_SESSION",
+    "WT_PROFILE_ID",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "USERNAME",
+];
+
+/// Windows 的进程环境块本身大小写不敏感，但调用方把它收进了普通 `BTreeMap<String, String>`
+/// （`std::env::vars()` 在 Windows 上多半给出 `Path`、`USERPROFILE` 这类非全大写的键名，取决于
+/// 创建这个进程的父进程/shell 怎么设的），精确字符串匹配会漏掉实际存在的变量。Unix 的环境变量
+/// 本身大小写敏感，这里保持精确匹配，不改变既有行为。
+#[cfg(unix)]
+fn client_env_get<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a String> {
+    env.get(key)
+}
+
+#[cfg(windows)]
+fn client_env_get<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a String> {
+    env.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v)
+}
 
 #[derive(Debug, Clone)]
 pub struct Request<'a> {
@@ -91,11 +120,14 @@ pub fn prepare(r: &Request) -> Result<Launch> {
 
     let mut env = BTreeMap::new();
     for k in PASS_ENV {
-        if let Some(v) = r.client_env.get(*k) {
+        if let Some(v) = client_env_get(r.client_env, k) {
             env.insert(k.to_string(), v.clone());
         }
     }
-    let path = r.client_env.get("PATH").cloned().unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+    // Windows 的进程环境块本身大小写不敏感（`Path`、`USERPROFILE` 等常以非全大写形式出现），
+    // 但 `client_env` 是普通 `BTreeMap`，精确匹配不到真实的 PATH 就会被当成"没设"，所以查找走
+    // `client_env_get`（大小写不敏感），不是直接 `.get("PATH")`。
+    let path = client_env_get(r.client_env, "PATH").cloned().unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
     let set = |env: &mut BTreeMap<String, String>, k: &str, v: &str| {
         env.insert(k.into(), v.into());
     };
@@ -103,6 +135,20 @@ pub fn prepare(r: &Request) -> Result<Launch> {
     set(&mut env, "HOME", &user_home.to_string_lossy());
     set(&mut env, "CLAUDE_CONFIG_DIR", &config_dir.to_string_lossy());
     set(&mut env, "TMPDIR", &format!("{}/", tmp.to_string_lossy()));
+    // Windows 等价的一组：Node（Claude Code 是 Node CLI）和大多数 Windows 工具链不看 `HOME`/
+    // `TMPDIR`，而是 `USERPROFILE`（用户目录）、`APPDATA`/`LOCALAPPDATA`（配置/缓存根）、
+    // `TMP`/`TEMP`（临时目录）。不批量覆盖这组变量，Claude Code 会退回解析真实用户的这些路径，
+    // 等于完全绕开了这里刻意做的隔离（读写真实 `%USERPROFILE%\.claude` 等）。全部指到同一个
+    // 沙箱目录树下：`USERPROFILE`/`APPDATA`/`LOCALAPPDATA` 都指 `user_home`（没有必要在沙箱内部
+    // 再细分 Roaming/Local，Claude Code 不需要那层区分），`TMP`/`TEMP` 指 `tmp`。
+    #[cfg(windows)]
+    for k in ["USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
+        set(&mut env, k, &user_home.to_string_lossy());
+    }
+    #[cfg(windows)]
+    for k in ["TMP", "TEMP"] {
+        set(&mut env, k, &tmp.to_string_lossy());
+    }
     set(&mut env, "ANTHROPIC_BASE_URL", &base_url);
     set(&mut env, "ANTHROPIC_API_KEY", r.local_token);
     for k in [
@@ -200,15 +246,36 @@ fn init_claude_json(config_dir: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn private_dir(d: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
     std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
+/// Windows 没有权限位；目录继承 `ONEX_HOME`（`%LOCALAPPDATA%\OneX`）本身的 ACL，
+/// 已经是当前用户私有，不需要额外收紧。
+#[cfg(windows)]
+fn private_dir(d: &Path) -> Result<()> {
+    std::fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let _ = std::fs::remove_file(path);
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    let _ = std::fs::remove_file(path);
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     f.write_all(data)?;
     f.sync_all()?;
     Ok(())
@@ -226,6 +293,7 @@ fn uuid_v4() -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn client_env() -> BTreeMap<String, String> {
         [
             ("PATH", "/opt/homebrew/bin:/usr/bin"),
@@ -241,6 +309,7 @@ mod tests {
         .collect()
     }
 
+    #[cfg(unix)]
     #[test]
     fn prepares_isolated_launch() {
         let home = tempfile::tempdir().unwrap();
@@ -273,7 +342,11 @@ mod tests {
 
         let settings_path = PathBuf::from(l.args.last().unwrap());
         assert_eq!(settings_path, l.run_dir.join("settings.json"));
-        assert_eq!(std::fs::metadata(&settings_path).unwrap().permissions().mode() & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&settings_path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
         let s: Value = serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
         assert_eq!(s["env"]["ANTHROPIC_API_KEY"], "0123456789abcdef0123456789abcdef");
         assert_eq!(s["model"], "Qwen3.8-27B");
@@ -286,6 +359,69 @@ mod tests {
         finish(home.path(), &l.launch_id).unwrap();
         assert!(!l.run_dir.exists());
         assert!(finish(home.path(), "../x").is_err());
+    }
+
+    /// Windows 版 `prepares_isolated_launch`：路径和 `PASS_ENV` 都换成 Windows 的等价物
+    /// （`ComSpec` 代替 `TERM`，`C:\...` 绝对路径），断言内容和 Unix 版对应一致；另外覆盖两个
+    /// Windows 专属点：(1) `client_env` 用真实 Windows 大小写（`Path` 不是 `PATH`），验证
+    /// `client_env_get` 的大小写不敏感查找确实生效，不是精确匹配漏判成"没设"；(2) 批量覆盖
+    /// `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`TMP`/`TEMP` 指到沙箱目录，不透出真实用户目录。
+    #[cfg(windows)]
+    #[test]
+    fn prepares_isolated_launch() {
+        let env: BTreeMap<String, String> = [
+            ("Path", r"C:\Program Files\nodejs;C:\Windows\System32"),
+            ("ComSpec", r"C:\Windows\System32\cmd.exe"),
+            ("HOME", r"C:\Users\someone"),
+            ("USERPROFILE", r"C:\Users\someone"),
+            ("APPDATA", r"C:\Users\someone\AppData\Roaming"),
+            ("LOCALAPPDATA", r"C:\Users\someone\AppData\Local"),
+            ("TMP", r"C:\Users\someone\AppData\Local\Temp"),
+            ("ANTHROPIC_AUTH_TOKEN", "personal"),
+            ("HTTPS_PROXY", "http://corp:3128"),
+            ("CLAUDE_CONFIG_DIR", r"C:\Users\someone\.claude"),
+            ("AWS_PROFILE", "x"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let r = Request {
+            home: home.path(),
+            router_addr: "127.0.0.1:4567",
+            local_token: "0123456789abcdef0123456789abcdef",
+            model: "Qwen3.8-27B",
+            program: Path::new(r"C:\Users\someone\AppData\Local\OneX\claude.exe"),
+            cwd: cwd.path(),
+            client_env: &env,
+        };
+        let l = prepare(&r).unwrap();
+        let ns = home.path().join("agents/claude-code");
+        assert_eq!(l.env["HOME"], ns.join("home").to_string_lossy());
+        assert_eq!(l.env["CLAUDE_CONFIG_DIR"], ns.join("claude").to_string_lossy());
+        assert_eq!(l.env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:4567");
+        assert_eq!(l.env["ANTHROPIC_SMALL_FAST_MODEL"], "Qwen3.8-27B");
+        // 大小写不敏感查找：client_env 里是 "Path"，这里仍然要能取到它的值，不能因为我们自己
+        // 写代码时查的是 "PATH" 就丢失。
+        assert_eq!(
+            (l.env["PATH"].as_str(), l.env["ComSpec"].as_str()),
+            (r"C:\Program Files\nodejs;C:\Windows\System32", r"C:\Windows\System32\cmd.exe")
+        );
+        // 批量覆盖：都指向沙箱目录（ns/home、ns/tmp），不是 client_env 里真实用户的那几个值。
+        for k in ["USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
+            assert_eq!(l.env[k], ns.join("home").to_string_lossy(), "{k}");
+            assert_ne!(l.env[k], env[k]);
+        }
+        for k in ["TMP", "TEMP"] {
+            assert_eq!(l.env[k], ns.join("tmp").to_string_lossy(), "{k}");
+        }
+        assert_ne!(l.env["TMP"], env["TMP"]);
+        for k in ["ANTHROPIC_AUTH_TOKEN", "HTTPS_PROXY", "AWS_PROFILE"] {
+            assert!(!l.env.contains_key(k), "{k}");
+        }
+        finish(home.path(), &l.launch_id).unwrap();
+        assert!(!l.run_dir.exists());
     }
 
     #[test]
@@ -306,6 +442,7 @@ mod tests {
         assert_eq!(std::fs::read(d.path().join(".claude.json")).unwrap(), b"{broken");
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_relative_program_and_missing_cwd() {
         let home = tempfile::tempdir().unwrap();
@@ -321,6 +458,25 @@ mod tests {
         };
         assert!(prepare(&base).is_err());
         let r = Request { program: Path::new("/bin/claude"), cwd: Path::new("/no/such/dir"), ..base };
+        assert!(prepare(&r).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_relative_program_and_missing_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let env = BTreeMap::new();
+        let base = Request {
+            home: home.path(),
+            router_addr: "127.0.0.1:1",
+            local_token: "t",
+            model: "m",
+            program: Path::new("claude.exe"),
+            cwd: Path::new(r"C:\"),
+            client_env: &env,
+        };
+        assert!(prepare(&base).is_err());
+        let r = Request { program: Path::new(r"C:\Windows\claude.exe"), cwd: Path::new(r"C:\no\such\dir"), ..base };
         assert!(prepare(&r).is_err());
     }
 }
