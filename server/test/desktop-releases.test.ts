@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -55,7 +55,7 @@ async function fixture() {
     const full = path.startsWith('/v1/') || path.startsWith('/download') ? path : `/v1${path}`;
     return fetch(new URL(full, service.server.url), { method, headers, body: body && JSON.stringify(body) });
   }
-  async function putArtifact(id: string, revision: number, bytes: Uint8Array, token?: string, contentLength?: number) {
+  async function putArtifact(id: string, revision: number, bytes: Uint8Array | ReadableStream<Uint8Array>, token?: string, contentLength?: number) {
     const headers = new Headers();
     if (token) headers.set('authorization', `Bearer ${token}`);
     headers.set('content-type', 'application/octet-stream');
@@ -77,7 +77,7 @@ async function fixture() {
     if (!code) throw new Error(`No code was issued for ${target}`);
     return code;
   }
-  return { ...service, request, putArtifact, admin, codeFor, advance: (ms: number) => { time += ms; }, now: () => time };
+  return { ...service, dataDir, request, putArtifact, admin, codeFor, advance: (ms: number) => { time += ms; }, now: () => time };
 }
 
 // A minimal, structurally valid XAR header: magic + 28-byte fixed header whose toc_length_compressed
@@ -248,6 +248,43 @@ test('a stale revision on upload or publish is rejected and never disturbs the a
   expect((await f.request(`/platform/desktop-releases/${draft.id}/publish`, { revision: 1 }, a.token, 'pub-stale')).status).toBe(409);
   // A duplicate (os, arch, version) draft is a conflict, not a new record.
   expect((await f.request('/platform/desktop-releases', { version: '1.0.0', os: 'darwin', arch: 'arm64' }, a.token, 'dup')).status).toBe(409);
+});
+
+test('a losing concurrent upload cannot delete the identical artifact committed by the winner', async () => {
+  const f = await fixture();
+  const admin = await f.admin('concurrent-upload@example.test');
+  const response = await f.request('/platform/desktop-releases', { version: '1.0.0', os: 'darwin', arch: 'arm64' }, admin.token, 'race-draft');
+  expect(response.status).toBe(201);
+  const draft = await response.json() as Release;
+  const bytes = xarBytes();
+  const directory = join(f.dataDir, 'desktop-releases');
+  mkdirSync(directory, { mode: 0o700 });
+
+  const bodies = [new TransformStream<Uint8Array>(), new TransformStream<Uint8Array>()];
+  const writers = bodies.map(body => body.writable.getWriter());
+  const uploads = Promise.all(bodies.map(body => f.putArtifact(draft.id, draft.revision, body.readable, admin.token)));
+  await Promise.all(writers.map(writer => writer.write(bytes.subarray(0, 1))));
+  // Each temp file is opened only after the server accepts that request's starting revision.
+  const deadline = Date.now() + 2500;
+  let waitingUploads = 0;
+  try {
+    while (Date.now() < deadline) {
+      waitingUploads = readdirSync(directory).filter(name => name.endsWith('.part')).length;
+      if (waitingUploads === 2) break;
+      await Bun.sleep(10);
+    }
+  } finally {
+    await Promise.all(writers.map(async writer => { await writer.write(bytes.subarray(1)); await writer.close(); }));
+  }
+  expect(waitingUploads).toBe(2);
+  const results = await uploads;
+  expect(results.map(result => result.status).sort()).toEqual([200, 409]);
+  const winner = await results.find(result => result.ok)!.json() as Release;
+  const publish = await f.request(`/platform/desktop-releases/${draft.id}/publish`, { revision: winner.revision }, admin.token, 'race-publish');
+  expect(publish.status).toBe(200);
+  const download = await f.request(`/desktop-releases/${draft.id}/download`);
+  expect(download.status).toBe(200);
+  expect(new Uint8Array(await download.arrayBuffer())).toEqual(bytes);
 });
 
 test('publish is refused before the artifact is verified, and unpublish is refused on a draft', async () => {

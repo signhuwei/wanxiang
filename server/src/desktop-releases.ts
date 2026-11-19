@@ -61,10 +61,6 @@ function artifactDir(dataDir: string) {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   return dir;
 }
-// 每次上传成功都落到自己独一份的文件名（按 sha256 命名，同样的字节重传会撞到同一个文件，这是良性
-// 幂等，不是复用旧文件）；绝不直接覆盖草稿当前指向的旧文件，新文件先落地、DB 指针确认切换成功
-// 之后才删旧的，失败只收拾新文件，旧文件和旧 DB 行始终保持一致（见下面 PUT 处理器）。
-function artifactPath(dataDir: string, id: string, sha256: string) { return join(artifactDir(dataDir), `${id}-${sha256}.bin`); }
 // 两种格式的关键头部都在文件最开头几十字节内；64 KiB 足够覆盖任何真实的 DOS stub 长度，又远小于
 // 整份安装包，所以校验阶段只读这一段，不把 256 MiB 的文件整个读回内存。
 const HEADER_PROBE_BYTES = 64 * 1024;
@@ -151,8 +147,7 @@ export function desktopReleaseRoutes(app: Hono, store: Store, opts: ManagementOp
     return result.response;
   });
 
-  // Edge 直传风格：原始字节走 PUT，不是 JSON，所以没有 Idempotency-Key；重试靠客户端重传整份文件，
-  // 校验和落盘都是幂等的（同样的字节产生同样的 sha256，落在同一个最终文件名上）。
+  // 原始字节走 PUT，客户端以当前草稿修订重传。并发尝试各自拥有一个文件，落败的请求只能清理自己的文件。
   app.put('/v1/platform/desktop-releases/:id/artifact', async (c) => {
     const at = opts.now();
     const id = field(c.req.param('id'), 'id');
@@ -174,80 +169,67 @@ export function desktopReleaseRoutes(app: Hono, store: Store, opts: ManagementOp
     const limit = declared === undefined ? DESKTOP_ARTIFACT_MAX_BYTES : Number(declared);
     if (!c.req.raw.body || !Number.isSafeInteger(limit) || limit <= 0) throw new ApiError('invalid', { fields: ['artifact'] });
     if (limit > DESKTOP_ARTIFACT_MAX_BYTES) throw new ApiError('too_large', { max_bytes: DESKTOP_ARTIFACT_MAX_BYTES });
-    // Every concurrent attempt streams to its own uniquely-named temp file (a fresh ulid, never the
-    // draft's current or future artifact path), so a losing request never touches another's bytes and
-    // the loser's leftover temp file is always removed below, win or lose.
-    const tempPath = join(artifactDir(opts.dataDir), `upload-${ulid()}.part`);
+    const uploadPath = join(artifactDir(opts.dataDir), `${id}-${ulid()}`);
+    const tempPath = `${uploadPath}.part`;
+    const finalPath = `${uploadPath}.bin`;
     const digest = createHash('sha256');
     let size = 0;
     let timedOut = false;
     const file = await open(tempPath, 'wx', 0o600);
     try {
-      const reader = c.req.raw.body.getReader();
-      const timer = setTimeout(() => { timedOut = true; void reader.cancel().catch(() => {}); }, 120_000);
       try {
-        for (;;) {
-          const chunk = await reader.read();
-          if (timedOut) throw new ApiError('invalid', { fields: ['artifact'], reason: 'upload_timed_out' });
-          if (chunk.done) break;
-          size += chunk.value.byteLength;
-          if (size > DESKTOP_ARTIFACT_MAX_BYTES) throw new ApiError('too_large', { max_bytes: DESKTOP_ARTIFACT_MAX_BYTES });
-          digest.update(chunk.value);
-          await file.write(chunk.value);
+        const reader = c.req.raw.body.getReader();
+        const timer = setTimeout(() => { timedOut = true; void reader.cancel().catch(() => {}); }, 120_000);
+        try {
+          for (;;) {
+            const chunk = await reader.read();
+            if (timedOut) throw new ApiError('invalid', { fields: ['artifact'], reason: 'upload_timed_out' });
+            if (chunk.done) break;
+            size += chunk.value.byteLength;
+            if (size > DESKTOP_ARTIFACT_MAX_BYTES) throw new ApiError('too_large', { max_bytes: DESKTOP_ARTIFACT_MAX_BYTES });
+            digest.update(chunk.value);
+            let written = 0;
+            while (written < chunk.value.byteLength) {
+              const { bytesWritten } = await file.write(chunk.value, written, chunk.value.byteLength - written);
+              if (bytesWritten === 0) throw new Error('Desktop artifact write made no progress');
+              written += bytesWritten;
+            }
+          }
+        } finally {
+          clearTimeout(timer);
+          void reader.cancel().catch(() => {});
         }
+        if (size === 0 || (declared !== undefined && size !== limit)) throw new ApiError('invalid', { fields: ['artifact'] });
+        await file.sync();
       } finally {
-        clearTimeout(timer);
-        void reader.cancel().catch(() => {});
+        await file.close();
       }
-      // The declared Content-Length must match what we actually received, not just bound it: a short
-      // read (truncated connection) must fail even though it's under the cap.
-      if (size === 0 || (declared !== undefined && size !== limit)) throw new ApiError('invalid', { fields: ['artifact'] });
-    } catch (error) {
-      await file.close();
-      unlinkSync(tempPath);
-      throw error;
-    }
-    await file.close();
-    // Validate the format from a fresh read-only handle on just the header bytes — never load the
-    // whole (up to 256 MiB) upload back into memory to check a few dozen header bytes.
-    try {
+      // 校验只读文件头，完整制品最多 256 MiB。
       checkFormat(claimed.os, await readHeader(tempPath, Math.min(HEADER_PROBE_BYTES, size)), size);
-    } catch (error) {
-      unlinkSync(tempPath);
-      throw error;
-    }
-    const sha256 = digest.digest('hex');
-    const finalPath = artifactPath(opts.dataDir, id, sha256);
-    try {
-      // Land the new file under its own name first; it never collides with or overwrites the draft's
-      // current artifact (different name), so a crash here leaves the old artifact and old DB row
-      // exactly as they were — there is no window where the DB points at bytes that aren't there yet.
-      if (tempPath !== finalPath) renameSync(tempPath, finalPath);
+      renameSync(tempPath, finalPath);
     } catch (error) {
       try { unlinkSync(tempPath); } catch {}
       throw error;
     }
-    try {
-      const result = await store.system.write((sql) => {
-        requirePlatform(sql, actor);
-        const row = sql.get<ReleaseRow>('SELECT * FROM desktop_releases WHERE id = ?', [id]);
-        if (!row || row.status !== 'draft') throw new ApiError('conflict');
-        expectRevision(revision, row.revision);
-        const updated: ReleaseRow = { ...row, size, sha256, artifact_path: finalPath, revision: row.revision + 1 };
-        sql.run('UPDATE desktop_releases SET size = ?, sha256 = ?, artifact_path = ?, revision = ? WHERE id = ?',
-          [updated.size, updated.sha256, updated.artifact_path, updated.revision, id]);
-        // Only once this commits do we know the DB's new pointer is durable; delete the previous
-        // artifact file now, never before — a failed commit above leaves it untouched.
-        if (row.artifact_path && row.artifact_path !== finalPath) { try { unlinkSync(row.artifact_path); } catch {} }
-        return { status: 200 as const, payload: view(updated) };
-      });
-      return c.json(result.payload, result.status);
-    } catch (error) {
-      // The DB write lost (stale revision, draft already left, etc.): clean up only the file we just
-      // created for this attempt. The previously-committed artifact (if any) is never touched here.
+    const sha256 = digest.digest('hex');
+    const result = await store.system.write((sql) => {
+      requirePlatform(sql, actor);
+      const row = sql.get<ReleaseRow>('SELECT * FROM desktop_releases WHERE id = ?', [id]);
+      if (!row || row.status !== 'draft') throw new ApiError('conflict');
+      expectRevision(revision, row.revision);
+      const updated: ReleaseRow = { ...row, size, sha256, artifact_path: finalPath, revision: row.revision + 1 };
+      sql.run('UPDATE desktop_releases SET size = ?, sha256 = ?, artifact_path = ?, revision = ? WHERE id = ?',
+        [updated.size, updated.sha256, updated.artifact_path, updated.revision, id]);
+      return { previousPath: row.artifact_path, payload: view(updated) };
+    }).catch((error: unknown) => {
       try { unlinkSync(finalPath); } catch {}
       throw error;
+    });
+    // SQLite's outer batch transaction has committed when write() resolves.
+    if (result.previousPath) {
+      try { unlinkSync(result.previousPath); } catch {}
     }
+    return c.json(result.payload);
   });
 
   app.post('/v1/platform/desktop-releases/:id/publish', async (c) => {
