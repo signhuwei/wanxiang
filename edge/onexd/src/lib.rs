@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod chat;
 pub mod id;
 pub mod ipc;

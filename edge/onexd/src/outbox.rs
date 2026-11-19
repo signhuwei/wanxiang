@@ -84,7 +84,8 @@ impl Outbox {
                  seq INTEGER PRIMARY KEY,
                  kind TEXT NOT NULL,
                  item TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS cursors (k TEXT PRIMARY KEY, v TEXT NOT NULL);",
         )?;
         // 第一批的表没有 acked_at，补上。
         let has_acked_at: bool =
@@ -241,6 +242,37 @@ impl Outbox {
     /// last_seq 变化时通知，WS 客户端用它触发发送。
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.last_seq_tx.subscribe()
+    }
+
+    /// 会话采集的读取游标（JSON），没有时返回 None。
+    pub fn cursor(&self, key: &str) -> Result<Option<Value>> {
+        let conn = self.conn.lock().unwrap();
+        let s: Option<String> = conn.query_row("SELECT v FROM cursors WHERE k = ?1", [key], |r| r.get(0)).optional()?;
+        Ok(s.map(|s| serde_json::from_str(&s)).transpose()?)
+    }
+
+    /// 在一个事务里写入一批事件并推进游标：要么都提交，要么都不提交。
+    pub fn append_events_with_cursor(&self, items: Vec<Value>, key: &str, cursor: &Value) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut seq = meta(&tx, "last_seq")?;
+        for mut item in items {
+            seq += 1;
+            item.as_object_mut().context("outbox item must be a JSON object")?.insert("seq".into(), seq.into());
+            tx.execute(
+                "INSERT INTO outbox (seq, kind, item) VALUES (?1, ?2, ?3)",
+                params![seq as i64, Kind::Events.as_str(), item.to_string()],
+            )?;
+        }
+        tx.execute("UPDATE meta SET v = ?1 WHERE k = 'last_seq'", [seq as i64])?;
+        tx.execute(
+            "INSERT INTO cursors (k, v) VALUES (?1, ?2) ON CONFLICT (k) DO UPDATE SET v = excluded.v",
+            params![key, cursor.to_string()],
+        )?;
+        tx.commit()?;
+        drop(conn);
+        self.last_seq_tx.send_replace(seq);
+        Ok(())
     }
 }
 

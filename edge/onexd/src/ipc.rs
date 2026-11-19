@@ -33,6 +33,17 @@ pub struct Ipc {
 pub struct LaunchCtx {
     pub home: PathBuf,
     pub local_token: String,
+    /// launch_id → 进行中的启动
+    pub running: std::sync::Mutex<std::collections::HashMap<String, Running>>,
+}
+
+/// (停止采集, 退出码, session_id)
+pub type Running = (CancellationToken, Arc<std::sync::Mutex<Option<i32>>>, String);
+
+impl LaunchCtx {
+    pub fn new(home: PathBuf, local_token: String) -> Self {
+        Self { home, local_token, running: Default::default() }
+    }
 }
 
 /// 绑定 socket，权限 0600。已有 socket 能连上说明另一个 onexd 在跑，报错退出；连不上就是残留文件，删掉重建。
@@ -119,6 +130,11 @@ fn dispatch(req: Request, ipc: &Ipc) -> (Value, bool) {
         Request::LaunchDone { launch_id, exit_code } => {
             let Some(ctx) = &ipc.launch else { return (err("invalid", "这个 onexd 不支持启动 Agent"), false) };
             info!(%launch_id, ?exit_code, "agent exited");
+            if let Some((stop, code, session_id)) = ctx.running.lock().unwrap().remove(&launch_id) {
+                *code.lock().unwrap() = exit_code;
+                stop.cancel();
+                ipc.state.active_session.write().unwrap().take_if(|s| *s == session_id);
+            }
             match crate::launch::finish(&ctx.home, &launch_id) {
                 Ok(()) => (json!({"ok": true}), false),
                 Err(e) => (err("invalid", &format!("{e:#}")), false),
@@ -177,6 +193,19 @@ fn launch(
     match crate::launch::prepare(&r) {
         Ok(l) => {
             info!(launch_id = %l.launch_id, session_id = %l.session_id, program, agent_version, model = %model, cwd, "agent launch prepared");
+            let s = crate::capture::Session {
+                session_id: l.session_id.clone(),
+                config_dir: l.config_dir.clone(),
+                agent_version: agent_version.map(str::to_owned),
+                model: model.clone(),
+                cwd: l.cwd.clone(),
+            };
+            let stop = CancellationToken::new();
+            let code = Arc::new(std::sync::Mutex::new(None));
+            ctx.running.lock().unwrap().insert(l.launch_id.clone(), (stop.clone(), code.clone(), l.session_id.clone()));
+            // MVP 一次只关联一个会话：router 的 usage 记到最近启动的会话
+            *ipc.state.active_session.write().unwrap() = Some(l.session_id.clone());
+            tokio::spawn(crate::capture::Capture::new(s, ipc.outbox.clone()).run(stop, code));
             json!({"ok": true, "launch_id": l.launch_id, "session_id": l.session_id, "program": l.program,
                 "args": l.args, "env": l.env, "cwd": l.cwd, "model": model})
         }

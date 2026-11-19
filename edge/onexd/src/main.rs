@@ -85,7 +85,7 @@ async fn run(home: PathBuf) -> Result<()> {
         outbox: outbox.clone(),
         router_addr: Some(router_addr.to_string()),
         server_url: server.as_deref().and_then(onex_core::ipc::http_base),
-        launch: Some(ipc::LaunchCtx { home: home.clone(), local_token }),
+        launch: Some(ipc::LaunchCtx::new(home.clone(), local_token)),
         shutdown: shutdown.clone(),
     });
     let ipc_task = tokio::spawn(ipc::serve(listener, sock_path, ipc));

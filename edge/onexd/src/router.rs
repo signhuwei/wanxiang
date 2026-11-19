@@ -83,7 +83,7 @@ pub struct UsageRecord {
     pub stream: bool,
     pub started_at_ms: i64,
     pub duration_ms: u64,
-    // TODO(claude-code.md): 从请求头或 metadata 里取会话 id。
+    /// 请求开始时正在运行的受管会话（MVP 一次一个）
     pub session_id: Option<String>,
 }
 
@@ -354,7 +354,7 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         stream,
         started_at_ms: now_ms(),
         duration_ms: 0,
-        session_id: None,
+        session_id: rt.state.active_session.read().unwrap().clone(),
     };
     let mut req = Req { rt: rt.clone(), rec, meter, ticket, started };
 

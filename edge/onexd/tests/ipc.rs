@@ -49,10 +49,10 @@ async fn status_login_shutdown() {
 
     let srv = Arc::new(Ipc {
         state: state.clone(),
-        outbox,
+        outbox: outbox.clone(),
         router_addr: Some("127.0.0.1:1".into()),
         server_url: Some("http://127.0.0.1:2".into()),
-        launch: Some(ipc::LaunchCtx { home: dir.path().to_path_buf(), local_token: "localtok".into() }),
+        launch: Some(ipc::LaunchCtx::new(dir.path().to_path_buf(), "localtok".into())),
         shutdown: shutdown.clone(),
     });
     let task = tokio::spawn(ipc::serve(listener, path.clone(), srv));
@@ -94,9 +94,35 @@ async fn status_login_shutdown() {
     assert!(l["env"].get("SECRET").is_none());
     let run_dir = dir.path().join("run").join(l["launch_id"].as_str().unwrap());
     assert!(run_dir.join("settings.json").exists());
+    let sid = l["session_id"].as_str().unwrap().to_string();
+    assert_eq!(state.active_session.read().unwrap().as_deref(), Some(sid.as_str()));
+    // Claude Code 写主会话文件，采集到 outbox
+    let proj = dir.path().join("agents/claude-code/claude/projects/-tmp-x");
+    std::fs::create_dir_all(&proj).unwrap();
+    let line = json!({"type":"user","uuid":"u1","sessionId":sid,"message":{"role":"user","content":"你好"}});
+    std::fs::write(proj.join(format!("{sid}.jsonl")), format!("{line}\n")).unwrap();
     let done = json!({"cmd":"launch_done","launch_id":l["launch_id"],"exit_code":0}).to_string();
     assert_eq!(c.call(&done).await, json!({"ok": true}));
     assert!(!run_dir.exists());
+    assert!(state.active_session.read().unwrap().is_none());
+    let kinds = timeout(T, async {
+        loop {
+            let k: Vec<String> = outbox
+                .pending(0, 100)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.item["session_id"] == sid)
+                .map(|r| r.item["kind"].as_str().unwrap().to_string())
+                .collect();
+            if k.last().map(String::as_str) == Some("session_end") {
+                return k;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(kinds, ["session_start", "user_message", "session_end"]);
     let bad = json!({"cmd":"launch","agent":"codex","program":"/bin/echo","cwd":cwd,"env":{}}).to_string();
     assert_eq!(c.call(&bad).await["error"]["code"], "agent_not_allowed");
 
