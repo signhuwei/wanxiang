@@ -8,6 +8,8 @@
 
 所有公开对象带 `revision` 和 `actions`。
 
+创建类操作没有对象可挂，放在 `/me` 的 `actions` 里，命名为 `create_<资源单数>`：`create_member`、`create_group`、`create_invite`、`update_contract`、`topup`（平台管理员）。列表响应也带 `actions`，内容与 `/me.actions` 中该资源相关的部分一致，空列表时同样返回。
+
 ## 登录与设备
 
 验证码是登录的必要条件；邀请码只用于加入租户。`target` 是邮箱或手机号。
@@ -18,7 +20,7 @@
 | POST | `/auth/login` | `{target, code, invite_code?, kind?}`，`kind` 为 `web`（默认）或 `desktop`。返回全局令牌 `{token, user, tenants[]}` |
 | POST | `/auth/select-tenant` | `{tenant_id, kind?}`，`kind` 不传时继承当前令牌。返回新的租户范围令牌 |
 | POST | `/auth/logout` | 204 |
-| GET | `/me` | `{user, tenant, role, agents, is_platform_admin}`；未选租户时 `tenant`、`role` 为 null |
+| GET | `/me` | `{user, tenant, role, agents, is_platform_admin, actions}`；未选租户时 `tenant`、`role` 为 null |
 | POST | `/devices` | `{name, os, arch, public_key}`，201，返回 `{device_id, device_token}` |
 
 ## 写入与角色（v0.3）
