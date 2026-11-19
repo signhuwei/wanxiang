@@ -80,7 +80,11 @@ export function observationRoutes(app: Hono, store: Store, now: () => number) {
   });
 
   app.get('/v1/observe/sessions', (c) => {
-    const { db, scope: permissionScope } = reader(c);
+    const actor = reader(c);
+    const { db, scope: permissionScope } = actor;
+    const content = permission(actor, true);
+    const groupMembers = content.group === null ? null : new Set(db.all<{ user_id: string }>(
+      `SELECT user_id FROM members WHERE ${groupFilter}`, [content.group]).map(({ user_id }) => user_id));
     const p = pagination(c);
     const id = c.req.query('user_id');
     const scope = scoped(permissionScope, 's.user_id');
@@ -88,7 +92,7 @@ export function observationRoutes(app: Hono, store: Store, now: () => number) {
       ${scope.sql} ${id ? 'AND s.user_id = ?' : ''}`;
     const params = [p.query, ...scope.params, ...(id ? [field(id, 'user_id')] : [])];
     const { n } = db.get<{ n: number }>(`SELECT count(*) AS n FROM agent_sessions s ${where}`, params)!;
-    const rows = db.all<Record<string, unknown>>(`WITH page AS (SELECT s.id, s.device_id, s.user_id, s.agent, s.agent_version,
+    const rows = db.all<{ user_id: string } & Record<string, unknown>>(`WITH page AS (SELECT s.id, s.device_id, s.user_id, s.agent, s.agent_version,
       s.model, s.started_at, s.ended_at, s.event_count, s.revision FROM agent_sessions s ${where}
       ORDER BY s.started_at DESC, s.id LIMIT ? OFFSET ?)
       SELECT p.*, (SELECT count(*) FROM session_events e WHERE e.session_id = p.id AND e.kind = 'user_message'
@@ -100,7 +104,10 @@ export function observationRoutes(app: Hono, store: Store, now: () => number) {
         count(CASE WHEN u.settlement_status = 'pending' OR u.settlement_status = 'unverified' THEN 1 END) AS pending_usage_count
       FROM page p LEFT JOIN usage u ON u.device_id = p.device_id AND u.session_id = p.id GROUP BY p.id
       ORDER BY p.started_at DESC, p.id`, [...params, p.limit, p.offset]);
-    return c.json(p.page(rows.map((row) => ({ ...row, actions: readable })), n));
+    return c.json(p.page(rows.map((row) => {
+      const canRead = content.self !== null ? row.user_id === content.self : groupMembers === null || groupMembers.has(row.user_id);
+      return { ...row, actions: canRead ? ['read', 'read_content'] : readable };
+    }), n));
   });
 
   app.get('/v1/observe/sessions/:id/events', async (c) => {

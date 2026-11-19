@@ -428,7 +428,7 @@ test('event and usage acknowledgments share a durable cursor, and observation is
       items: [{ user_id: f.userId, session_count: 1, cost_milli: 21, month_cost_milli: 11 }],
     });
     expect(await (await f.request('/observe/sessions', undefined, scoped)).json()).toMatchObject({ items: [{ id: session_id, event_count: 5,
-      turn_count: 1, cost_milli: 21, pending_usage_count: 3, input_tokens: 5, output_tokens: 2 }] });
+      turn_count: 1, cost_milli: 21, pending_usage_count: 3, input_tokens: 5, output_tokens: 2, actions: ['read', 'read_content'] }] });
     expect(await (await f.request(`/observe/sessions/${session_id}/events?after_seq=1`, undefined, scoped)).json()).toMatchObject({
       items: [{ seq: 3, source_offset: 50, payload: input.payload }, { seq: 4, kind: 'gap' }, { seq: 5 }, { seq: 6 }], total: 4 });
     expect(f.store.tenant(f.tenantId).all('SELECT actor, action, target FROM audit ORDER BY rowid')).toEqual([
@@ -451,10 +451,12 @@ test('event and usage acknowledgments share a durable cursor, and observation is
   const login = await f.request('/auth/login', { target, code: await f.code(target), invite_code: invite.invite_code });
   const admin = await f.select((await login.json() as { token: string }).token);
   expect(await (await f.request('/observe/people', undefined, admin)).json()).toMatchObject({ total: 2 });
+  expect(await (await f.request('/observe/sessions', undefined, admin)).json()).toMatchObject({ items: [{ id: session_id, actions: ['read'] }] });
   expect((await f.request(`/observe/sessions/${session_id}/events`, undefined, admin)).status).toBe(404);
   const contract = await (await f.request('/contract', undefined, scoped)).json() as Record<string, unknown>;
   const grants = { admin: { summary: true, content: true }, group_admin: { summary: true, content: false } };
   expect((await f.request('/contract', { ...contract, visibility: grants }, scoped, undefined, 'PUT')).status).toBe(200);
+  expect(await (await f.request('/observe/sessions', undefined, admin)).json()).toMatchObject({ items: [{ id: session_id, actions: ['read', 'read_content'] }] });
   expect((await f.request(`/observe/sessions/${session_id}/events`, undefined, admin)).status).toBe(200);
   expect(f.store.tenant(f.tenantId).get("SELECT actor FROM audit WHERE action = 'contract.visibility.update'")).toEqual({ actor: f.userId });
 });
