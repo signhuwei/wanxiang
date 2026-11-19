@@ -350,6 +350,19 @@ fn read_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+fn find_newline(path: &Path, mut from: u64) -> Result<Option<u64>> {
+    loop {
+        let buf = read_range(path, from, 1024 * 1024)?;
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        if let Some(i) = buf.iter().position(|&b| b == b'\n') {
+            return Ok(Some(from + i as u64));
+        }
+        from += buf.len() as u64;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,18 +563,5 @@ mod tests {
         assert_eq!(e.cap.pass().unwrap().events, 1);
         assert_eq!(e.cap.pass().unwrap().events, 0);
         assert_eq!(e.kinds(), ["session_start"]);
-    }
-}
-
-fn find_newline(path: &Path, mut from: u64) -> Result<Option<u64>> {
-    loop {
-        let buf = read_range(path, from, 1024 * 1024)?;
-        if buf.is_empty() {
-            return Ok(None);
-        }
-        if let Some(i) = buf.iter().position(|&b| b == b'\n') {
-            return Ok(Some(from + i as u64));
-        }
-        from += buf.len() as u64;
     }
 }
