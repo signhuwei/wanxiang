@@ -4,6 +4,7 @@ import { ApiError, field, invalid, json, operation } from './api';
 import { day, hash, iso, randomToken } from './credentials';
 import { enumField, expectRevision, int, pagination, tenantActor, type ManagementOptions } from './management';
 import { indexInvite, indexMember, type Member, type Store, type Transaction } from './store';
+import { defaultVisibility, visibility } from './visibility';
 
 type MemberRow = Member & { group_id: string | null; quota_milli: number | null; revision: number };
 type Profile = { id: string; name: string; email: string | null; phone: string | null };
@@ -15,7 +16,7 @@ const statuses = ['active', 'disabled'] as const;
 const readContract = (sql: Pick<Transaction, 'get'>) => sql.get<Contract>('SELECT * FROM contract ORDER BY revision DESC LIMIT 1');
 const contractView = ({ allowed_agents_json, allowed_models_json, visibility_json, ...row }: Contract, role: string) => ({
   ...row, allowed_agents: JSON.parse(allowed_agents_json), allowed_models: JSON.parse(allowed_models_json),
-  visibility: JSON.parse(visibility_json), actions: role === 'owner' ? ['read', 'update'] : ['read'],
+  visibility: visibility(JSON.parse(visibility_json)), actions: role === 'owner' ? ['read', 'update'] : ['read'],
 });
 const canManage = (role: string) => role === 'owner' || role === 'admin';
 const canEditMember = (actor: string, subject: string) => subject !== 'owner' && (actor === 'owner' || (actor === 'admin' && subject === 'member'));
@@ -211,18 +212,21 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
       if (writeRole(sql, actor) !== 'owner') throw new ApiError('forbidden');
       const cached = op.read(sql);
       if (cached) return { response: cached, changed: false };
-      const current = readContract(sql)?.revision ?? 0;
+      const previous = readContract(sql);
+      const current = previous?.revision ?? 0;
       expectRevision(body.revision, current, 0);
-      const visibility = body.visibility;
-      if (visibility === null || typeof visibility !== 'object' || Array.isArray(visibility)) invalid('visibility');
+      const grants = visibility(body.visibility);
       const row = { revision: current + 1, seat_limit: int(body.seat_limit, 'seat_limit'),
         allowed_agents_json: JSON.stringify(stringList(body.allowed_agents, 'allowed_agents')),
         allowed_models_json: JSON.stringify(stringList(body.allowed_models, 'allowed_models')),
         lease_minutes: int(body.lease_minutes, 'lease_minutes', 1, 1440), lease_budget_milli: int(body.lease_budget_milli, 'lease_budget_milli'),
-        visibility_json: JSON.stringify(visibility), updated_by: actor.userId, updated_at: iso(at) };
+        visibility_json: JSON.stringify(grants), updated_by: actor.userId, updated_at: iso(at) };
       sql.run(`INSERT INTO contract (revision, seat_limit, allowed_agents_json, allowed_models_json, lease_minutes, lease_budget_milli,
         visibility_json, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [row.revision, row.seat_limit, row.allowed_agents_json, row.allowed_models_json, row.lease_minutes, row.lease_budget_milli, row.visibility_json, row.updated_by, row.updated_at]);
+      const from = previous ? visibility(JSON.parse(previous.visibility_json)) : defaultVisibility;
+      if (JSON.stringify(from) !== row.visibility_json) sql.run('INSERT INTO audit (id, actor, action, target, detail_json, at) VALUES (?, ?, ?, ?, ?, ?)',
+        [`aud_${ulid()}`, actor.userId, 'contract.visibility.update', actor.id, JSON.stringify({ from, to: grants, revision: row.revision }), iso(at)]);
       return { response: op.complete(sql, { status: 200, payload: contractView(row, 'owner') }), changed: true };
     });
     if (result.changed) opts.onConfigChange?.(actor.id);
