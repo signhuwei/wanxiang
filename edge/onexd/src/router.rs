@@ -32,6 +32,7 @@ use crate::{chat, id};
 /// Claude Code 带图片和长上下文时请求体可达数十 MB。
 const MAX_BODY: usize = 64 * 1024 * 1024;
 const MAX_UPSTREAM_BODY: usize = 64 * 1024 * 1024;
+const MVP_LOCAL_QWEN_PROVIDER_ID: &str = "prv_mvp_local_qwen";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -287,7 +288,13 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
     let upstream_model = route.upstream_model.clone().unwrap_or_else(|| model.clone());
     let (url, body) = if to_chat {
         // `?beta=true` 之类的查询参数属于 Anthropic，不带给 Chat 上游。
-        let chat_req = match chat::build_request(&req, &upstream_model, stream) {
+        // MVP 本机 Qwen 的 chat template 只接受一条置于开头的 system 消息。
+        let system_messages = if route.provider_id == MVP_LOCAL_QWEN_PROVIDER_ID {
+            chat::SystemMessages::SingleLeading
+        } else {
+            chat::SystemMessages::InOrder
+        };
+        let chat_req = match chat::build_request(&req, &upstream_model, stream, system_messages) {
             Ok(v) => v,
             Err(msg) => return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg),
         };

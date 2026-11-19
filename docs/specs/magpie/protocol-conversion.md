@@ -50,7 +50,7 @@ IR 区分 start、正文、thinking / signature、工具头、参数片段、usa
 ## 第一轮最小子集（建议，待确认）
 
 1. 只接 Claude Code 的 Anthropic Messages。Anthropic 兼容上游同协议转发（不去掉签名、tool blocks 或合法 cache 标志），用量旁路提取。支持真实版本实际发出的 `messages/count_tokens` 和发现请求，计数不作为付费；先用干净 Mac 确认这些请求。跨译首选 **Anthropic→OpenAI Chat→Anthropic**；Responses、Gemini、WebSocket、推理历史移植、服务端搜索与所有厂商容错不是首轮前置。
-2. Anthropic→Chat 必有 system、文本对话、模型名与最大生成量、普通函数 schema、工具选择、并行调用/参数片段、后续 `tool_result`、正常/长度/工具/拒绝 stop、非流 JSON、SSE 和错误壳；上游模型支持图片且首轮验收需要时才加显式图像转换。支持厂商若要求推理回播、非标准工具或没有流式 usage，不应宣称与一般 Chat 兼容，先以 fixture 确认或禁用该能力。
+2. Anthropic→Chat 必有 system、文本对话、模型名与最大生成量、普通函数 schema、工具选择、并行调用/参数片段、后续 `tool_result`、正常/长度/工具/拒绝 stop、非流 JSON、SSE 和错误壳。顶层 `system` 转为首条 system 消息，Claude Code 发在 `messages` 里的 system 消息默认保留角色与原位置。MVP 预置的本地 Qwen Provider（`prv_mvp_local_qwen`）只接受开头的一条 system 消息，因此该 Provider 的 Chat 路由按出现顺序将非空 system 文本合成首条消息，用户、助手和工具消息的相对顺序保持不变。上游模型支持图片且首轮验收需要时才加显式图像转换。支持厂商若要求推理回播、非标准工具或没有流式 usage，不应宣称与一般 Chat 兼容，先以 fixture 确认或禁用该能力。
 3. 不使用“看起来能聊天”代替测试：两端都测一次有实际工具回合的闭环，测试 interleaved 参数与空尾、取消后再提交历史、缓存首尾帧、无 usage、响应中途断开/租约取消、上下文超限及首包后的错误。OneX 生产厂商验收另作授权，不属于本次只读分析。
 
 待裁决：首轮 OpenAI 兼容是否包含 Responses-only 上游；Claude Code 首轮必须支持哪些多模态或 beta 能力；对断开的工具轮次选择明确占位修正还是先拒绝并提示重开。

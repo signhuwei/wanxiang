@@ -21,24 +21,44 @@ pub fn chat_url(base: &str) -> String {
 
 // ---- 请求 ----
 
-pub fn build_request(req: &Value, upstream_model: &str, stream: bool) -> Result<Value, String> {
+pub enum SystemMessages {
+    InOrder,
+    SingleLeading,
+}
+
+pub fn build_request(
+    req: &Value,
+    upstream_model: &str,
+    stream: bool,
+    system_messages: SystemMessages,
+) -> Result<Value, String> {
     let mut out = Map::new();
     out.insert("model".into(), upstream_model.into());
     let mut msgs = Vec::new();
-    if let Some(s) = req.get("system") {
-        let t = text_of(s, "system")?;
-        if !t.is_empty() {
-            msgs.push(json!({"role": "system", "content": t}));
+    let mut leading_system = Vec::new();
+    let mut add_system = |content: Option<&Value>, msgs: &mut Vec<Value>| -> Result<(), String> {
+        let text = text_of(content.unwrap_or(&Value::Null), "system")?;
+        if !text.is_empty() {
+            match system_messages {
+                SystemMessages::InOrder => msgs.push(json!({"role": "system", "content": text})),
+                SystemMessages::SingleLeading => leading_system.push(text),
+            }
         }
-    }
+        Ok(())
+    };
+    add_system(req.get("system"), &mut msgs)?;
     // 上一条 assistant 里 tool_use 的顺序，tool 消息按它排，按 ID 配对
     let mut tool_order: Vec<String> = Vec::new();
     for m in req.get("messages").and_then(Value::as_array).ok_or("请求缺少 messages 数组。")? {
         match m.get("role").and_then(Value::as_str).unwrap_or("") {
+            "system" => add_system(m.get("content"), &mut msgs)?,
             "user" => user_message(m.get("content"), &tool_order, &mut msgs)?,
             "assistant" => tool_order = assistant_message(m.get("content"), &mut msgs)?,
             other => return Err(format!("不支持的消息角色 {other:?}。")),
         }
+    }
+    if !leading_system.is_empty() {
+        msgs.insert(0, json!({"role": "system", "content": leading_system.join("\n\n")}));
     }
     out.insert("messages".into(), msgs.into());
     if let Some(n) = req.get("max_tokens") {
@@ -678,6 +698,7 @@ mod tests {
                 "messages":[{"role":"user","content":"hello"}]}),
             "wire-m",
             true,
+            SystemMessages::InOrder,
         )
         .unwrap();
         assert_eq!(
@@ -688,12 +709,75 @@ mod tests {
     }
 
     #[test]
+    fn request_preserves_inline_system_messages() {
+        let request = json!({
+            "system": "initial instructions",
+            "messages": [
+                {"role": "system", "content": "session instructions"},
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "updated rule", "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "additional context"}
+                ]},
+                {"role": "user", "content": "next question"}
+            ]
+        });
+
+        let translated = build_request(&request, "wire-m", false, SystemMessages::InOrder).unwrap();
+
+        assert_eq!(
+            translated["messages"],
+            json!([
+                {"role": "system", "content": "initial instructions"},
+                {"role": "system", "content": "session instructions"},
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "system", "content": "updated rule\n\nadditional context"},
+                {"role": "user", "content": "next question"}
+            ])
+        );
+    }
+
+    #[test]
+    fn request_moves_system_to_front_for_leading_only_routes() {
+        let request = json!({
+            "system": [{"type": "text", "text": "initial instructions"}],
+            "messages": [
+                {"role": "system", "content": "session instructions"},
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "call_1", "name": "f", "input": {}}]},
+                {"role": "system", "content": [{"type": "text", "text": "updated rule"}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "result"}]},
+                {"role": "system", "content": ""},
+                {"role": "user", "content": "next question"}
+            ]
+        });
+
+        let translated = build_request(&request, "wire-m", false, SystemMessages::SingleLeading).unwrap();
+
+        assert_eq!(
+            translated["messages"],
+            json!([
+                {"role": "system", "content": "initial instructions\n\nsession instructions\n\nupdated rule"},
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+                {"role": "user", "content": "next question"}
+            ])
+        );
+    }
+
+    #[test]
     fn tool_choice_mapping_and_rejections() {
         let base = |tc: Value| {
             build_request(
                 &json!({"max_tokens":1,"messages":[],"tools":[{"name":"f","input_schema":{"type":"object"}}],"tool_choice":tc}),
                 "m",
                 false,
+                SystemMessages::InOrder,
             )
             .unwrap()
         };
@@ -709,12 +793,14 @@ mod tests {
             &json!({"messages":[],"tools":[{"type":"web_search_20250305","name":"web_search"}]}),
             "m",
             false,
+            SystemMessages::InOrder,
         );
         assert!(e.unwrap_err().contains("web_search"));
         let e = build_request(
             &json!({"messages":[{"role":"user","content":[{"type":"document","source":{}}]}]}),
             "m",
             false,
+            SystemMessages::InOrder,
         );
         assert!(e.unwrap_err().contains("document"));
     }
@@ -727,6 +813,7 @@ mod tests {
                 {"role":"assistant","content":[{"type":"thinking","thinking":"hmm","signature":"sig"},{"type":"text","text":"ok"}]}]}),
             "m",
             false,
+            SystemMessages::InOrder,
         )
         .unwrap();
         assert_eq!(
