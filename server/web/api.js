@@ -12,7 +12,7 @@ export class ApiError extends Error {
 }
 
 export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthorized = () => {}, fetchImpl = globalThis.fetch } = {}) {
-  async function request(path, { method = 'GET', params, body, idempotencyKey, signal } = {}) {
+  async function request(path, { method = 'GET', params, body, idempotencyKey, signal, binary = false } = {}) {
     let url = baseUrl + path
     if (params) {
       const qs = new URLSearchParams()
@@ -22,7 +22,7 @@ export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthoriz
       const s = qs.toString()
       if (s) url += '?' + s
     }
-    const headers = { Accept: 'application/json' }
+    const headers = { Accept: binary ? 'application/octet-stream' : 'application/json' }
     const token = getToken()
     if (token) headers.Authorization = 'Bearer ' + token
     if (body !== undefined) headers['Content-Type'] = 'application/json'
@@ -34,7 +34,8 @@ export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthoriz
         method,
         headers,
         body: body !== undefined ? JSON.stringify(body) : undefined,
-        signal
+        signal,
+        ...(binary && { redirect: 'error' })
       })
     } catch (e) {
       if (e && e.name === 'AbortError') throw e
@@ -48,6 +49,8 @@ export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthoriz
       onUnauthorized()
       throw new ApiError({ status: 401, code: 'unauthenticated', message: '登录已过期，请重新登录' })
     }
+
+    if (binary && res.ok) return res.blob()
 
     let data = null
     try {
@@ -71,6 +74,7 @@ export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthoriz
   return {
     request,
     get: (path, opts) => request(path, { ...opts, method: 'GET' }),
+    download: (path, opts) => request(path, { ...opts, method: 'GET', binary: true }),
     post: (path, body, opts) => request(path, { ...opts, method: 'POST', body }),
     put: (path, body, opts) => request(path, { ...opts, method: 'PUT', body })
   }

@@ -65,6 +65,19 @@ test('401 triggers onUnauthorized and throws unauthenticated', async () => {
   expect(err.message).toBe('登录已过期，请重新登录')
 })
 
+test('downloads diagnostic bytes with the session token and rejects redirects', async () => {
+  const fetchImpl = async (url, opts) => {
+    expect(url).toBe('/v1/diag/dia_1/download')
+    expect(opts.headers.Authorization).toBe('Bearer test-token')
+    expect(opts.headers.Accept).toBe('application/octet-stream')
+    expect(opts.redirect).toBe('error')
+    return new Response(new Uint8Array([1, 2, 3]))
+  }
+  const api = createApi({ fetchImpl, getToken: () => 'test-token' })
+  const blob = await api.download('/diag/dia_1/download')
+  expect(new Uint8Array(await blob.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]))
+})
+
 test('a rejected login stays on the form and explains the invalid credentials', async () => {
   const fetchImpl = fakeFetch([{ ok: false, status: 401 }])
   let kicked = 0
