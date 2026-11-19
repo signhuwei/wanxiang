@@ -6,7 +6,7 @@ const demo=mock&&!invoke
 const call=invoke ? request=>invoke('desktop_call',{request}) : demo ? (await import('./mock.js')).makeMock() : null
 $('badge').hidden=!demo
 let state,busy=false,prefs=false,last='',serial=0
-const labels={available:'可启动',downloading:'下载中',verifying:'校验中',starting:'启动中',running:'运行中',failed:'启动失败'}
+const labels={update_available:'有可用更新',available:'可启动',downloading:'下载中',verifying:'校验中',starting:'启动中',running:'运行中',failed:'启动失败'}
 function node(tag,text){const n=document.createElement(tag);if(text!=null)n.textContent=text;return n}
 function button(text,click,primary=false){const b=node('button',text);b.type='button';b.onclick=click;if(primary)b.className='primary';return b}
 function field(form,label,type,placeholder){const l=node('label',label),i=node('input');i.type=type;i.placeholder=placeholder||'';l.append(i);form.append(l);return i}
@@ -19,7 +19,7 @@ async function act(request,message=''){
 function paint(){
   const c=$('content');c.replaceChildren();$('notice').textContent='';$('scope').textContent=state.tenant ? `${state.tenant.name} · ${state.user?.name||''} · `+({connected:'已连接',connecting:'连接中',backoff:'断线重连中',idle:'未连接'}[state.connection]||state.connection) : '员工工作区'
   $('home').setAttribute('aria-current',prefs?'false':'page');$('prefs').setAttribute('aria-current',prefs?'page':'false')
-  if(prefs){$('title').textContent='设置';c.append(node('p','服务地址：'+state.settings.server_origin));const l=node('label'),i=node('input');i.type='checkbox';i.checked=state.settings.hide_on_close;l.append(i,' 关闭窗口时隐藏到托盘');c.append(l,button('保存设置',()=>act({op:'settings',hide_on_close:i.checked},'设置已保存'),true));if(state.phase!=='signed_out')c.append(button('退出登录',()=>act({op:'logout'})));return}
+  if(prefs){$('title').textContent='设置';c.append(node('p','Desktop 版本：'+(state.version || '未知')),node('p','服务地址：'+state.settings.server_origin));const l=node('label'),i=node('input');i.type='checkbox';i.checked=state.settings.hide_on_close;l.append(i,' 关闭窗口时隐藏到托盘');c.append(l,button('保存设置',()=>act({op:'settings',hide_on_close:i.checked},'设置已保存'),true));if(state.phase!=='signed_out')c.append(button('退出登录',()=>act({op:'logout'})));return}
   if(state.phase==='signed_out'){
     $('title').textContent='登录 OneX';const form=node('form');c.append(form)
     if(demo)form.append(node('p','仅供演示：demo@example.test · 验证码 246810 · 可选邀请码 DEMO。不要输入真实凭据。'))
@@ -32,7 +32,7 @@ function paint(){
   }
   if(state.phase==='choose_tenant'){$('title').textContent='选择租户';for(const t of state.tenants)c.append(button(t.name,()=>act({op:'select_tenant',tenant_id:t.id})));if(!state.tenants.length)c.append(node('p','没有可用的租户，请联系管理员。'));return}
   $('title').textContent='可用 Agent';if(!state.agents.length)c.append(node('p','尚无获准的 Agent。请等待配置同步或联系管理员。'))
-  for(const a of state.agents){const row=node('div');row.className='row';row.append(node('strong',a.name),node('small',a.version),node('span',labels[a.status]||a.status));if(a.actions?.includes('launch'))row.append(button('启动',()=>act({op:'launch',agent_id:a.id}),true));if(a.message)row.append(node('span',a.message));c.append(row)}
+  for(const a of state.agents){const row=node('div');row.className='row';row.append(node('strong',a.name),node('small',a.version),node('span',labels[a.status]||a.status));if(a.status!=='update_available' && a.actions?.includes('launch'))row.append(button('启动',()=>act({op:'launch',agent_id:a.id}),true));if(a.message)row.append(node('span',a.message));c.append(row)}
 }
 async function refresh(){if(!call||busy||document.hidden)return;const seq=++serial;try{const r=await call({op:'state'});if(seq!==serial)return;if(!r.ok)throw Error(r.error?.message);const json=JSON.stringify(r.state);if(last!==json){last=json;state=r.state;paint()}}catch{if(seq===serial)$('notice').textContent='无法读取本机状态，请检查 OneX 服务。'}}
 $('home').onclick=()=>{if(state&&!busy){prefs=false;paint()}};$('prefs').onclick=()=>{if(state&&!busy){prefs=true;paint()}}

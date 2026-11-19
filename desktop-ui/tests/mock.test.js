@@ -9,7 +9,12 @@ test('invitation cannot replace OTP and tenant selection precedes launch',async(
   const {state}=await call({op:'login',target,code:'246810',invite_code:'DEMO'})
   expect(state.phase).toBe('choose_tenant')
   expect((await call({op:'select_tenant',tenant_id:'unknown'})).ok).toBe(false)
-  expect((await call({op:'select_tenant',tenant_id:state.tenants[1].id})).state.tenant.id).toBe(state.tenants[1].id)
+  const ready=(await call({op:'select_tenant',tenant_id:state.tenants[1].id})).state
+  expect(ready.tenant.id).toBe(state.tenants[1].id)
+  expect(ready.version).toBe('0.1.0-demo')
+  const update=ready.agents.find(a=>a.status==='update_available')
+  expect(update.actions).toEqual([])
+  expect((await call({op:'launch',agent_id:update.id})).ok).toBe(false)
   expect((await call({op:'launch',agent_id:'unlisted'})).ok).toBe(false)
   expect((await call({op:'launch',agent_id:'claude-code'})).state.agents[0].status).toBe('starting')
   expect((await call({op:'launch',agent_id:'claude-code'})).ok).toBe(false)

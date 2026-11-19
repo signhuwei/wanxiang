@@ -1,4 +1,4 @@
-# S1-E6 · Desktop UI ↔ 原生桥（提审稿）
+# S1-E6 · Desktop UI ↔ 原生桥（governor 已审，待原生集成）
 
 这是 UI 与 edge 之间的提案，不是已实现的 Rust API。UI 是本地静态 HTML/ESM；不直连 Server、daemon socket 或上游。edge 持有 Tauri 命令适配、HTTP、凭据存储、设备注册、发行包校验与启动。现有 onex-core 的 `status/login/shutdown` 是 daemon 私有 IPC，不能直接暴露给 WebView。
 
@@ -19,10 +19,10 @@
 `Snapshot` 示例（字段名使用 snake_case）：
 
 ```json
-{"phase":"ready","user":{"name":"示例员工"},"tenant":{"id":"ten_demo","name":"示例租户"},"tenants":[],"connection":"connected","agents":[{"id":"claude-code","name":"Claude Code","version":"demo","status":"available","actions":["launch"]}],"settings":{"server_origin":"https://onex.example.invalid","hide_on_close":true}}
+{"version":"0.1.0-demo","phase":"ready","user":{"name":"示例员工"},"tenant":{"id":"ten_demo","name":"示例租户"},"tenants":[],"connection":"connected","agents":[{"id":"claude-code","name":"Claude Code","version":"demo","status":"available","actions":["launch"]}],"settings":{"server_origin":"https://onex.example.invalid","hide_on_close":true}}
 ```
 
-`phase`：`signed_out | choose_tenant | ready`。登录前 `user/tenant` 为 null，目录为空。选择态 `tenants:[{id,name}]`、`tenant:null`；包括单租户，用户确认后再进入。`ready` 目录仅含当前身份允许查看的 Agent。`connection: idle | connecting | connected | backoff`；短时失联不是注销。`agents[].status: available | downloading | verifying | starting | running | failed`，失败可带中文 `message`。仅 `actions` 含 `launch` 才提供启动，不按连接状态猜授权。快照不含验证码、令牌、安装路径、Provider 密钥、对话内容或完整日志；`server_origin` 无用户信息/query/fragment。错误用契约码及可展示中文，桥不可将敏感原始异常转发给 UI。
+`phase`：`signed_out | choose_tenant | ready`。登录前 `user/tenant` 为 null，目录为空。选择态 `tenants:[{id,name}]`、`tenant:null`；包括单租户，用户确认后再进入。`ready` 目录仅含当前身份允许查看的 Agent。`connection: idle | connecting | connected | backoff`；短时失联不是注销。顶层 `version` 是 Desktop 应用版本（不是 daemon 或 Agent 版本），所有阶段均返回，设置页展示。`agents[].status: available | update_available | downloading | verifying | starting | running | failed`；`update_available` 在 S1 仅作提示，`actions:[]`，页面不提供启动或更新。失败可带中文 `message`。仅 `actions` 含 `launch` 才提供启动，不按连接状态猜授权。快照不含验证码、令牌、安装路径、Provider 密钥、对话内容或完整日志；`server_origin` 无用户信息/query/fragment。错误用契约码及可展示中文，桥不可将敏感原始异常转发给 UI。
 
 ## 本轮交付与验收边界
 

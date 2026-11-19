@@ -2,7 +2,7 @@ const tenant={id:'ten_demo',name:'示例研发部'}
 const fail=(code,message)=>({ok:false,error:{code,message}})
 export function makeMock(){
   let issued=false,start=0
-  const state={phase:'signed_out',user:null,tenant:null,tenants:[],connection:'idle',agents:[],settings:{server_origin:'https://onex.example.invalid',hide_on_close:true}}
+  const state={version:'0.1.0-demo',phase:'signed_out',user:null,tenant:null,tenants:[],connection:'idle',agents:[],settings:{server_origin:'https://onex.example.invalid',hide_on_close:true}}
   return async r=>{
     switch(r.op){
       case 'state':
@@ -16,7 +16,7 @@ export function makeMock(){
       case 'select_tenant':{
         const t=state.tenants.find(t=>t.id===r.tenant_id)
         if(state.phase!=='choose_tenant'||!t)return fail('forbidden','无权进入此租户')
-        Object.assign(state,{phase:'ready',tenant:t,tenants:[],connection:'connected',agents:[{id:'claude-code',name:'Claude Code',version:'演示版',status:'available',actions:['launch']}]});break
+        Object.assign(state,{phase:'ready',tenant:t,tenants:[],connection:'connected',agents:[{id:'claude-code',name:'Claude Code',version:'演示版',status:'available',actions:['launch']},{id:'demo-preview',name:'示例预览 Agent',version:'演示版',status:'update_available',actions:[]} ]});break
       }
       case 'launch':{
         const a=state.agents.find(a=>a.id===r.agent_id)
