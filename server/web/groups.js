@@ -24,10 +24,10 @@ export function groupsPage(host, api, actions) {
     onOpen: entry, createLabel: '新建分组', onCreate: actions.includes('create_group') ? () => entry(null) : null })
 }
 
-export function invitePanel(pane, api) {
-  editForm(pane, { mode: 'create', label: '生成', values: { role: 'member', max_uses: 1, days: 7 },
-    fields: [{ key: 'role', label: '邀请角色', type: 'select', allowEmpty: false, options: [
-      { value: 'member', label: '成员' }, { value: 'group_admin', label: '组管' }, { value: 'admin', label: '管理员' }] },
+export function invitePanel(pane, api, grantable) {
+  const role = grantable.find(o => o.value === 'member') || grantable[0]
+  editForm(pane, { mode: 'create', label: '生成', values: { role: role.value, max_uses: 1, days: 7 },
+    fields: [{ key: 'role', label: '邀请角色', type: 'select', allowEmpty: false, options: grantable },
     { key: 'group_id', label: '分组 ID' }, { key: 'max_uses', label: '使用次数', type: 'number' }, { key: 'days', label: '有效天数', type: 'number' }],
     submit: ({ days, ...v }, opts) => api.post('/invites', { ...v, expires_in_ms: days * 86400000 }, opts),
     done(res) {

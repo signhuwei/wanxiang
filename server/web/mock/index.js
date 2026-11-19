@@ -153,7 +153,9 @@ export function installMock() {
       if (!s.tenantId) return json({ user, tenant: null, role: null, agents: [], is_platform_admin, actions: is_platform_admin ? ['create_provider','create_model','create_rate','topup'] : [] })
       const t = db.tenants.find(t => t.id === s.tenantId)
       const ms = db.memberships[s.target].find(m => m.tenant_id === s.tenantId)
-      return json({ user, tenant: t, role: ms?.role, agents: [], is_platform_admin, actions: ['owner','admin'].includes(ms?.role) ? ['create_group','create_invite'] : [] })
+      const actions = ['owner','admin'].includes(ms?.role) ? ['create_group','create_invite','assign_role:member'] : []
+      if (ms?.role === 'owner') actions.push('assign_role:admin','assign_role:group_admin')
+      return json({ user, tenant: t, role: ms?.role, agents: [], is_platform_admin, actions })
     }
 
     // ---- 成员与组（租户范围）----
