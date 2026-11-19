@@ -28,6 +28,8 @@ const KEY: &str = "sk-upstream-secret";
 
 #[derive(Default)]
 struct Seen {
+    /// 上游收到的请求数
+    calls: usize,
     headers: Option<HeaderMap>,
     body: Option<Value>,
     query: Option<String>,
@@ -92,6 +94,7 @@ impl Upstream {
                         headers.get("x-test-scenario").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                     {
                         let mut s = s.lock().unwrap();
+                        s.calls += 1;
                         s.headers = Some(headers);
                         s.body = serde_json::from_slice(&body).ok();
                         s.query = uri.query().map(String::from);
@@ -208,6 +211,24 @@ fn upstream_response(scenario: &str, drop_tx: Option<oneshot::Sender<()>>) -> Re
             ];
             sse_response(futures_util::stream::iter(s.into_iter().map(Ok)))
         }
+        "no_final_usage" | "empty_final_usage" => {
+            // 只发零占位、正文、message_stop；没有真实尾用量（或尾用量是空对象）
+            let mut s = vec![
+                sse("message_start", json!({"type":"message_start","message":{"id":"msg_n","usage":{"input_tokens":0,"output_tokens":0}}})),
+                sse("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"y".repeat(30)}})),
+            ];
+            if scenario == "empty_final_usage" {
+                s.push(sse("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}})));
+            }
+            s.push(sse("message_stop", json!({"type":"message_stop"})));
+            sse_response(futures_util::stream::iter(s.into_iter().map(Ok)))
+        }
+        "no_usage" => (
+            [("content-type", "application/json")],
+            json!({"id":"msg_nu","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn"})
+                .to_string(),
+        )
+            .into_response(),
         "eof" => {
             // 干净地结束，但没有 message_stop。
             let evs = stream_events("eof");
@@ -311,6 +332,21 @@ impl Env {
             .header("anthropic-beta", "prompt-caching-2024-07-31")
             .header("x-test-scenario", scenario)
             .json(&json!({"model":"claude-sonnet-5-5","max_tokens":100,"stream":stream,"messages":[{"role":"user","content":"hi"}]}))
+    }
+
+    /// max_tokens=1：预留 = 1×2 + 估算输入 2×1 = 4，用来测实际花费超过预留的情形。
+    fn small(&self, scenario: &str, stream: bool) -> reqwest::RequestBuilder {
+        self.req(scenario, stream)
+            .json(&json!({"model":"claude-sonnet-5-5","max_tokens":1,"stream":stream,"messages":[{"role":"user","content":"hi"}]}))
+    }
+
+    fn calls(&self) -> usize {
+        self.upstream.seen.lock().unwrap().calls
+    }
+
+    fn ledger(&self) -> (i64, i64) {
+        let s = self.state.lease.snapshot();
+        (s.used_milli, s.inflight_milli)
     }
 
     async fn usage(&mut self) -> UsageRecord {
@@ -727,24 +763,119 @@ async fn lease_expiry_interrupts_inflight_stream() {
     assert_eq!(e.usage().await.outcome, Outcome::Stopped(Block::Expired));
 }
 
+// 预留 = max_tokens 100 × 2 + 估算输入（"user" + "hi" 共 6 字节 ≈ 2 token）× 1 = 202
+const RESERVE: i64 = 202;
+
 #[tokio::test]
-async fn end_frame_only_upstream_reserves_max_tokens() {
+async fn reservation_over_lease_budget_is_rejected_before_upstream() {
+    let e = env().await;
+    // magpie 复现场景：额度 150 < 预留 202，首个请求就不出站
+    grant(&e.state, "lse_2", 2, RESERVE - 1, 600_000);
+    let r = e.req("hang_zero", true).send().await.unwrap();
+    let v = expect_blocked(r, 402, "balance_exhausted").await;
+    assert!(v["error"]["message"].as_str().unwrap().contains("max_tokens"));
+    assert_eq!(e.calls(), 0);
+    assert_eq!(e.ledger(), (0, 0));
+    assert!(e.state.lease.take_renew().is_none());
+}
+
+#[tokio::test]
+async fn concurrent_reservations_must_fit_remaining_budget() {
     let mut e = env().await;
-    // 预留 = max_tokens 100 × 2 + 估算输入（"user" + "hi" 共 6 字节 ≈ 2 token）× 1 = 202；
-    // 额度 150，单个请求仍放行，但第二个并发请求被拒
-    grant(&e.state, "lse_2", 2, 150, 600_000);
-    let resp = e.req("hang_zero", true).send().await.unwrap();
-    let mut body = resp.bytes_stream();
-    timeout(T, body.next()).await.unwrap().unwrap().unwrap();
-    assert_eq!(e.state.lease.snapshot().inflight_milli, 202);
+    // 正好放下两份预留
+    grant(&e.state, "lse_2", 2, 2 * RESERVE, 600_000);
+    let mut a = e.req("hang_zero", true).send().await.unwrap().bytes_stream();
+    timeout(T, a.next()).await.unwrap().unwrap().unwrap();
+    let mut b = e.req("hang_zero", true).send().await.unwrap().bytes_stream();
+    timeout(T, b.next()).await.unwrap().unwrap().unwrap();
+    assert_eq!(e.calls(), 2);
+    assert_eq!(e.ledger(), (0, 2 * RESERVE));
+    // 第三个放不下，不出站；只有在途预留，续租腾不出额度，不发续租
     let r = e.req("", false).send().await.unwrap();
     expect_blocked(r, 402, "balance_exhausted").await;
-    drop(body);
+    assert_eq!(e.calls(), 2);
+    assert!(e.state.lease.take_renew().is_none());
+    drop(a);
+    drop(b);
+    for _ in 0..2 {
+        let u = e.usage().await;
+        assert_eq!(u.outcome, Outcome::ClientCancelled);
+        // 没有任何用量：按已见的 0 计，标待结算，预留全部释放
+        assert_eq!((u.cost_milli, u.usage_final), (0, false));
+    }
+    assert_eq!(e.ledger(), (0, 0));
+}
+
+#[tokio::test]
+async fn non_streaming_success_without_usage_is_pending_not_reservation() {
+    let mut e = env().await;
+    let r = e.req("no_usage", false).send().await.unwrap();
+    assert_eq!(r.status(), 200);
     let u = e.usage().await;
-    assert_eq!(u.outcome, Outcome::ClientCancelled);
-    // 断开时没有任何用量：按已见的 0 计，标待结算，释放预留
-    assert_eq!((u.cost_milli, u.usage_final), (0, false));
-    assert_eq!(e.state.lease.snapshot().inflight_milli, 0);
+    assert_eq!(u.outcome, Outcome::Ok);
+    let item = u.to_item();
+    assert_eq!((item["cost_milli"].as_i64(), item["complete"].as_bool()), (Some(0), Some(false)));
+    assert_eq!(e.ledger(), (0, 0));
+}
+
+#[tokio::test]
+async fn stream_without_final_usage_is_priced_on_seen_part_only() {
+    for scenario in ["no_final_usage", "empty_final_usage"] {
+        let mut e = env().await;
+        let text = e.req(scenario, true).send().await.unwrap().text().await.unwrap();
+        assert_eq!(parse_sse(&text).last().unwrap().0, "message_stop", "{scenario}");
+        let u = e.usage().await;
+        // 协议正常结束，但计量不完整
+        assert_eq!(u.outcome, Outcome::Ok, "{scenario}");
+        assert!(!u.usage_final, "{scenario}");
+        // 30 字节 ≈ 10 token × 2 = 20，远小于预留 202
+        assert_eq!(u.cost_milli, 20, "{scenario}");
+        assert_eq!(e.ledger(), (20, 0), "{scenario}");
+    }
+}
+
+#[tokio::test]
+async fn non_streaming_cost_at_and_over_budget() {
+    // 实际 31 > 预留 4：正好用满放行，超出 1 不把内容交给客户端
+    let mut e = env().await;
+    grant(&e.state, "lse_2", 2, 31, 600_000);
+    let r = e.small("", false).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let u = e.usage().await;
+    assert_eq!((u.outcome, u.cost_milli, u.usage_final), (Outcome::Ok, 31, true));
+    assert_eq!(e.ledger(), (31, 0));
+
+    let mut e = env().await;
+    grant(&e.state, "lse_2", 2, 30, 600_000);
+    let r = e.small("", false).send().await.unwrap();
+    let v = expect_blocked(r, 402, "balance_exhausted").await;
+    assert!(v.get("content").is_none());
+    assert_eq!(e.calls(), 1);
+    let u = e.usage().await;
+    // 上游已经处理并报了用量：照实记 31，记在这个租约下
+    assert_eq!((u.outcome, u.cost_milli, u.usage_final), (Outcome::Stopped(Block::Exhausted), 31, true));
+    assert_eq!(u.lease_id.as_deref(), Some("lse_2"));
+    assert_eq!(e.ledger(), (31, 0));
+}
+
+#[tokio::test]
+async fn streaming_cost_at_and_over_budget() {
+    let mut e = env().await;
+    grant(&e.state, "lse_2", 2, STREAM_COST, 600_000);
+    let text = e.small("stream", true).send().await.unwrap().text().await.unwrap();
+    assert_eq!(parse_sse(&text).last().unwrap().0, "message_stop");
+    assert_eq!(e.usage().await.cost_milli, STREAM_COST);
+    assert_eq!(e.ledger(), (STREAM_COST, 0));
+
+    let mut e = env().await;
+    grant(&e.state, "lse_2", 2, STREAM_COST - 1, 600_000);
+    let text = e.small("stream", true).send().await.unwrap().text().await.unwrap();
+    let evs = parse_sse(&text);
+    assert_eq!(evs.last().unwrap().1["error"]["code"], "balance_exhausted");
+    assert!(!evs.iter().any(|(n, _)| n == "message_delta" || n == "message_stop"));
+    let u = e.usage().await;
+    assert_eq!(u.outcome, Outcome::Stopped(Block::Exhausted));
+    assert_eq!(e.ledger(), (u.cost_milli, 0));
 }
 
 #[tokio::test]
