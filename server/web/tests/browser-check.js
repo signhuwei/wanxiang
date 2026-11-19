@@ -1,0 +1,82 @@
+// 从工作区根目录运行；使用本机 Chrome，不访问外部服务。
+import { chromium } from 'playwright'
+import assert from 'node:assert/strict'
+import { mkdir } from 'node:fs/promises'
+import { join } from 'node:path'
+
+const dir = process.argv[2]
+assert(dir, '请指定截图目录')
+await mkdir(dir, { recursive: true })
+const browser = await chromium.launch({ channel: 'chrome' })
+try {
+  for (const [width, height] of [[1280, 720], [1440, 900]]) {
+    const page = await browser.newPage({ viewport: { width, height } })
+    const errors = []
+    page.on('pageerror', err => errors.push(err.message))
+    page.setDefaultTimeout(5000)
+    const button = name => page.getByRole('button', { name, exact: true })
+    async function check(label) {
+      const r = await page.evaluate(async label => (await import('./tests/layout-check.js')).runLayoutChecks(label), label)
+      assert.deepEqual(r.viewport, { width, height })
+      assert(r.pass, JSON.stringify(r.checks.filter(c => !c.pass)))
+      await page.screenshot({ path: join(dir, `${width}x${height}-${label}.png`) })
+    }
+    await page.goto('http://127.0.0.1:8123/?mock=1')
+    await button('验证码登录').waitFor()
+    await check('login')
+    await page.getByPlaceholder('邮箱或手机号').fill('admin@onex.dev')
+    await button('发送验证码').click()
+    await page.getByText('验证码已发送', { exact: false }).waitFor()
+    await page.getByPlaceholder('6 位验证码').fill('246810')
+    await button('登录').click()
+    await page.getByRole('button', { name: /万象科技/ }).click()
+    await page.getByPlaceholder('查询').fill('@example.com')
+    await page.getByText('共 137 条').waitFor()
+    await button('下一页').click()
+    await page.getByText('user51@example.com', { exact: true }).waitFor()
+    const rows = page.locator('tbody tr')
+    const row = rows.nth(17)
+    await row.scrollIntoViewIfNeeded()
+    const key = await row.getAttribute('data-key')
+    const scroll = page.locator('.table-scroll')
+    const top = await scroll.evaluate(n => n.scrollTop)
+    await check('ledger')
+    await row.getByRole('button', { name: '查看' }).click()
+    await button('编辑').waitFor()
+    await check('drill')
+    await button('编辑').click()
+    await page.locator('[name=quota_eraser]').fill('123.456')
+    await check('edit')
+    await button('保存').click()
+    await page.locator('output[data-field=quota_eraser]').getByText('123.456').waitFor()
+    await button('← 返回').click()
+    await page.locator(`tr.selected[data-key="${key}"]`).waitFor()
+    assert.equal(await scroll.evaluate(n => n.scrollTop), top)
+    assert.equal(await page.getByPlaceholder('查询').inputValue(), '@example.com')
+    await page.getByText('第 2 页').waitFor()
+    await rows.first().click()
+    await rows.nth(1).click()
+    await button('编辑').waitFor()
+    assert.equal(await page.locator('.inline-drill').count(), 1)
+    await button('← 返回').click()
+    await page.getByRole('link', { name: '平台' }).click()
+    await page.getByRole('heading', { name: '平台' }).waitFor()
+    await button('退出').click()
+    await button('邀请码登录').click()
+    await page.getByPlaceholder('邮箱或手机号').fill('demo@onex.dev')
+    await page.getByPlaceholder('邀请码', { exact: true }).fill('ONEX2026')
+    await page.getByPlaceholder('6 位验证码').fill('246810')
+    await button('登录').click()
+    await page.getByRole('button', { name: /示例制造/ }).click()
+    await page.locator('tr.clickable').first().click()
+    await page.locator('output[data-field=name]').waitFor()
+    assert.equal(await button('编辑').count(), 0)
+    await page.reload()
+    await button('验证码登录').waitFor() // mock 重置后，过期的租户令牌应跳转登录
+    assert.deepEqual(errors, [])
+    console.log(`${width}×${height}: 布局、登录、权限、分页与钻取通过`)
+    await page.close()
+  }
+} finally {
+  await browser.close()
+}
