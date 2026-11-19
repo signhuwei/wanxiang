@@ -80,9 +80,8 @@ impl Fixture {
 
     fn ledger_entries(&self, lease_id: &str, kind: &str) -> Vec<(i64, String)> {
         let db = self.db();
-        let mut st = db
-            .prepare("SELECT amount_milli, request_ref FROM ledger WHERE kind = ? AND lease_id = ?")
-            .unwrap();
+        let mut st =
+            db.prepare("SELECT amount_milli, request_ref FROM ledger WHERE kind = ? AND lease_id = ?").unwrap();
         st.query_map([kind, lease_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
             .unwrap()
             .map(Result::unwrap)
