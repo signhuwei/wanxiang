@@ -9,11 +9,10 @@
 在仓库根目录本机编译一次，之后两个二进制都在 `edge/target/debug/` 下：
 
 ```sh
-cargo build --manifest-path edge/Cargo.toml --workspace
+cargo build --manifest-path edge/Cargo.toml --workspace --locked
 export ONEX_URL=http://192.168.3.211:18700
 curl -fsS --max-time 10 "$ONEX_URL/v1/healthz"
 ls edge/target/debug/onexd edge/target/debug/onex
-edge/target/debug/onex 2>&1 | head -1
 command -v claude
 claude --version
 ```
@@ -107,24 +106,30 @@ cd "$DEMO_DIR"
 
 **已知风险，不能作为耗尽证据：** 新版本 macOS Claude Code 在第一轮可能并发发出不止一个请求（例如主回复之外还有一个辅助调用），每个并发请求各自预留额度。1 毫橡皮的夹具下，这些并发预留可能在额度还没有真实结算、没有真实非零用量之前就把预留占满，其中一路因此收到 402。这只证明「并发请求之间抢占预留」，不证明「真实用量耗尽余额」，不能代签本步要的耗尽证据。本步因此不用受管 Claude Code 发首轮，改用下面的单发合成请求绕开并发问题，确认真实结算耗尽后，才用受管 Claude Code 验证下一次请求被拒。
 
-1. 用独立 `ONEX_HOME` 和该员工重复第 2 步登录（新租户、同样的 `NO_PROXY` 豁免），不要启动 `onex run claude-code`。登录完成后读取 onexd 为本机 router 生成的地址和令牌（只在测试进程内读取，不要把取出的值写进命令行历史、日志或工具输出）：
+1. 用独立 `ONEX_HOME` 和新租户 ID 完成第 2 步登录。先用下面的 Bun 命令向本机 router 发一个合成单请求。地址和临时令牌由测试进程读取，输出仅含状态与用量。
 
    ```sh
    export ONEX_HOME="$HOME/Library/Application Support/OneX-MVP-exhaust"
-   ROUTER_ADDR="$(cat "$ONEX_HOME/router.addr")"
-   ROUTER_TOKEN="$(cat "$ONEX_HOME/router.token")"
+   bun --no-env-file -e '
+     const home = process.env.ONEX_HOME
+     const address = (await Bun.file(home + "/router.addr").text()).trim()
+     if (!/^127\.0\.0\.1:\d+$/.test(address)) throw new Error("需要本机 router 地址")
+     const token = (await Bun.file(home + "/router.token").text()).trim()
+     const response = await fetch("http://" + address + "/v1/messages", {
+       method: "POST",
+       headers: { "x-api-key": token, "content-type": "application/json", "anthropic-version": "2023-06-01" },
+       body: JSON.stringify({
+         model: "Qwen3.8-27B", stream: false, max_tokens: 1024,
+         messages: [{ role: "user", content: "只回复余额首轮" }],
+       }),
+       signal: AbortSignal.timeout(120000),
+     })
+     const { usage } = await response.json()
+     console.log(JSON.stringify({ status: response.status, usage }))
+   '
    ```
 
-   向本机 router 发一个合成的 Anthropic Messages 单请求，同 MVP 演示模型、`stream:false`、`max_tokens:1024`：
-
-   ```sh
-   curl -sS -o /tmp/mvp-exhaust-1.json -w '%{http_code}\n' \
-     -H "x-api-key: $ROUTER_TOKEN" -H 'content-type: application/json' \
-     "http://$ROUTER_ADDR/v1/messages" \
-     -d '{"model":"*","stream":false,"max_tokens":1024,"messages":[{"role":"user","content":"只回复「余额首轮」"}]}'
-   ```
-
-2. 核对这一发请求：HTTP 状态必须是 `200`；`/tmp/mvp-exhaust-1.json` 的 `usage` 字段必须是真实非零用量（`input_tokens`、`output_tokens` 等，不是估算或占位）；在「橡皮」页确认这笔用量已经结算为 1 毫橡皮，充值的 1 毫橡皮之后可用余额和在途预留都归零。**页面可用余额为 0、但还有可花预留时，不算耗尽**；预留非零也不能继续到第 3 步。只要这一步没有真实非零用量或没有结算到 0，本项标「无法验证」，不要用并发抢占时的 402 顶替。
+2. 核对这一发请求：HTTP 状态必须是 `200`；输出的 `usage` 字段必须是真实非零用量（`input_tokens`、`output_tokens` 等，不是估算或占位）；在「橡皮」页确认这笔用量已经结算为 1 毫橡皮，充值的 1 毫橡皮之后可用余额和在途预留都归零。**页面可用余额为 0、但还有可花预留时，不算耗尽**；预留非零也不能继续到第 3 步。只要这一步没有真实非零用量或没有结算到 0，本项标「无法验证」，不要用并发抢占时的 402 顶替。
 3. 确认耗尽后，用同一个 `ONEX_HOME` 跑 `onex run claude-code`（和第 3 步一样新建空目录），发一轮短文本，例如 `只回复「余额次轮」`。记录这次 Claude Code 里看到的拒绝。
 4. 对照 `onex status` 里的 `upstream.completed`/`upstream.inflight` 在第 1 步之后、第 3 步前后没有变化，以及运维可查的 211 Server 流水、账本（`/v1/balance` 或「橡皮」页）在第 3 步前后没有新增扣款或预留。第 3 步这一路不得发上游，应返回 Anthropic 格式 HTTP 402 `balance_exhausted`，Claude Code 可见明确的额度原因及联系管理员充值提示。首轮预留过大、租约过期、设备被停用、上游掉线都不能代签。没有「结算到 0 在先、第二次请求零出站被拒在后」这个顺序的证据，单列缺证。
 
