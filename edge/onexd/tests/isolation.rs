@@ -3,9 +3,11 @@
 //! 同一进程里起假 Server（WS）、假上游（SSE）、router 和 IPC，分别注入：
 //! - 只断控制连接：进行中的流照常完成，租约有效期内新请求照常放行；status 显示 ws 断开、上游正常。
 //! - 只断上游流：控制连接保持；status 显示 ws 已连接、上游最近一次出错。
+//! - 两条链路同时断开：对话失败；恢复后同一设备和会话可继续对话，未确认事件和用量按序补传。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
@@ -14,9 +16,9 @@ use axum::routing::post;
 use futures_util::{SinkExt, StreamExt};
 use onex_core::ws::{Rate, Route, UpstreamAuth};
 use onexd::ipc::{self, Ipc};
-use onexd::outbox::{Outbox, now_ms};
+use onexd::outbox::{Kind, Outbox, now_ms};
 use onexd::pricing::format_ms;
-use onexd::router::Router;
+use onexd::router::{Router, UsageRecord};
 use onexd::state::{ConfigSnapshot, Phase, State};
 use onexd::ws::{self, WsOptions};
 use serde_json::{Value, json};
@@ -35,8 +37,31 @@ fn sse(event: &str, data: Value) -> Bytes {
     Bytes::from(format!("event: {event}\ndata: {data}\n\n"))
 }
 
+struct UpstreamListener {
+    tcp: TcpListener,
+    online: Arc<AtomicBool>,
+}
+
+impl axum::serve::Listener for UpstreamListener {
+    type Io = TcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let connection = self.tcp.accept().await.unwrap();
+            if self.online.load(Ordering::SeqCst) {
+                return connection;
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.tcp.local_addr()
+    }
+}
+
 /// `gate`：发完 message_start 后等它放行再发剩下的；`cut`：发完 message_start 后断开。
-async fn start_upstream(gate: Arc<Notify>) -> SocketAddr {
+async fn start_upstream(gate: Arc<Notify>, online: Arc<AtomicBool>) -> SocketAddr {
     let app = axum::Router::new().route(
         "/v1/messages",
         post(move |headers: axum::http::HeaderMap| {
@@ -70,14 +95,15 @@ async fn start_upstream(gate: Arc<Notify>) -> SocketAddr {
                 };
                 Response::builder()
                     .header("content-type", "text/event-stream")
+                    .header("connection", "close")
                     .body(Body::from_stream(first.chain(tail)))
                     .unwrap()
             }
         }),
     );
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(UpstreamListener { tcp, online }, app).await.unwrap() });
     addr
 }
 
@@ -99,14 +125,19 @@ impl Peer {
 
     /// 握手并下发 10 分钟、额度充足的租约。
     async fn handshake_with_lease(&mut self, seq: u64) {
+        self.welcome().await;
+        self.send(json!({"type":"lease","id":format!("s{seq}"),"lease_id":format!("lse_{seq}"),
+            "expires_at":format_ms(now_ms() + 600_000),"budget_milli":1_000_000,"seq":seq}))
+            .await;
+    }
+
+    async fn welcome(&mut self) -> Value {
         let hello = self.recv().await;
         assert_eq!(hello["type"], "hello");
         self.send(json!({"type":"welcome","re":hello["id"],"device_id":"dev_1","user_id":"usr_1","tenant_id":"ten_1",
             "server_time":format_ms(now_ms()),"ack_seq":0,"heartbeat_ms":15000}))
             .await;
-        self.send(json!({"type":"lease","id":format!("s{seq}"),"lease_id":format!("lse_{seq}"),
-            "expires_at":format_ms(now_ms() + 600_000),"budget_milli":1_000_000,"seq":seq}))
-            .await;
+        hello
     }
 }
 
@@ -116,6 +147,8 @@ struct Env {
     router_url: String,
     sock: std::path::PathBuf,
     gate: Arc<Notify>,
+    upstream_online: Arc<AtomicBool>,
+    outbox: Arc<Outbox>,
     http: reqwest::Client,
     _dir: tempfile::TempDir,
 }
@@ -123,7 +156,8 @@ struct Env {
 async fn env() -> Env {
     let dir = tempfile::tempdir().unwrap();
     let gate = Arc::new(Notify::new());
-    let up = start_upstream(gate.clone()).await;
+    let upstream_online = Arc::new(AtomicBool::new(true));
+    let up = start_upstream(gate.clone(), upstream_online.clone()).await;
 
     let state = Arc::new(State::default());
     *state.config.write().unwrap() = ConfigSnapshot {
@@ -151,8 +185,13 @@ async fn env() -> Env {
     let cancel = CancellationToken::new();
     tokio::spawn(state.lease.clone().run(cancel.clone()));
 
-    let (usage_tx, mut usage_rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move { while usage_rx.recv().await.is_some() {} });
+    let (usage_tx, mut usage_rx) = mpsc::unbounded_channel::<UsageRecord>();
+    let outbox_writer = outbox.clone();
+    tokio::spawn(async move {
+        while let Some(record) = usage_rx.recv().await {
+            outbox_writer.append(Kind::Usage, record.to_item()).unwrap();
+        }
+    });
     let app = Router::new(state.clone(), LOCAL.into(), direct(), usage_tx).app();
     let rl = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let router_url = format!("http://{}/v1/messages", rl.local_addr().unwrap());
@@ -178,9 +217,9 @@ async fn env() -> Env {
     o.backoff_min = Duration::from_millis(300);
     o.backoff_max = Duration::from_millis(300);
     state.token.send_replace(Some("t".into()));
-    tokio::spawn(ws::run(o, state.clone(), outbox, cancel));
+    tokio::spawn(ws::run(o, state.clone(), outbox.clone(), cancel));
 
-    Env { state, ws_listener, router_url, sock, gate, http: direct(), _dir: dir }
+    Env { state, ws_listener, router_url, sock, gate, upstream_online, outbox, http: direct(), _dir: dir }
 }
 
 fn direct() -> reqwest::Client {
@@ -193,8 +232,18 @@ impl Env {
         Peer(tokio_tungstenite::accept_async(tcp).await.unwrap())
     }
 
+    async fn reject_control_for(&self, outage: Duration) {
+        let reset_connections = async {
+            loop {
+                let (tcp, _) = self.ws_listener.accept().await.unwrap();
+                drop(tcp);
+            }
+        };
+        let _ = timeout(outage, reset_connections).await;
+    }
+
     fn req(&self, scenario: &str) -> reqwest::RequestBuilder {
-        self.http.post(&self.router_url).header("x-api-key", LOCAL).header("x-test-scenario", scenario).json(
+        self.http.post(&self.router_url).timeout(T).header("x-api-key", LOCAL).header("x-test-scenario", scenario).json(
             &json!({"model":"claude-x","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}),
         )
     }
@@ -321,4 +370,103 @@ async fn upstream_stream_drop_does_not_affect_control_connection() {
     assert_eq!(s["upstream"]["last"]["outcome"], "ok");
     // 最近一次出错的记录保留
     assert_eq!(s["upstream"]["last_error"]["outcome"], "upstream_error");
+}
+
+async fn reconnect_after_both_links_drop(outage: Duration) {
+    let e = env().await;
+    let mut peer = e.accept().await;
+    peer.handshake_with_lease(1).await;
+    e.wait_lease().await;
+    let session = "fixture-session";
+    *e.state.active_session.write().unwrap() = Some(session.into());
+    e.outbox
+        .append(
+            Kind::Events,
+            json!({"session_id":session,"kind":"user_message","at":format_ms(now_ms()),
+                "source_offset":1,"payload":{"content":"before outage"}}),
+        )
+        .unwrap();
+    let response = e.req("").send().await.unwrap().text().await.unwrap();
+    assert_eq!(names(&response).last().map(String::as_str), Some("message_stop"));
+    let before = e.status().await;
+    assert_eq!(before["lease"]["used_milli"], 15);
+
+    // The control peer sends no acknowledgment before both links drop.
+    drop(peer);
+    e.upstream_online.store(false, Ordering::SeqCst);
+    e.wait_phase(Phase::Backoff).await;
+    let response = e.req("").send().await.unwrap();
+    assert_eq!(response.status(), 502);
+    assert_eq!(response.json::<Value>().await.unwrap()["error"]["type"], "api_error");
+    e.reject_control_for(outage).await;
+
+    let offline = e.status().await;
+    assert_ne!(offline["ws"], "connected");
+    assert_eq!(offline["logged_in"], true);
+    assert_eq!(offline["outbox_ack_seq"], 0);
+    assert_eq!(offline["lease"]["used_milli"], 15);
+    assert_eq!(offline["upstream"]["last"]["outcome"], "upstream_error");
+
+    e.upstream_online.store(true, Ordering::SeqCst);
+    let mut peer = e.accept().await;
+    let hello = peer.welcome().await;
+    e.wait_phase(Phase::Connected).await;
+    assert_eq!(hello["outbox_last_seq"], offline["outbox_last_seq"]);
+    let response = e.req("").send().await.unwrap().text().await.unwrap();
+    assert_eq!(names(&response).last().map(String::as_str), Some("message_stop"));
+
+    let count = timeout(T, async {
+        loop {
+            let total = e.outbox.last_seq();
+            if total >= 5 {
+                break total;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("missing event or usage");
+    assert_eq!(count, 5); // one event, two successes and two failed attempts across the outage
+    let mut replayed = Vec::new();
+    timeout(T, async {
+        while replayed.len() < count as usize {
+            if let Some(batch) = peer.recv().await["batch"].as_array() {
+                replayed.extend_from_slice(batch);
+            }
+        }
+    })
+    .await
+    .expect("outbox was not replayed");
+    let stored: Vec<_> = e.outbox.pending(0, 10).unwrap().into_iter().map(|row| row.item).collect();
+    assert_eq!(replayed, stored);
+    assert!(replayed.iter().all(|item| item["session_id"] == session));
+    assert_eq!(replayed[0]["payload"]["content"], "before outage");
+    assert_eq!(replayed[1]["cost_milli"], 15);
+    assert_eq!(replayed[2]["cost_milli"], 0);
+    assert_eq!(replayed[3]["cost_milli"], 0);
+    assert_eq!(replayed[4]["cost_milli"], 15);
+
+    peer.send(json!({"type":"events_ack","ack_seq":count})).await;
+    timeout(T, async {
+        while e.outbox.ack_seq().unwrap() != count {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("outbox acknowledgment did not advance");
+    let after = e.status().await;
+    assert_eq!(after["device_id"], before["device_id"]);
+    assert_eq!(after["logged_in"], true);
+    assert_eq!(after["lease"]["used_milli"], 30);
+}
+
+#[tokio::test]
+async fn simultaneous_outage_reconnects_and_replays_outbox() {
+    reconnect_after_both_links_drop(Duration::ZERO).await;
+}
+
+#[tokio::test]
+#[ignore = "two-minute local outage; run explicitly for S1-T1"]
+async fn two_minute_simultaneous_outage_reconnects_and_replays_outbox() {
+    reconnect_after_both_links_drop(Duration::from_secs(120)).await;
 }
