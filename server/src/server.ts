@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
-import { websocket } from 'hono/bun';
+import { serveStatic, websocket } from 'hono/bun';
 import { ulid } from 'ulid';
 import pkg from '../package.json';
 import { ApiError } from './api';
@@ -36,6 +36,10 @@ export async function createServer(opts: Options) {
   try {
     await store.rebuildIndexes();
     const app = new Hono();
+    const web = serveStatic({ root: `${import.meta.dir}/../web`, rewriteRequestPath: (path) => path === '/' ? '/index.html' : path });
+    app.get('/', web);
+    app.get('/:asset{[a-zA-Z0-9_-]+\\.(js|css)}', web);
+    app.get('/mock/:asset{[a-zA-Z0-9_-]+\\.(js|txt)}', web);
     app.use('/v1/*', async (c, next) => {
       await next();
       c.header('Cache-Control', 'no-store');

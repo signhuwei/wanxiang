@@ -74,6 +74,11 @@ test('health, OpenAPI, one-use codes, tenant selection and logout', async () => 
   const f = await fixture();
   expect(await (await f.request('/healthz')).json()).toMatchObject({ status: 'ok', commit: 'test' });
   const spec = await (await f.request('/openapi.json')).json() as { paths: object };
+  const consolePage = await fetch(f.server.url);
+  expect(consolePage.status).toBe(200);
+  expect(await consolePage.text()).toContain('app.js');
+  expect((await fetch(new URL('/app.js', f.server.url))).status).toBe(200);
+  expect((await fetch(new URL('/tests/package.json', f.server.url))).status).toBe(404);
   expect(Object.keys(spec.paths)).toContain('/v1/auth/login');
   expect(Object.keys(spec.paths)).toContain('/v1/platform/providers');
   const code = await f.code(f.owner);
