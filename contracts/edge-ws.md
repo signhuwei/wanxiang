@@ -97,5 +97,6 @@ Edge 连 Server 和上游时，默认使用环境变量中的代理设置（`HTT
 - `hello` 不带 `lease_id`，且租户有可用余额时，Server 在 `welcome` 之后发初始 `lease`。
 - `hello` 带 `lease_id` 时，Server 不在握手时自动结算，等 Edge 发 `lease_renew` 报 `used_milli`。
 - `lease_renew` 带 `op_id`（缺省时用消息 `id`），重复的 `op_id` 返回第一次的结果，不重复扣款。
-- 每条 `usage` 带 `lease_id`。Server 对账时按 lease 汇总；没有 `lease_id` 的条目只标“待核对”，不重复扣款。
+- 每条 `usage` 带 `lease_id`，记的是放行这次请求时的租约。没有 `lease_id` 的条目只标“待核对”，不重复扣款。
+- **结算依据是 `lease_renew.used_milli`**，不是按 lease 汇总的 usage。一个流跨越续租时，续租快照之后的花费算到新租约的 `used_milli` 里，但这条 usage 的 `lease_id` 仍是旧租约。所以按 lease 汇总的 usage 和 `used_milli` 可能不一致，差额会在相邻租约之间抵消，同一设备所有租约的合计必须一致。Server 只把按设备合计的差额当作异常。
 - 租约过期后，它的预留一直保留，直到 Edge 回连并报 `used_milli`。S1 不自动释放，以免离线用量超发。监察页列出超过 24 小时未回连的租约，由管理员人工处理（S2 再设计自动处理）。
