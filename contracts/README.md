@@ -6,6 +6,7 @@
 | --- | --- |
 | [edge-ws.md](edge-ws.md) | Edge 与 Server 之间的 WebSocket 协议 |
 | [http-api.md](http-api.md) | Server HTTP API（管理端、Desktop 登录、Agent 调用共用） |
+| [desktop-releases.md](desktop-releases.md) | S2 内测安装包发布与员工下载 |
 | [data-model.md](data-model.md) | system 库和租户库的表 |
 | [errors.md](errors.md) | 错误码 |
 

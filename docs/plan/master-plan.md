@@ -80,12 +80,12 @@ wanxiang/
 | --- | --- | --- |
 | S0 规格与骨架（进行中） | Magpie 与 SIMA 规格、契约 v0、三端骨架、CI、假上游 | 契约冻结；三端骨架能互通“登录 → 下发配置 → 心跳” |
 | S1 Claude Code 跑通（Mac） | 详见 [sprint-1.md](sprint-1.md) | 新员工在干净 Mac 上 5 分钟内装好并登录，用 Claude Code 连续工作 2 小时不掉线、不重新登录；管理员实时看到完整对话和 token 费用；Agent 能通过 API 拉取这台 Edge 的日志 |
-| S2 Windows 与 CLI Agent | Windows 版 Desktop 和 onexd；Codex、Kimi Code；橡皮分到组和个人；组管角色；可见范围设置；审计查询 | 测试员在 Windows 上完成 S1 同样的验收；三个 CLI Agent 各连续工作 2 小时 |
+| S2 Windows 与 CLI Agent | [首批 Windows 内测包、管理员发布页与员工下载页](sprint-2.md)；Codex、Kimi Code；橡皮分到组和个人；组管角色；可见范围设置；审计查询 | Mac 与 Windows 安装包可经内测入口发布、下载和下架；测试员在 Windows 上完成 S1 同样的验收；三个 CLI Agent 各连续工作 2 小时 |
 | S3 桌面 Agent 与分析 | WorkBuddy、DeepSeek Harness Desktop；DuckDB 和 Parquet 导出；监察统计；能力合约补全 | 5 个 Agent 全部可用；监察统计页在 100 人、30 天数据量下 p95 < 1 s |
-| S4 上线准备 | 租户开通流程、备份与恢复、升级与回退、监控告警、压测 | 第一个外部租户试用 |
+| S4 上线准备 | 租户开通流程、备份与恢复、签名公证、外部发布、升级与回退、监控告警、压测 | 第一个外部租户试用 |
 | 之后 | Magpie 覆盖的其他 Agent、合约模板、MCP/Skill 分发、c-si-bus 分发与协作、Linux 桌面 | 按客户需求排序 |
 
-每轮冲刺结束时由用户验收，通过后才开下一轮。
+各轮验收由用户安排。2026-11-20 确认 RC3 完整手测与 S2 开发并行。
 
 ## 6. 多进程分工
 
