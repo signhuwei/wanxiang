@@ -1,0 +1,11 @@
+#!/bin/bash
+# 总督用：等到 governor 收件箱有新信就退出（不取走信），由总督读取并处理。
+# 与 mail-wait 不同，它只报告有信，不归档，所以通知漏看时信仍留在收件箱里。
+M=/Users/HHH/Code/OneX/coord/mail/governor
+end=$((SECONDS + ${1:-3000}))
+while [ $SECONDS -lt $end ]; do
+  n=$(ls "$M"/*.md 2>/dev/null | wc -l | tr -d ' ')
+  [ "$n" -gt 0 ] && { echo "MAIL $n"; ls "$M"/*.md | xargs -n1 basename; exit 0; }
+  sleep 3
+done
+echo NO_MAIL

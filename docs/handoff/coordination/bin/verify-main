@@ -1,0 +1,20 @@
+#!/bin/bash
+# 总督用：在 main 检出目录安装依赖、跑全部测试；全部通过才推送。用法：verify-main [--push]
+set -u
+cd /Users/HHH/Code/OneX/wanxiang || exit 2
+fail=0
+(cd server && bun install --frozen-lockfile >/dev/null 2>&1) || { echo "server deps install failed"; fail=1; }
+(cd server/web/tests && bun install --frozen-lockfile >/dev/null 2>&1) || { echo "web test deps install failed"; fail=1; }
+out=$(bun --no-env-file test server/test tests/e2e/fake-upstream 2>&1); echo "$out" | grep -E '^ *[0-9]+ (pass|fail|skip)' | sed 's/^/server: /'
+echo "$out" | grep -qE '^ *0 fail' || fail=1
+out=$(cd server/web/tests && bun test 2>&1); echo "$out" | grep -E '^ *[0-9]+ (pass|fail)' | sed 's/^/web: /'
+echo "$out" | grep -qE '^ *0 fail' || fail=1
+out=$(bun test ./desktop-ui/tests 2>&1); echo "$out" | grep -E '^ *[0-9]+ (pass|fail)' | sed 's/^/desktop-ui: /'
+echo "$out" | grep -qE '^ *0 fail' || fail=1
+out=$(cd edge && cargo test 2>&1); echo "$out" | grep 'test result' | awk '{p+=$4; f+=$6} END {print "edge: pass", p, "fail", f}'
+echo "$out" | grep -q 'test result: FAILED' && fail=1
+echo "$out" | grep -qE '^error(\[|:)' && fail=1
+if [ $fail -ne 0 ]; then echo "VERIFY FAILED: not pushing"; exit 1; fi
+echo "VERIFY OK"
+[ "${1:-}" = "--push" ] && git push -q origin main 2>&1 | tail -1 && git status -sb | head -1
+exit 0

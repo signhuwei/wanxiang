@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(//Users/HHH/Code/SA/SIMA/.local/private/**)",
+      "Read(//Users/HHH/.claude/settings.json)",
+      "Read(//Users/HHH/.claude/settings.local.json)",
+      "Read(//Users/HHH/.claude.json)",
+      "Read(**/.env)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)"
+    ]
+  },
+  "crossSessionInbound": "accept"
+}

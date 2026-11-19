@@ -2,4 +2,4 @@
 
 企业 AI Agent 的纳管与统一管控基座。
 
-项目处于立项阶段，目标仍在厘清中。目前的结论和待回答的问题见[立项目标访谈记录](docs/kickoff/goal-interview-20261119.md)。
+MVP 代码已完成，待部署和人工验收。接手请先读 [AGENTS.md](AGENTS.md) 和 [HANDOFF.md](HANDOFF.md)。立项结论见[立项目标访谈记录](docs/kickoff/goal-interview-20261119.md)。

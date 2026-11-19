@@ -1,0 +1,17 @@
+#!/bin/bash
+# 用法：mail-wait <自己的角色> [最长等待秒数，默认 1800]
+# 有新信件就全部打印并移入 done/ 后退出；超时打印 NO_MAIL 后退出。
+set -uo pipefail
+M=/Users/HHH/Code/OneX/coord/mail
+me=$1 max=${2:-1800}
+dir="$M/$me"; [ -d "$dir" ] || { echo "unknown role: $me" >&2; exit 2; }
+end=$((SECONDS + max))
+while [ $SECONDS -lt $end ]; do
+  files=$(ls "$dir"/*.md 2>/dev/null | sort)
+  if [ -n "$files" ]; then
+    for f in $files; do echo "===== $(basename "$f")"; cat "$f"; echo; mv "$f" "$dir/done/"; done
+    exit 0
+  fi
+  sleep 3
+done
+echo NO_MAIL
