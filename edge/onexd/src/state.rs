@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use onex_core::ws::{Rate, Route};
+use onex_core::ws::{AgentRelease, Rate, Route};
 use tokio::sync::watch;
 
 use crate::lease::Ledger;
@@ -58,6 +58,7 @@ pub struct ConfigSnapshot {
     pub revision: i64,
     pub routes: Vec<Route>,
     pub rates: Vec<Rate>,
+    pub agents: Vec<AgentRelease>,
 }
 
 pub struct State {
@@ -65,6 +66,8 @@ pub struct State {
     pub token: watch::Sender<Option<String>>,
     /// 设备 X25519 私钥，解密下发的上游密钥。每次启动新生成、只在内存，所以重启后要重新登录注册设备。
     pub device_key: DeviceKey,
+    /// When set, only this registered device can acknowledge or replay this outbox.
+    pub expected_device_id: RwLock<Option<String>>,
     pub conn: Mutex<Conn>,
     pub config: RwLock<ConfigSnapshot>,
     /// provider_id → 上游密钥明文。只在内存里，不写日志。
@@ -81,6 +84,7 @@ impl Default for State {
         Self {
             token: Default::default(),
             device_key: DeviceKey::generate(),
+            expected_device_id: Default::default(),
             conn: Default::default(),
             config: Default::default(),
             secrets: Default::default(),

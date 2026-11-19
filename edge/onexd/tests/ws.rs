@@ -216,6 +216,22 @@ async fn waits_for_login_before_connecting() {
 }
 
 #[tokio::test]
+async fn wrong_device_cannot_acknowledge_the_registered_outbox() {
+    let srv = FakeServer::start().await;
+    let edge = start_edge(&srv.url, None);
+    *edge.state.expected_device_id.write().unwrap() = Some("dev_expected".into());
+    edge.outbox.append(Kind::Events, event(1)).unwrap();
+    edge.state.token.send_replace(Some("t".into()));
+
+    let mut peer = srv.accept().await;
+    peer.handshake(1, 15000).await;
+    wait_phase(&edge.state, Phase::Unauthenticated).await;
+    assert_eq!(edge.state.conn.lock().unwrap().device_id, None);
+    assert_eq!(edge.outbox.ack_seq().unwrap(), 0);
+    assert_eq!(edge.outbox.last_seq(), 1);
+}
+
+#[tokio::test]
 async fn answers_server_ping_and_pings_on_heartbeat() {
     let srv = FakeServer::start().await;
     let _edge = start_edge(&srv.url, Some("t"));
@@ -422,7 +438,9 @@ async fn config_applied_and_acked_and_stale_ignored() {
     p.handshake(0, 15000).await;
     let route = json!({"model":"claude-*","model_id":"mdl_1","provider_id":"prv_1","protocol":"anthropic","base_url":"http://up"});
     let rate = json!({"model_id":"mdl_1","input_milli_per_mtok":1,"output_milli_per_mtok":2,"cache_read_milli_per_mtok":0,"cache_write_milli_per_mtok":0});
-    p.send(json!({"type":"config","id":"c1","revision":5,"routes":[route],"agents":[],"rates":[rate]})).await;
+    let release = json!({"id":"rel_1","agent":"claude-code","version":"2.1.311","os":"darwin","arch":"arm64",
+        "url":"https://example.invalid/claude","sha256":"0".repeat(64),"size":42});
+    p.send(json!({"type":"config","id":"c1","revision":5,"routes":[route],"agents":[release],"rates":[rate]})).await;
     let a = p.recv_skip_ping().await;
     assert_eq!(a, json!({"type":"ack","re":"c1","ok":true}));
     assert_eq!(edge.state.config_revision(), 5);
@@ -432,6 +450,8 @@ async fn config_applied_and_acked_and_stale_ignored() {
     assert_eq!(p.recv_skip_ping().await["re"], "c2");
     let cfg = edge.state.config.read().unwrap().clone();
     assert_eq!((cfg.revision, cfg.routes.len()), (5, 1));
+    assert_eq!(cfg.agents[0].id, "rel_1");
+    assert_eq!(cfg.agents[0].size, 42);
     drop(cfg);
 
     // 重连时 hello 带上当前 revision

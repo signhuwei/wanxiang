@@ -97,6 +97,11 @@ pub async fn run(opts: WsOptions, state: Arc<State>, outbox: Arc<Outbox>, cancel
             End::Cancelled => return,
             End::Unauthenticated => {
                 warn!("server rejected device token; waiting for a new login");
+                *state.config.write().unwrap() = ConfigSnapshot::default();
+                state.secrets.write().unwrap().clear();
+                if let Err(e) = state.lease.cutoff("unauthenticated") {
+                    warn!(error = %e, "could not persist authentication cutoff");
+                }
                 state.set_phase(Phase::Unauthenticated);
                 tokio::select! {
                     _ = cancel.cancelled() => return,
@@ -250,6 +255,9 @@ async fn connected(
     welcome: &Welcome,
     cancel: &CancellationToken,
 ) -> Result<()> {
+    if state.expected_device_id.read().unwrap().as_ref().is_some_and(|id| id != &welcome.device_id) {
+        return Err(Special::Unauthenticated.into());
+    }
     {
         let mut c = state.conn.lock().unwrap();
         c.phase = Phase::Connected;
@@ -388,7 +396,7 @@ fn apply_config(state: &State, c: Config) {
     let mut cur = state.config.write().unwrap();
     if c.revision > cur.revision {
         info!(revision = c.revision, routes = c.routes.len(), rates = c.rates.len(), "config applied");
-        *cur = ConfigSnapshot { revision: c.revision, routes: c.routes, rates: c.rates };
+        *cur = ConfigSnapshot { revision: c.revision, routes: c.routes, rates: c.rates, agents: c.agents };
     }
 }
 

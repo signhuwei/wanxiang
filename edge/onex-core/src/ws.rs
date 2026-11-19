@@ -86,9 +86,21 @@ pub struct Config {
     #[serde(default)]
     pub routes: Vec<Route>,
     #[serde(default)]
-    pub agents: Vec<Value>,
+    pub agents: Vec<AgentRelease>,
     #[serde(default)]
     pub rates: Vec<Rate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRelease {
+    pub id: String,
+    pub agent: String,
+    pub version: String,
+    pub os: String,
+    pub arch: String,
+    pub url: String,
+    pub sha256: String,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

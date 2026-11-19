@@ -28,6 +28,7 @@ async fn anthropic_client_through_chat_fake_upstream() {
     let state = Arc::new(State::default());
     *state.config.write().unwrap() = ConfigSnapshot {
         revision: 1,
+        agents: vec![],
         routes: vec![Route {
             model: "*".into(),
             model_id: "m".into(),

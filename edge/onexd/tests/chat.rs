@@ -341,6 +341,7 @@ async fn env_with_base(base: impl FnOnce(SocketAddr) -> String) -> Env {
     let state = Arc::new(State::default());
     *state.config.write().unwrap() = ConfigSnapshot {
         revision: 1,
+        agents: vec![],
         routes: vec![Route {
             model: "local-m".into(),
             model_id: "mdl_q".into(),

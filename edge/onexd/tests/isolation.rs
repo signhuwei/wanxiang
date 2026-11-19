@@ -128,6 +128,7 @@ async fn env() -> Env {
     let state = Arc::new(State::default());
     *state.config.write().unwrap() = ConfigSnapshot {
         revision: 1,
+        agents: vec![],
         routes: vec![Route {
             model: "*".into(),
             model_id: "mdl_1".into(),
