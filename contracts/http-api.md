@@ -41,7 +41,7 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 | POST | `/invites` | `{role, group_id, max_uses, expires_in_ms}`，返回邀请码（只返回一次） |
 | GET/PUT | `/contract` | 当前租户合约 |
 | GET | `/balance` | 余额、已预留、本月消耗 |
-| GET | `/ledger` | 橡皮流水 |
+| GET | `/ledger` | 橡皮流水。 `overage_pending` 单列超租约待核对的差额，`amount_milli` 不计入余额、预留或本月消耗。 |
 | POST | `/platform/ledger/topup` | 平台管理员手工加分，全局令牌，`{tenant_id, amount_milli, note?}` |
 | GET | `/devices`，`/devices/:id` | 设备台账 |
 | POST | `/devices/:id/diag` | `{kind}`，返回 `diag_id` |

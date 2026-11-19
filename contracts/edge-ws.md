@@ -46,7 +46,7 @@ Server 回 `welcome`：
 | --- | --- | --- |
 | `events` | `batch[]`：`{seq, session_id, kind, at, payload}` | 会话事件回流。`seq` 每台设备单调递增、无空洞。Server 持久化后回 `events_ack{ack_seq}` |
 | `usage` | `batch[]`：`{seq, request_id, session_id, lease_id, provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_milli, at, status, complete}` | 用量计量。与 events 共用 seq 空间。`status`：`ok`、`upstream_<HTTP 状态码>`、`upstream_error`、`client_cancelled`，以及 Edge 主动断流的 `lease_exhausted`、`lease_expired`、`cutoff`。条目带 `model_id`。`complete=false` 表示流中断、用量不全，cost 按已收到的部分计算，Server 记为待结算，不当作零 |
-| `lease_renew` | `lease_id`、`used_milli`、`op_id` | 续租。`used_milli` 是该租约从签发起累计的绝对值（不是增量），Server 据此幂等结算。签发新租约或回 `cutoff` |
+| `lease_renew` | `lease_id`、`used_milli`、`op_id` | 续租。`used_milli` 是该租约从签发起累计的绝对值（不是增量），Server 据此在租约上限内幂等扣款。签发新租约或回 `cutoff` |
 | `diag_result` | `diag_id`、`ok`、`detail` | 诊断结果 |
 | `agent_state` | `agent`、`session_id`、`state`（`started`、`exited`、`crashed`）、`exit_code` | Agent 生命周期 |
 
@@ -108,5 +108,7 @@ Edge 连 Server 和上游时，默认使用环境变量中的代理设置（`HTT
 - `hello` 带 `lease_id` 时，Server 不在握手时自动结算，等 Edge 发 `lease_renew` 报 `used_milli`。
 - `lease_renew` 带 `op_id`（缺省时用消息 `id`），重复的 `op_id` 返回第一次的结果，不重复扣款。
 - 每条 `usage` 带 `lease_id`，记的是放行这次请求时的租约。没有 `lease_id` 的条目只标“待核对”，不重复扣款。
-- **结算依据是 `lease_renew.used_milli`**，不是按 lease 汇总的 usage。一个流跨越续租时，续租快照之后的花费算到新租约的 `used_milli` 里，但这条 usage 的 `lease_id` 仍是旧租约。所以按 lease 汇总的 usage 和 `used_milli` 可能不一致，差额会在相邻租约之间抵消，同一设备所有租约的合计必须一致。Server 只把按设备合计的差额当作异常。
+- **续租用量快照是 `lease_renew.used_milli`**，租户扣款取实报与 `budget_milli` 的较小值。实报超过额度时，Server 在同一事务里按上限结清旧租约、单列差额待核对，并按剩余余额签发新租约或返回 `cutoff`。重放同一 `op_id` 返回原结果，沿用原始快照，扣款和差额各只入账一次。
+- 超租约差额不转入下一份租约。新租约确认旧续租快照已处理，Edge 从本地累计用量中移除完整原始快照，只把快照后产生的实际用量计入新租约。
+- `usage.cost_milli` 保留真实用量，跨租约的请求仍引用放行时的租约。Server 按设备比较实际用量与已结算金额，有差额时保留待结算状态。独立的待核对流水关联旧租约及续租操作。
 - 租约过期后，它的预留一直保留，直到 Edge 回连并报 `used_milli`。S1 不自动释放，以免离线用量超发。监察页列出超过 24 小时未回连的租约，由管理员人工处理（S2 再设计自动处理）。

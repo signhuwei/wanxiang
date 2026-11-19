@@ -23,8 +23,9 @@
 | `members` | user_id、role、group_id、status、quota_milli（null 为不限） |
 | `groups` | id、name、parent_id、quota_milli |
 | `contract` | revision、seat_limit、allowed_agents_json、allowed_models_json、lease_minutes、lease_budget_milli、visibility_json、updated_by、updated_at |
-| `ledger` | id、kind（`topup`、`reserve`、`settle`、`release`、`adjust`）、amount_milli、user_id、lease_id、request_ref、by、at |
-| `leases` | id、device_id、user_id、budget_milli、used_milli、expires_at、status |
+| `ledger` | id、kind（`topup`、`reserve`、`settle`、`release`、`adjust`、`overage_pending`）、amount_milli、user_id、lease_id、request_ref、by、at、note |
+| `leases` | id、device_id、user_id、budget_milli、used_milli（已从租户扣款）、expires_at、status |
+| `lease_operations` | device_id、op_id、lease_id、used_milli（实报续租快照）、result_json |
 | `devices` | id、user_id、name、os、arch、edge_version、public_key、token_hash、token_expires_at、last_seen_at、status |
 | `invites` | code_hash、role、group_id、max_uses、used、expires_at、created_by |
 | `agent_sessions` | id、device_id、user_id、agent、agent_version、model、started_at、ended_at、event_count、cost_milli |
@@ -32,6 +33,8 @@
 | `usage` | device_id、seq、request_id、session_id、model_id、input/output/cache_read/cache_write_tokens、cost_milli、status、at |
 | `diag_jobs` | id、device_id、kind、status、object_key、requested_by、at |
 | `audit` | id、actor、action、target、detail_json、at |
+
+`ledger.kind=overage_pending` 只记录超过租约额度的正差额。该行用相同的 `lease_id` 和 `request_ref` 关联本次结算，可单独核对，不计入租户余额、已预留或本月消耗。单请求的真实金额仍保存在 `usage.cost_milli`。
 
 ## 权威与索引（v0.1）
 

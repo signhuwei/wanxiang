@@ -35,7 +35,7 @@ bun test ./desktop-ui/tests                                      # Desktop 前�
 
 ## 必须守住的规则
 
-- **安全边界**：上游密钥只在 onexd 内存中解密，不写日志、不进 Agent 配置；读取对话正文必写审计；计费不超发（预留与实际消费分开，结算以 `lease_renew.used_milli` 为准）。
+- **安全边界**：上游密钥只在 onexd 内存中解密，不写日志、不进 Agent 配置；读取对话正文必写审计；计费不超发（实耗以 `lease_renew.used_milli` 为准，租户扣款不超过租约，超出部分单列待核对）。
 - **管理端 UI 规则**（来自 SIMA）：只有台账、钻取、表单三种页面；钻取时台账左缩；主表单不用弹窗和遮罩；服务端分页；按钮按 API 返回的 `actions` 显示，不在页面推导权限。
 - **利旧知识，不利旧代码**：SIMA（`/Users/HHH/Code/SA/SIMA`）和 Magpie（`/Users/HHH/Code/OneX/refs/magpie`）只作参考。
 - **211 上还跑着 SIMA**（`sima.service`、`~/apps/sima`），部署 OneX 不能碰它。OneX 只用 `onex-*` systemd 单元和 18700–18702 端口。
