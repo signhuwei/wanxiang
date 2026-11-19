@@ -4,6 +4,7 @@
 import { createApi } from './api.js'
 import { createSessionStore } from './session.js'
 import { showToast } from './toast.js'
+import { observePage } from './observation.js'
 import { billingPage } from './billing.js'
 import { catalog } from './catalog.js'
 import { contractPage } from './contract.js'
@@ -60,7 +61,7 @@ function renderTop(hash) {
     tenantLink.classList.toggle('selected', hash.startsWith('#/tenant'))
     domains.appendChild(tenantLink)
     if (session.tenant && hash.startsWith('#/tenant')) {
-      for (const [path, label] of [['members','成员'], ['groups','分组'], ['contract','合约'], ['billing','橡皮']]) {
+      for (const [path, label] of [['members','成员'], ['groups','分组'], ['contract','合约'], ['billing','橡皮'], ['observe','监察']]) {
         const link = el('a', hash === '#/tenant/' + path ? 'selected' : '', label)
         link.href = '#/tenant/' + path
         domains.append(link)
@@ -120,7 +121,10 @@ function defaultHash() {
   return session.tenant ? '#/tenant/members' : '#/platform'
 }
 
+let lifecycle
 function route() {
+  lifecycle?.abort()
+  lifecycle = new AbortController()
   const hash = location.hash || '#/'
   app.textContent = ''
   renderTop(hash)
@@ -166,6 +170,7 @@ function route() {
       return
     }
     if (hash === '#/tenant/groups') groupsPage(ws, api, session.actions || [])
+    else if (hash === '#/tenant/observe') observePage(ws, api, session, lifecycle.signal, mockOn)
     else if (hash === '#/tenant/billing') billingPage(ws, api, platformApi, session)
     else if (hash === '#/tenant/contract') contractPage(ws, api)
     else renderMembersPage(ws, { api, actions: session.actions || [] })
