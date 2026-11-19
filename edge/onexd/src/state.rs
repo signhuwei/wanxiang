@@ -7,6 +7,7 @@ use onex_core::ws::{Rate, Route};
 use tokio::sync::watch;
 
 use crate::lease::Ledger;
+use crate::secret::DeviceKey;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Phase {
@@ -59,10 +60,11 @@ pub struct ConfigSnapshot {
     pub rates: Vec<Rate>,
 }
 
-#[derive(Default)]
 pub struct State {
     /// device_token。S0 只存内存，重启后需要重新 login。
     pub token: watch::Sender<Option<String>>,
+    /// 设备 X25519 私钥，解密下发的上游密钥。每次启动新生成、只在内存，所以重启后要重新登录注册设备。
+    pub device_key: DeviceKey,
     pub conn: Mutex<Conn>,
     pub config: RwLock<ConfigSnapshot>,
     /// provider_id → 上游密钥明文。只在内存里，不写日志。
@@ -70,6 +72,20 @@ pub struct State {
     /// 默认只在内存里；daemon 启动时换成落盘的。
     pub lease: Arc<Ledger>,
     pub upstream: Mutex<Upstream>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            token: Default::default(),
+            device_key: DeviceKey::generate(),
+            conn: Default::default(),
+            config: Default::default(),
+            secrets: Default::default(),
+            lease: Default::default(),
+            upstream: Default::default(),
+        }
+    }
 }
 
 impl State {
