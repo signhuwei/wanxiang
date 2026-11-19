@@ -1,0 +1,14 @@
+#!/bin/bash
+set -eu
+
+# An offline target loads the agent at its next graphical login.
+[[ ${3:-/} == / ]] || exit 0
+user_id=$(/usr/bin/stat -f %u /dev/console)
+domain=gui/$user_id
+label=com.onex.desktop.edge
+[[ $user_id -gt 0 ]] && /bin/launchctl print "$domain" >/dev/null 2>&1 || exit 0
+
+if /bin/launchctl print "$domain/$label" >/dev/null 2>&1; then
+  /bin/launchctl bootout "$domain/$label"
+fi
+/bin/launchctl bootstrap "$domain" "/Library/LaunchAgents/$label.plist"
