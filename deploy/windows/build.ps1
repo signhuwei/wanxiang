@@ -50,6 +50,7 @@ function Assert-X64 {
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $edge = Join-Path $repo 'edge'
 $desktop = Join-Path $edge 'desktop'
+$appVersion = (Get-Content -Raw -LiteralPath (Join-Path $desktop 'tauri.conf.json') | ConvertFrom-Json).version
 $target = 'x86_64-pc-windows-msvc'
 $targetDir = Join-Path $edge 'target\onex-windows'
 $releaseDir = Join-Path $targetDir "$target\release"
@@ -90,12 +91,12 @@ try {
         $buildConfig = @{
             bundle = @{
                 targets = @('nsis')
-                icon = @($icon)
-                externalBin = @((Join-Path $staging 'onex'), (Join-Path $staging 'onexd'))
+                icon = @('../target/onex-windows/inputs/icons/icon.ico')
+                externalBin = @('../target/onex-windows/inputs/onex', '../target/onex-windows/inputs/onexd')
                 windows = @{
                     nsis = @{
                         installMode = 'currentUser'
-                        installerHooks = (Join-Path $PSScriptRoot 'hooks.nsh')
+                        installerHooks = '../../deploy/windows/hooks.nsh'
                     }
                 }
             }
@@ -123,6 +124,7 @@ try {
     $revision = Invoke-Checked 'git' @('-C', $repo, 'rev-parse', 'HEAD')
     [pscustomobject] @{
         revision = $revision
+        version = $appVersion
         platform = 'windows/x64'
         installer = $installer.FullName
         bytes = $installer.Length
