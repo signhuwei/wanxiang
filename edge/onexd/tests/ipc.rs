@@ -85,8 +85,12 @@ async fn status_login_shutdown() {
             .to_string()
     };
     assert_eq!(c.call(&launch(None)).await["error"]["code"], "model_not_allowed");
-    state.config.write().unwrap().routes = vec![route("*"), route("Qwen3.8-27B")];
-    assert_eq!(c.call(&launch(Some("claude-opus-5-5"))).await["error"]["code"], "model_not_allowed");
+    state.config.write().unwrap().routes = vec![route("claude-*")];
+    assert_eq!(c.call(&launch(Some("kimi-k3"))).await["error"]["code"], "model_not_allowed");
+    // server MVP seed 的形状：通配路由固定上游模型，默认别名取它
+    let mut wild = route("*");
+    wild.upstream_model = Some("Qwen3.8-27B".into());
+    state.config.write().unwrap().routes = vec![wild];
     let l = c.call(&launch(None)).await;
     assert_eq!((l["ok"].as_bool(), l["model"].as_str()), (Some(true), Some("Qwen3.8-27B")));
     assert_eq!(l["env"]["ANTHROPIC_API_KEY"], "localtok");

@@ -77,6 +77,7 @@ async fn cmd_login(args: &[String]) -> Result<()> {
         "已登录租户「{}」，设备 {} 已注册。onexd 正在连接 Server，可用 onex status 查看。",
         r.tenant_name, r.device_id
     );
+    println!("注意：登录信息只保存在 onexd 内存里，onexd 重启后需要重新运行 onex login。");
     Ok(())
 }
 

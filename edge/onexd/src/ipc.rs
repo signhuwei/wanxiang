@@ -163,13 +163,20 @@ fn launch(
         return err("agent_not_allowed", &format!("OneX 暂不支持启动 {agent}"));
     }
     if ipc.state.token.borrow().is_none() {
-        return err("unauthenticated", "还没有登录，请先运行 onex login");
+        return err("unauthenticated", "还没有登录，请先运行 onex login。onexd 每次重启后都需要重新登录。");
     }
-    // 只用 Server 下发的、精确名字的模型作别名（通配路由不能当 --model）
-    let models: Vec<String> =
-        ipc.state.config.read().unwrap().routes.iter().map(|r| r.model.clone()).filter(|m| !m.contains('*')).collect();
+    // 别名候选：精确名字的路由；通配路由用它固定的上游模型名（server 的 MVP seed 是 `*` → Qwen3.8-27B）
+    let (models, routable) = {
+        let cfg = ipc.state.config.read().unwrap();
+        let mut exact: Vec<String> =
+            cfg.routes.iter().filter(|r| !r.model.contains('*')).map(|r| r.model.clone()).collect();
+        exact.extend(cfg.routes.iter().filter(|r| r.model.contains('*')).filter_map(|r| r.upstream_model.clone()));
+        exact.dedup();
+        let routable = model.is_some_and(|m| crate::router::select_route(&cfg.routes, m).is_some());
+        (exact, routable)
+    };
     let model = match model {
-        Some(m) if models.iter().any(|x| x == m) => m.to_string(),
+        Some(m) if routable => m.to_string(),
         Some(m) => return err("model_not_allowed", &format!("模型 {m} 没有开通，可用的有：{}", models.join("、"))),
         None => match models.first() {
             Some(m) => m.clone(),
