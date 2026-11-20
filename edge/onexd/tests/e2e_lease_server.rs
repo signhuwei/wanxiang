@@ -356,11 +356,7 @@ async fn committed_renew_over_budget_with_lost_reply_settles_budget_once_and_par
 
 /// 契约 v0.13：余额耗尽 → Server 续租回 cutoff 且带 settled_lease_id → Edge 丢弃旧租约 →
 /// 周期性 lease_request → 充值后自动恢复，拿到新租约。
-///
-/// 标 `#[ignore]`：Server 侧的 `settled_lease_id` 和 `lease_request` 由 quota-api 线实现，
-/// 这条测试写好接口形状，等 Server 合入后由总督去掉 ignore 跑。
 #[tokio::test]
-#[ignore]
 async fn cutoff_settled_by_renew_then_recovers_after_topup() {
     let srv_dir = tempfile::tempdir().unwrap();
     let srv = start_server(srv_dir.path()).await;
