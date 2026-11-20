@@ -344,8 +344,13 @@ async fn launch_without_program_downloads_the_managed_release() {
         sha256,
         size: body.len() as u64,
     };
-    *state.config.write().unwrap() =
-        onexd::state::ConfigSnapshot { revision: 1, routes: vec![wild], rates: vec![], agents: vec![release] };
+    *state.config.write().unwrap() = onexd::state::ConfigSnapshot {
+        agent_cache: false,
+        revision: 1,
+        routes: vec![wild],
+        rates: vec![],
+        agents: vec![release],
+    };
 
     let cwd = dir.path().to_string_lossy().to_string();
     let req =

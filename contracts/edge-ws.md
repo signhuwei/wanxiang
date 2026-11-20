@@ -160,3 +160,10 @@ S1 起存在的缺陷：续租回 `cutoff` 后，Edge 保留旧租约并重放�
 - **转 Chat 的输出条目**：`response.output_item.done` 和 `response.completed.output` 必须带完整条目：message 条目有 `id`、`role:"assistant"`、`content:[{type:"output_text",text}]`；function 条目有 `id`、`call_id`、`name`、`arguments`。同一条目在 added 和 done 里的 `id` 一致。缺 call_id 时生成稳定 ID，不留空串。
 - **同协议转发**：URL 拼接规则同 Chat（`base_url` 以 `/v1` 结尾时直接接 `/responses`）。只转发白名单请求头（`content-type`、`accept`、`openai-beta`、`user-agent`），认证头换成上游密钥。
 - **anthropic 上游**：返回 `model_not_allowed`，`message` 写明“该模型的上游协议暂不支持 Codex，请联系管理员调整路由”。
+
+## Server 缓存制品（v0.14）
+
+- 支持新缓存协议的 Edge 在 `hello` 加 `agent_cache: true`。Server 在对应 `config` 回传 `agent_cache: true`，且 `agents` 仅带当前设备平台、架构及能力合约允许的已缓存启用发行。
+- 缓存协议的 `agents[].url` 是 `/v1/edge/agent-artifacts/<release_id>`。Edge 使用当前连接的 OneX Server 作为下载服务器，沿用同一协议、主机和端口，携带设备 Bearer，拒绝重定向。落入本机缓存前核对原始字节数及 SHA-256。缓存协议启用时，IPC 拒绝调用方指定的非受管可执行文件。
+- 合约固定发行时只下发该发行的原始身份。停用、缺失缓存或换摘要的固定条目失效，不能自动改用同 Agent 的其他版本。
+- 无固定发行的设备平台上，不带能力位的旧 Edge 继续收到登记的厂商地址。固定发行的平台要求新版 Edge，旧 Edge 收到空配置和 `cutoff{contract}`。旧 Server 可忽略新 `hello` 字段。

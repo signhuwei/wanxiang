@@ -54,7 +54,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
 
     const live = () => state !== 'closed' && current.get(deviceId) === socket;
     const send = (msg: Record<string, unknown>) => { if (live()) socket.send(JSON.stringify(msg)); };
-    const subscription = { tenant: tenantId, live, send };
+    const subscription = { tenant: tenantId, agentCache: false, live, send };
     const stop = (code: number, reason: string) => {
       state = 'closed';
       clearTimeout(timer);
@@ -114,9 +114,11 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
           if (!msg || typeof msg !== 'object' || Array.isArray(msg)) { stop(1007, 'invalid JSON frame'); return; }
           if (state === 'hello') {
             if (msg.type !== 'hello' || !isText(msg.id) || msg.edge_version !== version || !isText(msg.os, 32) || !isText(msg.arch, 32)
+              || (msg.agent_cache !== undefined && typeof msg.agent_cache !== 'boolean')
               || !isSeq(msg.config_revision) || !isSeq(msg.outbox_last_seq) || (msg.lease_id != null && !isText(msg.lease_id))) {
               stop(1008, 'hello required'); return;
             }
+            subscription.agentCache = msg.agent_cache === true;
             state = 'starting';
             if (!await renew()) { if (live()) stop(1008, 'device unavailable'); return; }
             if (!live()) return;

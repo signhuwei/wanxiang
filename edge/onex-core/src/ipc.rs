@@ -136,6 +136,8 @@ mod tests {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default)]
+    pub agent_cache: bool,
     pub version: String,
     pub logged_in: bool,
     /// `idle`（未登录）、`connecting`、`connected`、`backoff`

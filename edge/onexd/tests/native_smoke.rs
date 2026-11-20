@@ -126,6 +126,7 @@ async fn local_installed_agent_receipt() {
     let state = Arc::new(State::default());
     let model = if is_codex { "gpt-5.4" } else { "kimi-smoke" };
     *state.config.write().unwrap() = ConfigSnapshot {
+        agent_cache: false,
         revision: 1,
         agents: vec![AgentRelease {
             id: "rel_smoke".into(),

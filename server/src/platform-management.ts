@@ -1,5 +1,6 @@
 import type { SQLQueryBindings } from 'bun:sqlite';
 import type { Context, Hono } from 'hono';
+import { AGENT_ARTIFACT_MAX_BYTES, hasArtifact, managedAgents, officialArtifactSource, releaseIdentity } from './agent-catalog';
 import { ulid } from 'ulid';
 import { ApiError, field, invalid, json, operation } from './api';
 import type { platformCreateActions } from './actions';
@@ -31,7 +32,8 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
   const requirePlatform = (sql: Transaction, userId: string) => {
     if (!sql.get('SELECT 1 FROM platform_admins WHERE user_id = ?', [userId])) throw new ApiError('forbidden');
   };
-  function list(path: string, table: string, columns: string, search: string, order: string, action: typeof platformCreateActions[number], parent?: 'provider_id' | 'model_id') {
+  function list(path: string, table: string, columns: string, search: string, order: string, action: typeof platformCreateActions[number], parent?: 'provider_id' | 'model_id',
+    project: (row: RecordRow) => Record<string, SQLQueryBindings | string[] | boolean> = view) {
     app.get(path, (c) => {
       platformActor(store, c, opts.now());
       const p = pagination(c);
@@ -40,14 +42,22 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
       const params = filter ? [p.query, field(filter, parent!)] : [p.query];
       const { n } = store.system.get<{ n: number }>(`SELECT count(*) AS n FROM ${table} ${where}`, params)!;
       return c.json(p.page(store.system.all<RecordRow>(`SELECT ${columns} FROM ${table} ${where} ORDER BY ${order} LIMIT ? OFFSET ?`,
-        [...params, p.limit, p.offset]).map(view), n, [action]));
+        [...params, p.limit, p.offset]).map(project), n, [action]));
     });
   }
 
   function register(entry: { path: string; table: string; columns: string; search: string; prefix: string; action: typeof platformCreateActions[number];
+    project?: (row: RecordRow) => Record<string, SQLQueryBindings | string[] | boolean>;
     parse: (input: Input, row: RecordRow | null, sql: Transaction) => Record<string, SQLQueryBindings> }) {
     const path = `/v1/platform/${entry.path}`;
-    list(path, entry.table, entry.columns, entry.search, 'id', entry.action, entry.table === 'models' ? 'provider_id' : undefined);
+    const project = entry.project ?? view;
+    list(path, entry.table, entry.columns, entry.search, 'id', entry.action, entry.table === 'models' ? 'provider_id' : undefined, project);
+    if (entry.project) app.get(`${path}/:id`, (c) => {
+      platformActor(store, c, opts.now());
+      const row = store.system.get<RecordRow>(`SELECT ${entry.columns} FROM ${entry.table} WHERE id = ?`, [c.req.param('id')]);
+      if (!row) throw new ApiError('not_found');
+      return c.json(project(row));
+    });
     // CONTRACT-PENDING: platform collection POST can also update by id; item PATCH aliases item POST.
     const write = async (c: Context) => {
       const body = await json(c);
@@ -70,7 +80,7 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
         const stored = secret === undefined ? row : { ...row, secret_ciphertext: encryptProviderSecret(opts.masterKey!, id, secret) };
         if (previous) change(sql, entry.table, stored, 'id = ?', [id]);
         else add(sql, entry.table, stored);
-        return { response: op.complete(sql, { status: previous ? 200 : 201, payload: view(row) }), changed: true };
+        return { response: op.complete(sql, { status: previous ? 200 : 201, payload: project(row) }), changed: true };
       });
       if (result.changed) opts.onConfigChange?.();
       return result.response;
@@ -100,12 +110,33 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
       return { provider_id, upstream_name, route_model, display_name: text(body, row, 'display_name'),
         context_window: number(body, row, 'context_window', 1), status: status(body, row) };
     } });
-  register({ path: 'agent-releases', table: 'agent_releases', columns: '*', search: "agent || ' ' || version", prefix: 'rel', action: 'create_agent_release',
-    parse: (body, row) => {
+  register({ path: 'agent-releases', table: 'agent_releases', columns: '*',
+    search: "agent || ' ' || version || ' ' || os || ' ' || arch", prefix: 'rel', action: 'create_agent_release',
+    project: (row) => {
+      const artifact_cached = hasArtifact(opts.dataDir, { sha256: String(row.sha256), size: Number(row.size) });
+      return { ...row, artifact_cached, actions: ['read', 'update', 'upload_artifact',
+        ...(officialArtifactSource({ agent: String(row.agent), url: String(row.url) }) ? ['pull_artifact'] : []),
+        ...(row.status === 'active' ? ['disable'] : artifact_cached ? ['activate'] : [])] };
+    },
+    parse: (body, row, sql) => {
       const sha256 = text(body, row, 'sha256').toLowerCase();
       if (!/^[0-9a-f]{64}$/.test(sha256)) invalid('sha256');
-      return { agent: text(body, row, 'agent'), version: text(body, row, 'version'), os: text(body, row, 'os'), arch: text(body, row, 'arch'),
-        url: urlField(value(body, row, 'url'), 'url'), sha256, size: number(body, row, 'size', 1), status: status(body, row) };
+      const next = {
+        agent: enumField(value(body, row, 'agent'), 'agent', managedAgents), version: text(body, row, 'version'),
+        os: enumField(value(body, row, 'os'), 'os', ['darwin', 'linux', 'win32'] as const),
+        arch: enumField(value(body, row, 'arch'), 'arch', ['arm64', 'x64'] as const),
+        url: urlField(value(body, row, 'url'), 'url'), sha256, size: number(body, row, 'size', 1), status: status(body, row),
+      };
+      if (next.size > AGENT_ARTIFACT_MAX_BYTES) invalid('size');
+      if (row && releaseIdentity.some(key => key !== 'id' && row[key] !== next[key])) {
+        throw new ApiError('conflict', { reason: 'release_identity_immutable' });
+      }
+      if (!row && sql.get('SELECT 1 FROM agent_releases WHERE agent = ? AND version = ? AND os = ? AND arch = ?',
+        [next.agent, next.version, next.os, next.arch])) throw new ApiError('conflict', { reason: 'release_exists' });
+      if (row?.status === 'disabled' && next.status === 'active' && !hasArtifact(opts.dataDir, next)) {
+        throw new ApiError('conflict', { reason: 'artifact_unavailable' });
+      }
+      return next;
     } });
 
   list('/v1/platform/rates', 'rates', '*', 'model_id', 'model_id, effective_from', 'create_rate', 'model_id');

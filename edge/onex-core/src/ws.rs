@@ -52,6 +52,8 @@ pub struct ErrorBody {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hello {
+    #[serde(default)]
+    pub agent_cache: bool,
     pub id: String,
     pub edge_version: String,
     pub os: String,
@@ -82,6 +84,8 @@ pub struct Ack {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub agent_cache: bool,
     pub id: String,
     pub revision: i64,
     #[serde(default)]
@@ -345,8 +349,8 @@ mod tests {
     fn lease_request_roundtrips() {
         let m: Msg = serde_json::from_value(json!({"type":"lease_request","id":"m1","op_id":"lrq_1"})).unwrap();
         assert!(matches!(m, Msg::LeaseRequest(LeaseRequest { op_id, .. }) if op_id == "lrq_1"));
-        let v = serde_json::to_value(Msg::LeaseRequest(LeaseRequest { id: "m2".into(), op_id: "lrq_2".into() }))
-            .unwrap();
+        let v =
+            serde_json::to_value(Msg::LeaseRequest(LeaseRequest { id: "m2".into(), op_id: "lrq_2".into() })).unwrap();
         assert_eq!(v, json!({"type":"lease_request","id":"m2","op_id":"lrq_2"}));
     }
 

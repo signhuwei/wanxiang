@@ -12,7 +12,7 @@ export class ApiError extends Error {
 }
 
 export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthorized = () => {}, fetchImpl = globalThis.fetch } = {}) {
-  async function request(path, { method = 'GET', params, body, rawBody, idempotencyKey, signal, binary = false } = {}) {
+  async function request(path, { method = 'GET', params, body, rawBody, idempotencyKey, signal, binary = false, contentType } = {}) {
     let url = baseUrl + path
     if (params) {
       const qs = new URLSearchParams()
@@ -25,7 +25,7 @@ export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthoriz
     const headers = { Accept: binary ? 'application/octet-stream' : 'application/json' }
     const token = getToken()
     if (token) headers.Authorization = 'Bearer ' + token
-    if (rawBody !== undefined) headers['Content-Type'] = 'application/octet-stream'
+    if (rawBody !== undefined) headers['Content-Type'] = contentType || 'application/octet-stream'
     else if (body !== undefined) headers['Content-Type'] = 'application/json'
     if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey
 

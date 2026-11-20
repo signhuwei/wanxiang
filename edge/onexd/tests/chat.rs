@@ -340,6 +340,7 @@ async fn env_with_base(base: impl FnOnce(SocketAddr) -> String) -> Env {
     let up = Upstream::start().await;
     let state = Arc::new(State::default());
     *state.config.write().unwrap() = ConfigSnapshot {
+        agent_cache: false,
         revision: 1,
         agents: vec![],
         routes: vec![Route {

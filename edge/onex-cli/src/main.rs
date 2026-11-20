@@ -115,13 +115,15 @@ fn parse_run_flags(args: &[String]) -> Result<(Option<String>, bool)> {
     Ok((model, managed))
 }
 
-/// 默认用 PATH 里已安装的可执行文件（旧用法／调试）。`--managed` 时改由 onexd 按 Server 下发的发行目录
+/// Server 缓存模式直接走受管发行。旧 Server 的 Claude Code 可从 PATH 启动，`--managed` 从发行目录
 /// 自己选型、下载、校验、缓存后启动。环境完全按 onexd 给的来。
 async fn cmd_run(agent: &str, args: &[String]) -> Result<()> {
     let binary = agent_binary(agent)?;
     let (model, managed) = parse_run_flags(args)?;
+    let managed =
+        managed || agent != "claude-code" || call(&Request::Status).await?["agent_cache"].as_bool().unwrap_or(false);
     let env: BTreeMap<String, String> = std::env::vars().collect();
-    let (program, version) = if managed || agent != "claude-code" {
+    let (program, version) = if managed {
         (None, None)
     } else {
         // Windows 的环境变量名大小写不敏感，`std::env::vars()` 多半给出 `Path` 而不是全大写的

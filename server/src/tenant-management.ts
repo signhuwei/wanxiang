@@ -1,6 +1,7 @@
 import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
 import { tenantAuditActions } from './actions';
+import { agentTarget, hasArtifact, matchesPin, releaseIdentity, type AgentPin, type AgentRelease } from './agent-catalog';
 import { ApiError, field, invalid, json, operation } from './api';
 import { groupMonthUsage, monthUsageByGroup, monthUsageByUser, selfMonthUsage } from './billing';
 import { day, hash, iso, randomToken } from './credentials';
@@ -12,15 +13,12 @@ type MemberRow = Member & { group_id: string | null; quota_milli: number | null;
 type Profile = { id: string; name: string; email: string | null; phone: string | null };
 type Group = { id: string; name: string; parent_id: string | null; quota_milli: number | null; revision: number };
 type Contract = { revision: number; seat_limit: number; allowed_agents_json: string; allowed_models_json: string;
+  agent_release_pins_json: string;
   lease_minutes: number; lease_budget_milli: number; visibility_json: string; updated_by: string; updated_at: string };
 type AuditRow = { id: string; actor: string; action: string; target: string; at: string };
 const roles = ['admin', 'group_admin', 'member'] as const;
 const statuses = ['active', 'disabled'] as const;
 const readContract = (sql: Pick<Transaction, 'get'>) => sql.get<Contract>('SELECT * FROM contract ORDER BY revision DESC LIMIT 1');
-const contractView = ({ allowed_agents_json, allowed_models_json, visibility_json, ...row }: Contract, role: string) => ({
-  ...row, allowed_agents: JSON.parse(allowed_agents_json), allowed_models: JSON.parse(allowed_models_json),
-  visibility: visibility(JSON.parse(visibility_json)), actions: role === 'owner' ? ['read', 'update'] : ['read'],
-});
 const canManage = (role: string) => role === 'owner' || role === 'admin';
 const canEditMember = (actor: string, subject: string) => subject !== 'owner' && (actor === 'owner' || (actor === 'admin' && subject === 'member'));
 
@@ -41,6 +39,34 @@ function stringList(value: unknown, name: string) {
 }
 
 export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
+  const releaseById = (id: string) => store.system.get<AgentRelease>('SELECT * FROM agent_releases WHERE id = ?', [id]);
+  const readPins = (row: Contract | null): AgentPin[] => row ? JSON.parse(row.agent_release_pins_json) : [];
+  const pinSummary = (pin: AgentPin) => {
+    const row = releaseById(pin.id);
+    const available = !!(row && row.status === 'active' && matchesPin(row, pin) && hasArtifact(opts.dataDir, row));
+    return { ...pin, available };
+  };
+  const contractView = ({ allowed_agents_json, allowed_models_json, agent_release_pins_json, visibility_json, ...row }: Contract, role: string) => ({
+    ...row, allowed_agents: JSON.parse(allowed_agents_json), allowed_models: JSON.parse(allowed_models_json),
+    agent_releases: (JSON.parse(agent_release_pins_json) as AgentPin[]).map(pinSummary),
+    visibility: visibility(JSON.parse(visibility_json)), actions: role === 'owner' ? ['read', 'update'] : ['read'],
+  });
+  function validatePins(value: unknown, allowed: string[], previous: AgentPin[]) {
+    if (value === undefined) return previous.filter(pin => allowed.includes(pin.agent));
+    const ids = stringList(value, 'agent_release_ids');
+    const result = ids.map(id => {
+      const saved = previous.find(pin => pin.id === id);
+      const release = releaseById(id);
+      if (saved && allowed.includes(saved.agent)) return saved;
+      if (!release || !allowed.includes(release.agent) || release.status !== 'active' || !hasArtifact(opts.dataDir, release)) {
+        throw new ApiError('invalid', { fields: ['agent_release_ids'], reason: 'artifact_unavailable', release_id: id });
+      }
+      return Object.fromEntries(releaseIdentity.map(key => [key, release[key]])) as AgentPin;
+    });
+    if (new Set(result.map(agentTarget)).size !== result.length) invalid('agent_release_ids');
+    return result.sort((a, b) => agentTarget(a).localeCompare(agentTarget(b)));
+  }
+
   const profile = (id: string) => store.system.get<Profile>('SELECT id, name, email, phone FROM platform_users WHERE id = ?', [id]);
   const memberView = (row: MemberRow, role: string, month_used_milli: number) => {
     const user = profile(row.user_id);
@@ -236,6 +262,16 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     if (!row) throw new ApiError('not_found');
     return c.json(contractView(row, role));
   });
+  app.get('/v1/contract/agent-releases', (c) => {
+    const actor = tenantActor(store, c, opts.now());
+    if (!canManage(actor.role)) throw new ApiError('forbidden');
+    const p = pagination(c);
+    const rows = store.system.all<AgentPin>(`SELECT id, agent, version, os, arch, sha256, size FROM agent_releases
+      WHERE status = 'active' AND instr(lower(agent || ' ' || version || ' ' || os || ' ' || arch), lower(?)) > 0
+      ORDER BY agent, os, arch, version, id`, [p.query]).filter(row => hasArtifact(opts.dataDir, row));
+    return c.json(p.page(rows.slice(p.offset, p.offset + p.limit), rows.length));
+  });
+
   app.put('/v1/contract', async (c) => {
     const body = await json(c);
     const at = opts.now();
@@ -250,17 +286,25 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
       const current = previous?.revision ?? 0;
       expectRevision(body.revision, current, 0);
       const grants = visibility(body.visibility);
+      const allowed = stringList(body.allowed_agents, 'allowed_agents');
+      const previousPins = readPins(previous);
+      const pins = validatePins(body.agent_release_ids, allowed, previousPins);
       const row = { revision: current + 1, seat_limit: int(body.seat_limit, 'seat_limit'),
-        allowed_agents_json: JSON.stringify(stringList(body.allowed_agents, 'allowed_agents')),
+        allowed_agents_json: JSON.stringify(allowed), agent_release_pins_json: JSON.stringify(pins),
         allowed_models_json: JSON.stringify(stringList(body.allowed_models, 'allowed_models')),
         lease_minutes: int(body.lease_minutes, 'lease_minutes', 1, 1440), lease_budget_milli: int(body.lease_budget_milli, 'lease_budget_milli'),
         visibility_json: JSON.stringify(grants), updated_by: actor.userId, updated_at: iso(at) };
       sql.run(`INSERT INTO contract (revision, seat_limit, allowed_agents_json, allowed_models_json, lease_minutes, lease_budget_milli,
-        visibility_json, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [row.revision, row.seat_limit, row.allowed_agents_json, row.allowed_models_json, row.lease_minutes, row.lease_budget_milli, row.visibility_json, row.updated_by, row.updated_at]);
+        visibility_json, updated_by, updated_at, agent_release_pins_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [row.revision, row.seat_limit, row.allowed_agents_json, row.allowed_models_json, row.lease_minutes, row.lease_budget_milli, row.visibility_json, row.updated_by, row.updated_at, row.agent_release_pins_json]);
       const from = previous ? visibility(JSON.parse(previous.visibility_json)) : defaultVisibility;
       if (JSON.stringify(from) !== row.visibility_json) sql.run('INSERT INTO audit (id, actor, action, target, detail_json, at) VALUES (?, ?, ?, ?, ?, ?)',
         [`aud_${ulid()}`, actor.userId, 'contract.visibility.update', actor.id, JSON.stringify({ from, to: grants, revision: row.revision }), iso(at)]);
+      if (JSON.stringify(previousPins) !== row.agent_release_pins_json) {
+        sql.run('INSERT INTO audit (id, actor, action, target, detail_json, at) VALUES (?, ?, ?, ?, ?, ?)',
+          [`aud_${ulid()}`, actor.userId, 'contract.agent_releases.update', actor.id,
+            JSON.stringify({ from: previousPins, to: pins, revision: row.revision }), iso(at)]);
+      }
       return { response: op.complete(sql, { status: 200, payload: contractView(row, 'owner') }), changed: true };
     });
     if (result.changed) opts.onConfigChange?.(actor.id);

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -614,6 +614,73 @@ test('new device connection replaces old; heartbeat is correlated and closes aft
   for (let i = 0; i < 3; i++) expect((await current.nextOf('ping')).type).toBe('ping');
   expect((await current.closed).code).toBe(1008);
   await until(async () => await f.presence.get(device_id) === null);
+});
+
+test('capability pins select an exact verified artifact and recheck it on each device download', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const scoped = await f.select(global);
+  await f.store.system.write(sql => sql.run('INSERT INTO platform_admins VALUES (?)', [f.userId]));
+  const platform = '/platform/agent-releases';
+  const register = async (version: string, os = 'darwin', arch = 'arm64') => {
+    const response = await f.request(platform, { agent: 'claude-code', version, os, arch, status: 'disabled',
+      url: 'https://downloads.claude.ai/fixture', sha256: createHash('sha256').update(version).digest('hex'), size: version.length }, global);
+    expect(response.status).toBe(201);
+    return await response.json() as { id: string };
+  };
+  const first = await register('2.1.30');
+  const other = await register('2.1.31');
+  const getConfig = () => f.request('/contract', undefined, scoped).then(r => r.json()) as Promise<Record<string, unknown>>;
+  const update = (body: Record<string, unknown>) => f.request('/contract', body, scoped, undefined, 'PUT');
+  const contract = await getConfig();
+  expect((await update({ ...contract, agent_release_ids: [first.id] })).status).toBe(422);
+  expect((await f.request(platform + '/' + first.id, { revision: 1, status: 'active' }, global, undefined, 'PATCH')).status).toBe(409);
+  for (const [version, release] of [['2.1.30', first], ['2.1.31', other]] as const) {
+    const uploaded = await fetch(new URL('/v1' + platform + '/' + release.id + '/artifact', f.server.url), {
+      method: 'PUT', headers: { authorization: `Bearer ${global}` }, body: version
+    });
+    expect(uploaded.status).toBe(200);
+    expect((await f.request(platform + '/' + release.id, { revision: 1, status: 'active' }, global, undefined, 'PATCH')).status).toBe(200);
+  }
+  expect((await update({ ...contract, agent_release_ids: [first.id, other.id] })).status).toBe(422);
+  const fixed = await update({ ...contract, agent_release_ids: [first.id] });
+  expect(fixed.status).toBe(200);
+  expect(await fixed.json()).toMatchObject({ agent_releases: [{ id: first.id, version: '2.1.30', available: true }] });
+  const device = await (await f.request('/devices', f.device, scoped)).json() as DeviceReply;
+  const path = '/edge/agent-artifacts/';
+  expect((await f.request(path + first.id)).status).toBe(401);
+  expect((await f.request(path + first.id, undefined, scoped)).status).toBe(401);
+  expect((await f.request(path + first.id, undefined, device.device_token)).status).toBe(200);
+  expect((await f.request(path + other.id, undefined, device.device_token)).status).toBe(404);
+
+  const windows = await (await f.request('/devices', { ...f.device, name: 'Windows', os: 'win32', arch: 'x64',
+    public_key: Buffer.alloc(32, 6).toString('base64') }, scoped)).json() as DeviceReply;
+  expect((await f.request(path + first.id, undefined, windows.device_token)).status).toBe(404);
+
+  const legacy = connect(f, device.device_token);
+  expect(await legacy.opened).toBe(true);
+  legacy.hello();
+  expect((await legacy.next()).type).toBe('welcome');
+  await legacy.next();
+  expect(await legacy.next()).toMatchObject({ type: 'config', agents: [], routes: [] });
+  expect(await legacy.next()).toMatchObject({ type: 'cutoff', reason: 'contract' });
+  legacy.ws.close();
+  await legacy.closed;
+
+  const modern = connect(f, device.device_token);
+  expect(await modern.opened).toBe(true);
+  modern.send({ type: 'hello', id: 'edge-modern', edge_version: '0.1.0', os: 'darwin', arch: 'arm64',
+    config_revision: 0, outbox_last_seq: 0, agent_cache: true });
+  expect((await modern.next()).type).toBe('welcome');
+  await modern.next();
+  expect(await modern.next()).toMatchObject({ type: 'config', agent_cache: true, agents: [{ id: first.id, url: '/v1' + path + first.id }] });
+
+  expect((await f.request(platform + '/' + first.id, { revision: 2, sha256: 'a'.repeat(64) }, global, undefined, 'PATCH')).status).toBe(409);
+  expect((await f.request(platform + '/' + first.id, { revision: 2, status: 'disabled' }, global, undefined, 'PATCH')).status).toBe(200);
+  expect(await modern.next()).toMatchObject({ type: 'config', agent_cache: true, agents: [] });
+  expect((await f.request(path + first.id, undefined, device.device_token)).status).toBe(404);
+  expect((await f.request(path + other.id, undefined, device.device_token)).status).toBe(404);
+  expect(await getConfig()).toMatchObject({ agent_releases: [{ id: first.id, available: false }] });
 });
 
 test('configuration scopes model routes and encrypts provider secrets to the registered device', async () => {

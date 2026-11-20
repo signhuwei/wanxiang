@@ -7,7 +7,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use onex_core::ws::{Ack, Config, DiagResult, ErrorBody, Hello, LeaseRenew, LeaseRequest, Msg, PROTOCOL_VERSION, Welcome};
+use onex_core::ws::{
+    Ack, Config, DiagResult, ErrorBody, Hello, LeaseRenew, LeaseRequest, Msg, PROTOCOL_VERSION, Welcome,
+};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
@@ -222,6 +224,7 @@ async fn handshake(opts: &WsOptions, state: &State, outbox: &Outbox, tx: &mut Tx
     send(
         tx,
         &Msg::Hello(Hello {
+            agent_cache: true,
             id: hello_id.clone(),
             edge_version: opts.edge_version.clone(),
             os: onex_core::ipc::os_name().into(),
@@ -438,7 +441,13 @@ fn apply_config(state: &State, c: Config) {
     let mut cur = state.config.write().unwrap();
     if c.revision > cur.revision {
         info!(revision = c.revision, routes = c.routes.len(), rates = c.rates.len(), "config applied");
-        *cur = ConfigSnapshot { revision: c.revision, routes: c.routes, rates: c.rates, agents: c.agents };
+        *cur = ConfigSnapshot {
+            revision: c.revision,
+            routes: c.routes,
+            rates: c.rates,
+            agents: c.agents,
+            agent_cache: c.agent_cache,
+        };
     }
 }
 

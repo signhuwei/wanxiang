@@ -55,6 +55,7 @@ pub struct Upstream {
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfigSnapshot {
+    pub agent_cache: bool,
     pub revision: i64,
     pub routes: Vec<Route>,
     pub rates: Vec<Rate>,

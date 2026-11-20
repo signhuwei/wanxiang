@@ -261,7 +261,7 @@ async fn launch(
     if !LAUNCHABLE_AGENTS.contains(&agent) {
         return err("agent_not_allowed", &format!("OneX 暂不支持启动 {agent}"));
     }
-    if agent != "claude-code" && program.is_some() {
+    if program.is_some() && (agent != "claude-code" || ipc.state.config.read().unwrap().agent_cache) {
         return err("agent_not_allowed", "该 Agent 需要使用已批准的受管发行版本");
     }
     if ipc.state.token.borrow().is_none() {
@@ -278,18 +278,30 @@ async fn launch(
         let Ok(release) = crate::managed_runtime::select(&cfg.agents, agent, os, arch) else {
             return err("agent_not_allowed", "没有可用的受管发行版本");
         };
+        if cfg.agent_cache && !crate::managed_runtime::is_server_artifact(release) {
+            return err("agent_not_allowed", "当前发行没有可用的 Server 缓存地址");
+        }
         Some(release.clone())
     } else {
         None
     };
     // program 不填：按 Server 下发的发行目录自己选型、下载、校验并原子缓存；program 填了就是旧 PATH 用法。
+    let device_token = ipc.state.token.borrow().clone();
+    let access = ipc
+        .server_url
+        .as_deref()
+        .zip(device_token.as_deref())
+        .map(|(origin, device_token)| crate::managed_runtime::ArtifactAccess { origin, device_token });
     let resolved_program = if let Some(release) = &approved {
         match tokio::select! {
             _ = ipc.shutdown.cancelled() => return err("unauthenticated", "请重新登录 OneX"),
-            result = crate::managed_runtime::resolve(&ctx.home, &ctx.http, std::slice::from_ref(release), agent, os, arch) => result,
+            result = crate::managed_runtime::resolve(&ctx.home, &ctx.http, std::slice::from_ref(release), agent, os, arch, access) => result,
         } {
             Ok(path) => path,
-            Err(_) => return err("upstream_error", "无法下载或校验受管 Agent 制品"),
+            Err(error) => {
+                warn!(agent, version = %release.version, error = %error, "managed agent artifact resolution failed");
+                return err("upstream_error", "无法下载或校验受管 Agent 制品");
+            }
         }
     } else {
         PathBuf::from(program.expect("legacy launch provides a program"))
@@ -306,6 +318,9 @@ async fn launch(
     // 别名候选：精确名字的路由；通配路由用它固定的上游模型名（server 的 MVP seed 是 `*` → Qwen3.8-27B）
     let (models, routable) = {
         let cfg = ipc.state.config.read().unwrap();
+        if approved.is_none() && cfg.agent_cache {
+            return err("agent_not_allowed", "该能力合约要求使用 Server 缓存的受管制品");
+        }
         if let Some(release) = &approved
             && crate::managed_runtime::select(&cfg.agents, agent, os, arch).ok() != Some(release)
         {
@@ -421,6 +436,7 @@ fn status(ipc: &Ipc) -> Status {
         })
         .unwrap_or_default();
     Status {
+        agent_cache: ipc.state.config.read().unwrap().agent_cache,
         ws_last_error: conn.last_error.as_ref().map(|(r, _)| r.clone()),
         ws_last_error_at: conn.last_error.as_ref().map(|(_, at)| format_ms(*at)),
         lease: ipc.state.lease.status(),

@@ -8,6 +8,7 @@ import { devicesPage } from './devices.js'
 import { observePage } from './observation.js'
 import { billingPage } from './billing.js'
 import { auditPage } from './audit.js'
+import { agentReleasesPage } from './agent-releases.js'
 import { catalog } from './catalog.js'
 import { contractPage } from './contract.js'
 import { groupsPage } from './groups.js'
@@ -115,7 +116,7 @@ function renderTop(hash) {
       platformLink.classList.toggle('selected', hash.startsWith('#/platform'))
       domains.appendChild(platformLink)
       if (hash.startsWith('#/platform')) {
-        for (const [path, label] of [['catalog', 'Provider'], ['maintenance', '维护与发布'], ['releases', 'Edge 安装包']]) {
+        for (const [path, label] of [['catalog', 'Provider'], ['maintenance', '维护与发布'], ['agents', 'Agent 制品'], ['releases', 'Edge 安装包']]) {
           const sel = hash === '#/platform/' + path || (path === 'catalog' && hash === '#/platform')
           const link = el('a', sel ? 'selected' : '', label)
           link.href = '#/platform/' + path
@@ -243,6 +244,7 @@ function route() {
       return
     }
     if (hash === '#/platform/maintenance') serverReleasesPage(ws, platformApi, lifecycle.signal)
+    else if (hash === '#/platform/agents') agentReleasesPage(ws, platformApi, lifecycle.signal)
     else if (hash === '#/platform/releases') releasesPage(ws, platformApi, session.globalActions || [])
     else catalog(ws, platformApi, session.globalActions || [])
     return

@@ -73,18 +73,19 @@ test('only platform admins can queue signed immutable releases; state and reques
     const { id } = await release.json() as { id: string };
     const upload = '/platform/agent-releases/' + id + '/artifact';
     const download = '/agent-artifacts/' + digest;
-    expect((await call(download)).status).toBe(404);
+    expect((await call(download, token)).status).toBe(404);
     expect((await call(upload, scoped, 'PUT', new Blob(['approved bytes']))).status).toBe(403);
     expect((await call(upload, token, 'PUT', new Blob(['tampered bytes']))).status).toBe(422);
-    expect((await call(download)).status).toBe(404);
+    expect((await call(download, token)).status).toBe(404);
     expect((await call(upload, token, 'PUT', new Blob(['not gzip'], { type: 'application/gzip' }))).status).toBe(422);
     const compressed = new Blob([gzipSync('approved bytes')], { type: 'application/gzip' });
     expect((await call(upload, token, 'PUT', compressed)).status).toBe(200);
-    const mirrored = await call(download);
-    expect(mirrored.headers.get('content-length')).toBe('14');
-    expect(await mirrored.text()).toBe('approved bytes');
+    expect((await call(download)).status).toBe(401);
+    const cachedArtifact = await call(download, token);
+    expect(cachedArtifact.headers.get('content-length')).toBe('14');
+    expect(await cachedArtifact.text()).toBe('approved bytes');
     expect((await call('/platform/agent-releases/' + id, token, 'PATCH', { status: 'disabled', revision: 1 })).status).toBe(200);
-    expect((await call(download)).status).toBe(404);
+    expect((await call(download, token)).status).toBe(404);
 
     await app.close();
     app = await boot(candidate);

@@ -75,7 +75,7 @@ export async function createServer(opts: Options) {
     app.get('/v1/healthz', (c) => c.json({ status: 'ok', version: pkg.version, commit: opts.commit }));
     app.get('/v1/openapi.json', (c) => c.json(openapi));
     const pending = new PendingWork();
-    const config = configPublisher(store, now, opts.masterKey);
+    const config = configPublisher(store, opts.dataDir, now, opts.masterKey);
     const management = { ...opts, now, onConfigChange: (id?: string) => { void pending.track(config.changed(id)); } };
     authRoutes(app, store, management);
     personalLoginTokenRoutes(app, store, management);

@@ -29,9 +29,21 @@ onex-server-release-v1
 
 独立 Linux 执行器复核签名和摘要，验证归档成员后才执行固定 OneX 发布流程。发布之前备份业务 SQLite 库。只有健康接口报告目标提交才算成功。启动失败时尝试切回上一版代码，保留业务数据与备份供核对。历史制品在签名和数据兼容性满足时可重新选择部署。异地授权、系统组件策略和 Desktop 自动安装属于另外的维护场景。
 
-## 受管 Agent 制品镜像
+## Agent 制品库
 
-平台管理员可用 `PUT /v1/platform/agent-releases/{id}/artifact` 上传当前获批的制品，传输上限 256 MiB。使用 `application/gzip` 时解压后的上限为 512 MiB。
-只有实际大小与 SHA-256 均匹配发行记录时，才保存到持久目录并写审计。返回 `{sha256,size,download_url}`。
-`GET /v1/agent-artifacts/{sha256}` 仅提供仍有有效发行记录的镜像。使用端仍应按独立获批的摘要校验。
-此接口也可用于在内网给已有 Desktop 安装预热经过校验的本机缓存。
+平台管理员从「维护与发布 → Agent 制品」登记发行，上传或拉取文件，确认 Server 已缓存后启用。
+发行的 Agent、系统、架构、版本、大小和 SHA-256 固定。来源地址和启用状态可按修订更新。
+制品按 SHA-256 保存于 Server 私有持久目录。停用会取消新下载资格并保留同摘要字节供历史发行核对。
+
+| API | 请求与结果 |
+| --- | --- |
+| `GET/POST /v1/platform/agent-releases` | 服务端分页与发行登记。管理页以 `status: disabled` 新建 |
+| `GET/PATCH /v1/platform/agent-releases/{id}` | 制品状态 `artifact_cached`、当前修订与可执行操作。修改来源或启用状态 |
+| `PUT /v1/platform/agent-releases/{id}/artifact` | 上传原始可执行文件。传输上限 256 MiB。使用 `application/gzip` 可上传单文件压缩制品，解压上限 512 MiB |
+| `POST /v1/platform/agent-releases/{id}/pull` | 从登记且匹配厂商白名单的 HTTPS 地址拉取原始可执行文件，拒绝重定向。缓存已就绪时重试返回原摘要 |
+| `GET /v1/agent-artifacts/{sha256}` | 平台管理员核取仍启用的制品 |
+| `GET /v1/edge/agent-artifacts/{id}` | 凭设备令牌取能力合约当前允许的制品 |
+
+上传和拉取均在私有暂存文件中校验原始字节数及 SHA-256，验证通过后原子发布，并记录审计。
+厂商地址受限时，平台管理员可上传手头的已批准制品。同一发行允许在启用前上传或拉取。
+支持缓存协议的 Edge 使用它当前连接的 OneX Server 作为下载服务器，跟随同一协议、主机和端口。厂商源地址供 Server 入库。旧 Edge 的兼容规则见 [Edge ↔ Server 协议](edge-ws.md)。

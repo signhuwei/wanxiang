@@ -76,11 +76,27 @@ fn validate(r: &AgentRelease) -> Result<(), ResolveError> {
     if r.size > 512 * 1024 * 1024 {
         return Err(ResolveError::BadRelease("size is outside the supported artifact limit"));
     }
-    let Ok(url) = reqwest::Url::parse(&r.url) else { return Err(ResolveError::BadRelease("url does not parse")) };
-    if (url.scheme() != "https" && !loopback_http(&url)) || !url.username().is_empty() || url.password().is_some() {
-        return Err(ResolveError::BadRelease("url must be https (loopback http only for local test fixtures)"));
+    if !is_server_artifact(r) {
+        let Ok(url) = reqwest::Url::parse(&r.url) else {
+            return Err(ResolveError::BadRelease("url must be an HTTPS URL or its same-origin artifact path"));
+        };
+        if (url.scheme() != "https" && !loopback_http(&url)) || !url.username().is_empty() || url.password().is_some() {
+            return Err(ResolveError::BadRelease("url must be https (loopback http only for local test fixtures)"));
+        }
     }
     Ok(())
+}
+
+pub(crate) fn is_server_artifact(release: &AgentRelease) -> bool {
+    !release.id.is_empty()
+        && release.id.len() <= 128
+        && release.id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && release.url.strip_prefix("/v1/edge/agent-artifacts/") == Some(release.id.as_str())
+}
+
+pub struct ArtifactAccess<'a> {
+    pub origin: &'a str,
+    pub device_token: &'a str,
 }
 
 fn loopback_http(url: &reqwest::Url) -> bool {
@@ -133,13 +149,14 @@ pub async fn resolve(
     agent: &str,
     os: &str,
     arch: &str,
+    access: Option<ArtifactAccess<'_>>,
 ) -> Result<PathBuf> {
     let release = select(releases, agent, os, arch)?;
     let path = cache_path(home, agent, release);
     if path.is_file() && verify(&path, release).is_ok() {
         return Ok(path);
     }
-    download_and_verify(http, release, &path).await?;
+    download_and_verify(http, release, &path, access).await?;
     Ok(path)
 }
 
@@ -161,23 +178,42 @@ fn verify(path: &Path, release: &AgentRelease) -> Result<()> {
 
 /// 下载到同目录的临时文件，边下边算摘要；大小或摘要不符就删临时文件并报错，绝不把未经校验的文件
 /// 暴露在最终路径上。校验通过后 `rename` 原子落地并加可执行权限。
-async fn download_and_verify(http: &reqwest::Client, release: &AgentRelease, dest: &Path) -> Result<()> {
+async fn download_and_verify(
+    http: &reqwest::Client,
+    release: &AgentRelease,
+    dest: &Path,
+    access: Option<ArtifactAccess<'_>>,
+) -> Result<()> {
     let dir = dest.parent().context("artifact cache path has no parent")?;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
 
-    let url = reqwest::Url::parse(&release.url).context("parse approved artifact URL")?;
-    let direct;
-    let client = if loopback_http(&url) {
-        direct = reqwest::Client::builder()
-            .no_proxy()
+    let request = if is_server_artifact(release) {
+        let access = access.context("device credentials are required for the server cache")?;
+        let origin = crate::ipc::normalize_origin(access.origin).context("invalid OneX Server origin")?;
+        let url = reqwest::Url::parse(&format!("{origin}{}", release.url))?;
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
-        &direct
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(300));
+        if url.scheme() == "http" {
+            // Use the direct route for the configured HTTP control plane.
+            builder = builder.no_proxy();
+        }
+        builder.build()?.get(url).bearer_auth(access.device_token)
     } else {
-        http
+        let url = reqwest::Url::parse(&release.url).context("parse approved artifact URL")?;
+        if loopback_http(&url) {
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?
+                .get(url)
+        } else {
+            http.get(url)
+        }
     };
-    let resp = client.get(url).send().await.map_err(reqwest::Error::without_url)?;
+    let resp = request.send().await.map_err(reqwest::Error::without_url)?;
     let status = resp.status();
     if !status.is_success() {
         bail!("download failed: HTTP {status}");
@@ -264,6 +300,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn cache_download_uses_device_auth_only_at_the_configured_origin() {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+
+        let raw = b"verified artifact";
+        let app = axum::Router::new()
+            .route(
+                "/v1/edge/agent-artifacts/rel_1",
+                get(|headers: HeaderMap| async move {
+                    if headers.get("authorization").and_then(|value| value.to_str().ok())
+                        != Some("Bearer fake-device-token")
+                    {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    Bytes::from_static(b"verified artifact").into_response()
+                }),
+            )
+            .route(
+                "/v1/edge/agent-artifacts/rel_redirect",
+                get(|| async { axum::response::Redirect::temporary("/v1/edge/agent-artifacts/rel_1") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let http = reqwest::Client::new();
+        let rel = release("/v1/edge/agent-artifacts/rel_1", raw);
+        let access = || Some(ArtifactAccess { origin: &origin, device_token: "fake-device-token" });
+        let attempt = resolve(home.path(), &http, std::slice::from_ref(&rel), "claude-code", "darwin", "arm64", None);
+        assert!(attempt.await.is_err());
+        let path = resolve(home.path(), &http, &[rel], "claude-code", "darwin", "arm64", access()).await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), raw);
+        let rel = AgentRelease {
+            id: "rel_redirect".into(),
+            ..release("/v1/edge/agent-artifacts/rel_redirect", b"different")
+        };
+        let result = resolve(home.path(), &http, &[rel], "claude-code", "darwin", "arm64", access()).await;
+        assert!(result.unwrap_err().to_string().contains("307"));
+        task.abort();
+    }
+
     async fn serve(body: Vec<u8>, hits: Arc<Mutex<u32>>) -> String {
         let app = axum::Router::new().route(
             "/claude",
@@ -288,7 +366,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let http = reqwest::Client::new();
 
-        let p1 = resolve(home.path(), &http, &[rel.clone()], "claude-code", "darwin", "arm64").await.unwrap();
+        let p1 = resolve(home.path(), &http, &[rel.clone()], "claude-code", "darwin", "arm64", None).await.unwrap();
         assert_eq!(std::fs::read(&p1).unwrap(), body);
         #[cfg(unix)]
         {
@@ -298,7 +376,7 @@ mod tests {
         assert_eq!(*hits.lock().unwrap(), 1);
 
         // 第二次命中缓存，不重新下载
-        let p2 = resolve(home.path(), &http, &[rel], "claude-code", "darwin", "arm64").await.unwrap();
+        let p2 = resolve(home.path(), &http, &[rel], "claude-code", "darwin", "arm64", None).await.unwrap();
         assert_eq!(p1, p2);
         assert_eq!(*hits.lock().unwrap(), 1);
     }
@@ -313,7 +391,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let http = reqwest::Client::new();
 
-        let err = resolve(home.path(), &http, &[rel.clone()], "claude-code", "darwin", "arm64").await.unwrap_err();
+        let err =
+            resolve(home.path(), &http, &[rel.clone()], "claude-code", "darwin", "arm64", None).await.unwrap_err();
         assert!(format!("{err:#}").contains("sha256 mismatch"), "{err:#}");
         let dir = cache_path(home.path(), "claude-code", &rel).parent().unwrap().to_path_buf();
         let leftover: Vec<_> = std::fs::read_dir(&dir).map(|d| d.collect()).unwrap_or_default();
@@ -336,7 +415,7 @@ mod tests {
         assert_eq!(cached(home.path(), &[rel.clone()], "claude-code", "win32", "x64"), None);
 
         let http = reqwest::Client::new();
-        resolve(home.path(), &http, &[rel.clone()], "claude-code", "darwin", "arm64").await.unwrap();
+        resolve(home.path(), &http, &[rel.clone()], "claude-code", "darwin", "arm64", None).await.unwrap();
         assert_eq!(cached(home.path(), &[rel], "claude-code", "darwin", "arm64"), Some(("2.1.308".into(), true)));
     }
 
@@ -349,7 +428,7 @@ mod tests {
         rel.size = 3; // manifest 和服务器实际响应不符
         let home = tempfile::tempdir().unwrap();
         let http = reqwest::Client::new();
-        let err = resolve(home.path(), &http, &[rel], "claude-code", "darwin", "arm64").await.unwrap_err();
+        let err = resolve(home.path(), &http, &[rel], "claude-code", "darwin", "arm64", None).await.unwrap_err();
         assert!(format!("{err:#}").contains("size mismatch"), "{err:#}");
     }
 
@@ -362,11 +441,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let http = reqwest::Client::new();
 
-        let p = resolve(home.path(), &http, &[rel.clone()], "claude-code", "darwin", "arm64").await.unwrap();
+        let p = resolve(home.path(), &http, &[rel.clone()], "claude-code", "darwin", "arm64", None).await.unwrap();
         assert_eq!(*hits.lock().unwrap(), 1);
         // 篡改缓存里的文件
         std::fs::write(&p, b"tampered!!!!!!!!!").unwrap();
-        let p2 = resolve(home.path(), &http, &[rel], "claude-code", "darwin", "arm64").await.unwrap();
+        let p2 = resolve(home.path(), &http, &[rel], "claude-code", "darwin", "arm64", None).await.unwrap();
         assert_eq!(p, p2);
         assert_eq!(std::fs::read(&p2).unwrap(), body);
         assert_eq!(*hits.lock().unwrap(), 2);
@@ -416,10 +495,7 @@ mod tests {
     fn rejects_release_for_an_unsupported_agent() {
         let mut r = valid_release();
         r.agent = "workbuddy".into();
-        assert_eq!(
-            select(&[r], "workbuddy", "darwin", "arm64"),
-            Err(ResolveError::BadRelease("unsupported agent"))
-        );
+        assert_eq!(select(&[r], "workbuddy", "darwin", "arm64"), Err(ResolveError::BadRelease("unsupported agent")));
     }
 
     #[test]

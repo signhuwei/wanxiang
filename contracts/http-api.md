@@ -92,3 +92,11 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 
 - `/members` 与 `/groups` 的每行加 `month_used_milli`（本月已结算 + 仍 active 的租约预留，口径同 `data-model.md` 配额一节）。不新增页面专用接口。
 - `/me` 加 `quota`：`{quota_milli, month_used_milli, remaining_milli, limited_by}`，`limited_by` 为 `member`、`group:<id>` 或 null（不限），供 Desktop 与管理端提示。`limited_by` 是组时，三个数是该组的合计，普通成员也能看到；这是提示所需，允许（v0.13）。普通成员仍不能经 `/quota/usage` 查组。
+
+## 能力合约的 Agent 制品
+
+- `GET /v1/contract` 增加 `agent_releases`。每项含固定发行 ID、Agent、版本、系统、架构、SHA-256、大小及 `available`。
+- `GET /v1/contract/agent-releases?q=&cursor=&limit=` 向租户 owner/admin 分页返回启用且已缓存的可选发行。
+- owner 写 `PUT /v1/contract` 时可传 `agent_release_ids`，每个 Agent、系统、架构组合最多固定一项。所选 Agent 必须出现在 `allowed_agents`。空数组清除固定版本，缺省保留现有准许 Agent 的固定条目。
+- 保存合约时冻结原始发行身份并写审计。没有固定版本的目标跟随平台已启用的缓存发行。固定发行不可用时该目标暂停供给。固定发行的平台要求支持 Server 制品缓存的 Edge。
+- 设备下载及平台管理接口见 [维护与发布](maintenance-releases.md)。

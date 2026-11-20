@@ -26,11 +26,13 @@ export function serverReleasesPage(host, api, signal) {
   const current = el('span', 'muted', '正在读取当前版本…')
   const edge = el('a', 'keep', 'Edge 安装包')
   edge.href = '#/platform/releases'
+  const agents = el('a', 'keep', 'Agent 制品')
+  agents.href = '#/platform/agents'
   const schema = el('a', 'keep', 'API')
   schema.href = '/v1/openapi.json'
   schema.target = '_blank'
   schema.rel = 'noopener'
-  tools.append(current, el('span', 'grow'), edge, schema)
+  tools.append(current, el('span', 'grow'), agents, edge, schema)
   host.append(tools)
   let list
   const open = detailPanel(host, () => list)

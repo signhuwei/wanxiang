@@ -22,7 +22,7 @@
 | --- | --- |
 | `members` | user_id、role、group_id、status、quota_milli（null 为不限） |
 | `groups` | id、name、parent_id、quota_milli |
-| `contract` | revision、seat_limit、allowed_agents_json、allowed_models_json、lease_minutes、lease_budget_milli、visibility_json、updated_by、updated_at |
+| `contract` | revision、seat_limit、allowed_agents_json、agent_release_pins_json、allowed_models_json、lease_minutes、lease_budget_milli、visibility_json、updated_by、updated_at |
 | `ledger` | id、kind（`topup`、`reserve`、`settle`、`release`、`adjust`、`overage_pending`）、amount_milli、user_id、lease_id、request_ref、by、at、note |
 | `leases` | id、device_id、user_id、budget_milli、used_milli（已从租户扣款）、expires_at、status |
 | `lease_operations` | device_id、op_id、lease_id、used_milli（实报续租快照）、result_json |

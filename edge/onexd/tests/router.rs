@@ -322,6 +322,7 @@ async fn env_with(auth: UpstreamAuth, upstream_model: Option<&str>) -> Env {
     let upstream = Upstream::start().await;
     let state = Arc::new(State::default());
     *state.config.write().unwrap() = ConfigSnapshot {
+        agent_cache: false,
         revision: 1,
         agents: vec![],
         routes: vec![Route {
