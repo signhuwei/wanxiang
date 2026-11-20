@@ -4,6 +4,7 @@ import { serveStatic, websocket } from 'hono/bun';
 import { ulid } from 'ulid';
 import pkg from '../package.json';
 import { ApiError } from './api';
+import { agentArtifactRoutes, AGENT_ARTIFACT_DOWNLOAD_PATH, AGENT_ARTIFACT_UPLOAD_PATH } from './agent-artifacts';
 import { authRoutes } from './auth';
 import { billingRoutes } from './billing';
 import { deviceRoutes, diagRoutes, DIAG_UPLOAD_PATH, sweepExpiredJobs } from './diag';
@@ -50,7 +51,7 @@ export async function createServer(opts: Options) {
     app.get('/:asset{[a-zA-Z0-9_-]+\\.(js|css)}', web);
     app.get('/mock/:asset{[a-zA-Z0-9_-]+\\.(js|txt)}', web);
     app.use('/v1/*', async (c, next) => {
-      if (c.req.method === 'GET' && DESKTOP_ARTIFACT_DOWNLOAD_PATH.test(c.req.path)) {
+      if (c.req.method === 'GET' && (DESKTOP_ARTIFACT_DOWNLOAD_PATH.test(c.req.path) || AGENT_ARTIFACT_DOWNLOAD_PATH.test(c.req.path))) {
         // Mutating headers after the handler converts a BunFile into a chunked response.
         c.header('Cache-Control', 'no-store');
         return next();
@@ -62,7 +63,7 @@ export async function createServer(opts: Options) {
     // The diagnostic and desktop artifact upload routes check auth and draft state, then read their
     // own bounded body directly; every other route keeps the small JSON limit.
     const isRawUpload = (c: { req: { method: string; path: string } }) => c.req.method === 'PUT'
-      && (DIAG_UPLOAD_PATH.test(c.req.path) || DESKTOP_ARTIFACT_UPLOAD_PATH.test(c.req.path) || SERVER_ARTIFACT_UPLOAD_PATH.test(c.req.path));
+      && (DIAG_UPLOAD_PATH.test(c.req.path) || DESKTOP_ARTIFACT_UPLOAD_PATH.test(c.req.path) || SERVER_ARTIFACT_UPLOAD_PATH.test(c.req.path) || AGENT_ARTIFACT_UPLOAD_PATH.test(c.req.path));
     app.use('/v1/*', (c, next) => isRawUpload(c) ? next() : smallBody(c, next));
     app.onError((error, c) => {
       if (error instanceof ApiError) return c.json({ error: error.body() }, error.status);
@@ -80,6 +81,7 @@ export async function createServer(opts: Options) {
     personalLoginTokenRoutes(app, store, management);
     tenantRoutes(app, store, management);
     platformRoutes(app, store, management);
+    agentArtifactRoutes(app, store, management);
     billingRoutes(app, store, management);
     const observation = observationRoutes(app, store, now);
     const diag = diagRoutes(app, store, management, opts.objectStorage);
@@ -91,8 +93,7 @@ export async function createServer(opts: Options) {
     const server = Bun.serve({ hostname: opts.hostname, port: opts.port,
       fetch: (request, server) => shuttingDown ? new Response(null, { status: 503 }) : pending.track(Promise.resolve(app.fetch(request, server))),
       websocket: { ...websocket, maxPayloadLength: 4 * 1024 * 1024, idleTimeout: 0, sendPings: false },
-      // Bun's own default (128 MiB) is below the 256 MiB desktop installer cap; every other route still
-      // enforces its own, much smaller limit above (smallBody, DIAG_MAX_BYTES), so this doesn't widen them.
+      // Each raw upload route applies its own cap. Other routes remain limited to small JSON requests.
       maxRequestBodySize: DESKTOP_ARTIFACT_MAX_BYTES,
     });
     let sweeping = false;

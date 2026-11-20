@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { open, unlink } from 'node:fs/promises';
 import { ApiError, invalid } from './api';
 
-export async function receiveArtifact(request: Request, path: string, max: number, expected?: number) {
+export async function receiveArtifact(request: Pick<Request, 'body' | 'headers'>, path: string, max: number, expected?: number) {
   const header = request.headers.get('content-length');
   const declared = header === null ? null : Number(header);
   if (!request.body || (declared !== null && (!Number.isSafeInteger(declared) || declared <= 0))) invalid('artifact');

@@ -3,6 +3,7 @@ import { createHash, generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { MemoryPresence } from '../src/presence';
 import { signManifest } from '../src/release-package';
 import { createServer } from '../src/server';
@@ -29,7 +30,7 @@ test('only platform admins can queue signed immutable releases; state and reques
     async function call(path: string, token = '', method = 'GET', body?: object | Blob, idempotencyKey?: string) {
       const headers = new Headers();
       if (token) headers.set('authorization', `Bearer ${token}`);
-      if (body) headers.set('content-type', body instanceof Blob ? 'application/octet-stream' : 'application/json');
+      if (body) headers.set('content-type', body instanceof Blob ? (body.type || 'application/octet-stream') : 'application/json');
       if (idempotencyKey) headers.set('idempotency-key', idempotencyKey);
       return fetch(new URL('/v1' + path, app.server.url), {
         method, headers, body: body instanceof Blob ? body : body && JSON.stringify(body),
@@ -62,6 +63,28 @@ test('only platform admins can queue signed immutable releases; state and reques
     const job = await accepted.json() as { id: string; status: string };
     expect(job.status).toBe('queued');
     expect((await deploy(active, 'another-request')).status).toBe(409);
+
+    const digest = createHash('sha256').update('approved bytes').digest('hex');
+    const release = await call('/platform/agent-releases', token, 'POST', {
+      agent: 'claude-code', version: '2.1.311', os: 'darwin', arch: 'arm64', url: 'https://example.test/claude',
+      sha256: digest, size: 'approved bytes'.length,
+    });
+    expect(release.status).toBe(201);
+    const { id } = await release.json() as { id: string };
+    const upload = '/platform/agent-releases/' + id + '/artifact';
+    const download = '/agent-artifacts/' + digest;
+    expect((await call(download)).status).toBe(404);
+    expect((await call(upload, scoped, 'PUT', new Blob(['approved bytes']))).status).toBe(403);
+    expect((await call(upload, token, 'PUT', new Blob(['tampered bytes']))).status).toBe(422);
+    expect((await call(download)).status).toBe(404);
+    expect((await call(upload, token, 'PUT', new Blob(['not gzip'], { type: 'application/gzip' }))).status).toBe(422);
+    const compressed = new Blob([gzipSync('approved bytes')], { type: 'application/gzip' });
+    expect((await call(upload, token, 'PUT', compressed)).status).toBe(200);
+    const mirrored = await call(download);
+    expect(mirrored.headers.get('content-length')).toBe('14');
+    expect(await mirrored.text()).toBe('approved bytes');
+    expect((await call('/platform/agent-releases/' + id, token, 'PATCH', { status: 'disabled', revision: 1 })).status).toBe(200);
+    expect((await call(download)).status).toBe(404);
 
     await app.close();
     app = await boot(candidate);

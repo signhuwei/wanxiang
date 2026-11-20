@@ -28,3 +28,10 @@ onex-server-release-v1
 任务依次进入 `queued`、`running` 和 `succeeded` 或 `failed`。一次只允许一个活动任务。相同操作人和幂等键返回原任务，同键异参返回 409。部署会核对正在运行的版本仍等于 `expected_commit`。同版本任务执行制品与运行状态校验。Server 重启期间轮询可能暂时失败，重连后可继续查询原任务 ID。
 
 独立 Linux 执行器复核签名和摘要，验证归档成员后才执行固定 OneX 发布流程。发布之前备份业务 SQLite 库。只有健康接口报告目标提交才算成功。启动失败时尝试切回上一版代码，保留业务数据与备份供核对。历史制品在签名和数据兼容性满足时可重新选择部署。异地授权、系统组件策略和 Desktop 自动安装属于另外的维护场景。
+
+## 受管 Agent 制品镜像
+
+平台管理员可用 `PUT /v1/platform/agent-releases/{id}/artifact` 上传当前获批的制品，传输上限 256 MiB。使用 `application/gzip` 时解压后的上限为 512 MiB。
+只有实际大小与 SHA-256 均匹配发行记录时，才保存到持久目录并写审计。返回 `{sha256,size,download_url}`。
+`GET /v1/agent-artifacts/{sha256}` 仅提供仍有有效发行记录的镜像。使用端仍应按独立获批的摘要校验。
+此接口也可用于在内网给已有 Desktop 安装预热经过校验的本机缓存。
