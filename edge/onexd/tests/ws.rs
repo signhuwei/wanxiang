@@ -592,6 +592,73 @@ async fn renew_failure_cutoff_blocks_and_renew_resent_after_reconnect() {
     assert_eq!((st["state"].as_str(), st["renew"]["last_result"].as_str()), (Some("cutoff"), Some("rejected")));
 }
 
+/// v0.13：续租回的 cutoff 带 settled_lease_id，Edge 丢弃旧租约，hello 不再带 lease_id，
+/// 靠周期性 lease_request 恢复（这里用 lease_request_interval 很短来触发重发，不等 60 秒）。
+#[tokio::test]
+async fn settled_cutoff_drops_lease_and_recovers_via_lease_request() {
+    let srv = FakeServer::start().await;
+    let lo = LeaseOptions { lease_request_interval: Duration::from_millis(50), ..Default::default() };
+    let edge = start_edge_full(opts(&srv.url), Some("t"), lo);
+    let mut p = srv.accept().await;
+    p.handshake(0, 15000).await;
+    p.send(lease_msg("s1", "lse_1", 1, 100, 600_000)).await;
+    p.recv_skip_ping().await;
+    edge.state.lease.admit(0).unwrap().finish(80);
+    let m = recv_skip(&mut p, &["ping"]).await;
+    assert_eq!(m["type"], "lease_renew");
+
+    // 续租回 cutoff，带 settled_lease_id 等于当前租约：Edge 丢弃它
+    p.send(json!({"type":"cutoff","id":"s3","re":m["id"],"reason":"balance","settled_lease_id":"lse_1"})).await;
+    assert_eq!(p.recv_skip_ping().await, json!({"type":"ack","re":"s3","ok":true}));
+    assert!(edge.state.lease.lease_id().is_none());
+    assert_eq!(edge.state.lease.snapshot().used_milli, 0);
+
+    // 连上后立即发一次 lease_request，之后按抖动间隔重发
+    let r1 = recv_skip(&mut p, &["ping", "lease_renew"]).await;
+    assert_eq!(r1["type"], "lease_request");
+    let r2 = recv_skip(&mut p, &["ping", "lease_renew"]).await;
+    assert_eq!(r2["type"], "lease_request");
+    assert_ne!(r1["op_id"], r2["op_id"]);
+
+    // Server 充值后批准：收到 lease 即解除 cutoff
+    p.send(lease_msg("s4", "lse_2", 2, 50, 600_000)).await;
+    assert_eq!(p.recv_skip_ping().await, json!({"type":"ack","re":"s4","ok":true}));
+    assert_eq!(edge.state.lease.lease_id().as_deref(), Some("lse_2"));
+    assert!(edge.state.lease.admit(0).is_ok());
+
+    // 不再发 lease_request
+    p.expect_no_data(Duration::from_millis(150)).await;
+
+    // 重连后 hello 不带 lease_id 的情形单独验证：丢弃一个新的 cutoff 看第二次连接
+    drop(p);
+    wait_phase(&edge.state, Phase::Backoff).await;
+    let mut p = srv.accept().await;
+    let hello = p.handshake(1, 15000).await;
+    assert_eq!(hello["lease_id"], "lse_2");
+}
+
+/// hello 不带 lease_id：settled cutoff 清空租约后重连时的握手。
+#[tokio::test]
+async fn hello_omits_lease_id_after_settled_cutoff() {
+    let srv = FakeServer::start().await;
+    let edge = start_edge(&srv.url, Some("t"));
+    let mut p = srv.accept().await;
+    p.handshake(0, 15000).await;
+    p.send(lease_msg("s1", "lse_1", 1, 100, 600_000)).await;
+    p.recv_skip_ping().await;
+    edge.state.lease.admit(0).unwrap().finish(80);
+    let m = recv_skip(&mut p, &["ping"]).await;
+    p.send(json!({"type":"cutoff","id":"s3","re":m["id"],"reason":"balance","settled_lease_id":"lse_1"})).await;
+    p.recv_skip_ping().await;
+    assert!(edge.state.lease.lease_id().is_none());
+
+    drop(p);
+    wait_phase(&edge.state, Phase::Backoff).await;
+    let mut p = srv.accept().await;
+    let hello = p.handshake(0, 15000).await;
+    assert_eq!(hello["lease_id"], Value::Null);
+}
+
 #[tokio::test]
 async fn committed_renew_with_lost_reply_is_replayed_unchanged_after_more_spend() {
     // magpie 阻塞 2：额度 100、已用 80 触发续租；Server 已提交但回包丢失；之后又花了 5；回连

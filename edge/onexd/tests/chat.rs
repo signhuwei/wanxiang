@@ -852,7 +852,7 @@ async fn cutoff_interrupts_translated_stream() {
     while !got.contains("hel") {
         got.push_str(&String::from_utf8_lossy(&timeout(T, stream.next()).await.unwrap().unwrap().unwrap()));
     }
-    e.state.lease.cutoff("balance").unwrap();
+    e.state.lease.cutoff("balance", None).unwrap();
     while let Some(c) = timeout(T, stream.next()).await.unwrap() {
         got.push_str(&String::from_utf8_lossy(&c.unwrap()));
     }

@@ -373,6 +373,45 @@ async fn launch_without_program_downloads_the_managed_release() {
     assert_eq!(s["managed_agents"], json!([{"id":"claude-code","version":"2.1.311","status":"cached"}]));
 }
 
+/// v0.13：处于 cutoff 且没有租约时，`onex run` 启动 Agent 立即申请一次租约，不等下一个周期。
+#[tokio::test]
+async fn launch_requests_a_lease_immediately_when_cut_off_without_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mut c, _shutdown) = start(dir.path(), None).await;
+    assert_eq!(c.call(r#"{"cmd":"login","token":"t"}"#).await, json!({"ok": true}));
+    let mut wild = route("*");
+    wild.upstream_model = Some("Qwen3.8-27B".into());
+    state.config.write().unwrap().routes = vec![wild];
+
+    // 模拟 Server 续租回 cutoff 且结清：没有租约，处于 cutoff
+    state.lease.grant(&onex_core::ws::Lease {
+        id: "m1".into(),
+        re: None,
+        lease_id: "lse_1".into(),
+        expires_at: onexd::pricing::format_ms(onexd::outbox::now_ms() + 600_000),
+        budget_milli: 100,
+        seq: 1,
+    }).unwrap();
+    state.lease.cutoff("balance", Some("lse_1")).unwrap();
+    assert!(state.lease.lease_id().is_none());
+    assert!(state.lease.take_lease_request().is_some(), "cutoff 本身已经排好了第一次申请");
+    // 消费掉它，模拟已经发过；不该再有排队的，直到下一个 60 秒窗口
+    assert!(state.lease.take_lease_request().is_none());
+
+    #[cfg(unix)]
+    let (program, path_env) = ("/bin/echo", "/usr/bin");
+    #[cfg(windows)]
+    let (program, path_env) = (r"C:\Windows\System32\cmd.exe", r"C:\Windows\System32");
+    let cwd = dir.path().to_string_lossy().to_string();
+    let req = json!({"cmd":"launch","agent":"claude-code","program":program,"cwd":cwd,
+        "env":{"PATH":path_env},"model":null})
+        .to_string();
+    let l = c.call(&req).await;
+    assert_eq!(l["ok"], true, "{l}");
+    // 启动触发了一次立即申请，不受上一次窗口限制
+    assert!(state.lease.take_lease_request().is_some());
+}
+
 #[tokio::test]
 async fn launch_without_program_and_no_matching_release_fails() {
     let dir = tempfile::tempdir().unwrap();

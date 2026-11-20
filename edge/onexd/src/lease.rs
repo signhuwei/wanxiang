@@ -106,15 +106,27 @@ pub struct LeaseOptions {
     pub renew_before: Duration,
     /// 续租没有回应时多久重发；实际等待不超过剩余租期的一半
     pub renew_retry: Duration,
+    /// 处于 cutoff 且没有租约时，两次 `lease_request` 之间的基准间隔（v0.13），实际按 ±20% 抖动
+    pub lease_request_interval: Duration,
 }
 
 impl Default for LeaseOptions {
     fn default() -> Self {
-        Self { renew_at_pct: 80, renew_before: Duration::from_secs(120), renew_retry: Duration::from_secs(10) }
+        Self {
+            renew_at_pct: 80,
+            renew_before: Duration::from_secs(120),
+            renew_retry: Duration::from_secs(10),
+            lease_request_interval: Duration::from_secs(60),
+        }
     }
 }
 
 const MIN_RETRY: Duration = Duration::from_millis(500);
+
+/// `base` 的 ±20% 抖动，用于 `lease_request` 的重发间隔（v0.13）。
+fn jittered(base: Duration) -> Duration {
+    base.mul_f64(rand::random_range(0.8..=1.2))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {
@@ -213,6 +225,17 @@ struct Renew {
     parked: bool,
 }
 
+/// 处于 cutoff 且没有租约时，定期（和每次连上、启动 Agent 时）申请新租约。
+/// Server 不缓存结果，每次都用新的 `op_id`，不需要重放逻辑。
+#[derive(Default)]
+struct LeaseReq {
+    /// 上一次发出的时刻；None 表示下一次 tick 立即发
+    sent_at: Option<Instant>,
+    /// 到下一次该发的间隔（含抖动），发出时重新抽样
+    next_wait: Option<Duration>,
+    sent: u64,
+}
+
 struct Inner {
     saved: Saved,
     inflight: HashMap<u64, Flight>,
@@ -227,6 +250,7 @@ struct Inner {
     renew: Renew,
     /// 本租约是否已经因过期中断过进行中的流
     expiry_handled: bool,
+    lease_req: LeaseReq,
 }
 
 impl Inner {
@@ -282,6 +306,8 @@ pub struct Ledger {
     inner: Mutex<Inner>,
     /// 有续租要发时加一，WS 客户端监听它
     renew_tx: watch::Sender<u64>,
+    /// 处于 cutoff 且没有租约、该发 `lease_request` 时加一，WS 客户端监听它（v0.13）
+    lease_request_tx: watch::Sender<u64>,
     /// 租约变化时唤醒定时任务
     changed: Notify,
 }
@@ -311,8 +337,10 @@ impl Ledger {
                 tenant_id: None,
                 renew: Renew::default(),
                 expiry_handled: false,
+                lease_req: LeaseReq::default(),
             }),
             renew_tx: watch::Sender::new(0),
+            lease_request_tx: watch::Sender::new(0),
             changed: Notify::new(),
         }
     }
@@ -440,6 +468,8 @@ impl Ledger {
                 self.persist(&next)?;
                 i.saved = next;
                 i.renew.parked = false;
+                i.lease_req.sent_at = None;
+                i.lease_req.next_wait = None;
                 info!(lease_id = %l.lease_id, "current lease reaffirmed; cutoff cleared");
                 self.check_renew(&i, Instant::now());
                 return Ok(true);
@@ -472,6 +502,8 @@ impl Ledger {
         i.renew.sent_at = None;
         i.renew.wanted = false;
         i.renew.parked = false;
+        i.lease_req.sent_at = None;
+        i.lease_req.next_wait = None;
         i.deadline = Some(Instant::now() + Duration::from_millis(remaining_ms.max(0) as u64));
         i.deadline_from_wall = false;
         i.expiry_handled = false;
@@ -483,24 +515,48 @@ impl Ledger {
     }
 
     /// 处理 Server 的 `cutoff`：拒绝新请求，中断进行中的流。
-    /// 租约、已用额度和续租快照都不动：cutoff 不能说明旧租约已结算（Server 停用设备时不看续租就回 cutoff），
-    /// 新租约（seq 更大）到来才说明已结算。等待中的续租在下次连上时再重放；
-    /// 没有等待中的续租时，等流都结束后发一次续租报最终用量。
-    pub fn cutoff(&self, reason: &str) -> Result<()> {
+    ///
+    /// `settled_lease_id` 等于当前租约时（v0.13：续租已在本次操作中结清），在同一次落盘里
+    /// 删掉当前租约和续租快照，只保留 cutoff 原因；之后 `lease_id()` 返回 None，恢复靠周期性
+    /// `lease_request`。累计用量不清零，减去快照的 `used_milli`（和 `grant()` 收到新租约时的
+    /// `carried` 同一算法）：快照之后结束的请求、被 cutoff 中断后才释放的流，花费继续累加在
+    /// 这份"无租约用量"里，等拿到新租约时整体带入。
+    ///
+    /// 不带该字段（或不等于当前租约）时维持 v0.5 行为：租约、已用额度和续租快照都不动——
+    /// cutoff 不能说明旧租约已结算（Server 停用设备时不看续租就回 cutoff），新租约（seq 更大）
+    /// 到来才说明已结算。等待中的续租在下次连上时再重放；没有等待中的续租、也没有用量要结清时，
+    /// 靠周期性 `lease_request` 恢复；有用量时等流都结束后发一次续租报最终用量。
+    pub fn cutoff(&self, reason: &str, settled_lease_id: Option<&str>) -> Result<()> {
         let mut i = self.inner.lock().unwrap();
         // 先中断再落盘：落盘失败也不能让流继续花钱。
         i.stop_all(Block::Cutoff(CutoffReason::parse(reason)));
-        if i.saved.renew.is_some() {
-            i.set_result(RenewResult::Rejected);
-            i.renew.parked = true;
-        }
-        i.renew.sent_at = None;
-        i.renew.wanted = false;
+        let settles_current =
+            settled_lease_id.is_some_and(|sid| i.saved.lease.as_ref().is_some_and(|g| g.lease_id == sid));
         let mut next = i.saved.clone();
         next.cutoff = Some(reason.to_string());
+        if settles_current {
+            let settled = i.saved.renew.as_ref().map_or(0, |p| p.used_milli);
+            next.lease = None;
+            next.used_milli -= settled;
+            next.renew = None;
+            i.renew.sent_at = None;
+            i.renew.wanted = false;
+            i.renew.parked = false;
+            i.lease_req.sent_at = None;
+            i.lease_req.next_wait = None;
+        } else {
+            if i.saved.renew.is_some() {
+                i.set_result(RenewResult::Rejected);
+                i.renew.parked = true;
+            }
+            i.renew.sent_at = None;
+            i.renew.wanted = false;
+        }
         let r = self.persist(&next);
         i.saved = next;
-        warn!(reason, inflight = i.inflight.len(), unsettled_milli = i.saved.used_milli, "cutoff");
+        warn!(reason, settled = settles_current, inflight = i.inflight.len(), unsettled_milli = i.saved.used_milli, "cutoff");
+        self.check_renew(&i, Instant::now());
+        self.check_lease_request(&i, Instant::now());
         drop(i);
         self.changed.notify_one();
         r
@@ -541,12 +597,15 @@ impl Ledger {
         self.changed.notify_one();
     }
 
-    /// 新连接建立：之前发出的续租可能没送到，允许立即重发。
+    /// 新连接建立：之前发出的续租可能没送到，允许立即重发；处于 cutoff 且没有待结清用量时也立即申请一次。
     pub fn on_connected(&self) {
         let mut i = self.inner.lock().unwrap();
         i.renew.sent_at = None;
         i.renew.parked = false;
+        i.lease_req.sent_at = None;
+        i.lease_req.next_wait = None;
         self.check_renew(&i, Instant::now());
+        self.check_lease_request(&i, Instant::now());
     }
 
     /// 控制连接断开：等待中的续租记为网络不可达。不影响进行中的请求。
@@ -597,6 +656,55 @@ impl Ledger {
         self.renew_tx.subscribe()
     }
 
+    /// 处于 cutoff、且没有待发或待回的续租时（无论是否还持有租约）返回要发的 `lease_request`，
+    /// 并记为已发送、重新抽样下一次间隔。没有 cutoff，或持有租约且 `used_milli > 0`
+    /// （续租会先把它结清，有了结果才轮到这里）时不发。
+    pub fn take_lease_request(&self) -> Option<String> {
+        let now = Instant::now();
+        let mut i = self.inner.lock().unwrap();
+        if !self.lease_request_ready(&i, now) {
+            return None;
+        }
+        i.lease_req.sent_at = Some(now);
+        i.lease_req.next_wait = Some(jittered(self.opts.lease_request_interval));
+        i.lease_req.sent += 1;
+        drop(i);
+        self.changed.notify_one();
+        Some(crate::id::new("lrq"))
+    }
+
+    /// `onex run` 启动 Agent 时立即申请一次：清掉等待计时，让下一次 `take_lease_request` 不受上次间隔限制。
+    pub fn request_lease_now(&self) {
+        let mut i = self.inner.lock().unwrap();
+        if self.lease_request_due(&i, Instant::now()) {
+            i.lease_req.sent_at = None;
+            i.lease_req.next_wait = None;
+            self.check_lease_request(&i, Instant::now());
+        }
+    }
+
+    pub fn subscribe_lease_request(&self) -> watch::Receiver<u64> {
+        self.lease_request_tx.subscribe()
+    }
+
+    /// 处于 cutoff、且没有待发或待回的续租：没有续租快照在等回应，`renew_due` 也不会马上要发一次
+    /// （持有租约且 `used_milli > 0` 时 `renew_due` 为真，续租先把它结清，有了结果才轮到这里；
+    /// 没有租约——已被 `settled_lease_id` 的 cutoff 清掉——时 `renew_due` 天然为假，直接轮到这里）。
+    fn lease_request_due(&self, i: &Inner, now: Instant) -> bool {
+        i.saved.cutoff.is_some() && i.saved.renew.is_none() && !self.renew_due(i, now)
+    }
+
+    fn lease_request_ready(&self, i: &Inner, now: Instant) -> bool {
+        self.lease_request_due(i, now)
+            && i.lease_req.sent_at.is_none_or(|at| now.duration_since(at) >= i.lease_req.next_wait.unwrap_or_default())
+    }
+
+    fn check_lease_request(&self, i: &Inner, now: Instant) {
+        if self.lease_request_ready(i, now) {
+            self.lease_request_tx.send_modify(|g| *g += 1);
+        }
+    }
+
     /// 定时检查续租时间、续租重发和过期。随 daemon 一直运行。
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) {
         loop {
@@ -613,9 +721,13 @@ impl Ledger {
     fn tick(&self, now: Instant) -> Duration {
         let mut i = self.inner.lock().unwrap();
         self.check_renew(&i, now);
+        self.check_lease_request(&i, now);
         let idle = Duration::from_secs(3600);
-        let (Some(g), Some(deadline)) = (i.saved.lease.clone(), i.deadline) else { return idle };
         let mut next = idle;
+        if let (Some(at), Some(wait)) = (i.lease_req.sent_at, i.lease_req.next_wait) {
+            next = next.min((at + wait).saturating_duration_since(now));
+        }
+        let (Some(g), Some(deadline)) = (i.saved.lease.clone(), i.deadline) else { return next.max(Duration::from_millis(1)) };
         if now >= deadline {
             if !i.expiry_handled {
                 i.expiry_handled = true;
@@ -880,7 +992,7 @@ mod tests {
     fn quota_cutoff_is_its_own_reason() {
         let l = ledger();
         l.grant(&lease("l1", 1, 1000, 600_000)).unwrap();
-        l.cutoff("quota").unwrap();
+        l.cutoff("quota", None).unwrap();
         assert_eq!(l.admit(0).err(), Some(Block::Cutoff(CutoffReason::Quota)));
     }
 
@@ -889,7 +1001,7 @@ mod tests {
         let l = ledger();
         l.grant(&lease("l1", 1, 1000, 600_000)).unwrap();
         let t = l.admit(0).unwrap();
-        l.cutoff("balance").unwrap();
+        l.cutoff("balance", None).unwrap();
         assert_eq!(t.stopped().await, Block::Cutoff(CutoffReason::Balance));
         assert_eq!(l.admit(0).err(), Some(Block::Cutoff(CutoffReason::Balance)));
         assert!(l.take_renew().is_none());
@@ -1096,7 +1208,7 @@ mod tests {
             l.grant(&lease("l1", 1, 100, 600_000)).unwrap();
             l.admit(0).unwrap().finish(90);
             assert!(l.take_renew().is_some());
-            l.cutoff("disabled").unwrap();
+            l.cutoff("disabled", None).unwrap();
             assert_eq!(l.status()["renew"]["last_result"], "rejected");
             // 这条连接上不再重放
             assert!(l.take_renew().is_none());
@@ -1115,7 +1227,7 @@ mod tests {
         l.admit(0).unwrap().finish(30);
         let mut t = l.admit(0).unwrap();
         t.update(10).unwrap();
-        l.cutoff("contract").unwrap();
+        l.cutoff("contract", None).unwrap();
         // 流还没结束，先不报
         assert!(l.take_renew().is_none());
         drop(t);
@@ -1132,10 +1244,147 @@ mod tests {
         let g = lease("l1", 1, 1000, 600_000);
         l.grant(&g).unwrap();
         l.admit(0).unwrap().finish(30);
-        l.cutoff("disabled").unwrap();
+        l.cutoff("disabled", None).unwrap();
         l.on_connected();
         assert!(l.grant(&g).unwrap());
         assert!(l.admit(0).is_ok());
         assert_eq!(l.snapshot().used_milli, 30);
+    }
+
+    // --- v0.13：断流后的恢复 ---
+
+    #[test]
+    fn settled_cutoff_drops_lease_and_blocks_hello_lease_id() {
+        let l = ledger();
+        l.grant(&lease("l1", 1, 100, 600_000)).unwrap();
+        l.admit(0).unwrap().finish(80);
+        assert!(l.take_renew().is_some());
+        // Server 续租回包是 cutoff，带 settled_lease_id 等于当前租约
+        l.cutoff("balance", Some("l1")).unwrap();
+        assert!(l.lease_id().is_none());
+        assert_eq!(l.snapshot().used_milli, 0);
+        assert!(l.snapshot().lease.is_none());
+        assert_eq!(l.admit(0).err(), Some(Block::Cutoff(CutoffReason::Balance)));
+        // 没有续租快照了，不再重放
+        assert!(l.take_renew().is_none());
+        assert_eq!(l.status()["lease_id"], Value::Null);
+    }
+
+    #[test]
+    fn settled_cutoff_keeps_usage_finished_after_the_snapshot() {
+        // 额度 100：花 80 触发续租（快照 80），回应之前又花了 30（续租回应之前进来的）；
+        // 收到带 settled_lease_id 的 cutoff 时不清零，减去快照后留下这 30；
+        // 之后靠 lease_request 拿到新租约时整体带入。
+        let l = ledger();
+        l.grant(&lease("l1", 1, 100, 600_000)).unwrap();
+        l.admit(0).unwrap().finish(80);
+        assert_eq!(l.take_renew().unwrap().used_milli, 80);
+        l.admit(0).unwrap().finish(30);
+        assert_eq!(l.snapshot().used_milli, 110);
+        l.cutoff("balance", Some("l1")).unwrap();
+        assert!(l.lease_id().is_none());
+        assert_eq!(l.snapshot().used_milli, 30);
+        // 没有待发或待回的续租（旧租约已经没了，没有续租快照在等回应，renew_due 也因为没有租约
+        // 而天然为假）：靠 lease_request 拿新租约，把这 30 整体带入。
+        assert!(l.take_lease_request().is_some());
+        l.grant(&lease("l2", 2, 100, 600_000)).unwrap();
+        assert_eq!(l.snapshot().used_milli, 30);
+        assert_eq!(l.lease_id().as_deref(), Some("l2"));
+    }
+
+    #[test]
+    fn cutoff_settled_for_a_different_lease_is_ignored() {
+        // 旧的、已经被替换的租约结清不该清掉当前这份（理论上不会发生，防御性校验）
+        let l = ledger();
+        l.grant(&lease("l1", 1, 100, 600_000)).unwrap();
+        l.admit(0).unwrap().finish(10);
+        l.cutoff("balance", Some("some_other_lease")).unwrap();
+        assert_eq!(l.lease_id().as_deref(), Some("l1"));
+        assert_eq!(l.snapshot().used_milli, 10);
+    }
+
+    #[test]
+    fn settled_cutoff_requests_a_new_lease_on_every_connect() {
+        let l = ledger();
+        l.grant(&lease("l1", 1, 100, 600_000)).unwrap();
+        l.cutoff("balance", Some("l1")).unwrap();
+        // cutoff 本身已经让下一次请求就位
+        assert!(l.take_lease_request().is_some());
+        assert!(l.take_lease_request().is_none());
+        // 重新连上：立即可以再发一次，不受上次间隔限制
+        l.on_connected();
+        let op1 = l.take_lease_request().unwrap();
+        l.on_connected();
+        let op2 = l.take_lease_request().unwrap();
+        assert_ne!(op1, op2);
+        // 收到新租约后不再申请
+        l.grant(&lease("l2", 2, 100, 600_000)).unwrap();
+        l.on_connected();
+        assert!(l.take_lease_request().is_none());
+    }
+
+    #[test]
+    fn lease_request_repeats_on_a_jittered_60s_interval() {
+        let l = Arc::new(Ledger::with_options(LeaseOptions {
+            lease_request_interval: Duration::from_millis(100),
+            ..Default::default()
+        }));
+        l.grant(&lease("l1", 1, 100, 600_000)).unwrap();
+        l.cutoff("balance", Some("l1")).unwrap();
+        assert!(l.take_lease_request().is_some());
+        assert!(l.take_lease_request().is_none());
+        // 还没到抖动后的间隔，不重发
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(l.take_lease_request().is_none());
+        // 抖动最多 120ms；再等足够久一定已经到期
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(l.take_lease_request().is_some());
+    }
+
+    #[test]
+    fn launching_agent_requests_a_lease_immediately() {
+        let l = Arc::new(Ledger::with_options(LeaseOptions {
+            lease_request_interval: Duration::from_secs(60),
+            ..Default::default()
+        }));
+        l.grant(&lease("l1", 1, 100, 600_000)).unwrap();
+        l.cutoff("balance", Some("l1")).unwrap();
+        assert!(l.take_lease_request().is_some());
+        // 没到 60 秒也不重发
+        assert!(l.take_lease_request().is_none());
+        // `onex run` 启动 Agent：立即可以再发一次
+        l.request_lease_now();
+        assert!(l.take_lease_request().is_some());
+    }
+
+    #[test]
+    fn no_lease_request_without_cutoff() {
+        // 还没拿到过第一份租约、也没有 cutoff：不发 lease_request（走正常签发流程）
+        let l = ledger();
+        assert!(l.take_lease_request().is_none());
+        l.request_lease_now();
+        assert!(l.take_lease_request().is_none());
+    }
+
+    #[test]
+    fn settled_cutoff_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::open(&dir.path().join("o.sqlite")).unwrap();
+        let path = dir.path().join("lease.json");
+        {
+            let l = Arc::new(Ledger::open(path.clone(), LeaseOptions::default(), &ob).unwrap());
+            l.grant(&lease("l1", 1, 100, 600_000)).unwrap();
+            l.admit(0).unwrap().finish(80);
+            assert!(l.take_renew().is_some());
+            l.cutoff("balance", Some("l1")).unwrap();
+        }
+        let l = Arc::new(Ledger::open(path, LeaseOptions::default(), &ob).unwrap());
+        assert!(l.lease_id().is_none());
+        assert_eq!(l.snapshot().used_milli, 0);
+        assert_eq!(l.admit(0).err(), Some(Block::Cutoff(CutoffReason::Balance)));
+        assert!(l.take_renew().is_none());
+        // 重启后、下一次连上仍会申请新租约
+        l.on_connected();
+        assert!(l.take_lease_request().is_some());
     }
 }
