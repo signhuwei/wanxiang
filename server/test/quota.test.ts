@@ -238,6 +238,26 @@ test('a replayed op_id for a quota-bound renewal does not double charge the mont
   expect(f.store.tenant(f.tenantId).get("SELECT count(*) AS n FROM ledger WHERE kind = 'settle' AND lease_id = ?", [lease.lease_id])).toEqual({ n: 1 });
 });
 
+test('/quota/usage remaining_milli can go negative when overage pushed settle past the quota', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1000);
+  const member = await f.join('negative-remaining@example.test');
+  // 配额 2，但这份租约的额度被余额/合约裁决成 5（lease_budget_milli 默认 2000，5% 下限 50，配额本来会把它压到 2，
+  // 这里先不设配额签发，再调低配额，制造"已预留/已结算超过新配额"的场景）
+  const edge = await linkedEdge(f, member.scoped);
+  const lease = await edge.nextOf('lease');
+  expect(lease).toMatchObject({ type: 'lease', budget_milli: 50 });
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, quota_milli: 2 }, owner)).status).toBe(200);
+  // 诚实上报用满这份已签发的额度 50，超过新配额 2 一大截；租户按额度 50 实扣（配额不追溯旧租约）
+  edge.send({ type: 'lease_renew', id: 'renew-1', op_id: 'op-1', lease_id: lease.lease_id, used_milli: 50 });
+  expect(await edge.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  const usage = await (await f.request(`/quota/usage?scope=member&id=${member.userId}`, undefined, owner)).json();
+  // used_milli 50（settle）> quota_milli 2，没有活跃租约（已 cutoff），remaining 为负，不钳制到 0
+  expect(usage).toMatchObject({ scope: 'member', id: member.userId, quota_milli: 2, used_milli: 50, reserved_milli: 0, remaining_milli: -48 });
+});
+
 test('balance and quota exhausted together still report balance', async () => {
   const f = await fixture();
   const ownerToken = (await f.login()).token;
