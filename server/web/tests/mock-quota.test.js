@@ -34,3 +34,17 @@ test('group month_used_milli equals the sum of its members usage', () => {
     }
   }
 })
+
+// 契约澄清（main 7e08d85）：used_milli 只含本月 settle，reserved_milli 是仍 active 的租约预留，
+// 两者之和才是台账列和 /me.quota 的 month_used_milli。
+test('settled_milli + reserved_milli equals month_used_milli for members and groups', () => {
+  const db = buildMockDb()
+  for (const tenantId of Object.keys(db.members)) {
+    for (const m of db.members[tenantId]) {
+      expect(m.settled_milli + m.reserved_milli).toBe(m.month_used_milli)
+    }
+    for (const g of db.groups[tenantId]) {
+      expect(g.settled_milli + g.reserved_milli).toBe(g.month_used_milli)
+    }
+  }
+})

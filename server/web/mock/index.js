@@ -118,28 +118,32 @@ export function installMock() {
   }
 
   // 成员的有效配额：本人与各级祖先组先到先停；返回剩余最小的一方，null 表示不限。
+  // used_milli 只含本月 settle；reserved_milli 是仍 active 的租约预留；两者之和才是配额口径的占用量。
   function memberQuotaContext(tenantId, member) {
     const candidates = []
     if (member.quota_milli !== null && member.quota_milli !== undefined) {
-      candidates.push({ limited_by: 'member', quota_milli: member.quota_milli, used_milli: member.month_used_milli || 0 })
+      candidates.push({ limited_by: 'member', quota_milli: member.quota_milli, consumed_milli: member.month_used_milli || 0 })
     }
     for (const g of groupChain(tenantId, member.group_id)) {
       if (g.quota_milli !== null && g.quota_milli !== undefined) {
-        candidates.push({ limited_by: 'group:' + g.id, quota_milli: g.quota_milli, used_milli: g.month_used_milli || 0 })
+        candidates.push({ limited_by: 'group:' + g.id, quota_milli: g.quota_milli, consumed_milli: g.month_used_milli || 0 })
       }
     }
+    const used_milli = member.settled_milli ?? member.month_used_milli ?? 0
+    const reserved_milli = member.reserved_milli ?? 0
     if (!candidates.length) {
-      return { quota_milli: null, month_used_milli: member.month_used_milli || 0, remaining_milli: null, limited_by: null }
+      return { quota_milli: null, used_milli, reserved_milli, remaining_milli: null, limited_by: null }
     }
     let tightest = candidates[0]
     for (const c of candidates) {
-      const remaining = c.quota_milli - c.used_milli
-      if (remaining < tightest.quota_milli - tightest.used_milli) tightest = c
+      const remaining = c.quota_milli - c.consumed_milli
+      if (remaining < tightest.quota_milli - tightest.consumed_milli) tightest = c
     }
     return {
       quota_milli: tightest.quota_milli,
-      month_used_milli: member.month_used_milli || 0,
-      remaining_milli: tightest.quota_milli - tightest.used_milli,
+      used_milli,
+      reserved_milli,
+      remaining_milli: tightest.quota_milli - used_milli - reserved_milli,
       limited_by: tightest.limited_by
     }
   }
@@ -204,7 +208,11 @@ export function installMock() {
       const actions = ['owner','admin'].includes(ms?.role) ? ['create_group','create_invite','assign_role:member'] : []
       if (ms?.role === 'owner') actions.push('assign_role:admin','assign_role:group_admin')
       const selfMember = (db.members[s.tenantId] || []).find(m => m.target === s.target)
-      const quota = selfMember ? memberQuotaContext(s.tenantId, selfMember) : { quota_milli: null, month_used_milli: 0, remaining_milli: null, limited_by: null }
+      // /me.quota 口径同台账：month_used_milli = used_milli（本月 settle）+ reserved_milli（active 租约预留）
+      const ctx = selfMember
+        ? memberQuotaContext(s.tenantId, selfMember)
+        : { quota_milli: null, used_milli: 0, reserved_milli: 0, remaining_milli: null, limited_by: null }
+      const quota = { quota_milli: ctx.quota_milli, month_used_milli: ctx.used_milli + ctx.reserved_milli, remaining_milli: ctx.remaining_milli, limited_by: ctx.limited_by }
       return json({ user, tenant: t, role: ms?.role, agents: [], is_platform_admin, actions, quota })
     }
 
@@ -335,15 +343,16 @@ export function installMock() {
         if (!m) return err(404, 'not_found', '成员不存在')
         if (role === 'member' && m.target !== session.target) return err(403, 'forbidden', '只能查询自己的配额')
         const q = memberQuotaContext(session.tenantId, m)
-        return json({ scope, id, quota_milli: q.quota_milli, used_milli: q.month_used_milli, reserved_milli: 0, remaining_milli: q.remaining_milli })
+        return json({ scope, id, quota_milli: q.quota_milli, used_milli: q.used_milli, reserved_milli: q.reserved_milli, remaining_milli: q.remaining_milli })
       }
       if (scope === 'group') {
         const g = findGroup(session.tenantId, id)
         if (!g) return err(404, 'not_found', '分组不存在')
         if (role === 'member') return err(403, 'forbidden', '没有查询分组配额的权限')
-        const used = g.month_used_milli || 0
-        const remaining = g.quota_milli === null || g.quota_milli === undefined ? null : g.quota_milli - used
-        return json({ scope, id, quota_milli: g.quota_milli, used_milli: used, reserved_milli: 0, remaining_milli: remaining })
+        const used = g.settled_milli ?? g.month_used_milli ?? 0
+        const reserved = g.reserved_milli || 0
+        const remaining = g.quota_milli === null || g.quota_milli === undefined ? null : g.quota_milli - used - reserved
+        return json({ scope, id, quota_milli: g.quota_milli, used_milli: used, reserved_milli: reserved, remaining_milli: remaining })
       }
       return err(422, 'invalid', 'scope 必须是 member 或 group', { fields: ['scope'] })
     }
