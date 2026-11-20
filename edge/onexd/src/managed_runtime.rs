@@ -15,9 +15,11 @@ use sha2::{Digest, Sha256};
 
 use crate::id;
 
-/// 目前只实现了 Claude Code 这一个适配。Server 下发的目录里混进别的 agent（配置错误或将来扩展）
-/// 不能被当作可执行的候选，否则校验通过也不该拿来启动——这里连选型都不让它进来。
-const SUPPORTED_AGENTS: &[&str] = &["claude-code"];
+/// `contracts/edge-ws.md` 多 Agent 一节定下的三个名字。Server 下发的目录里混进别的 agent
+/// （配置错误或将来扩展）不能被当作可执行的候选，否则校验通过也不该拿来启动——这里连选型
+/// 都不让它进来。制品的下载、校验、缓存逻辑本身不分 Agent（已经按 `agent` 参数化），只有
+/// 启动准备（`launch.rs::prepare`）和采集（`capture.rs`）按 Agent 分派。
+const SUPPORTED_AGENTS: &[&str] = &["claude-code", "codex", "kimi-code"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolveError {
@@ -413,8 +415,21 @@ mod tests {
     #[test]
     fn rejects_release_for_an_unsupported_agent() {
         let mut r = valid_release();
-        r.agent = "codex".into();
-        assert_eq!(select(&[r], "codex", "darwin", "arm64"), Err(ResolveError::BadRelease("unsupported agent")));
+        r.agent = "workbuddy".into();
+        assert_eq!(
+            select(&[r], "workbuddy", "darwin", "arm64"),
+            Err(ResolveError::BadRelease("unsupported agent"))
+        );
+    }
+
+    #[test]
+    fn accepts_releases_for_all_v0_12_agents() {
+        for agent in ["claude-code", "codex", "kimi-code"] {
+            let mut r = valid_release();
+            r.agent = agent.into();
+            let releases = [r];
+            assert_eq!(select(&releases, agent, "darwin", "arm64"), Ok(&releases[0]));
+        }
     }
 
     #[test]

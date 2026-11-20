@@ -1,9 +1,12 @@
-//! 受管启动 Claude Code（S1-E4 最小版，见 docs/specs/agents/claude-code.md §2、§3）。
+//! 受管启动 Agent（S1-E4 最小版，见 docs/specs/agents/claude-code.md §2、§3）。
 //!
 //! onexd 只准备：受管目录、本次策略文件、参数和完整环境；由 `onex run` 在员工终端里前台启动，
-//! 这样 TUI 直接拿到终端。MVP 不做下载、校验和 resume，用 PATH 里的 `claude`，记录版本。
+//! 这样 TUI 直接拿到终端。`prepare()` 按 `Request.agent` 分派到各 Agent 自己的准备函数——
+//! 目录命名空间、配置文件格式、环境变量和启动参数都是 Agent 特定的，公共的只有「准备到
+//! `<home>/run/<launch_id>` 这个本次目录、再由调用方前台起进程」这套骨架。目前只有 Claude Code
+//! 实现（S2 起加 Codex、Kimi Code），MVP 不做下载、校验和 resume，用 PATH 里的 `claude`，记录版本。
 //!
-//! 目录：持久命名空间 `N = <home>/agents/claude-code`（`claude/`、`home/`、`tmp/`），
+//! Claude Code 目录：持久命名空间 `N = <home>/agents/claude-code`（`claude/`、`home/`、`tmp/`），
 //! 本次目录 `R = <home>/run/<launch_id>`（`settings.json`，含本机令牌，0600，结束时删除）。
 //! 个人的 `~/.claude` 不读不写。
 
@@ -62,13 +65,15 @@ fn client_env_get<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'
 
 #[derive(Debug, Clone)]
 pub struct Request<'a> {
+    /// `claude-code`、`codex`、`kimi-code`（`contracts/edge-ws.md` 多 Agent 一节的同一组名字）
+    pub agent: &'a str,
     pub home: &'a Path,
     /// `127.0.0.1:<port>`
     pub router_addr: &'a str,
     pub local_token: &'a str,
     /// 获准模型别名（config.routes 里的 model）
     pub model: &'a str,
-    /// claude 可执行文件的绝对路径
+    /// Agent 可执行文件的绝对路径
     pub program: &'a Path,
     pub cwd: &'a Path,
     /// 员工终端的环境，只取 `PASS_ENV` 和 PATH
@@ -88,13 +93,25 @@ pub struct Launch {
     pub run_dir: PathBuf,
 }
 
+/// 按 `r.agent` 分派到各 Agent 自己的准备函数。新增 Agent 在这里加一个分支和一个
+/// `prepare_<agent>` 函数，不改这个函数以外的公共骨架（`finish`/`clean_stale` 按 `launch_id`
+/// 操作，和具体是哪个 Agent 无关）。
 pub fn prepare(r: &Request) -> Result<Launch> {
     if !r.program.is_absolute() {
-        bail!("claude path must be absolute: {}", r.program.display());
+        bail!("agent executable path must be absolute: {}", r.program.display());
     }
     if !r.cwd.is_absolute() || !r.cwd.is_dir() {
         bail!("working directory not found: {}", r.cwd.display());
     }
+    match r.agent {
+        "claude-code" => prepare_claude_code(r),
+        other => bail!("no managed launch preparer for agent {other}"),
+    }
+}
+
+/// Claude Code 的准备逻辑（S1-E4 最小版）：不变，只是从通用 `prepare()` 里搬出来，
+/// 调用前已经做过 program/cwd 的公共校验。
+fn prepare_claude_code(r: &Request) -> Result<Launch> {
     let ns = r.home.join("agents/claude-code");
     let config_dir = ns.join("claude");
     let user_home = ns.join("home");
@@ -325,6 +342,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let env = client_env();
         let r = Request {
+            agent: "claude-code",
             home: home.path(),
             router_addr: "127.0.0.1:4567",
             local_token: "0123456789abcdef0123456789abcdef",
@@ -396,6 +414,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let r = Request {
+            agent: "claude-code",
             home: home.path(),
             router_addr: "127.0.0.1:4567",
             local_token: "0123456789abcdef0123456789abcdef",
@@ -473,6 +492,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let env = BTreeMap::new();
         let base = Request {
+            agent: "claude-code",
             home: home.path(),
             router_addr: "127.0.0.1:1",
             local_token: "t",
@@ -492,6 +512,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let env = BTreeMap::new();
         let base = Request {
+            agent: "claude-code",
             home: home.path(),
             router_addr: "127.0.0.1:1",
             local_token: "t",
@@ -503,5 +524,26 @@ mod tests {
         assert!(prepare(&base).is_err());
         let r = Request { program: Path::new(r"C:\Windows\claude.exe"), cwd: Path::new(r"C:\no\such\dir"), ..base };
         assert!(prepare(&r).is_err());
+    }
+
+    /// 分派未覆盖的 agent 要明确报错，不能悄悄落到 Claude Code 的准备逻辑上。
+    #[cfg(unix)]
+    #[test]
+    fn rejects_agent_without_a_preparer() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let env = BTreeMap::new();
+        let r = Request {
+            agent: "codex",
+            home: home.path(),
+            router_addr: "127.0.0.1:1",
+            local_token: "t",
+            model: "m",
+            program: Path::new("/bin/codex"),
+            cwd: cwd.path(),
+            client_env: &env,
+        };
+        let err = prepare(&r).unwrap_err();
+        assert!(format!("{err:#}").contains("no managed launch preparer"), "{err:#}");
     }
 }
