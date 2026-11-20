@@ -1,8 +1,22 @@
 import { createLedger } from './ledger.js'
 import { el, button, editForm, detailPanel } from './panel.js'
-import { formatMilli } from './format.js'
+import { formatMilli, formatQuotaUsage, quotaUsageLevel, QUOTA_HINT, QUOTA_INVALID_MESSAGE, parseQuotaEraserInput } from './format.js'
 
-const groupFields = [{ key: 'name', label: '组名' }, { key: 'parent_id', label: '上级组 ID' }, { key: 'quota_milli', label: '配额（毫橡皮）', type: 'number', step: 1 }]
+const viewFields = [
+  { key: 'name', label: '组名', readonly: true },
+  { key: 'parent_id', label: '上级组 ID', readonly: true, nullText: '—' },
+  { key: 'quota_eraser', label: '橡皮配额', readonly: true, nullText: '不限' }
+]
+const editFields = [
+  { key: 'name', label: '组名' },
+  { key: 'parent_id', label: '上级组 ID' },
+  { key: 'quota_eraser', label: '橡皮配额', type: 'number', step: 1, placeholder: '不限', hint: QUOTA_HINT }
+]
+
+function quotaUsageCell(item) {
+  const level = quotaUsageLevel(item.month_used_milli, item.quota_milli)
+  return el('span', 'status ' + level, formatQuotaUsage(item.month_used_milli, item.quota_milli))
+}
 
 export function groupsPage(host, api, actions) {
   let list
@@ -10,16 +24,39 @@ export function groupsPage(host, api, actions) {
   function entry(item) {
     open(item?.name || '新建分组', async pane => {
       const group = item && await api.get('/groups/' + encodeURIComponent(item.id))
+      const usage = group && await api.get('/quota/usage', { params: { scope: 'group', id: group.id } }).catch(() => null)
+      function kvBlock() {
+        if (!usage) return null
+        const kv = el('div', 'kv')
+        kv.append(
+          el('span', null, '本月已结算'), document.createTextNode(formatMilli(usage.used_milli)),
+          el('span', null, '预留'), document.createTextNode(formatMilli(usage.reserved_milli)),
+          el('span', null, '剩余'), document.createTextNode(usage.remaining_milli === null ? '不限' : formatMilli(usage.remaining_milli))
+        )
+        return kv
+      }
       function paint(mode) {
-        editForm(pane, { fields: groupFields, values: group || {}, mode,
-          submit: (v, opts) => api.post('/groups' + (group ? '/' + encodeURIComponent(group.id) : ''), { ...v, revision: group?.revision }, opts) })
+        const values = group ? { ...group, quota_eraser: group.quota_milli === null ? null : group.quota_milli / 1000 } : {}
+        editForm(pane, {
+          fields: mode === 'view' ? viewFields : editFields,
+          values,
+          mode,
+          submit: (v, opts) => {
+            const parsed = parseQuotaEraserInput(v.quota_eraser)
+            if (parsed.error) throw new Error(QUOTA_INVALID_MESSAGE)
+            return api.post('/groups' + (group ? '/' + encodeURIComponent(group.id) : ''),
+              { ...v, quota_milli: parsed.quotaMilli, quota_eraser: undefined, revision: group?.revision }, opts)
+          }
+        })
+        const kv = kvBlock()
+        if (kv) pane.body.prepend(kv)
         if (mode === 'view' && group.actions.includes('update')) pane.foot.append(button('编辑', () => paint('edit'), 'primary'))
       }
       paint(group ? 'view' : 'create')
     })
   }
   list = createLedger(host, { title: '分组', columns: [{ key: 'name', title: '组名' }, { key: 'parent_id', title: '上级组' },
-    { key: 'quota_milli', title: '橡皮配额', render: g => formatMilli(g.quota_milli) }],
+    { key: 'month_used_milli', title: '本月已用 / 配额', render: quotaUsageCell }],
     fetchPage: ({ q, cursor, limit, signal }) => api.get('/groups', { params: { q, cursor, limit }, signal }),
     onOpen: entry, createLabel: '新建分组', onCreate: actions.includes('create_group') ? () => entry(null) : null })
 }
