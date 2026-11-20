@@ -48,7 +48,7 @@ export function advanceCursor(sql: Transaction, device: string) {
   return ack;
 }
 
-const eventKinds = ['session_start', 'user_message', 'assistant_message', 'tool_call', 'tool_result', 'session_end', 'gap', 'compact'];
+const eventKinds = ['session_start', 'user_message', 'assistant_message', 'system_message', 'tool_call', 'tool_result', 'session_end', 'gap', 'compact'];
 
 export function eventItems(value: unknown) {
   return batchItems(value).map((row) => {

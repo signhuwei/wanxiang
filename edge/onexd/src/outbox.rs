@@ -98,6 +98,14 @@ impl Outbox {
                  CREATE INDEX IF NOT EXISTS outbox_acked_at ON outbox (acked_at) WHERE acked_at IS NOT NULL;",
             )?;
         }
+        // Earlier native capture versions queued events without an `at`; the Server rejects the
+        // whole batch, which otherwise prevents this device's ordered cursor from advancing.
+        conn.execute(
+            "UPDATE outbox SET item = json_set(item, '$.at', ?1)
+             WHERE kind = 'events' AND seq > (SELECT v FROM meta WHERE k = 'ack_seq')
+               AND coalesce(json_type(item, '$.at'), 'null') = 'null'",
+            [crate::pricing::format_ms(now_ms())],
+        )?;
         let last = meta(&conn, "last_seq")?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -311,6 +319,28 @@ mod tests {
         assert_eq!(rows[1].kind, Kind::Usage);
         assert_eq!(rows[1].item["seq"], 2);
         assert_eq!(ob.pending(1, 1).unwrap()[0].seq, 2);
+    }
+
+    #[test]
+    fn reopening_repairs_missing_timestamps_without_changing_pending_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.sqlite");
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            outbox.append(Kind::Events, ev(1)).unwrap();
+            outbox.ack(1).unwrap();
+            let mut legacy = ev(2);
+            legacy["at"] = Value::Null;
+            outbox.append(Kind::Events, legacy).unwrap();
+            outbox.append(Kind::Events, ev(3)).unwrap();
+        }
+        let outbox = Outbox::open(&path).unwrap();
+        assert_eq!(outbox.ack_seq().unwrap(), 1);
+        assert_eq!(outbox.last_seq(), 3);
+        let rows = outbox.pending(1, 10).unwrap();
+        assert!(rows[0].item["at"].as_str().and_then(crate::pricing::parse_ms).is_some());
+        assert_eq!(rows[0].item["seq"], 2);
+        assert_eq!(rows[1].item["at"], ev(3)["at"]);
     }
 
     #[test]

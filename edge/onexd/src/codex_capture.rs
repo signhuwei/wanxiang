@@ -31,7 +31,7 @@ impl Capture {
     }
 
     fn base(&self, kind: &str, payload: Value, offset: Option<u64>) -> Value {
-        json!({"session_id": self.s.session_id, "kind": kind, "at": null,
+        json!({"session_id": self.s.session_id, "kind": kind, "at": crate::pricing::format_ms(crate::outbox::now_ms()),
             "source_offset": offset, "payload": payload})
     }
 
@@ -139,9 +139,10 @@ impl Capture {
             "response_item" => self.response_item(&v["payload"], offset, out),
             other => out.push(self.gap(&format!("unknown_type:{}", crate::capture::truncate(other, 40)), offset)),
         }
-        let timestamp = v["timestamp"].as_str().and_then(crate::pricing::parse_ms).map(crate::pricing::format_ms);
-        for event in &mut out[start..] {
-            event["at"] = json!(timestamp);
+        if let Some(timestamp) = v["timestamp"].as_str().and_then(crate::pricing::parse_ms) {
+            for event in &mut out[start..] {
+                event["at"] = json!(crate::pricing::format_ms(timestamp));
+            }
         }
     }
 

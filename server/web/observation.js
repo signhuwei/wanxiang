@@ -20,7 +20,7 @@ export async function readStream(body, receive) {
     }
   } finally {reader.releaseLock()}
 }
-const names={user_message:'用户',assistant_message:'助手',tool_call:'工具调用',tool_result:'工具结果',session_start:'会话开始',session_end:'会话结束',gap:'采集缺口',compact:'上下文摘要'}
+const names={user_message:'用户',assistant_message:'助手',system_message:'系统',tool_call:'工具调用',tool_result:'工具结果',session_start:'会话开始',session_end:'会话结束',gap:'采集缺口',compact:'上下文摘要'}
 function contentText(value) {
   if (typeof value === 'string') return value
   if (Array.isArray(value)) return value.map(contentText).filter(Boolean).join('\n')
@@ -32,7 +32,7 @@ export function eventText(e) {
   const p=e.payload || {}
   switch(e.kind) {
     case 'session_start': return `${[agentLabel(p.agent),p.agent_version].filter(Boolean).join(' ')} · 模型 ${p.model || '未知'} · 开始于 ${formatDateTime(e.at)}`
-    case 'user_message': case 'assistant_message': return contentText(p.content) || '无可展示的正文'
+    case 'user_message': case 'assistant_message': case 'system_message': return contentText(p.content) || '无可展示的正文'
     case 'tool_call': return p.tool || '未命名工具'
     case 'tool_result': return (contentText(p.output) || '无可展示的输出') + (p.truncated ? '\n（结果已截断）' : '')
     case 'compact': return p.summary == null ? '上下文已压缩' : (contentText(p.summary) || '上下文已压缩')

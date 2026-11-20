@@ -150,7 +150,7 @@ impl Capture {
 
     fn base(&self, kind: &str, payload: Value, at_ms: Option<i64>, offset: Option<u64>) -> Value {
         json!({"session_id": self.s.session_id, "kind": kind,
-            "at": at_ms.map(crate::pricing::format_ms), "source_offset": offset, "payload": payload})
+            "at": crate::pricing::format_ms(at_ms.unwrap_or_else(crate::outbox::now_ms)), "source_offset": offset, "payload": payload})
     }
 
     /// 读一次新增内容（所有已发现的 Agent 子目录）。首次调用时补发 session_start。
@@ -253,7 +253,7 @@ impl Capture {
         })
     }
 
-    /// 记录自带的原生时间（毫秒），没有就 None（调用方把 `at` 留空，不用采集时刻顶替）。
+    /// 优先保留 Wire 的原生毫秒。没有时间的记录由 base 使用采集时刻。
     fn record_time(v: &Value) -> Option<i64> {
         v["time"].as_i64()
     }
