@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use onexd::lease::{LeaseOptions, Ledger};
-use onexd::outbox::Outbox;
+use onexd::outbox::{Outbox, now_ms};
+use onexd::pricing::format_ms;
 use onexd::state::State;
 use onexd::ws::{self, WsOptions};
 use serde_json::Value;
@@ -98,6 +99,41 @@ impl Fixture {
             )
             .unwrap()
     }
+
+    /// 给租户记一笔充值。走短连接直写 WAL 库，和 `tests/e2e/lease-server.ts` 自己播种数据的方式一样；
+    /// Server 常驻进程已经开着 WAL，两边各自的短事务不会互相破坏。
+    fn topup(&self, amount_milli: i64) {
+        self.ledger_write("topup", amount_milli);
+    }
+
+    /// 夹具播种的余额（10000）远大于单份租约额度（100），直接花掉一份租约不会耗尽余额。
+    /// 记一笔不挂租约的 `settle`（只影响 `balance()` 的 credits 计算，不touch 任何真实租约或
+    /// usage 行）把余额降到接近零，这样一次性花光当前租约就能真正触发 Server 的 balance cutoff。
+    fn drain_balance_to(&self, remaining_milli: i64) {
+        let current = self
+            .db()
+            .query_row(
+                "SELECT coalesce(sum(CASE WHEN kind IN ('topup','adjust') THEN amount_milli WHEN kind = 'settle' THEN -amount_milli ELSE 0 END), 0) FROM ledger",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        let drain = current - remaining_milli;
+        if drain > 0 {
+            self.ledger_write("settle", drain);
+        }
+    }
+
+    fn ledger_write(&self, kind: &str, amount_milli: i64) {
+        let p = self.data_dir.join(format!("tenant-{}.sqlite", self.tenant_id));
+        let db = rusqlite::Connection::open(p).unwrap();
+        let at = now_ms();
+        db.execute(
+            "INSERT INTO ledger (id, kind, amount_milli, at) VALUES (?, ?, ?, ?)",
+            rusqlite::params![format!("led_{kind}_{amount_milli}_{at}"), kind, amount_milli, format_ms(at)],
+        )
+        .unwrap();
+    }
 }
 
 /// Edge ↔ Server 的 WS 中间人。`drop_renew_reply` 置位时，丢掉下一条回应续租的 lease（带 `re`），
@@ -182,8 +218,12 @@ struct Edge {
 }
 
 fn start_edge(home: &Path, url: &str, token: &str, backoff: Duration) -> Edge {
+    start_edge_with_options(home, url, token, backoff, LeaseOptions::default())
+}
+
+fn start_edge_with_options(home: &Path, url: &str, token: &str, backoff: Duration, lo: LeaseOptions) -> Edge {
     let outbox = Arc::new(Outbox::open(&home.join("outbox.sqlite")).unwrap());
-    let lease = Arc::new(Ledger::open(home.join("lease.json"), LeaseOptions::default(), &outbox).unwrap());
+    let lease = Arc::new(Ledger::open(home.join("lease.json"), lo, &outbox).unwrap());
     tokio::spawn(lease.clone().run(CancellationToken::new()));
     let state = Arc::new(State { lease, ..Default::default() });
     state.token.send_replace(Some(token.into()));
@@ -311,5 +351,46 @@ async fn committed_renew_over_budget_with_lost_reply_settles_budget_once_and_par
     let st = edge.state.lease.status();
     assert_eq!((st["state"].as_str(), st["renew"]["pending"].as_bool()), (Some("active"), Some(false)));
     assert_eq!(st["renew"]["last_result"], "granted");
+    edge.stop().await;
+}
+
+/// 契约 v0.13：余额耗尽 → Server 续租回 cutoff 且带 settled_lease_id → Edge 丢弃旧租约 →
+/// 周期性 lease_request → 充值后自动恢复，拿到新租约。
+///
+/// 标 `#[ignore]`：Server 侧的 `settled_lease_id` 和 `lease_request` 由 quota-api 线实现，
+/// 这条测试写好接口形状，等 Server 合入后由总督去掉 ignore 跑。
+#[tokio::test]
+#[ignore]
+async fn cutoff_settled_by_renew_then_recovers_after_topup() {
+    let srv_dir = tempfile::tempdir().unwrap();
+    let srv = start_server(srv_dir.path()).await;
+    let url = format!("ws://127.0.0.1:{}/v1/edge/ws", srv.port);
+    let home = tempfile::tempdir().unwrap();
+    let lo = LeaseOptions { lease_request_interval: Duration::from_millis(200), ..Default::default() };
+
+    let edge = start_edge_with_options(home.path(), &url, &srv.device_token, Duration::from_secs(30), lo);
+    wait_for(|| edge.state.lease.lease_id().is_some()).await;
+    let l1 = edge.state.lease.lease_id().unwrap();
+    let budget = edge.state.lease.snapshot().lease.unwrap().budget_milli;
+
+    // 夹具播种的余额（10000）远大于单份租约额度（100）：先把余额降到正好够这份租约，
+    // 这样花光它、续租结算后余额恰好归零，触发真实的 balance cutoff。
+    srv.drain_balance_to(budget);
+
+    // 花光这份租约的全部额度；续租报的用量等于额度，正好也是余额，触发 Server 的 balance cutoff
+    edge.state.lease.admit(0).unwrap().finish(budget);
+    wait_for(|| edge.state.lease.lease_id().is_none()).await;
+
+    // 期望：余额耗尽后 Server 回 cutoff{reason:"balance", settled_lease_id: l1}，Edge 丢弃租约
+    let st = edge.state.lease.status();
+    assert_eq!(st["cutoff_reason"], "balance");
+    assert_eq!(st["lease_id"], Value::Null);
+    assert_eq!(edge.state.lease.snapshot().used_milli, 0, "settled cutoff must clear used_milli");
+
+    // 充值后，周期性 lease_request 应该在几个间隔内拿到新租约
+    srv.topup(100_000);
+    wait_for(|| edge.state.lease.lease_id().is_some()).await;
+    assert_ne!(edge.state.lease.lease_id().as_deref(), Some(l1.as_str()));
+    assert!(edge.state.lease.admit(0).is_ok());
     edge.stop().await;
 }

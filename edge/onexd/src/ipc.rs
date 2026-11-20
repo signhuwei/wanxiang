@@ -224,7 +224,7 @@ fn logout(ipc: &Ipc) -> (Value, bool) {
         return (err("internal", "无法清除系统钥匙串里的设备身份"), false);
     }
     info!("device logged out via ipc; shutting down for a clean restart");
-    if let Err(e) = ipc.state.lease.cutoff("logout") {
+    if let Err(e) = ipc.state.lease.cutoff("logout", None) {
         warn!(error = %format!("{e:#}"), "could not persist logout cutoff");
     }
     *ipc.state.config.write().unwrap() = Default::default();
@@ -258,6 +258,8 @@ async fn launch(
     if ipc.state.token.borrow().is_none() {
         return err("unauthenticated", "还没有登录，请先登录 OneX");
     }
+    // 处于 cutoff 且没有租约时，启动 Agent 立即申请一次租约，不等下一个 60 秒窗口（v0.13）。
+    ipc.state.lease.request_lease_now();
     let Ok(_prepare) = ctx.preparing.try_lock() else {
         return err("conflict", "已有 Agent 正在启动");
     };

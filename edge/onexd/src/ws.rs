@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use onex_core::ws::{Ack, Config, DiagResult, ErrorBody, Hello, LeaseRenew, Msg, PROTOCOL_VERSION, Welcome};
+use onex_core::ws::{Ack, Config, DiagResult, ErrorBody, Hello, LeaseRenew, LeaseRequest, Msg, PROTOCOL_VERSION, Welcome};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
@@ -108,7 +108,7 @@ pub async fn run(opts: WsOptions, state: Arc<State>, outbox: Arc<Outbox>, cancel
                 warn!("server rejected device token; waiting for a new login");
                 *state.config.write().unwrap() = ConfigSnapshot::default();
                 state.secrets.write().unwrap().clear();
-                if let Err(e) = state.lease.cutoff("unauthenticated") {
+                if let Err(e) = state.lease.cutoff("unauthenticated", None) {
                     warn!(error = %e, "could not persist authentication cutoff");
                 }
                 state.set_phase(Phase::Unauthenticated);
@@ -295,9 +295,11 @@ async fn connected(
     let mut missed: u32 = 0;
     let mut outbox_rx = outbox.subscribe();
     let mut renew_rx = state.lease.subscribe_renew();
+    let mut lease_request_rx = state.lease.subscribe_lease_request();
     let mut diagnostic_tasks = JoinSet::new();
     state.lease.on_connected();
     send_renew(state, tx).await?;
+    send_lease_request(state, tx).await?;
 
     flush(opts, outbox, tx, &mut sent, acked).await?;
     loop {
@@ -317,6 +319,10 @@ async fn connected(
             r = renew_rx.changed() => {
                 r.context("lease closed")?;
                 send_renew(state, tx).await?;
+            }
+            r = lease_request_rx.changed() => {
+                r.context("lease closed")?;
+                send_lease_request(state, tx).await?;
             }
             r = diagnostic_tasks.join_next(), if !diagnostic_tasks.is_empty() => {
                 if let Some(Ok(result)) = r {
@@ -351,8 +357,8 @@ async fn connected(
                         send(tx, &reply).await?;
                     }
                     Msg::Cutoff(c) => {
-                        // 落盘失败也已经断流了，照样确认。cutoff 不清续租快照，见 lease::Ledger::cutoff。
-                        if let Err(e) = state.lease.cutoff(&c.reason) {
+                        // 落盘失败也已经断流了，照样确认。cutoff 清不清续租快照见 lease::Ledger::cutoff。
+                        if let Err(e) = state.lease.cutoff(&c.reason, c.settled_lease_id.as_deref()) {
                             warn!(error = %format!("{e:#}"), "persist cutoff");
                         }
                         send(tx, &ack_ok(c.id)).await?;
@@ -397,6 +403,15 @@ async fn send_renew(state: &State, tx: &mut Tx) -> Result<()> {
         info!(lease_id = %r.lease_id, used_milli = r.used_milli, op_id = %r.op_id, "lease_renew");
         let m = LeaseRenew { id: id::new("msg"), op_id: r.op_id, lease_id: r.lease_id, used_milli: r.used_milli };
         send(tx, &Msg::LeaseRenew(m)).await?;
+    }
+    Ok(())
+}
+
+/// 处于 cutoff 且没有租约时发一次 `lease_request`（v0.13）。
+async fn send_lease_request(state: &State, tx: &mut Tx) -> Result<()> {
+    if let Some(op_id) = state.lease.take_lease_request() {
+        info!(op_id = %op_id, "lease_request");
+        send(tx, &Msg::LeaseRequest(LeaseRequest { id: id::new("msg"), op_id })).await?;
     }
     Ok(())
 }

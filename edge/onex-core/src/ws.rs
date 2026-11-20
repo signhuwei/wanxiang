@@ -33,6 +33,7 @@ pub enum Msg {
     Events(Events),
     Usage(UsageBatch),
     LeaseRenew(LeaseRenew),
+    LeaseRequest(LeaseRequest),
     DiagResult(DiagResult),
     AgentState(AgentState),
 
@@ -173,6 +174,10 @@ pub struct Cutoff {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub re: Option<String>,
     pub reason: String,
+    /// 旧租约已在本次续租中结清（v0.13）。等于 Edge 当前租约时，Edge 丢弃该租约、
+    /// 累计用量和续租快照，之后 `hello` 不再带 `lease_id`。缺省时维持 v0.5 行为：旧租约和快照保留。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_lease_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -256,6 +261,13 @@ pub struct LeaseRenew {
     pub used_milli: i64,
 }
 
+/// 没有租约时申请新租约（v0.13）。Server 按签发规则回 `lease` 或 `cutoff`，不缓存结果，同一 `op_id` 可重发。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LeaseRequest {
+    pub id: String,
+    pub op_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiagResult {
     pub id: String,
@@ -310,6 +322,32 @@ mod tests {
         assert_eq!(v, json!({"type":"ping","id":"m3"}));
         let v = serde_json::to_value(Msg::Ack(Ack { re: "s1".into(), ok: true, error: None })).unwrap();
         assert_eq!(v, json!({"type":"ack","re":"s1","ok":true}));
+    }
+
+    #[test]
+    fn cutoff_settled_lease_id_roundtrips() {
+        let m: Msg = serde_json::from_value(
+            json!({"type":"cutoff","id":"c1","re":"r1","reason":"balance","settled_lease_id":"lse_1"}),
+        )
+        .unwrap();
+        let Msg::Cutoff(c) = m else { panic!() };
+        assert_eq!(c.settled_lease_id.as_deref(), Some("lse_1"));
+
+        // 缺省时解析为 None，序列化时不出现该字段
+        let m: Msg = serde_json::from_value(json!({"type":"cutoff","id":"c2","reason":"disabled"})).unwrap();
+        let Msg::Cutoff(c) = m else { panic!() };
+        assert_eq!(c.settled_lease_id, None);
+        let v = serde_json::to_value(Msg::Cutoff(c)).unwrap();
+        assert!(v.get("settled_lease_id").is_none());
+    }
+
+    #[test]
+    fn lease_request_roundtrips() {
+        let m: Msg = serde_json::from_value(json!({"type":"lease_request","id":"m1","op_id":"lrq_1"})).unwrap();
+        assert!(matches!(m, Msg::LeaseRequest(LeaseRequest { op_id, .. }) if op_id == "lrq_1"));
+        let v = serde_json::to_value(Msg::LeaseRequest(LeaseRequest { id: "m2".into(), op_id: "lrq_2".into() }))
+            .unwrap();
+        assert_eq!(v, json!({"type":"lease_request","id":"m2","op_id":"lrq_2"}));
     }
 
     #[test]

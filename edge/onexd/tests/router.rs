@@ -790,7 +790,7 @@ async fn count_tokens_enforces_access_and_requires_anthropic_upstream() {
     assert_eq!(e.count_req("count").send().await.unwrap().status(), StatusCode::NOT_IMPLEMENTED);
 
     e.state.config.write().unwrap().routes[0].protocol = "anthropic".into();
-    e.state.lease.cutoff("device_disabled").unwrap();
+    e.state.lease.cutoff("device_disabled", None).unwrap();
     assert_eq!(e.count_req("count").send().await.unwrap().status(), StatusCode::FORBIDDEN);
     assert_eq!(e.calls(), 0);
 }
@@ -939,7 +939,7 @@ async fn non_streaming_cost() {
 #[tokio::test]
 async fn no_lease_rejects_before_upstream() {
     let e = env().await;
-    e.state.lease.cutoff("balance").unwrap();
+    e.state.lease.cutoff("balance", None).unwrap();
     let r = e.req("stream", true).send().await.unwrap();
     expect_blocked(r, 402, "balance_exhausted").await;
     assert!(e.upstream.seen.lock().unwrap().headers.is_none());
@@ -1002,7 +1002,7 @@ async fn cutoff_interrupts_inflight_stream() {
     let first = timeout(T, body.next()).await.unwrap().unwrap().unwrap();
     assert!(String::from_utf8_lossy(&first).contains("message_start"));
 
-    e.state.lease.cutoff("disabled").unwrap();
+    e.state.lease.cutoff("disabled", None).unwrap();
     let mut rest = Vec::new();
     while let Some(c) = timeout(T, body.next()).await.unwrap() {
         rest.extend_from_slice(&c.unwrap());
