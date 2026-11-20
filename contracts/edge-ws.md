@@ -133,9 +133,9 @@ S1 起存在的缺陷：续租回 `cutoff` 后，Edge 保留旧租约并重放�
 
 - Server 对 `lease_renew` 的回复如果是 `cutoff`，且旧租约已在这次操作中结清，`cutoff` 带 `settled_lease_id`。`lease_operations` 照常缓存这份回复，重放同一 `op_id` 仍返回它（含 `settled_lease_id`）。`disabled` 在结清前判定，不带该字段。
 - Edge 收到带 `settled_lease_id` 且等于当前租约的 `cutoff`：在同一次落盘中删除当前租约和续租快照，累计用量减去快照的 `used_milli`（与 v0.5 收到新租约时一致，不清零），保留 `cutoff` 原因。快照之后结束的请求、被 cutoff 中断后才释放的流，花费继续累加在这份“无租约用量”里，拿到新租约后整体带入新租约。之后 `hello` 不再带 `lease_id`。
-- 处于 `cutoff` 且没有租约的 Edge，在每次连上后和每隔 60 秒（加 ±20% 抖动）发一次 `lease_request`；`onex run` 启动 Agent 时也立即发一次。收到 `lease` 即解除 `cutoff`。
+- 处于 `cutoff` 且**没有待发或待回的续租**的 Edge（无论是否还持有租约），在每次连上后和每隔 60 秒（加 ±20% 抖动）发一次 `lease_request`；`onex run` 启动 Agent 时也立即发一次。收到新租约即解除 `cutoff`；收到与当前相同的租约（Server 回已有 active 租约）走“重申”分支，只解除 `cutoff`、不结算。持有租约且 `used_milli > 0` 时，先按 v0.5 发续租结清，续租有了结果之后才轮到 `lease_request`。
 - Server 处理 `lease_request`：设备不可用回 `cutoff{disabled}`；已有 active 租约直接回该租约；否则按签发规则回 `lease` 或 `cutoff`。不写 `lease_operations`。
-- 不带 `settled_lease_id` 的 `cutoff`（例如 `disabled`、或 Server 主动推送）保持 v0.5 行为：旧租约和快照保留，恢复后重放续租结清。
+- 不带 `settled_lease_id` 的 `cutoff`（例如 `disabled`、或 Server 主动推送）：旧租约和快照保留，恢复后重放续租结清；没有用量要结清时由上一条的 `lease_request` 恢复。
 
 ### 断流原因优先级
 
