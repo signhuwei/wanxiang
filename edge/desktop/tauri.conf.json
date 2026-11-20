@@ -31,10 +31,21 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app"],
-    "icon": ["icons/icon.png"],
+    "targets": "all",
+    "icon": ["icons/icon.png", "icons/icon.ico"],
     "macOS": {
       "minimumSystemVersion": "12.0"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "installerHooks": "../../deploy/windows/installer-hooks.nsh"
+      }
+    },
+    "externalBin": ["binaries/onex", "binaries/onexd"],
+    "resources": {
+      "../../deploy/windows/onex-run-claude.cmd": "onex-run-claude.cmd"
     }
   }
 }

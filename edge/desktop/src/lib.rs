@@ -28,8 +28,21 @@ async fn desktop_call(window: WebviewWindow, bridge: State<'_, Bridge>, request:
     })
 }
 
+/// 本地主窗口的 origin 判定，这是 `desktop_call` 唯一的访问控制点，必须精确匹配到具体平台：
+/// macOS（WKWebView）把本地内容放在自定义 scheme `tauri://localhost` 下；Windows（WebView2，
+/// Chromium 内核不支持把任意自定义 scheme 当顶层文档 origin）用虚拟主机 `http://tauri.localhost`
+/// 代替，这不是降级成明文 HTTP 的安全性——`tauri.localhost` 不是真实可路由的域名，WebView2 的
+/// virtual host 机制保证它只能由本进程自己的资源协议处理器应答，不会被同机其它进程或真实网络
+/// 上的 `tauri.localhost` 冒充。两个平台各自固定一种 scheme，不写成"scheme 是 tauri 或 http
+/// 都算"这种宽松判断，避免某一平台意外接受了另一平台的 origin 形状。
+#[cfg(target_os = "macos")]
 fn local_page(url: &tauri::Url) -> bool {
     url.scheme() == "tauri" && url.host_str() == Some("localhost")
+}
+
+#[cfg(windows)]
+fn local_page(url: &tauri::Url) -> bool {
+    url.scheme() == "http" && url.host_str() == Some("tauri.localhost")
 }
 
 fn reply_err(code: &str, message: &str) -> Value {
@@ -37,11 +50,8 @@ fn reply_err(code: &str, message: &str) -> Value {
 }
 
 fn socket_path() -> PathBuf {
-    if let Some(h) = std::env::var_os("ONEX_HOME") {
-        return PathBuf::from(h).join(onex_core::ipc::SOCKET_NAME);
-    }
-    let home = std::env::var_os("HOME").expect("HOME not set");
-    PathBuf::from(home).join("Library/Application Support/OneX").join(onex_core::ipc::SOCKET_NAME)
+    let home = onex_core::ipc::default_home().expect("ONEX_HOME could not be determined");
+    home.join(onex_core::ipc::SOCKET_NAME)
 }
 
 fn show_main(app: &tauri::AppHandle) {
@@ -52,10 +62,71 @@ fn show_main(app: &tauri::AppHandle) {
     }
 }
 
+/// Windows：macOS 靠独立的 LaunchAgent（`KeepAlive: true`）常驻 `onexd`，daemon 退出后 launchd
+/// 几秒内自动拉起一个新的；Windows 的 HKCU Run 项只在登录时拉起一次 `OneX Desktop.exe`，没有等价
+/// 的"进程退出就重启"机制，所以这个职责落到 Desktop 自己身上，两个时机都要调用：
+/// 1. 冷启动（`run()` 的 `setup`），daemon 可能从来没启动过；
+/// 2. `Logout` 之后（`bridge.rs::logout`），`onexd` 收到 `Logout` 请求会把自己整个关掉（和 macOS
+///    行为一致，见 `onexd/src/ipc.rs::logout`），同一个 Desktop 进程要能马上再登录，不能让用户去
+///    手动重启 Desktop 才能找回一个活的 daemon。
+///
+/// `onexd.exe` 是 Tauri externalBin sidecar，和 Desktop 的可执行文件装在同一个目录（见
+/// `tauri.conf.json` 的 `bundle.externalBin`），按同目录解析路径，不接受外部配置的路径。
+/// 用 DeviceInfo 确认 daemon 可以应答。注销后等待新设备密钥，旧 daemon 在退出前仍可能应答。
+/// 如果新进程因旧管道尚未关闭而退出，在有界等待期间重试。
+#[cfg(windows)]
+pub(crate) async fn ensure_onexd_running(socket: &std::path::Path, retired_key: Option<&str>) {
+    use std::os::windows::process::CommandExt;
+    use std::time::Duration;
+
+    const MAX_WAIT: u32 = 20;
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+    const RETRY_INTERVAL: Duration = Duration::from_millis(250);
+    const DETACHED_PROCESS: u32 = 0x00000008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+
+    let mut child: Option<std::process::Child> = None;
+    for _ in 0..MAX_WAIT {
+        let probe = bridge::ipc_call_with(socket, &onex_core::ipc::Request::DeviceInfo);
+        if let Ok(Ok(info)) = tokio::time::timeout(PROBE_TIMEOUT, probe).await
+            && info["ok"] == true
+            && let Some(key) = info["public_key"].as_str()
+        {
+            if Some(key) != retired_key {
+                return;
+            }
+        } else if child.as_mut().is_none_or(|child| matches!(child.try_wait(), Ok(Some(_)))) {
+            let Ok(exe) = std::env::current_exe() else { return };
+            let (Some(dir), Some(home)) = (exe.parent(), socket.parent()) else { return };
+            let onexd = dir.join("onexd.exe");
+            if !onexd.is_file() {
+                tracing::warn!(path = %onexd.display(), "onexd.exe sidecar not found next to OneX Desktop.exe");
+                return;
+            }
+            match std::process::Command::new(&onexd)
+                .env("ONEX_HOME", home)
+                .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+                .spawn()
+            {
+                Ok(started) => child = Some(started),
+                Err(error) => {
+                    tracing::warn!(%error, path = %onexd.display(), "failed to start onexd sidecar");
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(RETRY_INTERVAL).await;
+    }
+    tracing::warn!("onexd sidecar did not become ready");
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let bridge = Bridge::new(socket_path());
+            let sock = socket_path();
+            #[cfg(windows)]
+            tauri::async_runtime::block_on(ensure_onexd_running(&sock, None));
+            let bridge = Bridge::new(sock);
             app.manage(bridge);
             let config = &app.config().app.windows[0];
             WebviewWindowBuilder::from_config(app, config)?

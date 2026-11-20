@@ -3,11 +3,11 @@
 //! 职责边界按 [desktop-ui/IPC.md](../../../desktop-ui/IPC.md)：这里持有登录 HTTP、设备注册、
 //! 偏好、daemon IPC 客户端，只向 WebView 返回裁剪后的安全快照。UI 本身没有任何网络或文件权限。
 //!
-//! **启动走 Terminal，不是本进程 fork**：Claude Code 是 TUI，需要真实 PTY，Tauri 的 WebView
-//! 进程没有终端可接管。按与 Codex 的裁决，`launch()` 只调用系统 `open -a Terminal` 打开一个固定、
-//! 随包分发、不接受外部参数的 `.command`（见 `launch_script_path`），脚本内部写死调用可信路径下的
-//! `onex run claude-code`，复用现有 CLI 的 `Launch`/`LaunchDone` 流程；这里不经 IPC 传 program、
-//! 路径或环境，也不自己管子进程生命周期。
+//! **启动走系统终端，不是本进程 fork**：Claude Code 是 TUI，需要真实 PTY/控制台，Tauri 的 WebView
+//! 进程没有终端可接管。两个平台分开实现（见 `spawn_managed_cli`）：macOS 按与 Codex 的裁决打开
+//! 系统 Terminal.app 运行一个固定、随包分发、不接受外部参数的 `.command`；Windows 不经中间脚本，
+//! 直接用 `CREATE_NEW_CONSOLE` 起装在 Desktop 同目录的 `onex.exe` sidecar。两条路径都复用现有 CLI
+//! 的 `Launch`/`LaunchDone` 流程；这里不经 IPC 传 program、路径或环境，也不自己管子进程生命周期。
 //!
 //! onexd 持久化设备令牌和私钥。桌面只保存显示所需的账号和租户信息，并与 daemon 的设备身份核对。
 
@@ -19,7 +19,6 @@ use onex_core::ipc::{Request, Status};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 use crate::profile;
 
@@ -389,25 +388,15 @@ impl Bridge {
         self.state().await
     }
 
-    /// 受管 CLI 需要真实 PTY（Claude Code 是 TUI），Tauri 的 WebView 进程没有终端可接管。按裁决：
-    /// Desktop 只通过系统 Terminal 打开一个固定、随包分发、不接受外部参数的 `.command`；脚本内部写死
-    /// 调用可信路径下的 `onex run claude-code`，复用现有 CLI 的 `Launch`/`LaunchDone` 流程，这里不再
-    /// 重复实现一遍启动和回收子进程的逻辑，也不把 program/路径/环境经 IPC 从 WebView 传过来。
+    /// 受管 CLI 需要真实 PTY（Claude Code 是 TUI），Tauri 的 WebView 进程没有终端可接管。两个平台
+    /// 分开实现，不共用一套"随包脚本"：macOS 按裁决打开系统 Terminal.app 运行一个固定、随包分发、
+    /// 不接受外部参数的 `.command`，脚本内部写死调用可信路径下的 `onex run claude-code`；Windows
+    /// 不经中间脚本，直接起装在 Desktop 同目录的 `onex.exe`（Tauri externalBin sidecar），同样固定
+    /// `run claude-code --managed` 两个参数，`CREATE_NEW_CONSOLE` 开一个新控制台窗口给它。两条路径
+    /// 都复用现有 CLI 的 `Launch`/`LaunchDone` 流程，这里不再重复实现一遍启动和回收子进程的逻辑，
+    /// 也不把 program/路径/环境经 IPC 从 WebView 传过来。
     async fn launch_claude_code(&self) -> Result<(), ErrorBody> {
-        let script = launch_script_path()
-            .ok_or_else(|| ErrorBody {
-                code: "internal".into(), message: "本机服务暂不可用，请稍后重试".into()
-            })?;
-        // 固定两个参数：目标 app 和脚本自身路径，均来自本进程资源目录，不接受调用方输入。
-        let status = tokio::process::Command::new("/usr/bin/open")
-            .args(["-a", "/System/Applications/Utilities/Terminal.app", "--"])
-            .arg(&script)
-            .status()
-            .await;
-        match status {
-            Ok(s) if s.success() => Ok(()),
-            _ => Err(unavailable()),
-        }
+        spawn_managed_cli().await.map_err(|_| unavailable())
     }
 
     async fn settings(&self, hide_on_close: bool) -> Reply {
@@ -420,7 +409,15 @@ impl Bridge {
     }
 
     async fn logout(&self) -> Reply {
-        if self.inner.lock().unwrap().phase == Phase::Ready {
+        let was_logged_in = self.inner.lock().unwrap().phase == Phase::Ready;
+        #[cfg(windows)]
+        let retired_key = if was_logged_in {
+            let info = self.ipc_call(&Request::DeviceInfo).await.map_err(|_| unavailable())?;
+            Some(str_field(&info, "public_key")?)
+        } else {
+            None
+        };
+        if was_logged_in {
             self.ipc_call(&Request::Logout).await.map_err(|_| unavailable())?;
         }
         let _ = profile::clear(&self.socket_path);
@@ -433,6 +430,14 @@ impl Bridge {
             inner.pending = None;
             inner.send_code_target = None;
             inner.launching = None;
+        }
+        // Windows：`Logout` 让 onexd 把自己整个关掉（和 macOS 一致，见 onexd/src/ipc.rs::logout），
+        // macOS 靠 LaunchAgent 的 KeepAlive 自动重启；Windows 没有等价机制，Desktop 必须在这里自己
+        // 把它重新拉起，否则这同一个窗口里马上再 SendCode/Login 就会因为连不上 daemon 直接失败，
+        // 用户只能靠重启整个 Desktop 应用才能恢复，这不是"注销后能再登录"该有的体验。
+        #[cfg(windows)]
+        if let Some(retired_key) = retired_key.as_deref() {
+            crate::ensure_onexd_running(&self.socket_path, Some(retired_key)).await;
         }
         self.state().await
     }
@@ -533,8 +538,8 @@ fn same_device(status: &Value, inner: &Inner) -> bool {
         && inner.device_id.as_deref().is_some_and(|id| status["device_id"].as_str() == Some(id))
 }
 
-async fn ipc_call_with(socket_path: &std::path::Path, req: &Request) -> anyhow::Result<Value> {
-    let stream = UnixStream::connect(socket_path).await?;
+pub(crate) async fn ipc_call_with(socket_path: &std::path::Path, req: &Request) -> anyhow::Result<Value> {
+    let stream = onex_core::transport::connect(socket_path).await?;
     let (r, mut w) = stream.into_split();
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
@@ -544,13 +549,62 @@ async fn ipc_call_with(socket_path: &std::path::Path, req: &Request) -> anyhow::
     Ok(serde_json::from_str(&reply)?)
 }
 
-/// The installer places the Terminal entry point in the application resources.
+/// The installer places the terminal entry point in the application resources. macOS bundles
+/// resources at `<App>.app/Contents/Resources/`, one level up from the executable's own
+/// `Contents/MacOS/`.
+#[cfg(target_os = "macos")]
 fn launch_script_path() -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
     let bundled = executable.parent()?.join("../Resources/onex-run-claude.command");
     bundled.is_file().then_some(bundled)
 }
 
+/// macOS：打开一个新的 Terminal.app 窗口运行随包脚本，固定两个参数（目标 app 和脚本自身路径），
+/// 均来自本进程资源目录，不接受调用方输入。
+#[cfg(target_os = "macos")]
+async fn spawn_managed_cli() -> std::io::Result<()> {
+    let script = launch_script_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "onex-run-claude.command not found"))?;
+    let status = tokio::process::Command::new("/usr/bin/open")
+        .args(["-a", "/System/Applications/Utilities/Terminal.app", "--"])
+        .arg(&script)
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!("Terminal.app launch failed: {status}")));
+    }
+    Ok(())
+}
+
+/// Windows：不经中间脚本，直接起装在 Desktop 同目录的 `onex.exe`（Tauri externalBin sidecar，
+/// 和 `ensure_onexd_running` 解析 `onexd.exe` 用同一种"同目录"约定，见 `lib.rs`）。固定两个参数
+/// `run claude-code --managed`，不接受调用方输入。`CREATE_NEW_CONSOLE` 让它在一个新控制台窗口里
+/// 运行——Claude Code 是 TUI，需要自己的控制台，不能继承 Desktop（没有控制台的 GUI 子系统进程）
+/// 不存在的控制台。
+#[cfg(windows)]
+async fn spawn_managed_cli() -> std::io::Result<()> {
+    const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+    let executable = std::env::current_exe()?;
+    let onex = executable
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no parent directory for current_exe"))?
+        .join("onex.exe");
+    if !onex.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "onex.exe sidecar not found"));
+    }
+    let mut child = tokio::process::Command::new(&onex)
+        .args(["run", "claude-code", "--managed"])
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .spawn()?;
+    tokio::spawn(async move {
+        if let Err(error) = child.wait().await {
+            tracing::warn!(%error, "failed to wait for the OneX terminal process");
+        }
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn device_name() -> String {
     std::process::Command::new("scutil")
         .args(["--get", "ComputerName"])
@@ -558,6 +612,15 @@ fn device_name() -> String {
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "OneX Desktop".into())
+}
+
+#[cfg(windows)]
+fn device_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "OneX Desktop".into())

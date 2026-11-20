@@ -14,6 +14,7 @@ use axum::body::{Body, Bytes};
 use axum::response::Response;
 use axum::routing::post;
 use futures_util::{SinkExt, StreamExt};
+use onex_core::transport;
 use onex_core::ws::{Rate, Route, UpstreamAuth};
 use onexd::ipc::{self, Ipc};
 use onexd::outbox::{Kind, Outbox, now_ms};
@@ -23,7 +24,7 @@ use onexd::state::{ConfigSnapshot, Phase, State};
 use onexd::ws::{self, WsOptions};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::WebSocketStream;
@@ -249,7 +250,7 @@ impl Env {
     }
 
     async fn status(&self) -> Value {
-        let (r, mut w) = UnixStream::connect(&self.sock).await.unwrap().into_split();
+        let (r, mut w) = transport::connect(&self.sock).await.unwrap().into_split();
         w.write_all(b"{\"cmd\":\"status\"}\n").await.unwrap();
         let mut line = String::new();
         BufReader::new(r).read_line(&mut line).await.unwrap();

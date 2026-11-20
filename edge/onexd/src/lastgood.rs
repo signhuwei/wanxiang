@@ -4,9 +4,8 @@
 //! 读：当前文件有效用当前；无效时尝试 `.bak`；都不行是 `Unreadable`，不当作空。
 //! 当前文件不存在时返回 `Missing`，不看 `.bak`，避免用户有意删除后复活旧状态。
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,11 +62,21 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+fn private_open() -> OpenOptions {
+    let mut o = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
+}
+
 fn keep_bad(path: &Path, cur: &[u8]) -> Result<()> {
     let ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
     for n in 0..100 {
         let p = with_suffix(path, &format!(".bad-{ms}-{n}"));
-        match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&p) {
+        match private_open().write(true).create_new(true).open(&p) {
             Ok(mut f) => {
                 f.write_all(cur)?;
                 f.sync_all()?;
@@ -84,11 +93,18 @@ fn replace(path: &Path, data: &[u8]) -> Result<()> {
     let dir = path.parent().context("state file has no parent dir")?;
     let tmp = with_suffix(path, &format!(".tmp-{}", std::process::id()));
     let r = (|| {
-        let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        let mut f = private_open().write(true).create(true).truncate(true).open(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
         fs::rename(&tmp, path)?;
-        File::open(dir)?.sync_all()
+        // 目录本身的 fsync 只是 Unix 下"确保 rename 元数据落盘"的惯用法（NTFS 不允许用
+        // `File::open` 打开目录再 `sync_all`，`rename` 在 Windows 上本身就是元数据级原子操作，
+        // 不需要额外这一步）。
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
+        #[cfg(windows)]
+        let _ = dir;
+        Ok(())
     })();
     if r.is_err() {
         let _ = fs::remove_file(&tmp);
