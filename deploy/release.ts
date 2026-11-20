@@ -3,6 +3,7 @@ import { createReadStream, mkdtempSync, mkdirSync, readFileSync, renameSync, rmS
 import { join, resolve } from 'node:path';
 import { commitPattern, isManifest, signManifest, type ServerManifest } from '../server/src/release-package';
 
+process.umask(0o077);
 const repo = resolve(import.meta.dir, '..');
 const [command, ...args] = process.argv.slice(2);
 
@@ -27,9 +28,9 @@ function setting(name: string) {
   return value;
 }
 
-async function packServer(output: string) {
+async function packServer(output: string, revision = 'HEAD') {
   const key = createPrivateKey(readFileSync(setting('ONEX_RELEASE_PRIVATE_KEY')));
-  const commit = await run(['git', 'rev-parse', 'HEAD'], true);
+  const commit = await run(['git', 'rev-parse', '--verify', '--end-of-options', revision + '^{commit}'], true);
   if (!commitPattern.test(commit)) throw new Error('Use a full Git commit');
   const timestamp = await run(['git', 'show', '-s', '--format=%ct', commit], true);
   const dir = resolve(output);
@@ -40,7 +41,7 @@ async function packServer(output: string) {
     mkdirSync(tree, { mode: 0o700 });
     await run(['git', 'archive', '--format=tar', `--output=${join(temp, 'source.tar')}`, commit, 'server', 'deploy']);
     await run(['tar', '-xf', join(temp, 'source.tar'), '-C', tree]);
-    await run([process.execPath, 'install', '--cwd', join(tree, 'server'), '--frozen-lockfile', '--production']);
+    await run([process.execPath, 'install', '--cwd', join(tree, 'server'), '--frozen-lockfile', '--production', '--ignore-scripts']);
     const bundle = join(temp, 'bundle.tar.gz');
     await run(['python3', join(import.meta.dir, 'server-release-pack.py'), tree, bundle, timestamp]);
     const manifest = signManifest(key, { commit, ...await digest(bundle) });
@@ -152,11 +153,11 @@ async function publishEdge(origin: string, os: string, version: string, archive:
 
 try {
   let result;
-  if (command === 'pack-server' && args.length === 1) result = await packServer(args[0]);
+  if (command === 'pack-server' && (args.length === 1 || args.length === 2)) result = await packServer(args[0], args[1]);
   else if (command === 'publish-server' && args.length === 3) result = await publishServer(args[0], args[1], args[2]);
   else if (command === 'publish-edge' && args.length === 4) result = await publishEdge(args[0], args[1], args[2], args[3]);
   else if (command === 'rollout' && args.length === 2) result = await waitForRollout(await connect(args[0]), args[1]);
-  else throw new Error('Usage: release.ts pack-server DIR | publish-server URL MANIFEST ARCHIVE | publish-edge URL OS VERSION INSTALLER | rollout URL ID');
+  else throw new Error('Usage: release.ts pack-server DIR [COMMIT] | publish-server URL MANIFEST ARCHIVE | publish-edge URL OS VERSION INSTALLER | rollout URL ID');
   console.log(JSON.stringify(result));
 } catch (error) {
   console.error(JSON.stringify({ status: 'failed', error: error instanceof Error ? error.message : 'release_failed' }));

@@ -70,6 +70,8 @@ To disable LAN development, set `ONEX_HOST=127.0.0.1` and remove `ONEX_ALLOW_LAN
 
 初次启用时，部署运维在受信任的打包机器生成 Ed25519 密钥，给 OneX 主机的 `~/apps/onex/secrets/server-release.pub` 安装公钥。安装含维护页和执行器的版本后，OneX 启用 `onex-release-worker.timer`。私钥仅在授权打包环境使用。已有的 SSH 发布命令保留用于首次启用和故障恢复。
 
+Edge 先用 `deploy/mac/package.sh` 或 Windows 原生环境中的 `deploy/windows/build.ps1` 生成安装器。
+
 Agent 在已提交且通过回归的源码目录运行：
 
 ```sh
@@ -78,6 +80,8 @@ ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token bun deploy/release.ts
 ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token bun deploy/release.ts publish-edge https://onex.example darwin 1.2.3 /secure/output/OneX.pkg
 ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token bun deploy/release.ts rollout https://onex.example roll_ID
 ```
+
+`pack-server` 也可在输出目录之后指定已审核的 Git 提交。
 
 `publish-edge` 的 Windows 对应参数为 `windows VERSION installer.exe`。如已有全局管理会话，使用 `ONEX_RELEASE_TOKEN_FILE`。命令将凭据从文件读入，标准输出返回一条 JSON。Server 发布可通过 `ONEX_EXPECTED_COMMIT` 固定当前版本，`ONEX_RELEASE_REQUEST_ID` 固定幂等键。完成后根据返回的任务状态和 `observed_commit` 验证运行版本。失败任务保留，确认原因后用新幂等键发起重试。
 

@@ -10,6 +10,8 @@ with open(archive, "xb") as target, gzip.GzipFile(filename="", fileobj=target, m
     with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as bundle:
         for folder in (tree / "deploy", tree / "server"):
             for path in sorted([folder, *folder.rglob("*")]):
+                if path.is_relative_to(tree / "server" / "node_modules" / ".bin"):
+                    continue
                 if path.is_symlink() or not (path.is_dir() or path.is_file()):
                     raise ValueError(f"Unsupported runtime entry: {path.relative_to(tree)}")
                 item = bundle.gettarinfo(str(path), arcname=path.relative_to(tree).as_posix())
