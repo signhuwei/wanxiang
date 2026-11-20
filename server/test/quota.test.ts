@@ -341,3 +341,183 @@ test('reassigning a member to another group moves their settled usage with them 
   expect(await (await f.request(`/quota/usage?scope=group&id=${newGroup.id}`, undefined, owner)).json())
     .toMatchObject({ used_milli: lease.budget_milli });
 });
+
+// S2B-Q3（v0.13）：断流后的恢复与账务口径
+
+test('a cutoff that settled the old lease carries settled_lease_id, and a replay returns the identical result', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1000);
+  const member = await f.join('settled-cutoff@example.test');
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, quota_milli: 4 }, owner)).status).toBe(200);
+  const edge = await linkedEdge(f, member.scoped);
+  const lease = await edge.nextOf('lease');
+  expect(lease).toMatchObject({ type: 'lease', budget_milli: 4 });
+  edge.send({ type: 'lease_renew', id: 'renew-1', op_id: 'op-1', lease_id: lease.lease_id, used_milli: 4 });
+  const first = await edge.nextOf('cutoff');
+  // 旧租约已经在这次续租里结清：cutoff 带 settled_lease_id 指向它
+  expect(first).toMatchObject({ type: 'cutoff', reason: 'quota', settled_lease_id: lease.lease_id, re: 'renew-1' });
+  edge.send({ type: 'lease_renew', id: 'renew-replay', op_id: 'op-1', lease_id: lease.lease_id, used_milli: 4 });
+  const replay = await edge.nextOf('cutoff');
+  expect(replay).toEqual({ ...first, re: 'renew-replay' });
+});
+
+test('a disabled cutoff before settlement never carries settled_lease_id', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1000);
+  const member = await f.join('disabled-cutoff@example.test');
+  const edge = await linkedEdge(f, member.scoped);
+  const lease = await edge.nextOf('lease');
+  // 停用成员：deviceAllowed() 在结清前就判定失败。这一步本身先触发一次配置推送的主动 cutoff（没有 re），
+  // 排干它，再看这次 lease_renew 真正的回复。
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, status: 'disabled' }, owner)).status).toBe(200);
+  expect(await edge.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'disabled' });
+  edge.send({ type: 'lease_renew', id: 'renew-1', op_id: 'op-1', lease_id: lease.lease_id, used_milli: 1 });
+  const result = await edge.nextOf('cutoff');
+  expect(result).toMatchObject({ type: 'cutoff', reason: 'disabled', re: 'renew-1' });
+  expect(result).not.toHaveProperty('settled_lease_id');
+  // 旧租约没有被结清，仍然是 active
+  expect(f.store.tenant(f.tenantId).get('SELECT status FROM leases WHERE id = ?', [lease.lease_id])).toEqual({ status: 'active' });
+});
+
+test('lease_request: disabled device, an outstanding lease, and a fresh issue', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1000);
+  const member = await f.join('lease-request@example.test');
+  const edge = await linkedEdge(f, member.scoped);
+  const lease = await edge.nextOf('lease');
+  // 已有 active 租约：直接回这份租约（leaseView() 每次都生成新的消息 id，只比对租约本身的字段）
+  edge.send({ type: 'lease_request', id: 'req-outstanding' });
+  expect(await edge.nextOf('lease')).toMatchObject({ re: 'req-outstanding', lease_id: lease.lease_id, budget_milli: lease.budget_milli, seq: lease.seq });
+  // 结清掉这份租约，让设备没有租约：这时请求走签发规则
+  edge.send({ type: 'lease_renew', id: 'renew-1', op_id: 'op-1', lease_id: lease.lease_id, used_milli: 1 });
+  await edge.nextOf('lease');
+  edge.send({ type: 'lease_request', id: 'req-fresh' });
+  const fresh = await edge.nextOf('lease');
+  expect(fresh).toMatchObject({ type: 'lease', re: 'req-fresh' });
+  // 设备不可用：回 disabled，不带 settled_lease_id。停用成员这一步本身也会让配置推送主动发一次 cutoff（没有 re），
+  // 和这次 lease_request 的回复是两条独立的消息，先排干前者再找带 re 的那条。
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, status: 'disabled' }, owner)).status).toBe(200);
+  expect(await edge.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'disabled' });
+  edge.send({ type: 'lease_request', id: 'req-disabled' });
+  const disabled = await edge.nextOf('cutoff');
+  expect(disabled).toMatchObject({ type: 'cutoff', reason: 'disabled', re: 'req-disabled' });
+  expect(disabled).not.toHaveProperty('settled_lease_id');
+});
+
+test('lease_request does not write lease_operations, so the same op_id can be resent freely', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1000);
+  const member = await f.join('lease-request-idempotent@example.test');
+  const edge = await linkedEdge(f, member.scoped);
+  const lease = await edge.nextOf('lease');
+  edge.send({ type: 'lease_renew', id: 'renew-1', op_id: 'op-1', lease_id: lease.lease_id, used_milli: 1 });
+  await edge.nextOf('lease');
+  edge.send({ type: 'lease_request', id: 'first' });
+  const a = await edge.nextOf('lease');
+  edge.send({ type: 'lease_request', id: 'second' });
+  const b = await edge.nextOf('lease');
+  // 每次都重新裁决：同一活跃租约被原样返回（忽略各自新生成的消息 id），不走 lease_operations 缓存
+  expect(b).toMatchObject({ lease_id: a.lease_id, budget_milli: a.budget_milli, seq: a.seq, re: 'second' });
+  expect(f.store.tenant(f.tenantId).get("SELECT count(*) AS n FROM lease_operations WHERE lease_id = ?", [a.lease_id])).toEqual({ n: 0 });
+});
+
+test('after balance exhaustion, a top-up lets lease_request issue a fresh lease', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1);
+  const member = await f.join('balance-recovers@example.test');
+  const edge = await linkedEdge(f, member.scoped);
+  const lease = await edge.nextOf('lease');
+  expect(lease).toMatchObject({ type: 'lease', budget_milli: 1 });
+  edge.send({ type: 'lease_renew', id: 'renew-1', op_id: 'op-1', lease_id: lease.lease_id, used_milli: 1 });
+  const cut = await edge.nextOf('cutoff');
+  expect(cut).toMatchObject({ type: 'cutoff', reason: 'balance', settled_lease_id: lease.lease_id });
+  edge.send({ type: 'lease_request', id: 'before-topup' });
+  expect(await edge.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'balance' });
+  await f.fund(ownerToken, 1000);
+  edge.send({ type: 'lease_request', id: 'after-topup' });
+  expect(await edge.nextOf('lease')).toMatchObject({ type: 'lease', re: 'after-topup' });
+});
+
+test('after quota exhaustion, raising the quota lets lease_request issue a fresh lease', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1000);
+  const member = await f.join('quota-recovers@example.test');
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, quota_milli: 2 }, owner)).status).toBe(200);
+  const edge = await linkedEdge(f, member.scoped);
+  const lease = await edge.nextOf('lease');
+  expect(lease).toMatchObject({ type: 'lease', budget_milli: 2 });
+  edge.send({ type: 'lease_renew', id: 'renew-1', op_id: 'op-1', lease_id: lease.lease_id, used_milli: 2 });
+  expect(await edge.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'quota', settled_lease_id: lease.lease_id });
+  edge.send({ type: 'lease_request', id: 'before-raise' });
+  expect(await edge.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 2, quota_milli: 100 }, owner)).status).toBe(200);
+  edge.send({ type: 'lease_request', id: 'after-raise' });
+  // 余额结清 2 后剩 998，5% 下限 floor(998/20)=49，比新配额剩余 98 更紧
+  expect(await edge.nextOf('lease')).toMatchObject({ type: 'lease', re: 'after-raise', budget_milli: 49 });
+});
+
+test('a new calendar month lets lease_request recover without a top-up or quota change', async () => {
+  const f = await fixture(Date.parse('2027-02-27T20:00:00.000Z')); // 2027-02-28 04:00 Asia/Shanghai
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1000);
+  const member = await f.join('month-recovers@example.test');
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, quota_milli: 5 }, owner)).status).toBe(200);
+  const edge = await linkedEdge(f, member.scoped);
+  const lease = await edge.nextOf('lease');
+  expect(lease).toMatchObject({ type: 'lease', budget_milli: 5 });
+  edge.send({ type: 'lease_renew', id: 'renew-1', op_id: 'op-1', lease_id: lease.lease_id, used_milli: 5 });
+  expect(await edge.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  edge.send({ type: 'lease_request', id: 'still-february' });
+  expect(await edge.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  f.advance(21 * 60 * 60_000); // 跨入 2027-03-01 Asia/Shanghai
+  edge.send({ type: 'lease_request', id: 'next-month' });
+  expect(await edge.nextOf('lease')).toMatchObject({ type: 'lease', re: 'next-month', budget_milli: 5 });
+});
+
+test('/balance.month_used_milli rolls over at Asia/Shanghai midnight, not UTC midnight', async () => {
+  // UTC 2027-01-31T16:30 是上海 2027-02-01T00:30：已经跨入二月，这笔结算不该算进一月
+  const f = await fixture(Date.parse('2027-01-31T15:00:00.000Z')); // 上海 2027-01-31 23:00
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1000);
+  const member = await f.join('shanghai-midnight@example.test');
+  const edge = await linkedEdge(f, member.scoped);
+  const lease = await edge.nextOf('lease');
+  edge.send({ type: 'lease_renew', id: 'renew-before', op_id: 'op-before', lease_id: lease.lease_id, used_milli: lease.budget_milli });
+  const next = await edge.nextOf('lease');
+  expect(await (await f.request('/balance', undefined, owner)).json()).toMatchObject({ month_used_milli: lease.budget_milli });
+  f.advance(Date.parse('2027-01-31T16:30:00.000Z') - f.now()); // 上海 2027-02-01 00:30，跨入二月
+  edge.send({ type: 'lease_renew', id: 'renew-after', op_id: 'op-after', lease_id: next.lease_id, used_milli: next.budget_milli });
+  await edge.nextOf('lease');
+  // 一月结算的那一笔已经不算进这个新的（二月）自然月
+  expect(await (await f.request('/balance', undefined, owner)).json()).toMatchObject({ month_used_milli: next.budget_milli });
+});
+
+test('limited_by breaks ties in favor of the member, then the nearest group', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1000);
+  const parent = await (await f.request('/groups', { name: 'Tie parent', quota_milli: 5 }, owner)).json() as { id: string };
+  const child = await (await f.request('/groups', { name: 'Tie child', quota_milli: 5 }, owner)).json() as { id: string };
+  const member = await f.join('tie-break@example.test');
+  // 本人、子组、祖先组配额都是 5，剩余并列：/me.quota.limited_by 应该先取本人
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, group_id: child.id, quota_milli: 5 }, owner)).status).toBe(200);
+  expect(await (await f.request('/me', undefined, member.scoped)).json()).toMatchObject({ quota: { limited_by: 'member' } });
+  // 去掉本人配额：并列的子组和祖先组之间，取离成员最近的（子组）
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 2, quota_milli: null }, owner)).status).toBe(200);
+  expect(await (await f.request('/me', undefined, member.scoped)).json()).toMatchObject({ quota: { limited_by: `group:${child.id}` } });
+});

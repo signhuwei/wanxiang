@@ -9,16 +9,18 @@ import type { Store, Transaction } from './store';
 type Reader = Pick<Transaction, 'get'>;
 type LedgerKind = 'topup' | 'reserve' | 'settle' | 'release' | 'overage_pending';
 type LeaseRow = { id: string; device_id: string; user_id: string; budget_milli: number; used_milli: number; expires_at: string; status: string; seq: number };
-export type Cutoff = { type: 'cutoff'; id: string; reason: 'balance' | 'contract' | 'disabled' | 'quota' };
+export type Cutoff = { type: 'cutoff'; id: string; reason: 'balance' | 'contract' | 'disabled' | 'quota'; settled_lease_id?: string };
 type Lease = { type: 'lease'; id: string; lease_id: string; expires_at: string; budget_milli: number; seq: number };
 type LeaseReply = Cutoff | Lease;
 const leaseView = (row: LeaseRow): Lease => ({ type: 'lease', id: `msg_${ulid()}`, lease_id: row.id,
   expires_at: row.expires_at, budget_milli: row.budget_milli, seq: row.seq });
-export const cutoff = (reason: Cutoff['reason']): Cutoff => ({ type: 'cutoff', id: `msg_${ulid()}`, reason });
+// settledLeaseId 只在续租结清旧租约之后才带（v0.13）；disabled 在结清前判定，不带这个字段。
+export const cutoff = (reason: Cutoff['reason'], settledLeaseId?: string): Cutoff =>
+  ({ type: 'cutoff', id: `msg_${ulid()}`, reason, ...(settledLeaseId !== undefined && { settled_lease_id: settledLeaseId }) });
 
 export function balance(sql: Reader, now: number) {
-  const date = new Date(now);
-  const month = iso(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
+  // 月份口径同配额和 observe.ts 的 month_cost_milli：Asia/Shanghai 自然月（v0.13）。
+  const [month] = monthBounds(now);
   const { credits, month_used_milli } = sql.get<{ credits: number; month_used_milli: number }>(`SELECT
     coalesce(sum(CASE WHEN kind IN ('topup', 'adjust') THEN amount_milli WHEN kind = 'settle' THEN -amount_milli ELSE 0 END), 0) AS credits,
     coalesce(sum(CASE WHEN kind = 'settle' AND at >= ? THEN amount_milli ELSE 0 END), 0) AS month_used_milli FROM ledger`, [month])!;
@@ -107,17 +109,18 @@ export function deviceAllowed(store: Store, sql: Reader, tenantId: string, devic
       AND d.status = 'active' AND d.token_expires_at > ? AND m.status = 'active'`, [deviceId, iso(at)]));
 }
 
-function issue(sql: Transaction, deviceId: string, userId: string, at: number): LeaseReply {
+// 断流优先级（v0.13 edge-ws.md「断流原因优先级」）：disabled（调用方在 issue() 之前判定）> contract > balance > quota。
+function issue(sql: Transaction, deviceId: string, userId: string, at: number, settledLeaseId?: string): LeaseReply {
   const contract = sql.get<{ lease_budget_milli: number; lease_minutes: number }>(
     'SELECT lease_budget_milli, lease_minutes FROM contract ORDER BY revision DESC LIMIT 1');
-  if (!contract || contract.lease_budget_milli <= 0) return cutoff('contract');
+  if (!contract || contract.lease_budget_milli <= 0) return cutoff('contract', settledLeaseId);
   const outstanding = sql.get<LeaseRow>("SELECT * FROM leases WHERE device_id = ? AND status = 'active'", [deviceId]);
   if (outstanding) return leaseView(outstanding);
   const { balance_milli: available } = balance(sql, at);
   // 余额和配额都耗尽时报 balance（合约优先级见 data-model.md 配额一节）。
-  if (available <= 0) return cutoff('balance');
+  if (available <= 0) return cutoff('balance', settledLeaseId);
   const binding = quotaBinding(sql, userId, at);
-  if (binding && binding.remaining_milli <= 0) return cutoff('quota');
+  if (binding && binding.remaining_milli <= 0) return cutoff('quota', settledLeaseId);
   const budget = Math.min(available, contract.lease_budget_milli, Math.max(1, Math.floor(available / 20)),
     ...(binding ? [binding.remaining_milli] : []));
   const last = sql.get<{ seq: number }>('SELECT seq FROM leases WHERE device_id = ? ORDER BY seq DESC LIMIT 1', [deviceId]);
@@ -130,6 +133,14 @@ function issue(sql: Transaction, deviceId: string, userId: string, at: number): 
 }
 
 export function initialLease(store: Store, tenantId: string, deviceId: string, userId: string, at: number, live: () => boolean) {
+  return store.tenant(tenantId).write((sql) => {
+    if (!live() || !deviceAllowed(store, sql, tenantId, deviceId, at)) return cutoff('disabled');
+    return issue(sql, deviceId, userId, at);
+  });
+}
+
+/** lease_request（v0.13）：设备不可用回 disabled；已有 active 租约直接回它；否则按签发规则裁决。不写 lease_operations。 */
+export function requestLease(store: Store, tenantId: string, deviceId: string, userId: string, at: number, live: () => boolean) {
   return store.tenant(tenantId).write((sql) => {
     if (!live() || !deviceAllowed(store, sql, tenantId, deviceId, at)) return cutoff('disabled');
     return issue(sql, deviceId, userId, at);
@@ -167,7 +178,8 @@ export function renewLease(store: Store, tenantId: string, deviceId: string, use
     if (charged < lease.budget_milli) entry(sql, 'release', lease.budget_milli - charged, at, { lease, requestRef: opId });
     if (used > charged) entry(sql, 'overage_pending', used - charged, at, { lease, requestRef: opId, note: '超租约差额待核对' });
     reconcileUsage(sql, deviceId);
-    const response = issue(sql, deviceId, userId, at);
+    // 旧租约已经在上面结清；如果这次裁决回 cutoff，带上 settled_lease_id 让 Edge 知道这份租约不用再保留或重放（v0.13）。
+    const response = issue(sql, deviceId, userId, at, lease.id);
     sql.run('INSERT INTO lease_operations (device_id, op_id, lease_id, used_milli, result_json) VALUES (?, ?, ?, ?, ?)',
       [deviceId, opId, leaseId, used, JSON.stringify(response)]);
     return response;
