@@ -68,8 +68,8 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/observe/people` | 人员台账：`session_count`、`cost_milli`（全部时间）、`month_cost_milli`（本月，按租户时区，S1 固定 Asia/Shanghai）、`last_active_at` |
-| GET | `/observe/sessions` | `?user_id=`，会话台账，按 `started_at` 倒序。字段含 `turn_count`（主会话中 `user_message` 的条数，不含子 Agent 和系统注入）、`event_count`、`cost_milli`、`pending_usage_count` |
+| GET | `/observe/people` | 人员台账：`session_count`、`cost_milli`（全部时间）、`month_cost_milli`（本月，Asia/Shanghai）、`last_active_at`、`last_agent`（最近会话的 Agent，无会话时为 null）、`quota_milli`、`month_used_milli`（个人配额口径，同 `/members`） |
+| GET | `/observe/sessions` | 支持 `user_id` 和精确的 `agent` 筛选（`claude-code`、`codex`、`kimi-code`），筛选结果计算 `total` 和分页。按 `started_at` 倒序。字段含 `turn_count`（主会话中 `user_message` 的条数，不含子 Agent 和系统注入）、`event_count`、`cost_milli`、`pending_usage_count` |
 | GET | `/observe/sessions/:id/events` | `?after_seq=`，对话事件；每次读取写审计。只有会话对象的 `actions` 含 `read_content` 时才能调用；`read` 只表示能看摘要 |
 | GET | `/observe/stream` | SSE，推送新会话和新事件的摘要 |
 

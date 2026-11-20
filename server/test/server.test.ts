@@ -73,6 +73,33 @@ test('server shutdown drains accepted writes and can be awaited concurrently', a
   expect(await f.presence.get(edge.device_id)).toBeNull();
 });
 
+test('observation uses the quota ledger and filters whole session pages by agent', async () => {
+  const f = await fixture();
+  const scoped = await f.select(await f.login());
+  const device = await (await f.request('/devices', f.device, scoped)).json() as DeviceReply;
+  const db = f.store.tenant(f.tenantId);
+  const at = iso(f.now());
+  await db.write(sql => {
+    sql.run('UPDATE members SET quota_milli = 96 WHERE user_id = ?', [f.userId]);
+    sql.run("INSERT INTO ledger (id, kind, amount_milli, user_id, at) VALUES (?, 'settle', ?, ?, ?)", ['led-observe-test', 42, f.userId, at]);
+    for (const [index, agent] of ['kimi-code', 'codex', 'kimi-code'].entries()) {
+      sql.run(`INSERT INTO agent_sessions (id, device_id, user_id, agent, agent_version, started_at)
+        VALUES (?, ?, ?, ?, ?, ?)`, [`s-observe-${index}`, device.device_id, f.userId, agent, 'test', iso(f.now() + index)]);
+    }
+  });
+  const people = await f.request('/observe/people', undefined, scoped);
+  expect(await people.json()).toMatchObject({
+    items: [{ user_id: f.userId, last_agent: 'kimi-code', quota_milli: 96, month_used_milli: 42, month_cost_milli: 0 }],
+  });
+  const path = '/observe/sessions?agent=kimi-code&limit=1';
+  const first = await (await f.request(path, undefined, scoped)).json() as { next_cursor: string };
+  expect(first).toMatchObject({ items: [{ id: 's-observe-2', agent: 'kimi-code' }], total: 2 });
+  expect(await (await f.request(`${path}&cursor=${first.next_cursor}`, undefined, scoped)).json()).toMatchObject({
+    items: [{ id: 's-observe-0' }], total: 2, next_cursor: null,
+  });
+  expect((await f.request('/observe/sessions?agent=unknown', undefined, scoped)).status).toBe(422);
+});
+
 test('health, OpenAPI, one-use codes, tenant selection and logout', async () => {
   const f = await fixture();
   expect(await (await f.request('/healthz')).json()).toMatchObject({ status: 'ok', commit: 'test' });

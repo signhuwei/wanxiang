@@ -1,5 +1,6 @@
 import pkg from '../package.json';
 import { personalLoginTokenPattern } from './credentials';
+import { observedAgents } from './observe';
 
 const text = { type: 'string' };
 const nullableText = { type: ['string', 'null'] };
@@ -167,10 +168,14 @@ export const openapi = {
       summary: '本租户审计台账，仅限本租户 owner', description: 'q 在动作、操作者和目标上按字面搜索。按 at、id 依次倒序排列。' } },
     '/v1/platform/ledger/topup': { post: write(object({ tenant_id: tenantId, amount_milli: { ...sequence, minimum: 1 }, note: text },
       ['tenant_id', 'amount_milli']), { allOf: [ledger, object({ tenant_id: tenantId })] }, 'create') },
-    '/v1/observe/people': { get: listOf(managed({ user_id: text, name: text, session_count: sequence, cost_milli: sequence, month_cost_milli: sequence, last_active_at: nullableText })) },
+    '/v1/observe/people': { get: listOf(managed({ user_id: text, name: text, session_count: sequence, cost_milli: sequence,
+      month_cost_milli: sequence, last_active_at: nullableText, last_agent: nullableText,
+      quota_milli: memberInput.quota_milli, month_used_milli: sequence })) },
     '/v1/observe/sessions': { get: listOf(managed({ id: text, device_id: text, user_id: text, agent: text, agent_version: text, model: nullableText,
       started_at: text, ended_at: nullableText, event_count: sequence, turn_count: sequence, cost_milli: sequence, input_tokens: sequence, output_tokens: sequence,
-      cache_read_tokens: sequence, cache_write_tokens: sequence, pending_usage_count: sequence }), [{ name: 'user_id', in: 'query', schema: text }]) },
+      cache_read_tokens: sequence, cache_write_tokens: sequence, pending_usage_count: sequence }), [
+      { name: 'user_id', in: 'query', schema: text },
+      { name: 'agent', in: 'query', schema: { ...text, enum: observedAgents } }]) },
     '/v1/observe/sessions/{id}/events': { get: { ...listOf(managed({ device_id: text, seq: sequence, session_id: text, kind: text,
       at: text, source_offset: { type: ['integer', 'null'] }, payload: { type: 'object' } }), [idPath, { name: 'after_seq', in: 'query', schema: sequence }]),
       description: '按序号读取正文；每次成功读取审计。' } },

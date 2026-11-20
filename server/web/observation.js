@@ -1,6 +1,6 @@
 import { createLedger } from './ledger.js'
 import { detailPanel, el, button } from './panel.js'
-import { formatMilli, formatDateTime } from './format.js'
+import { formatMilli, formatDateTime, agentLabel, AGENT_OPTIONS, quotaUsageLevel, formatQuotaUsage } from './format.js'
 
 export async function readStream(body, receive) {
   const reader=body.pipeThrough(new TextDecoderStream()).getReader()
@@ -21,7 +21,6 @@ export async function readStream(body, receive) {
   } finally {reader.releaseLock()}
 }
 const names={user_message:'用户',assistant_message:'助手',tool_call:'工具调用',tool_result:'工具结果',session_start:'会话开始',session_end:'会话结束',gap:'采集缺口',compact:'上下文摘要'}
-const agentName = agent => agent === 'claude-code' ? 'Claude Code' : agent || '未知 Agent'
 function contentText(value) {
   if (typeof value === 'string') return value
   if (Array.isArray(value)) return value.map(contentText).filter(Boolean).join('\n')
@@ -32,13 +31,13 @@ function contentText(value) {
 export function eventText(e) {
   const p=e.payload || {}
   switch(e.kind) {
-    case 'session_start': return `${[agentName(p.agent),p.agent_version].filter(Boolean).join(' ')} · 模型 ${p.model || '未知'} · 开始于 ${formatDateTime(e.at)}`
+    case 'session_start': return `${[agentLabel(p.agent),p.agent_version].filter(Boolean).join(' ')} · 模型 ${p.model || '未知'} · 开始于 ${formatDateTime(e.at)}`
     case 'user_message': case 'assistant_message': return contentText(p.content) || '无可展示的正文'
     case 'tool_call': return p.tool || '未命名工具'
     case 'tool_result': return (contentText(p.output) || '无可展示的输出') + (p.truncated ? '\n（结果已截断）' : '')
-    case 'compact': return contentText(p.summary) || '无摘要'
+    case 'compact': return p.summary == null ? '上下文已压缩' : (contentText(p.summary) || '上下文已压缩')
     case 'session_end': return p.reason || '会话已结束'
-    case 'gap': return `${p.reason || '内容缺失'} · 偏移 ${p.offset ?? '未知'}`
+    case 'gap': return `采集缺口：${p.reason || '原因未知'}`
     default: return '不支持展示此事件'
   }
 }
@@ -70,17 +69,27 @@ export async function observePage(host,api,session,signal) {
   const live=el('span','muted')
   status.append(live)
   const openPerson=detailPanel(peopleHost,()=>people)
-  const people=createLedger(peopleHost,{title:'监察人员',rowKey:'user_id',columns:[{key:'name',title:'人员',render:p=>compactCell(p.name+' · '+formatDateTime(p.last_active_at),`${p.session_count} 个会话 · 本月 ${monthCost(p)}`)},{key:'session_count',title:'会话数'},
-    {key:'month_cost_milli',title:'本月费用',render:monthCost},{key:'last_active_at',title:'最近活动',render:p=>formatDateTime(p.last_active_at)}],
+  function quotaCell(p) {
+    if (p.quota_milli===undefined || p.month_used_milli===undefined) return null
+    const level=quotaUsageLevel(p.month_used_milli,p.quota_milli)
+    if (level!=='error') return null
+    return el('span','status error',formatQuotaUsage(p.month_used_milli,p.quota_milli)+' · 已达配额')
+  }
+  const people=createLedger(peopleHost,{title:'监察人员',rowKey:'user_id',columns:[{key:'name',title:'人员',render:p=>compactCell(p.name+' · '+formatDateTime(p.last_active_at),`${p.session_count} 个会话 · 本月 ${monthCost(p)}`)},
+    {key:'last_agent',title:'Agent',render:p=>p.last_agent ? agentLabel(p.last_agent) : '—'},{key:'session_count',title:'会话数'},
+    {key:'month_cost_milli',title:'本月费用',render:monthCost},{key:'quota',title:'配额',render:p=>quotaCell(p) || '—'},
+    {key:'last_active_at',title:'最近活动',render:p=>formatDateTime(p.last_active_at)}],
     fetchPage:({q,cursor,limit})=>{if(first&&!q&&!cursor){const data=first;first=null;return data}return api.get('/observe/people',{params:{q,cursor,limit},signal})},
     onOpen:p=>openPerson(p.name,pane=>{
       pane.body.classList.add('child-ledger'); reading=null
       let list
       const open=detailPanel(pane.body,()=>list)
-      sessions={host:pane.body,list:list=createLedger(pane.body,{title:'会话',rowKey:'id',openAction:'read_content',noOpenText:'无正文查看权限，可请户主开放',columns:[{key:'agent',title:'会话',render:s=>compactCell(agentName(s.agent)+' · '+formatDateTime(s.started_at),`${turns(s)} · ${formatMilli(s.cost_milli)} 橡皮`)},{key:'model',title:'模型'},
-        {key:'started_at',title:'开始时间 ↓',render:s=>formatDateTime(s.started_at)},{key:'turn_count',title:'轮数',render:turns},{key:'input_tokens',title:'输入 token'},{key:'output_tokens',title:'输出 token'},{key:'cost_milli',title:'橡皮',render:s=>formatMilli(s.cost_milli)}],
-        fetchPage:async ({q,cursor,limit,signal:listSignal})=>{
-          const data=await api.get('/observe/sessions',{params:{user_id:p.user_id,q,cursor,limit},signal:listSignal})
+      sessions={host:pane.body,list:list=createLedger(pane.body,{title:'会话',rowKey:'id',openAction:'read_content',noOpenText:'无正文查看权限，可请户主开放',
+        filters:[{key:'agent',label:'Agent',options:[{value:'',label:'全部 Agent'},...AGENT_OPTIONS]}],
+        columns:[{key:'agent',title:'Agent',render:s=>agentLabel(s.agent)},{key:'started_at',title:'开始时间 ↓',render:s=>compactCell(formatDateTime(s.started_at),`${turns(s)} · ${formatMilli(s.cost_milli)} 橡皮`)},{key:'model',title:'模型'},
+        {key:'turn_count',title:'轮数',render:turns},{key:'input_tokens',title:'输入 token'},{key:'output_tokens',title:'输出 token'},{key:'cost_milli',title:'橡皮',render:s=>formatMilli(s.cost_milli)}],
+        fetchPage:async ({q,filters,cursor,limit,signal:listSignal})=>{
+          const data=await api.get('/observe/sessions',{params:{user_id:p.user_id,agent:filters.agent,q,cursor,limit},signal:listSignal})
           if (!listSignal.aborted && reading?.node.isConnected) {
             const row=data.items.find(s=>s.id===reading.id)
             if (row) reading.summary.textContent=usageText(row)

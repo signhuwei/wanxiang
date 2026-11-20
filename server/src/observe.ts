@@ -1,9 +1,10 @@
 import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
 import { ApiError, field, invalid } from './api';
+import { monthUsageByUser } from './billing';
 import { iso, monthBounds } from './credentials';
 import type { IngestSummary } from './ingest';
-import { int, pagination, tenantActor } from './management';
+import { enumField, int, pagination, tenantActor } from './management';
 import type { Store } from './store';
 import { visibility } from './visibility';
 
@@ -11,6 +12,7 @@ const groupFilter = `group_id IN (WITH RECURSIVE subtree(id) AS (VALUES (?) UNIO
   SELECT g.id FROM groups g JOIN subtree s ON g.parent_id = s.id) SELECT id FROM subtree)`;
 const encoder = new TextEncoder();
 const readable = ['read'];
+export const observedAgents = ['claude-code', 'codex', 'kimi-code'] as const;
 
 type Scope = { group: string | null; self: string | null };
 function permission(actor: ReturnType<typeof tenantActor>, body: boolean): Scope {
@@ -57,16 +59,23 @@ export function observationRoutes(app: Hono, store: Store, now: () => number) {
     const params = [...scope.params, ...(p.query ? [JSON.stringify(profiles.map(({ id }) => id))] : [])];
     const where = `WHERE 1 ${scope.sql} ${match}`;
     const { n } = db.get<{ n: number }>(`SELECT count(*) AS n FROM members m ${where}`, params)!;
-    const rows = db.all<{ user_id: string; revision: number; session_count: number; cost_milli: number; month_cost_milli: number; last_active_at: string | null }>(`
-      SELECT m.user_id, m.revision + coalesce((SELECT sum(s.revision) FROM agent_sessions s WHERE s.user_id = m.user_id), 0) AS revision,
+    const at = now();
+    const rows = db.all<{ user_id: string; revision: number; session_count: number; cost_milli: number; month_cost_milli: number;
+      last_active_at: string | null; last_agent: string | null; quota_milli: number | null }>(`
+      SELECT m.user_id, m.quota_milli,
+        m.revision + coalesce((SELECT sum(s.revision) FROM agent_sessions s WHERE s.user_id = m.user_id), 0) AS revision,
         (SELECT count(*) FROM agent_sessions s WHERE s.user_id = m.user_id) AS session_count,
+        (SELECT s.agent FROM agent_sessions s WHERE s.user_id = m.user_id
+          ORDER BY coalesce(s.last_event_at, s.started_at) DESC, s.id LIMIT 1) AS last_agent,
         (SELECT total(u.cost_milli) FROM usage u JOIN devices d ON d.id = u.device_id WHERE d.user_id = m.user_id) AS cost_milli,
         (SELECT total(u.cost_milli) FROM usage u JOIN devices d ON d.id = u.device_id WHERE d.user_id = m.user_id
           AND u.at >= ? AND u.at < ?) AS month_cost_milli,
         max(coalesce((SELECT max(coalesce(s.last_event_at, s.started_at)) FROM agent_sessions s WHERE s.user_id = m.user_id), ''),
           coalesce((SELECT max(u.at) FROM usage u JOIN devices d ON d.id = u.device_id WHERE d.user_id = m.user_id), '')) AS last_active_at
-      FROM members m ${where} ORDER BY last_active_at DESC, m.user_id LIMIT ? OFFSET ?`, [...monthBounds(now()), ...params, p.limit, p.offset]);
+      FROM members m ${where} ORDER BY last_active_at DESC, m.user_id LIMIT ? OFFSET ?`, [...monthBounds(at), ...params, p.limit, p.offset]);
+    const usage = monthUsageByUser(db, at);
     return c.json(p.page(rows.map((row) => ({ ...row, last_active_at: row.last_active_at || null,
+      month_used_milli: usage.get(row.user_id) ?? 0,
       name: store.system.get<{ name: string }>('SELECT name FROM platform_users WHERE id = ?', [row.user_id])?.name ?? row.user_id,
       actions: readable })), n));
   });
@@ -79,10 +88,12 @@ export function observationRoutes(app: Hono, store: Store, now: () => number) {
       `SELECT user_id FROM members WHERE ${groupFilter}`, [content.group]).map(({ user_id }) => user_id));
     const p = pagination(c);
     const id = c.req.query('user_id');
+    const rawAgent = c.req.query('agent');
+    const agent = rawAgent === undefined ? undefined : enumField(rawAgent, 'agent', observedAgents);
     const scope = scoped(permissionScope, 's.user_id');
     const where = `WHERE instr(lower(s.id || ' ' || s.agent || ' ' || coalesce(s.model, '')), lower(?)) > 0
-      ${scope.sql} ${id ? 'AND s.user_id = ?' : ''}`;
-    const params = [p.query, ...scope.params, ...(id ? [field(id, 'user_id')] : [])];
+      ${scope.sql} ${id ? 'AND s.user_id = ?' : ''} ${agent ? 'AND s.agent = ?' : ''}`;
+    const params = [p.query, ...scope.params, ...(id ? [field(id, 'user_id')] : []), ...(agent ? [agent] : [])];
     const { n } = db.get<{ n: number }>(`SELECT count(*) AS n FROM agent_sessions s ${where}`, params)!;
     const rows = db.all<{ user_id: string } & Record<string, unknown>>(`WITH page AS (SELECT s.id, s.device_id, s.user_id, s.agent, s.agent_version,
       s.model, s.started_at, s.ended_at, s.event_count, s.revision FROM agent_sessions s ${where}
