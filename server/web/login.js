@@ -31,6 +31,8 @@ export function renderLogin(host, { api, mockOn, setPendingToken, onSession }) {
   const fieldsBox = el('div')
   const hint = el('p', 'login-hint')
   const submitBtn = el('button', 'primary submit', '登录')
+  const download = el('a', 'login-download', '下载 OneX Desktop')
+  download.href = '/download'
 
   function setHint(text, isError) {
     hint.textContent = text || ''
@@ -218,7 +220,7 @@ export function renderLogin(host, { api, mockOn, setPendingToken, onSession }) {
     }
   })
 
-  panel.append(tabs, fieldsBox, hint, submitBtn)
+  panel.append(tabs, fieldsBox, hint, submitBtn, download)
   renderFields()
   targetInput.focus()
 }

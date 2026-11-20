@@ -129,6 +129,7 @@ try {
   await field('role').selectOption('admin')
   await button('生成').click()
   const adminInvite = await page.getByLabel('一次性邀请码').inputValue()
+  await page.locator('.account-menu summary').click()
   await button('退出').click()
   await button('邀请码登录').click()
   await page.getByPlaceholder('邮箱或手机号').fill(admin)

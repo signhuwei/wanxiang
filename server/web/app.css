@@ -58,15 +58,40 @@ small { font-size: 12px; }
   height: 48px; flex: none; border-bottom: 1px solid var(--line);
   display: flex; align-items: center; padding: 0 16px; gap: 20px; background: #fff;
 }
-.brand { font-size: 18px; font-weight: 650; letter-spacing: 1px; color: var(--blue); }
+.brand { font-size: 18px; font-weight: 650; letter-spacing: 1px; color: var(--blue); white-space: nowrap; }
 .brand small { font-size: 11px; color: var(--muted); font-weight: 400; margin-left: 6px; letter-spacing: 0; }
-.domains { display: flex; height: 100%; gap: 2px; }
+.domains { display: flex; height: 100%; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
 .domains a {
   height: 100%; display: flex; align-items: center; padding: 0 16px;
-  color: #42526a; border-bottom: 2px solid transparent;
+  color: #42526a; border-bottom: 2px solid transparent; white-space: nowrap;
 }
 .domains a.selected { border-color: var(--blue); color: var(--blue); font-weight: 600; }
-.top-tools { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+.top-tools { display: flex; align-items: center; gap: 10px; margin-left: auto; flex: none; }
+.top-tools .tenant-name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-menu { position: relative; }
+.account-menu summary {
+  display: flex; align-items: center; gap: 7px; list-style: none; cursor: pointer; color: var(--blue);
+  min-height: 30px; padding: 4px 8px; border-radius: 4px;
+}
+.account-menu summary::-webkit-details-marker { display: none; }
+.account-menu summary::after {
+  content: ''; width: 5px; height: 5px; border: solid currentColor; border-width: 0 1px 1px 0;
+  transform: translateY(-2px) rotate(45deg); flex: none;
+}
+.account-menu-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.account-name { max-width: min(27vw, 172px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-items {
+  position: absolute; right: 0; top: calc(100% + 5px); z-index: 10; min-width: 170px;
+  padding: 4px; border: 1px solid var(--line); border-radius: 4px; background: #fff;
+  box-shadow: 0 4px 12px rgba(34, 50, 74, .14);
+}
+.account-items a, .account-items .link { display: block; width: 100%; text-align: left; padding: 7px 9px; white-space: nowrap; }
+.account-items a:hover, .account-items .link:hover, .account-menu summary:hover { background: var(--soft); }
+@media (max-width: 640px) {
+  .top { padding: 0 10px; gap: 8px; }
+  .domains a { padding: 0 9px; }
+  .top-tools .tenant-name { display: none; }
+}
 .mock-badge {
   background: #fff6de; color: #8a5c05; padding: 2px 6px; border-radius: 3px;
   font-size: 11px; white-space: nowrap;
@@ -96,6 +121,8 @@ small { font-size: 12px; }
 .code-row { display: flex; gap: 8px; }
 .code-row input { flex: 1; min-width: 0; }
 .login-panel .submit { width: 100%; margin-top: 4px; }
+.login-download { display: block; width: fit-content; margin: 12px auto 0; }
+.login-download:hover { text-decoration: underline; }
 .login-hint { min-height: 18px; font-size: 12px; color: var(--muted); margin: 8px 0 2px; }
 .login-hint.error { color: #b42336; }
 .tenant-list { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }

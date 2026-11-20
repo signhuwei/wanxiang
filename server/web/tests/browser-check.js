@@ -66,6 +66,7 @@ try {
     await check('device')
     await page.getByRole('link', { name: '平台' }).click()
     await page.getByRole('heading', { name: 'Provider' }).waitFor()
+    await page.locator('.account-menu summary').click()
     await button('退出').click()
     await button('邀请码登录').click()
     await page.getByPlaceholder('邮箱或手机号').fill('demo@onex.dev')

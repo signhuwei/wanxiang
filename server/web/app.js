@@ -91,7 +91,14 @@ function renderTop(hash) {
       const tn = el('span', 'tenant-name muted', session.tenant.name)
       tools.appendChild(tn)
     }
-    if (session.user && session.user.name) tools.appendChild(el('span', null, session.user.name))
+    const account = el('details', 'account-menu')
+    const name = session.user?.name
+    const summary = el('summary')
+    if (name) summary.appendChild(el('span', 'account-menu-label', '个人菜单'))
+    summary.appendChild(el('span', 'account-name', name || '个人菜单'))
+    const items = el('div', 'account-items')
+    const download = el('a', null, '下载 OneX Desktop')
+    download.href = '/download'
     const logout = el('button', 'link', '退出')
     logout.addEventListener('click', async () => {
       const globalToken = session?.globalToken
@@ -108,7 +115,18 @@ function renderTop(hash) {
       sessionStore.clear()
       location.hash = '#/login'
     })
-    tools.appendChild(logout)
+    account.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && account.open) {
+        account.open = false
+        summary.focus()
+      }
+    })
+    account.addEventListener('focusout', e => {
+      if (!account.contains(e.relatedTarget)) account.open = false
+    })
+    items.append(download, logout)
+    account.append(summary, items)
+    tools.append(account)
     top.appendChild(tools)
   }
 
