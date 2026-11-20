@@ -24,14 +24,16 @@ export function formatQuotaUsage(usedMilli, quotaMilli) {
 }
 
 export const QUOTA_HINT = '每自然月重置，按 Asia/Shanghai；留空为不限'
-export const QUOTA_INVALID_MESSAGE = '橡皮配额必须是不小于 0 的整数'
+export const QUOTA_INVALID_MESSAGE = '橡皮配额必须是不小于 0 的数字，最多三位小数'
 
-// 配额表单输入是整数橡皮，换算成毫橡皮（契约字段 quota_milli）后再校验非负整数。
+// 配额表单输入是橡皮，最多三位小数；换算成毫橡皮（契约字段 quota_milli，非负整数）后再校验。
 export function parseQuotaEraserInput(value) {
   if (value === null || value === undefined || value === '') return { quotaMilli: null }
   const n = Number(value)
-  if (!Number.isInteger(n) || n < 0) return { error: QUOTA_INVALID_MESSAGE }
-  return { quotaMilli: n * 1000 }
+  if (!Number.isFinite(n) || n < 0) return { error: QUOTA_INVALID_MESSAGE }
+  const quotaMilli = Math.round(n * 1000)
+  if (!Number.isInteger(quotaMilli) || quotaMilli < 0) return { error: QUOTA_INVALID_MESSAGE }
+  return { quotaMilli }
 }
 
 export function formatDateTime(rfc3339) {

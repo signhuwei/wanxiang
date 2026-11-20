@@ -63,16 +63,18 @@ test('quotaUsageLevel flags near-limit and over-limit usage, unlimited is always
   expect(quotaUsageLevel(999999999, null)).toBe('ok')     // 不限
 })
 
-test('parseQuotaEraserInput accepts non-negative integers and null for 不限', () => {
+test('parseQuotaEraserInput accepts non-negative 橡皮 with up to 3 decimals and null for 不限', () => {
   expect(parseQuotaEraserInput(null)).toEqual({ quotaMilli: null })
   expect(parseQuotaEraserInput('')).toEqual({ quotaMilli: null })
   expect(parseQuotaEraserInput(0)).toEqual({ quotaMilli: 0 })
   expect(parseQuotaEraserInput('500')).toEqual({ quotaMilli: 500000 })
   expect(parseQuotaEraserInput(500)).toEqual({ quotaMilli: 500000 })
+  expect(parseQuotaEraserInput('123.456')).toEqual({ quotaMilli: 123456 })
+  expect(parseQuotaEraserInput(0.001)).toEqual({ quotaMilli: 1 })
 })
 
-test('parseQuotaEraserInput rejects negative numbers, fractions and non-numeric input', () => {
-  for (const bad of [-1, '-1', 0.5, '0.5', 'abc', NaN]) {
+test('parseQuotaEraserInput rejects negative numbers and non-numeric input', () => {
+  for (const bad of [-1, '-1', -0.001, 'abc', NaN]) {
     expect(parseQuotaEraserInput(bad)).toEqual({ error: QUOTA_INVALID_MESSAGE })
   }
 })

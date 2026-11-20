@@ -141,7 +141,7 @@ export function renderMembersPage(host, { api, actions = [] }) {
         { key: 'group_id', label: '分组', type: 'select', options: [] },
         mode === 'view'
           ? { key: 'quota_eraser', label: '橡皮配额', readonly: true, nullText: '不限' }
-          : { key: 'quota_eraser', label: '橡皮配额', type: 'number', step: 1, placeholder: '不限', hint: QUOTA_HINT },
+          : { key: 'quota_eraser', label: '橡皮配额', type: 'number', step: 0.001, placeholder: '不限', hint: QUOTA_HINT },
         { key: 'status', label: '状态', readonly: true, format: memberStatusLabel }
       ]
 

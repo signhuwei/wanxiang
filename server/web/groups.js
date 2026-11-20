@@ -10,7 +10,7 @@ const viewFields = [
 const editFields = [
   { key: 'name', label: '组名' },
   { key: 'parent_id', label: '上级组 ID' },
-  { key: 'quota_eraser', label: '橡皮配额', type: 'number', step: 1, placeholder: '不限', hint: QUOTA_HINT }
+  { key: 'quota_eraser', label: '橡皮配额', type: 'number', step: 0.001, placeholder: '不限', hint: QUOTA_HINT }
 ]
 
 function quotaUsageCell(item) {
