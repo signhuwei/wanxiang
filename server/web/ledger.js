@@ -21,6 +21,8 @@ export function createLedger(host, {
   noOpenText = '',
   onCreate,         // () => void；提供后工具栏出现“新建”
   createLabel = '新建',
+  createAction,
+  searchable = true,
   pageSize = 50,
   emptyText = '暂无数据'
 }) {
@@ -48,9 +50,10 @@ export function createLedger(host, {
     filterSelects[f.key] = sel
     toolbar.appendChild(sel)
   }
-  toolbar.appendChild(searchInput)
-  if (onCreate) {
-    const createBtn = el('button', 'primary keep', createLabel)
+  if (searchable) toolbar.appendChild(searchInput)
+  const createBtn = onCreate ? el('button', 'primary keep', createLabel) : null
+  if (createBtn) {
+    createBtn.hidden = Boolean(createAction)
     createBtn.addEventListener('click', () => onCreate())
     toolbar.appendChild(createBtn)
   }
@@ -185,12 +188,16 @@ export function createLedger(host, {
         signal: ctrl.signal
       })
       if (ctrl.signal.aborted) return
+      if (createBtn && createAction) {
+        createBtn.hidden = !(Array.isArray(data.actions) && data.actions.includes(createAction))
+      }
       items = data.items || []
       total = data.total ?? items.length
       pager.applyResult(data.next_cursor ?? null)
     } catch (e) {
       if (e && e.name === 'AbortError') return
       if (ctrl.signal.aborted) return
+      if (createBtn && createAction) createBtn.hidden = true
       items = []
       total = 0
       loadError = (e && e.message) || '加载失败'

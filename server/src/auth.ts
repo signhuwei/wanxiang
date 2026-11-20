@@ -3,7 +3,7 @@ import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
 import { ApiError, field, invalid, json, operation } from './api';
 import { platformCreateActions, tenantActions } from './actions';
-import { bearer, day, hash, hmac, iso, normalizedTarget } from './credentials';
+import { bearer, day, hash, hmac, iso, normalizedTarget, personalLoginTokenPattern, randomToken } from './credentials';
 import { ensureUser, findUser, type User } from './seed';
 import { indexDevice, indexMember, type Member, type Store, type Transaction } from './store';
 
@@ -11,7 +11,8 @@ const codeCooldown = 60_000;
 const codeTtl = 10 * 60_000;
 export const deviceTtl = 30 * day;
 type Kind = 'web' | 'desktop';
-type Session = { user_id: string; tenant_id: string | null; kind: Kind; expires_at: string };
+type Session = { user_id: string; tenant_id: string | null; kind: Kind; expires_at: string; login_token_id: string | null };
+type LoginTokenLink = { id: string; expires_at: string };
 type Tenant = { id: string; name: string; status: string; revision: number };
 
 function kind(value: unknown): Kind | undefined {
@@ -23,10 +24,12 @@ export function isTenantId(value: unknown): value is string {
   return typeof value === 'string' && /^ten_[0-9A-HJKMNP-TV-Z]{26}$/.test(value);
 }
 
-function insertSession(sql: Transaction, token: string, user: string, tenant: string | null, kind: Kind, now: number) {
+function insertSession(sql: Transaction, token: string, user: string, tenant: string | null, kind: Kind, now: number, loginToken?: LoginTokenLink) {
+  const expiresAt = iso(now + (kind === 'desktop' ? 7 * day : day));
+  const expiry = loginToken && loginToken.expires_at < expiresAt ? loginToken.expires_at : expiresAt;
   sql.run('DELETE FROM sessions WHERE expires_at <= ?', [iso(now)]);
-  sql.run('INSERT INTO sessions (token_hash, user_id, tenant_id, kind, expires_at) VALUES (?, ?, ?, ?, ?)',
-    [hash(token), user, tenant, kind, iso(now + (kind === 'desktop' ? 7 * day : day))]);
+  sql.run('INSERT INTO sessions (token_hash, user_id, tenant_id, kind, expires_at, login_token_id) VALUES (?, ?, ?, ?, ?, ?)',
+    [hash(token), user, tenant, kind, expiry, loginToken?.id ?? null]);
 }
 
 function tokenOf(c: Context) {
@@ -35,29 +38,44 @@ function tokenOf(c: Context) {
   return hash(raw);
 }
 
-export function readSession(store: Store, tokenHash: string, at: number) {
-  const s = store.system.get<Session>('SELECT * FROM sessions WHERE token_hash = ? AND expires_at > ?', [tokenHash, iso(at)]);
+function readSession(sql: Pick<Transaction, 'get'>, tokenHash: string, at: number) {
+  const s = sql.get<Session>('SELECT user_id, tenant_id, kind, expires_at, login_token_id FROM sessions WHERE token_hash = ? AND expires_at > ?', [tokenHash, iso(at)]);
   if (!s) throw new ApiError('unauthenticated');
   return s;
 }
 
-export function authenticate(store: Store, c: Context, at: number) { return readSession(store, tokenOf(c), at); }
+export function authenticate(store: Store, c: Context, at: number) { return readSession(store.system, tokenOf(c), at); }
 
 export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; now: () => number; deliverCode?: (target: string, code: string) => void }) {
   const { now, codeSecret } = opts;
   const pending = new Map<string, Promise<Response>>();
-  const tenant = (id: string) => store.system.get<Tenant>("SELECT id, name, status, revision FROM tenants WHERE id = ? AND status = 'active'", [id]);
+  const tenant = (id: string, sql: Pick<Transaction, 'get'> = store.system) =>
+    sql.get<Tenant>("SELECT id, name, status, revision FROM tenants WHERE id = ? AND status = 'active'", [id]);
   const user = (id: string) => store.system.get<User>('SELECT * FROM platform_users WHERE id = ?', [id]);
   const publicUser = (u: User) => ({ ...u, actions: ['read'] });
   const publicTenant = (t: Tenant, m: Member) => ({ ...t, role: m.role, actions: ['select'] });
   const otpHash = (target: string, code: string) => hmac(codeSecret, ['login-code', target, code]);
 
-  const session = (tokenHash: string, at: number) => readSession(store, tokenHash, at);
+  const session = (tokenHash: string, at: number) => readSession(store.system, tokenHash, at);
   async function requireMember(id: string, userId: string) {
     const t = tenant(id);
     const m = t ? await store.member(id, userId) : null;
     if (!t || m?.status !== 'active') throw new ApiError('forbidden');
     return { t, m };
+  }
+
+  function loginMemberships(sql: Pick<Transaction, 'get'>, userId: string, tenantIds: string[]) {
+    const memberships: ReturnType<typeof publicTenant>[] = [];
+    for (const id of tenantIds) {
+      const t = tenant(id, sql);
+      if (!t) continue;
+      const m = store.tenant(id).get<Member>("SELECT user_id, role, status FROM members WHERE user_id = ? AND status = 'active'", [userId]);
+      if (m) memberships.push(publicTenant(t, m));
+    }
+    if (memberships.length === 0 && !sql.get('SELECT 1 FROM platform_admins WHERE user_id = ?', [userId])) {
+      throw new ApiError('unauthenticated');
+    }
+    return memberships;
   }
 
   app.post('/v1/auth/code', async (c) => {
@@ -138,18 +156,10 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
         u = account;
       }
       if (!u) throw new ApiError('unauthenticated');
-      const memberships: ReturnType<typeof publicTenant>[] = [];
-      for (const id of await store.tenantIdsForUser(u.id)) {
-        const t = tenant(id);
-        const m = t ? await store.member(id, u.id) : null;
-        if (t && m?.status === 'active') memberships.push(publicTenant(t, m));
-      }
-      // An account created before a failed invite must not become an active login.
-      if (memberships.length === 0 && !store.system.get('SELECT 1 FROM platform_admins WHERE user_id = ?', [u.id])) {
-        throw new ApiError('unauthenticated');
-      }
       const account = u;
+      const tenantIds = await store.tenantIdsForUser(account.id);
       return store.system.write((sql) => {
+        const memberships = loginMemberships(sql, account.id, tenantIds);
         insertSession(sql, op.token, account.id, null, k, at);
         return op.complete(sql, { status: 200, credential: 'token', payload: { user: publicUser(account), tenants: memberships } }, codeTtl);
       });
@@ -168,6 +178,31 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
     finally { pending.delete(lock); }
   });
 
+  app.post('/v1/auth/token-login', async (c) => {
+    const body = await json(c);
+    if (typeof body.token !== 'string' || !personalLoginTokenPattern.test(body.token)) invalid('token');
+    if (body.kind !== undefined && body.kind !== 'web') invalid('kind');
+    const tokenHash = hash(body.token);
+    const activeToken = (sql: Pick<Transaction, 'get'>, at: number) =>
+      sql.get<LoginTokenLink & { user_id: string }>(`SELECT id, user_id, expires_at FROM personal_login_tokens
+        WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?`, [tokenHash, iso(at)]);
+    const personal = activeToken(store.system, now());
+    if (!personal) throw new ApiError('unauthenticated');
+    const tenantIds = await store.tenantIdsForUser(personal.user_id);
+    return store.system.write((sql) => {
+      const at = now();
+      const current = activeToken(sql, at);
+      if (!current || current.id !== personal.id || current.user_id !== personal.user_id) throw new ApiError('unauthenticated');
+      const account = sql.get<User>('SELECT * FROM platform_users WHERE id = ?', [current.user_id]);
+      if (!account) throw new ApiError('unauthenticated');
+      const memberships = loginMemberships(sql, account.id, tenantIds);
+      const token = randomToken();
+      insertSession(sql, token, account.id, null, 'web', at, current);
+      sql.run('UPDATE personal_login_tokens SET last_used_at = ? WHERE id = ?', [iso(at), current.id]);
+      return c.json({ token, user: publicUser(account), tenants: memberships });
+    });
+  });
+
   app.post('/v1/auth/select-tenant', async (c) => {
     const at = now();
     const token = tokenOf(c);
@@ -176,13 +211,18 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
     const id = body.tenant_id;
     if (!isTenantId(id)) invalid('tenant_id');
     const k = kind(body.kind) ?? s.kind;
+    if (s.login_token_id && k !== 'web') throw new ApiError('forbidden');
     await requireMember(id, s.user_id);
     const op = operation(c, codeSecret, at, token, [id, k]);
     return store.system.write((sql) => {
-      if (!sql.get('SELECT 1 FROM sessions WHERE token_hash = ? AND expires_at > ?', [token, iso(at)])) throw new ApiError('unauthenticated');
+      const checkedAt = now();
+      const current = readSession(sql, token, checkedAt);
+      const loginToken = current.login_token_id ? sql.get<LoginTokenLink>(`SELECT id, expires_at FROM personal_login_tokens
+        WHERE id = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > ?`, [current.login_token_id, current.user_id, iso(checkedAt)]) : null;
+      if (current.login_token_id && !loginToken) throw new ApiError('unauthenticated');
       const cached = op.read(sql);
       if (cached) return cached;
-      insertSession(sql, op.token, s.user_id, id, k, at);
+      insertSession(sql, op.token, current.user_id, id, k, checkedAt, loginToken ?? undefined);
       return op.complete(sql, { status: 200, credential: 'token' });
     });
   });
@@ -215,7 +255,7 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
     const at = now();
     const token = tokenOf(c);
     const s = session(token, at);
-    if (!s.tenant_id) throw new ApiError('forbidden');
+    if (!s.tenant_id || s.login_token_id) throw new ApiError('forbidden');
     const id = s.tenant_id;
     if (!tenant(id)) throw new ApiError('forbidden');
     const body = await json(c);

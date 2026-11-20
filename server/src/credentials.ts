@@ -5,6 +5,7 @@ export const iso = (ms: number) => new Date(ms).toISOString();
 export const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 export const hmac = (secret: string, value: unknown) => createHmac('sha256', secret).update(JSON.stringify(value)).digest('base64url');
 export const randomToken = () => randomBytes(32).toString('base64url');
+export const personalLoginTokenPattern = /^onex_login_[A-Za-z0-9_-]{43}$/;
 
 export function normalizedTarget(value: unknown) {
   if (typeof value !== 'string' || value.length > 254) return null;

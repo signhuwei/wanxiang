@@ -14,6 +14,7 @@ import { openapi } from './openapi';
 import { observationRoutes } from './observe';
 import type { ObjectStorage } from './object-storage';
 import { PendingWork } from './pending';
+import { personalLoginTokenRoutes } from './personal-login-tokens';
 import { platformRoutes } from './platform-management';
 import { tenantRoutes } from './tenant-management';
 import type { Presence } from './presence';
@@ -73,6 +74,7 @@ export async function createServer(opts: Options) {
     const config = configPublisher(store, now, opts.masterKey);
     const management = { ...opts, now, onConfigChange: (id?: string) => { void pending.track(config.changed(id)); } };
     authRoutes(app, store, management);
+    personalLoginTokenRoutes(app, store, management);
     tenantRoutes(app, store, management);
     platformRoutes(app, store, management);
     billingRoutes(app, store, management);

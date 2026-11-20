@@ -7,7 +7,7 @@ import { createServer } from '../src/server';
 import { seedTenant } from '../src/seed';
 import { seedMvp } from '../src/seed-mvp';
 import { MemoryPresence } from '../src/presence';
-import { hash } from '../src/credentials';
+import { day, hash, iso } from '../src/credentials';
 import { decryptProviderSecret } from '../src/provider-secret';
 import { diffieHellman, generateKeyPairSync, hkdfSync, createPublicKey } from 'node:crypto';
 import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
@@ -46,8 +46,8 @@ async function fixture(heartbeatMs = 15_000, testTime?: number) {
     expect(await response.json()).toEqual({});
     return codes.get(target)!;
   }
-  async function login(target = owner) {
-    const response = await request('/auth/login', { target, code: await code(target), kind: 'desktop' });
+  async function login(target = owner, kind: 'web' | 'desktop' = 'desktop') {
+    const response = await request('/auth/login', { target, code: await code(target), kind });
     expect(response.status).toBe(200);
     return (await response.json() as { token: string }).token;
   }
@@ -84,6 +84,9 @@ test('health, OpenAPI, one-use codes, tenant selection and logout', async () => 
   expect((await fetch(new URL('/tests/package.json', f.server.url))).status).toBe(404);
   expect(Object.keys(spec.paths)).toContain('/v1/auth/login');
   expect(Object.keys(spec.paths)).toContain('/v1/platform/providers');
+  expect(Object.keys(spec.paths)).toEqual(expect.arrayContaining([
+    '/v1/auth/token-login', '/v1/auth/personal-tokens', '/v1/auth/personal-tokens/{id}/revoke',
+  ]));
   const code = await f.code(f.owner);
   const body = { target: f.owner, code, kind: 'desktop' };
   const res = await f.request('/auth/login', body, undefined, 'one-login');
@@ -100,6 +103,160 @@ test('health, OpenAPI, one-use codes, tenant selection and logout', async () => 
   expect((await f.request('/auth/logout', {}, scoped, 'bye')).status).toBe(204);
   expect((await f.request('/auth/logout', {}, scoped, 'bye')).status).toBe(204);
   expect((await f.request('/me', undefined, scoped)).status).toBe(401);
+});
+
+const personalTokens = '/auth/personal-tokens';
+const tokenLogin = '/auth/token-login';
+type PersonalTokenReply = { id: string; token: string; name: string; created_at: string; expires_at: string;
+  last_used_at: string | null; revoked_at: string | null; revision: number; actions: string[] };
+
+test('personal tokens are account-owned, disclosed once, and can be managed by ordinary members', async () => {
+  const f = await fixture();
+  const global = await f.login(f.owner, 'web');
+  const owner = await f.select(global);
+  expect((await f.request(personalTokens)).status).toBe(401);
+  expect(await (await f.request(personalTokens, undefined, owner)).json()).toEqual({
+    items: [], total: 0, next_cursor: null, actions: ['create_personal_token'],
+  });
+  const body = { name: 'Browser lab' };
+  const issued = await f.request(personalTokens, body, owner, 'once');
+  expect(issued.status).toBe(201);
+  expect(issued.headers.get('cache-control')).toBe('no-store');
+  const { token, ...metadata } = await issued.json() as PersonalTokenReply;
+  expect(token).toMatch(/^onex_login_[A-Za-z0-9_-]{43}$/);
+  expect(Buffer.from(token.slice('onex_login_'.length), 'base64url')).toHaveLength(32);
+  expect(metadata).toEqual({ id: metadata.id, name: 'Browser lab', created_at: iso(f.now()), expires_at: iso(f.now() + 7 * day),
+    last_used_at: null, revoked_at: null, revision: 1, actions: ['read', 'revoke'] });
+  const replay = await f.request(personalTokens, body, global, 'once');
+  expect(replay.status).toBe(201);
+  expect(await replay.json()).toEqual(metadata);
+  expect((await f.request(personalTokens, { name: 'Different request' }, owner, 'once')).status).toBe(409);
+  expect(JSON.stringify(f.store.system.all('SELECT * FROM personal_login_tokens'))).not.toContain(token);
+  expect(JSON.stringify(f.store.system.all('SELECT * FROM idempotency'))).not.toContain(token);
+  expect(f.store.system.get('SELECT token_hash FROM personal_login_tokens')).toEqual({ token_hash: hash(token) });
+
+  const target = 'personal-member@example.test';
+  const joined = await f.request('/auth/login', { target, code: await f.code(target), invite_code: f.inviteCode });
+  expect(joined.status).toBe(200);
+  const account = await joined.json() as { token: string; user: { id: string } };
+  const member = await f.select(account.token);
+  expect((await f.request(`${personalTokens}/${metadata.id}/revoke`, { revision: 1 }, member)).status).toBe(404);
+  expect(await (await f.request(personalTokens, undefined, member)).json()).toMatchObject({ total: 0, items: [] });
+  const memberIssued = await f.request(personalTokens, { name: 'Member token' }, member);
+  expect(memberIssued.status).toBe(201);
+  const memberToken = (await memberIssued.json() as PersonalTokenReply).token;
+  expect(await (await f.request(tokenLogin, { token: memberToken })).json()).toMatchObject({
+    tenants: [{ id: f.tenantId, role: 'member' }],
+  });
+  expect(await (await f.request(`${personalTokens}?q=lab&limit=1`, undefined, global)).json()).toEqual({
+    items: [metadata], total: 1, next_cursor: null, actions: ['create_personal_token'],
+  });
+  const group = await f.request('/groups', { name: 'Test group' }, owner);
+  expect(group.status).toBe(201);
+  const { id: group_id } = await group.json() as { id: string };
+  for (const [role, revision] of [['admin', 1], ['group_admin', 2]] as const) {
+    expect((await f.request(`/members/${account.user.id}`, { role, revision, group_id }, owner)).status).toBe(200);
+    const roleIssue = await f.request(personalTokens, { name: `${role} token` }, member);
+    expect(roleIssue.status).toBe(201);
+    const { token } = await roleIssue.json() as PersonalTokenReply;
+    expect(await (await f.request(tokenLogin, { token })).json()).toMatchObject({ tenants: [{ id: f.tenantId, role }] });
+  }
+});
+
+test('token exchange is web-only and revokes all derived sessions at once', async () => {
+  const f = await fixture();
+  const otp = await f.login(f.owner, 'web');
+  const issued = await f.request(personalTokens, { name: 'Revocable' }, otp);
+  expect(issued.status).toBe(201);
+  const personal = await issued.json() as PersonalTokenReply;
+  expect((await f.request('/me', undefined, personal.token)).status).toBe(401);
+  expect((await f.request(tokenLogin, { token: personal.token, kind: 'desktop' })).status).toBe(422);
+  const loggedIn = await f.request(tokenLogin, { token: personal.token });
+  expect(loggedIn.status).toBe(200);
+  const result = await loggedIn.json() as { token: string; user: { id: string }; tenants: { id: string }[] };
+  expect(result).toMatchObject({ user: { id: f.userId }, tenants: [{ id: f.tenantId }] });
+  const global = result.token;
+  expect(global).not.toBe(personal.token);
+  const scoped = await f.select(global);
+  expect((await f.request('/auth/select-tenant', { tenant_id: f.tenantId, kind: 'desktop' }, global)).status).toBe(403);
+  expect((await f.request('/devices', f.device, scoped)).status).toBe(403);
+  expect((await f.request('/me', undefined, scoped)).status).toBe(200);
+  expect(f.store.system.all('SELECT kind, expires_at, login_token_id FROM sessions WHERE login_token_id = ?', [personal.id]))
+    .toEqual(Array.from({ length: 2 }, () => ({ kind: 'web', expires_at: iso(f.now() + day), login_token_id: personal.id })));
+  expect(await (await f.request(personalTokens, undefined, global)).json()).toMatchObject({
+    items: [{ id: personal.id, last_used_at: iso(f.now()), revision: 1 }],
+  });
+  const other = await f.request(personalTokens, { name: 'Second personal token' }, scoped);
+  expect(other.status).toBe(201);
+  const child = await other.json() as PersonalTokenReply;
+  expect((await f.request(`${personalTokens}/${personal.id}/revoke`, { revision: 2 }, otp)).status).toBe(409);
+  expect((await f.request(`${personalTokens}/${personal.id}/revoke`, { revision: personal.revision }, otp, 'revoke')).status).toBe(204);
+  expect((await f.request(`${personalTokens}/${personal.id}/revoke`, { revision: personal.revision }, otp, 'revoke')).status).toBe(204);
+  expect((await f.request(tokenLogin, { token: personal.token })).status).toBe(401);
+  for (const stale of [global, scoped]) expect((await f.request('/me', undefined, stale)).status).toBe(401);
+  expect((await f.request('/me', undefined, otp)).status).toBe(200);
+  expect((await f.request(tokenLogin, { token: child.token })).status).toBe(200);
+  expect(await (await f.request(`${personalTokens}?q=revocable`, undefined, otp)).json()).toMatchObject({
+    items: [{ id: personal.id, revision: 2, actions: ['read'], revoked_at: iso(f.now()) }],
+  });
+});
+
+test('personal tokens cap concurrent issuance and bound web session expiry to the original token', async () => {
+  const f = await fixture();
+  const session = await f.login(f.owner, 'web');
+  const issued = await Promise.all(Array.from({ length: 11 }, (_, i) => f.request(personalTokens, { name: `Browser ${i}` }, session)));
+  expect(issued.map(({ status }) => status).sort()).toEqual([...Array.from({ length: 10 }, () => 201), 409]);
+  const personal = await issued.find(({ status }) => status === 201)!.json() as PersonalTokenReply;
+  expect(await (await f.request(`${personalTokens}?limit=2`, undefined, session)).json()).toMatchObject({
+    items: [expect.any(Object), expect.any(Object)], total: 10, next_cursor: expect.any(String),
+  });
+  f.advance(7 * day - 60_000);
+  const exchange = await f.request(tokenLogin, { token: personal.token });
+  expect(exchange.status).toBe(200);
+  const { token: global } = await exchange.json() as { token: string };
+  const scoped = await f.select(global);
+  expect(f.store.system.all('SELECT expires_at FROM sessions WHERE login_token_id = ?', [personal.id]))
+    .toEqual([{ expires_at: personal.expires_at }, { expires_at: personal.expires_at }]);
+  f.advance(60_000);
+  expect((await f.request(tokenLogin, { token: personal.token })).status).toBe(401);
+  expect((await f.request('/me', undefined, global)).status).toBe(401);
+  expect((await f.request('/me', undefined, scoped)).status).toBe(401);
+  const desktop = await f.login();
+  expect((await f.request(personalTokens, { name: 'Desktop' }, desktop)).status).toBe(403);
+  f.advance(60_000);
+  expect((await f.request(personalTokens, { name: 'New after expiry' }, await f.login(f.owner, 'web'))).status).toBe(201);
+});
+
+test('token exchange requires active membership or platform privilege and rechecks revocation during login', async () => {
+  const f = await fixture();
+  const session = await f.login(f.owner, 'web');
+  const issue = await f.request(personalTokens, { name: 'Platform test' }, session);
+  expect(issue.status).toBe(201);
+  const personal = await issue.json() as PersonalTokenReply;
+  await f.store.system.write((sql) => sql.run("UPDATE tenants SET status = 'suspended' WHERE id = ?", [f.tenantId]));
+  expect((await f.request(tokenLogin, { token: personal.token })).status).toBe(401);
+  await f.store.system.write((sql) => sql.run('INSERT INTO platform_admins (user_id) VALUES (?)', [f.userId]));
+  const exchange = await f.request(tokenLogin, { token: personal.token });
+  expect(exchange.status).toBe(200);
+  const result = await exchange.json() as { token: string; tenants: unknown[] };
+  expect(result.tenants).toEqual([]);
+  expect((await f.request('/platform/tenants', undefined, result.token)).status).toBe(200);
+
+  const entered = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  const memberships = f.store.tenantIdsForUser.bind(f.store);
+  f.store.tenantIdsForUser = async (userId) => {
+    entered.resolve();
+    await resume.promise;
+    return memberships(userId);
+  };
+  const pending = f.request(tokenLogin, { token: personal.token });
+  try {
+    await Promise.race([entered.promise, pending.then(() => { throw new Error('Exchange did not check membership'); })]);
+    expect((await f.request(`${personalTokens}/${personal.id}/revoke`, { revision: 1 }, session)).status).toBe(204);
+  } finally { resume.resolve(); }
+  expect((await pending).status).toBe(401);
+  expect(f.store.system.get('SELECT token_hash FROM sessions WHERE login_token_id = ?', [personal.id])).toBeNull();
 });
 
 test('expired and over-attempted codes cannot log in; code issuance is rate-limited', async () => {

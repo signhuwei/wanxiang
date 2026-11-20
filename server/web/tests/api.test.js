@@ -103,3 +103,15 @@ test('non-JSON error body falls back to status text message', async () => {
   expect(err.code).toBe('internal')
   expect(err.message).toContain('503')
 })
+
+test('a rejected personal-token login stays on the selected login form', async () => {
+  let unauthorized = 0
+  const api = createApi({
+    onUnauthorized: () => { unauthorized++ },
+    fetchImpl: async () => new Response('{}', { status: 401 })
+  })
+  await expect(api.post('/auth/token-login', { token: 'fixture-only' })).rejects.toMatchObject({
+    status: 401, code: 'unauthenticated', message: '令牌无效、已过期或已撤销'
+  })
+  expect(unauthorized).toBe(0)
+})

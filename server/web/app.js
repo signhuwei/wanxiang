@@ -10,9 +10,10 @@ import { billingPage } from './billing.js'
 import { catalog } from './catalog.js'
 import { contractPage } from './contract.js'
 import { groupsPage } from './groups.js'
-import { renderLogin } from './login.js'
+import { bindTokenLoginTrigger, renderLogin } from './login.js'
 import { renderMembersPage } from './members.js'
 import { releasesPage } from './releases.js'
+import { personalTokensPage } from './personal-tokens.js'
 import { mockEnabled, installMock } from './mock/index.js'
 
 const mockOn = mockEnabled()
@@ -21,9 +22,10 @@ if (mockOn) installMock()
 const sessionStore = createSessionStore({ key: mockOn ? 'onex.session.mock' : 'onex.session' })
 let session = sessionStore.load()
 let pendingToken = null // 登录流程中、选租户之前的全局令牌
+let openLoginTokenForm
 
 const api = createApi({
-  getToken: () => (session && session.token) || pendingToken,
+  getToken: () => session?.token || pendingToken,
   onUnauthorized: () => {
     const hadSession = !!session
     session = null
@@ -52,8 +54,10 @@ function el(tag, className, text) {
 
 function renderTop(hash) {
   const top = el('div', 'top')
-  const brand = el('div', 'brand', 'OneX')
+  const loginPage = !session && hash === '#/login'
+  const brand = el(loginPage ? 'button' : 'div', loginPage ? 'brand token-login-trigger' : 'brand', 'OneX')
   brand.appendChild(el('small', null, '万象'))
+  if (loginPage) bindTokenLoginTrigger(brand, 'OneX 万象，令牌登录', () => openLoginTokenForm())
   top.appendChild(brand)
 
   if (session) {
@@ -99,6 +103,8 @@ function renderTop(hash) {
     const items = el('div', 'account-items')
     const download = el('a', null, '下载 OneX Desktop')
     download.href = '/download'
+    const tokens = el('a', null, '令牌管理')
+    tokens.href = '#/account/tokens'
     const logout = el('button', 'link', '退出')
     logout.addEventListener('click', async () => {
       const globalToken = session?.globalToken
@@ -124,7 +130,7 @@ function renderTop(hash) {
     account.addEventListener('focusout', e => {
       if (!account.contains(e.relatedTarget)) account.open = false
     })
-    items.append(download, logout)
+    items.append(download, tokens, logout)
     account.append(summary, items)
     tools.append(account)
     top.appendChild(tools)
@@ -146,13 +152,15 @@ function renderPlatformPlaceholder(ws) {
 
 function defaultHash() {
   if (!session) return '#/login'
-  return session.tenant ? '#/tenant/members' : '#/platform'
+  if (session.tenant) return '#/tenant/members'
+  return session.is_platform_admin ? '#/platform' : '#/account/tokens'
 }
 
 let lifecycle
 function route() {
   lifecycle?.abort()
   lifecycle = new AbortController()
+  openLoginTokenForm = null
   const hash = location.hash || '#/'
   app.textContent = ''
   renderTop(hash)
@@ -164,11 +172,15 @@ function route() {
       location.replace(defaultHash())
       return
     }
-    renderLogin(ws, {
+    const signal = lifecycle.signal
+    pendingToken = null
+    openLoginTokenForm = renderLogin(ws, {
       api,
       mockOn,
+      signal,
       setPendingToken: t => { pendingToken = t },
       onSession: s => {
+        if (signal.aborted) return
         session = s
         pendingToken = null
         sessionStore.save(s)
@@ -180,6 +192,11 @@ function route() {
 
   if (!session) {
     location.replace('#/login')
+    return
+  }
+
+  if (hash === '#/account/tokens') {
+    personalTokensPage(ws, api, lifecycle.signal)
     return
   }
 

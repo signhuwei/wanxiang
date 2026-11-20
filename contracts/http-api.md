@@ -23,6 +23,17 @@
 | GET | `/me` | `{user, tenant, role, agents, is_platform_admin, actions}`；未选租户时 `tenant`、`role` 为 null |
 | POST | `/devices` | `{name, os, arch, public_key}`，201，返回 `{device_id, device_token}` |
 
+### 网页个人登录令牌
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/auth/personal-tokens` | 已登录账号自己的令牌台账，使用通用分页，不返回令牌明文。 |
+| POST | `/auth/personal-tokens` | 自己的网页会话创建 `{name}`，201，首次响应附 `token`。同一幂等请求重放仅返回记录。 |
+| POST | `/auth/personal-tokens/:id/revoke` | `{revision}`，撤销自己的令牌，204。同时结束由该令牌签发的全局和租户网页会话。 |
+| POST | `/auth/token-login` | `{token}`，200，与验证码登录相同的 `{token,user,tenants}`。输入为个人登录令牌，输出为普通网页会话。 |
+
+台账记录返回 `id`、`name`、`created_at`、`expires_at`、`last_used_at`、`revoked_at`、`revision` 和 `actions`。网页会话的列表动作含 `create_personal_token`，有效记录含 `revoke`。服务器只存登录令牌的哈希。同一账号最多同时有 10 个有效令牌，每个最长有效 7 天。实体权限以登录时当前账号及租户为准，由令牌签发的会话不能换成 Desktop 会话或注册设备，且不会超过令牌原有效期。
+
 ## 写入与角色（v0.3）
 
 - 新建用 `POST /<资源>`；更新用 `POST /<资源>/:id`（`PATCH` 同义），请求体带 `revision`。

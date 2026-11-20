@@ -1,4 +1,4 @@
-// 登录页：验证码登录、邀请码登录、租户选择。
+// 登录页：验证码登录、邀请码登录、个人令牌登录与租户选择。
 // 契约 v0.1：验证码必需，邀请码只用于加入租户；登录返回全局令牌，/me 的 tenant 为 null 时进入租户选择。
 
 function el(tag, className, text) {
@@ -10,18 +10,32 @@ function el(tag, className, text) {
 
 const ROLE_TEXT = { owner: '户主', admin: '管理员', group_admin: '组管', member: '成员' }
 
-export function renderLogin(host, { api, mockOn, setPendingToken, onSession }) {
+export function bindTokenLoginTrigger(button, label, open) {
+  button.type = 'button'
+  button.setAttribute('aria-label', label)
+  button.addEventListener('dblclick', open)
+  button.addEventListener('click', e => {
+    if (e.detail === 0) open()
+  })
+}
+
+export function renderLogin(host, { api, mockOn, signal, setPendingToken, onSession }) {
   const wrap = el('div', 'login-wrap')
   const panel = el('div', 'login-panel')
   wrap.appendChild(panel)
   host.appendChild(wrap)
 
-  panel.appendChild(el('h1', null, '万象 OneX'))
-  const sub = el('p', 'sub', '企业 AI Agent 纳管与统一管控平台')
+  const heading = el('h1')
+  const title = el('button', 'token-login-trigger', '万象 OneX')
+  bindTokenLoginTrigger(title, '万象 OneX，令牌登录', () => switchTab('token'))
+  heading.appendChild(title)
+  panel.appendChild(heading)
+  const defaultHint = '企业 AI Agent 纳管与统一管控平台'
+  const sub = el('p', 'sub', defaultHint)
   panel.appendChild(sub)
 
   let stage = 'form' // 'form' | 'tenants'
-  let tab = 'code' // 'code' | 'invite'
+  let tab = 'code' // 'code' | 'invite' | 'token'
 
   const tabs = el('div', 'login-tabs')
   const tabCode = el('button', 'selected', '验证码登录')
@@ -50,6 +64,16 @@ export function renderLogin(host, { api, mockOn, setPendingToken, onSession }) {
   targetInput.type = 'text'
   targetInput.placeholder = '邮箱或手机号'
   targetInput.autocomplete = 'username'
+
+  const tokenInput = el('input')
+  tokenInput.type = 'password'
+  tokenInput.placeholder = '登录令牌'
+  tokenInput.setAttribute('aria-label', '登录令牌')
+  tokenInput.autocomplete = 'off'
+  tokenInput.spellcheck = false
+  const clearToken = () => { tokenInput.value = '' }
+  window.addEventListener('pagehide', clearToken, { once: true, signal })
+  signal?.addEventListener('abort', clearToken, { once: true })
 
   const inviteInput = el('input')
   inviteInput.type = 'text'
@@ -80,6 +104,7 @@ export function renderLogin(host, { api, mockOn, setPendingToken, onSession }) {
       }
     }, 1000)
   }
+  signal?.addEventListener('abort', () => clearInterval(countdownTimer), { once: true })
 
   sendBtn.addEventListener('click', async () => {
     const target = targetInput.value.trim()
@@ -90,7 +115,7 @@ export function renderLogin(host, { api, mockOn, setPendingToken, onSession }) {
     }
     sendBtn.disabled = true
     try {
-      await api.post('/auth/code', { target })
+      await api.post('/auth/code', { target }, { signal })
       setHint(mockOn ? '验证码已发送（开发环境固定为 246810）' : '验证码已发送，请查收')
       startCountdown()
       codeInput.focus()
@@ -102,17 +127,25 @@ export function renderLogin(host, { api, mockOn, setPendingToken, onSession }) {
 
   function renderFields() {
     fieldsBox.textContent = ''
+    sub.textContent = tab === 'token' ? '使用个人令牌登录' : defaultHint
+    if (tab === 'token') {
+      fieldsBox.appendChild(field('登录令牌', tokenInput))
+      return
+    }
     fieldsBox.appendChild(field('账号', targetInput))
     if (tab === 'invite') fieldsBox.appendChild(field('邀请码', inviteInput))
     fieldsBox.appendChild(field('验证码', codeRow))
   }
 
   function switchTab(next) {
+    if (stage !== 'form' || submitBtn.disabled) return
+    if (next !== 'token') clearToken()
     tab = next
     tabCode.classList.toggle('selected', tab === 'code')
     tabInvite.classList.toggle('selected', tab === 'invite')
     setHint('')
     renderFields()
+    if (tab === 'token') tokenInput.focus()
   }
   tabCode.addEventListener('click', () => switchTab('code'))
   tabInvite.addEventListener('click', () => switchTab('invite'))
@@ -121,15 +154,15 @@ export function renderLogin(host, { api, mockOn, setPendingToken, onSession }) {
   let globalMe
   let globalToken
   async function finishWithTenant(tenantEntry) {
-    const res = await api.post('/auth/select-tenant', { tenant_id: tenantEntry.id })
+    const res = await api.post('/auth/select-tenant', { tenant_id: tenantEntry.id }, { signal })
     setPendingToken(res.token)
-    const me = await api.get('/me')
+    const me = await api.get('/me', { signal })
     return { ...me, token: res.token, globalToken, globalActions: globalMe.actions || [], is_platform_admin: globalMe.is_platform_admin === true }
   }
 
   async function afterLogin(loginRes) {
     setPendingToken(loginRes.token)
-    const me = globalMe = await api.get('/me')
+    const me = globalMe = await api.get('/me', { signal })
     globalToken = loginRes.token
     if (me.tenant) {
       // 令牌已带租户（例如刚用邀请码加入）
@@ -177,30 +210,43 @@ export function renderLogin(host, { api, mockOn, setPendingToken, onSession }) {
   }
 
   async function submit() {
-    const target = targetInput.value.trim()
-    const code = codeInput.value.trim()
-    if (!target) {
-      setHint('请输入邮箱或手机号', true)
-      return
-    }
-    if (!code) {
-      setHint('请输入验证码', true)
-      return
-    }
-    const body = { target, code }
-    if (tab === 'invite') {
-      const invite = inviteInput.value.trim()
-      if (!invite) {
-        setHint('请输入邀请码', true)
+    if (submitBtn.disabled) return
+    const useToken = tab === 'token'
+    let body
+    if (useToken) {
+      const token = tokenInput.value.trim()
+      if (!token) {
+        setHint('请输入登录令牌', true)
         return
       }
-      body.invite_code = invite
+      body = { token }
+    } else {
+      const target = targetInput.value.trim()
+      const code = codeInput.value.trim()
+      if (!target) {
+        setHint('请输入邮箱或手机号', true)
+        return
+      }
+      if (!code) {
+        setHint('请输入验证码', true)
+        return
+      }
+      body = { target, code }
+      if (tab === 'invite') {
+        const invite = inviteInput.value.trim()
+        if (!invite) {
+          setHint('请输入邀请码', true)
+          return
+        }
+        body.invite_code = invite
+      }
     }
     submitBtn.disabled = true
     submitBtn.textContent = '登录中…'
     setHint('')
     try {
-      const loginRes = await api.post('/auth/login', body)
+      const loginRes = await api.post(useToken ? '/auth/token-login' : '/auth/login', body, { signal })
+      if (useToken) clearToken()
       const session = await afterLogin(loginRes)
       if (session) onSession(session)
     } catch (e) {
@@ -223,4 +269,5 @@ export function renderLogin(host, { api, mockOn, setPendingToken, onSession }) {
   panel.append(tabs, fieldsBox, hint, submitBtn, download)
   renderFields()
   targetInput.focus()
+  return () => switchTab('token')
 }

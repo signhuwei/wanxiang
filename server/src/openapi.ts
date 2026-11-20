@@ -1,4 +1,5 @@
 import pkg from '../package.json';
+import { personalLoginTokenPattern } from './credentials';
 
 const text = { type: 'string' };
 const nullableText = { type: ['string', 'null'] };
@@ -7,9 +8,11 @@ const actions = { type: 'array', items: text };
 const kind = { type: 'string', enum: ['web', 'desktop'] };
 const role = { type: 'string', enum: ['owner', 'admin', 'group_admin', 'member'] };
 const token = { type: 'string', pattern: '^[A-Za-z0-9_-]{43}$' };
+const personalToken = { type: 'string', pattern: personalLoginTokenPattern.source };
 const tenantId = { type: 'string', pattern: '^ten_[0-9A-HJKMNP-TV-Z]{26}$' };
 const ref = (name: string) => ({ $ref: `#/components/schemas/${name}` });
 const object = (properties: Record<string, unknown>, required = Object.keys(properties)) => ({ type: 'object', properties, required });
+const loginResponse = object({ token, user: ref('User'), tenants: { type: 'array', items: ref('Tenant') } });
 const response = (description: string, schema?: object) => ({ description, ...(schema && { content: { 'application/json': { schema } } }) });
 const error = (description: string) => response(description, ref('Error'));
 const status = { 401: error('凭据无效或已过期'), 403: error('无权限或租户已满'), 409: error('版本不一致或幂等键已用于不同请求'), 422: error('参数无效'), 500: error('内部错误') };
@@ -23,6 +26,11 @@ const listParams = [
 ];
 const idPath = { name: 'id', in: 'path', required: true, schema: text };
 const managed = (properties: Record<string, unknown>) => object({ ...properties, revision, actions });
+const tokenName = { ...text, minLength: 1, maxLength: 128 };
+const timestamp = { ...text, format: 'date-time' };
+const nullableTimestamp = { ...nullableText, format: 'date-time' };
+const personalTokenRecord = managed({ id: text, name: tokenName, created_at: timestamp, expires_at: timestamp,
+  last_used_at: nullableTimestamp, revoked_at: nullableTimestamp });
 const listOf = (schema: object, parameters: object[] = []) => ({ security: bearer, parameters: [...listParams, ...parameters], responses: { 200: response('分页结果',
   object({ items: { type: 'array', items: schema }, total: sequence, next_cursor: nullableText, actions })), 401: status[401], 403: status[403], 422: status[422] } });
 const detailOf = (schema: object, hasId = true) => ({ security: bearer, ...(hasId && { parameters: [idPath] }),
@@ -90,8 +98,22 @@ export const openapi = {
       responses: { 202: response('已受理', object({})), 403: error('未启用验证码发送'), 409: status[409], 422: status[422], 429: error('发送过快'), 500: status[500] } } },
     '/v1/auth/login': { post: { summary: '使用验证码登录，可同时接受邀请', parameters: headers,
       requestBody: requestBody(object({ target: text, code: { type: 'string', pattern: '^[0-9]{6}$' }, invite_code: text, kind: { ...kind, default: 'web' } }, ['target', 'code'])),
-      responses: { 200: response('全局令牌', object({ token, user: ref('User'), tenants: { type: 'array', items: ref('Tenant') } })),
+      responses: { 200: response('全局令牌', loginResponse),
         404: error('邀请码无效或已用完'), 429: error('验证码暂时锁定'), ...status } } },
+    '/v1/auth/token-login': { post: { summary: '使用个人登录令牌换取 Web 会话',
+      requestBody: requestBody(object({ token: personalToken })),
+      responses: { 200: response('Web 全局会话令牌', loginResponse), 401: status[401], 422: status[422], 500: status[500] } } },
+    '/v1/auth/personal-tokens': {
+      get: { ...listOf(personalTokenRecord), summary: '当前账户的个人登录令牌台账' },
+      post: { ...write(object({ name: tokenName }), { ...personalTokenRecord,
+        properties: { ...personalTokenRecord.properties, token: personalToken } }, 'create'),
+        summary: '为当前账户创建个人登录令牌，需要 Web 会话',
+        description: '令牌有效期七天，每账户最多十枚有效令牌。明文只在首次创建时返回，幂等重放仅返回记录。' },
+    },
+    '/v1/auth/personal-tokens/{id}/revoke': { post: { summary: '撤销当前账户的个人登录令牌及其会话',
+      security: bearer, parameters: [idPath, ...headers], requestBody: requestBody(object({ revision })),
+      responses: { 204: response('已撤销'), 401: status[401], 404: error('令牌不存在或不属于当前账户'),
+        409: status[409], 422: status[422], 500: status[500] } } },
     '/v1/auth/select-tenant': { post: { summary: '签发租户范围令牌', security: bearer, parameters: headers,
       requestBody: requestBody(object({ tenant_id: tenantId, kind }, ['tenant_id'])), responses: { 200: response('租户令牌', object({ token })), ...status } } },
     '/v1/auth/logout': { post: { summary: '吊销当前会话令牌', security: bearer, parameters: headers,
