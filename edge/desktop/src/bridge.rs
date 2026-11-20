@@ -3,7 +3,7 @@
 //! 职责边界按 [desktop-ui/IPC.md](../../../desktop-ui/IPC.md)：这里持有登录 HTTP、设备注册、
 //! 偏好、daemon IPC 客户端，只向 WebView 返回裁剪后的安全快照。UI 本身没有任何网络或文件权限。
 //!
-//! **启动走系统终端，不是本进程 fork**：Claude Code 是 TUI，需要真实 PTY/控制台，Tauri 的 WebView
+//! **启动走系统终端，不是本进程 fork**：受管 Agent 需要真实 PTY/控制台，Tauri 的 WebView
 //! 进程没有终端可接管。两个平台分开实现（见 `spawn_managed_cli`）：macOS 按与 Codex 的裁决打开
 //! 系统 Terminal.app 运行一个固定、随包分发、不接受外部参数的 `.command`；Windows 不经中间脚本，
 //! 直接用 `CREATE_NEW_CONSOLE` 起装在 Desktop 同目录的 `onex.exe` sidecar。两条路径都复用现有 CLI
@@ -141,7 +141,39 @@ struct Inner {
     pending: Option<PendingLogin>,
     hide_on_close: bool,
     send_code_target: Option<String>,
-    launching: Option<Instant>,
+    launching: Option<(&'static str, Instant)>,
+}
+
+struct AgentLauncher {
+    id: &'static str,
+    name: &'static str,
+    #[cfg(target_os = "macos")]
+    script: &'static str,
+}
+
+const AGENT_LAUNCHERS: &[AgentLauncher] = &[
+    AgentLauncher {
+        id: "claude-code",
+        name: "Claude Code",
+        #[cfg(target_os = "macos")]
+        script: "onex-run-claude.command",
+    },
+    AgentLauncher {
+        id: "codex",
+        name: "Codex",
+        #[cfg(target_os = "macos")]
+        script: "onex-run-codex.command",
+    },
+    AgentLauncher {
+        id: "kimi-code",
+        name: "Kimi Code",
+        #[cfg(target_os = "macos")]
+        script: "onex-run-kimi.command",
+    },
+];
+
+fn agent_launcher(id: &str) -> Option<&'static AgentLauncher> {
+    AGENT_LAUNCHERS.iter().find(|agent| agent.id == id)
 }
 
 #[derive(Default, Clone, PartialEq, Eq)]
@@ -354,49 +386,37 @@ impl Bridge {
 
     async fn launch(&self, agent_id: String) -> Reply {
         let status = self.ipc_call(&Request::Status).await.map_err(|_| unavailable())?;
-        let already_launching = {
+        let (launcher, already_launching) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.phase != Phase::Ready || !same_device(&status, &inner) {
                 return Err(forbidden());
             }
-            let already = inner.launching.is_some_and(|until| until > Instant::now());
-            if !already
-                && !self
+            let invalid_agent =
+                || ErrorBody { code: "agent_not_allowed".into(), message: "OneX 暂不支持启动该 Agent".into() };
+            let launcher = agent_launcher(&agent_id).ok_or_else(invalid_agent)?;
+            let already = inner.launching.is_some_and(|(_, until)| until > Instant::now());
+            if !already {
+                if !self
                     .ready_agents(Some(&status), &inner)
                     .iter()
-                    .any(|a| a.id == agent_id && a.actions.iter().any(|action| action == "launch"))
-            {
-                return Err(ErrorBody {
-                    code: "agent_not_allowed".into(),
-                    message: "OneX 暂不支持启动该 Agent".into(),
-                });
+                    .any(|agent| agent.id == launcher.id && agent.actions.iter().any(|action| action == "launch"))
+                {
+                    return Err(invalid_agent());
+                }
+                inner.launching = Some((launcher.id, Instant::now() + Duration::from_secs(5)));
             }
-            if !already {
-                inner.launching = Some(Instant::now() + Duration::from_secs(5));
-            }
-            already
+            (launcher, already)
         };
         // 重复点击不另启进程：直接返回当前快照
         if already_launching {
             return self.state().await;
         }
-        let result = self.launch_claude_code().await;
+        let result = spawn_managed_cli(launcher).await.map_err(|_| unavailable());
         if result.is_err() {
             self.inner.lock().unwrap().launching = None;
         }
         result?;
         self.state().await
-    }
-
-    /// 受管 CLI 需要真实 PTY（Claude Code 是 TUI），Tauri 的 WebView 进程没有终端可接管。两个平台
-    /// 分开实现，不共用一套"随包脚本"：macOS 按裁决打开系统 Terminal.app 运行一个固定、随包分发、
-    /// 不接受外部参数的 `.command`，脚本内部写死调用可信路径下的 `onex run claude-code`；Windows
-    /// 不经中间脚本，直接起装在 Desktop 同目录的 `onex.exe`（Tauri externalBin sidecar），同样固定
-    /// `run claude-code --managed` 两个参数，`CREATE_NEW_CONSOLE` 开一个新控制台窗口给它。两条路径
-    /// 都复用现有 CLI 的 `Launch`/`LaunchDone` 流程，这里不再重复实现一遍启动和回收子进程的逻辑，
-    /// 也不把 program/路径/环境经 IPC 从 WebView 传过来。
-    async fn launch_claude_code(&self) -> Result<(), ErrorBody> {
-        spawn_managed_cli().await.map_err(|_| unavailable())
     }
 
     async fn settings(&self, hide_on_close: bool) -> Reply {
@@ -456,30 +476,30 @@ impl Bridge {
     }
 
     fn ready_agents(&self, status: Option<&Value>, inner: &Inner) -> Vec<Agent> {
-        let starting = inner.launching.is_some_and(|until| until > Instant::now());
+        let starting = inner.launching.filter(|(_, until)| *until > Instant::now()).map(|(id, _)| id);
         status
             .filter(|s| same_device(s, inner))
             .and_then(|s| s["managed_agents"].as_array())
             .into_iter()
             .flatten()
             .filter_map(|a| {
-                let id = a["id"].as_str()?;
-                if id != "claude-code" {
-                    return None;
-                }
+                let launcher = agent_launcher(a["id"].as_str()?)?;
                 let version = a["version"].as_str()?.to_owned();
                 let status = match a["status"].as_str()? {
-                    "available" | "cached" if starting => "starting",
+                    "available" | "cached" if starting == Some(launcher.id) => "starting",
                     "available" | "cached" => "available",
                     "downloading" => "downloading",
                     "running" => "running",
                     _ => return None,
                 };
-                let actions =
-                    if matches!(status, "available" | "running") && !starting { vec!["launch".into()] } else { vec![] };
+                let actions = if matches!(status, "available" | "running") && starting.is_none() {
+                    vec!["launch".into()]
+                } else {
+                    vec![]
+                };
                 Some(Agent {
-                    id: id.into(),
-                    name: "Claude Code".into(),
+                    id: launcher.id.into(),
+                    name: launcher.name.into(),
                     version,
                     status: status.into(),
                     actions,
@@ -553,18 +573,18 @@ pub(crate) async fn ipc_call_with(socket_path: &std::path::Path, req: &Request) 
 /// resources at `<App>.app/Contents/Resources/`, one level up from the executable's own
 /// `Contents/MacOS/`.
 #[cfg(target_os = "macos")]
-fn launch_script_path() -> Option<PathBuf> {
+fn launch_script_path(launcher: &AgentLauncher) -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
-    let bundled = executable.parent()?.join("../Resources/onex-run-claude.command");
+    let bundled = executable.parent()?.join("../Resources").join(launcher.script);
     bundled.is_file().then_some(bundled)
 }
 
 /// macOS：打开一个新的 Terminal.app 窗口运行随包脚本，固定两个参数（目标 app 和脚本自身路径），
 /// 均来自本进程资源目录，不接受调用方输入。
 #[cfg(target_os = "macos")]
-async fn spawn_managed_cli() -> std::io::Result<()> {
-    let script = launch_script_path()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "onex-run-claude.command not found"))?;
+async fn spawn_managed_cli(launcher: &AgentLauncher) -> std::io::Result<()> {
+    let script = launch_script_path(launcher)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "OneX Agent terminal launcher not found"))?;
     let status = tokio::process::Command::new("/usr/bin/open")
         .args(["-a", "/System/Applications/Utilities/Terminal.app", "--"])
         .arg(&script)
@@ -578,11 +598,9 @@ async fn spawn_managed_cli() -> std::io::Result<()> {
 
 /// Windows：不经中间脚本，直接起装在 Desktop 同目录的 `onex.exe`（Tauri externalBin sidecar，
 /// 和 `ensure_onexd_running` 解析 `onexd.exe` 用同一种"同目录"约定，见 `lib.rs`）。固定两个参数
-/// `run claude-code --managed`，不接受调用方输入。`CREATE_NEW_CONSOLE` 让它在一个新控制台窗口里
-/// 运行——Claude Code 是 TUI，需要自己的控制台，不能继承 Desktop（没有控制台的 GUI 子系统进程）
-/// 不存在的控制台。
+/// `run <已知 Agent ID> --managed`，由固定的启动目录提供参数。`CREATE_NEW_CONSOLE` 给 Agent 自己的控制台。
 #[cfg(windows)]
-async fn spawn_managed_cli() -> std::io::Result<()> {
+async fn spawn_managed_cli(launcher: &AgentLauncher) -> std::io::Result<()> {
     const CREATE_NEW_CONSOLE: u32 = 0x00000010;
     let executable = std::env::current_exe()?;
     let onex = executable
@@ -593,7 +611,7 @@ async fn spawn_managed_cli() -> std::io::Result<()> {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "onex.exe sidecar not found"));
     }
     let mut child = tokio::process::Command::new(&onex)
-        .args(["run", "claude-code", "--managed"])
+        .args(["run", launcher.id, "--managed"])
         .creation_flags(CREATE_NEW_CONSOLE)
         .spawn()?;
     tokio::spawn(async move {
@@ -667,4 +685,37 @@ fn forbidden() -> ErrorBody {
 
 fn unavailable() -> ErrorBody {
     ErrorBody { code: "internal".into(), message: "本机服务暂不可用，请稍后重试".into() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_projects_only_supported_agents_from_the_current_device() {
+        let bridge = Bridge::new(PathBuf::new());
+        let mut inner = Inner { device_id: Some("dev_a".into()), ..Default::default() };
+        let mut status = json!({"logged_in": true, "ws": "connected", "device_id": "dev_a", "managed_agents": [
+            {"id": "claude-code", "version": "2.1.311", "status": "cached"},
+            {"id": "codex", "version": "0.164.0", "status": "available"},
+            {"id": "kimi-code", "version": "2.3.0", "status": "running"},
+            {"id": "../untrusted.command", "version": "1.0.0", "status": "available"}
+        ]});
+        let agents = bridge.ready_agents(Some(&status), &inner);
+        assert_eq!(
+            agents.iter().map(|agent| agent.name.as_str()).collect::<Vec<_>>(),
+            ["Claude Code", "Codex", "Kimi Code"]
+        );
+        assert!(agents.iter().all(|agent| agent.actions == ["launch"]));
+
+        inner.launching = Some(("codex", Instant::now() + Duration::from_secs(5)));
+        let agents = bridge.ready_agents(Some(&status), &inner);
+        assert_eq!(
+            agents.iter().map(|agent| agent.status.as_str()).collect::<Vec<_>>(),
+            ["available", "starting", "running"]
+        );
+
+        status["device_id"] = json!("dev_other");
+        assert!(bridge.ready_agents(Some(&status), &inner).is_empty());
+    }
 }

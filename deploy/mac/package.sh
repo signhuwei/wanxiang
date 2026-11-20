@@ -80,7 +80,9 @@ mkdir -p "$payload/Applications" "$launch_agents" "$stage/scripts"
 mkdir -p "$resources/onex/bin"
 install -m 0755 "$cli" "$resources/onex/bin/onex"
 install -m 0755 "$daemon" "$resources/onex/bin/onexd"
-install -m 0755 "$scripts/onex-run-claude.command" "$resources/onex-run-claude.command"
+for launcher in onex-run-claude.command onex-run-codex.command onex-run-kimi.command; do
+  install -m 0755 "$scripts/$launcher" "$resources/$launcher"
+done
 install -m 0755 "$scripts/postinstall" "$stage/scripts/postinstall"
 
 cat > "$launch_agents/$agent.plist" <<PLIST

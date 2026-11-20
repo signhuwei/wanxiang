@@ -12,7 +12,7 @@
 | `send_code` | `target` | 向配置好的 Server 请求验证码；限流错误原样分类 |
 | `login` | `target,code,invite_code?` | `kind:desktop`；邀请码仅用于入租。返回选租户快照，不返回令牌 |
 | `select_tenant` | `tenant_id` | 只能选择返回的稳定 ID。原生层换租户令牌并注册设备、连接 onexd |
-| `launch` | `agent_id` | 仅启动当前目录授权项；原生层再次验证身份、许可和版本，处理下载及校验，迅速返回进行中状态。重复点击不另启进程 |
+| `launch` | `agent_id` | 仅启动当前目录授权的 `claude-code`、`codex` 或 `kimi-code`。原生层验证设备与授权，将所选 Agent 交给随包 CLI，下载及校验由 onexd 完成。重复点击不另启进程 |
 | `settings` | `hide_on_close:boolean` | 设置关闭窗口时是否隐藏到托盘。只改此偏好；Server 地址在 S1 UI 中只读 |
 | `logout` | 无 | 作废会话，清设备关联和本地敏感态；不得被旧登录、同步、启动回调恢复 |
 

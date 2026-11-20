@@ -46,19 +46,37 @@ pub struct LaunchCtx {
     pub http: reqwest::Client,
     /// launch_id → 进行中的启动
     running: std::sync::Mutex<std::collections::HashMap<String, Running>>,
-    preparing: tokio::sync::Mutex<()>,
+    preparing: std::sync::Mutex<Option<String>>,
 }
 
 struct Running {
+    agent: String,
     stop: CancellationToken,
     code: Arc<std::sync::Mutex<Option<i32>>>,
     session_id: String,
     token: String,
 }
 
+struct Preparing<'a>(&'a std::sync::Mutex<Option<String>>);
+
+impl Drop for Preparing<'_> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().take();
+    }
+}
+
 impl LaunchCtx {
     pub fn new(home: PathBuf, http: reqwest::Client) -> Self {
         Self { home, http, running: Default::default(), preparing: Default::default() }
+    }
+
+    fn try_prepare(&self, agent: &str) -> Option<Preparing<'_>> {
+        let mut preparing = self.preparing.lock().unwrap();
+        if preparing.is_some() {
+            return None;
+        }
+        *preparing = Some(agent.to_owned());
+        Some(Preparing(&self.preparing))
     }
 }
 
@@ -269,7 +287,7 @@ async fn launch(
     }
     // 处于 cutoff 且没有租约时，启动 Agent 立即申请一次租约，不等下一个 60 秒窗口（v0.13）。
     ipc.state.lease.request_lease_now();
-    let Ok(_prepare) = ctx.preparing.try_lock() else {
+    let Some(_prepare) = ctx.try_prepare(agent) else {
         return err("conflict", "已有 Agent 正在启动");
     };
     let (os, arch) = (onex_core::ipc::os_name(), onex_core::ipc::arch_name());
@@ -377,6 +395,7 @@ async fn launch(
             ctx.running.lock().unwrap().insert(
                 l.launch_id.clone(),
                 Running {
+                    agent: agent.to_owned(),
                     stop: stop.clone(),
                     code: code.clone(),
                     session_id: l.session_id.clone(),
@@ -409,21 +428,21 @@ fn status(ipc: &Ipc) -> Status {
     let entry = |e: Option<(String, String, i64)>| {
         e.map(|(outcome, request_id, at)| json!({"outcome": outcome, "request_id": request_id, "at": format_ms(at)}))
     };
-    // 按 LAUNCHABLE_AGENTS 逐个查目录（S1 只有 claude-code 这一项，循环本身不改变现有行为）；
-    // `running`/`downloading` 仍是整个 daemon 级别的粗粒度状态，不是按 agent 区分，和此前一致。
     let managed_agents = ipc
         .launch
         .as_ref()
         .map(|ctx| {
             let releases = ipc.state.config.read().unwrap().agents.clone();
             let (os, arch) = (onex_core::ipc::os_name(), onex_core::ipc::arch_name());
+            let preparing = ctx.preparing.lock().unwrap().clone();
+            let running = ctx.running.lock().unwrap();
             LAUNCHABLE_AGENTS
                 .iter()
                 .filter_map(|&agent| {
                     let (version, is_cached) = crate::managed_runtime::cached(&ctx.home, &releases, agent, os, arch)?;
-                    let stage = if !ctx.running.lock().unwrap().is_empty() {
+                    let stage = if running.values().any(|launch| launch.agent == agent) {
                         "running"
-                    } else if ctx.preparing.try_lock().is_err() {
+                    } else if preparing.as_deref() == Some(agent) {
                         "downloading"
                     } else if is_cached {
                         "cached"
