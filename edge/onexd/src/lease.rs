@@ -517,13 +517,15 @@ impl Ledger {
     /// 处理 Server 的 `cutoff`：拒绝新请求，中断进行中的流。
     ///
     /// `settled_lease_id` 等于当前租约时（v0.13：续租已在本次操作中结清），在同一次落盘里
-    /// 删掉当前租约、累计用量和续租快照，只保留 cutoff 原因；之后 `lease_id()` 返回 None，
-    /// 恢复靠周期性 `lease_request`。
+    /// 删掉当前租约和续租快照，只保留 cutoff 原因；之后 `lease_id()` 返回 None，恢复靠周期性
+    /// `lease_request`。累计用量不清零，减去快照的 `used_milli`（和 `grant()` 收到新租约时的
+    /// `carried` 同一算法）：快照之后结束的请求、被 cutoff 中断后才释放的流，花费继续累加在
+    /// 这份"无租约用量"里，等拿到新租约时整体带入。
     ///
     /// 不带该字段（或不等于当前租约）时维持 v0.5 行为：租约、已用额度和续租快照都不动——
     /// cutoff 不能说明旧租约已结算（Server 停用设备时不看续租就回 cutoff），新租约（seq 更大）
-    /// 到来才说明已结算。等待中的续租在下次连上时再重放；没有等待中的续租时，等流都结束后
-    /// 发一次续租报最终用量。
+    /// 到来才说明已结算。等待中的续租在下次连上时再重放；没有等待中的续租、也没有用量要结清时，
+    /// 靠周期性 `lease_request` 恢复；有用量时等流都结束后发一次续租报最终用量。
     pub fn cutoff(&self, reason: &str, settled_lease_id: Option<&str>) -> Result<()> {
         let mut i = self.inner.lock().unwrap();
         // 先中断再落盘：落盘失败也不能让流继续花钱。
@@ -533,8 +535,9 @@ impl Ledger {
         let mut next = i.saved.clone();
         next.cutoff = Some(reason.to_string());
         if settles_current {
+            let settled = i.saved.renew.as_ref().map_or(0, |p| p.used_milli);
             next.lease = None;
-            next.used_milli = 0;
+            next.used_milli -= settled;
             next.renew = None;
             i.renew.sent_at = None;
             i.renew.wanted = false;
@@ -594,7 +597,7 @@ impl Ledger {
         self.changed.notify_one();
     }
 
-    /// 新连接建立：之前发出的续租可能没送到，允许立即重发；没有租约时也立即申请一次。
+    /// 新连接建立：之前发出的续租可能没送到，允许立即重发；处于 cutoff 且没有待结清用量时也立即申请一次。
     pub fn on_connected(&self) {
         let mut i = self.inner.lock().unwrap();
         i.renew.sent_at = None;
@@ -653,8 +656,9 @@ impl Ledger {
         self.renew_tx.subscribe()
     }
 
-    /// 没有租约且处于 cutoff 时返回要发的 `lease_request`，并记为已发送、重新抽样下一次间隔。
-    /// 有租约、或没有 cutoff（例如刚登录还没收到第一份租约前的瞬间）时不发。
+    /// 处于 cutoff、且没有待发或待回的续租时（无论是否还持有租约）返回要发的 `lease_request`，
+    /// 并记为已发送、重新抽样下一次间隔。没有 cutoff，或持有租约且 `used_milli > 0`
+    /// （续租会先把它结清，有了结果才轮到这里）时不发。
     pub fn take_lease_request(&self) -> Option<String> {
         let now = Instant::now();
         let mut i = self.inner.lock().unwrap();
@@ -672,7 +676,7 @@ impl Ledger {
     /// `onex run` 启动 Agent 时立即申请一次：清掉等待计时，让下一次 `take_lease_request` 不受上次间隔限制。
     pub fn request_lease_now(&self) {
         let mut i = self.inner.lock().unwrap();
-        if i.saved.lease.is_none() && i.saved.cutoff.is_some() {
+        if self.lease_request_due(&i, Instant::now()) {
             i.lease_req.sent_at = None;
             i.lease_req.next_wait = None;
             self.check_lease_request(&i, Instant::now());
@@ -683,12 +687,15 @@ impl Ledger {
         self.lease_request_tx.subscribe()
     }
 
-    fn lease_request_due(&self, i: &Inner) -> bool {
-        i.saved.lease.is_none() && i.saved.cutoff.is_some()
+    /// 处于 cutoff、且没有待发或待回的续租：没有续租快照在等回应，`renew_due` 也不会马上要发一次
+    /// （持有租约且 `used_milli > 0` 时 `renew_due` 为真，续租先把它结清，有了结果才轮到这里；
+    /// 没有租约——已被 `settled_lease_id` 的 cutoff 清掉——时 `renew_due` 天然为假，直接轮到这里）。
+    fn lease_request_due(&self, i: &Inner, now: Instant) -> bool {
+        i.saved.cutoff.is_some() && i.saved.renew.is_none() && !self.renew_due(i, now)
     }
 
     fn lease_request_ready(&self, i: &Inner, now: Instant) -> bool {
-        self.lease_request_due(i)
+        self.lease_request_due(i, now)
             && i.lease_req.sent_at.is_none_or(|at| now.duration_since(at) >= i.lease_req.next_wait.unwrap_or_default())
     }
 
@@ -1261,6 +1268,28 @@ mod tests {
         // 没有续租快照了，不再重放
         assert!(l.take_renew().is_none());
         assert_eq!(l.status()["lease_id"], Value::Null);
+    }
+
+    #[test]
+    fn settled_cutoff_keeps_usage_finished_after_the_snapshot() {
+        // 额度 100：花 80 触发续租（快照 80），回应之前又花了 30（续租回应之前进来的）；
+        // 收到带 settled_lease_id 的 cutoff 时不清零，减去快照后留下这 30；
+        // 之后靠 lease_request 拿到新租约时整体带入。
+        let l = ledger();
+        l.grant(&lease("l1", 1, 100, 600_000)).unwrap();
+        l.admit(0).unwrap().finish(80);
+        assert_eq!(l.take_renew().unwrap().used_milli, 80);
+        l.admit(0).unwrap().finish(30);
+        assert_eq!(l.snapshot().used_milli, 110);
+        l.cutoff("balance", Some("l1")).unwrap();
+        assert!(l.lease_id().is_none());
+        assert_eq!(l.snapshot().used_milli, 30);
+        // 没有待发或待回的续租（旧租约已经没了，没有续租快照在等回应，renew_due 也因为没有租约
+        // 而天然为假）：靠 lease_request 拿新租约，把这 30 整体带入。
+        assert!(l.take_lease_request().is_some());
+        l.grant(&lease("l2", 2, 100, 600_000)).unwrap();
+        assert_eq!(l.snapshot().used_milli, 30);
+        assert_eq!(l.lease_id().as_deref(), Some("l2"));
     }
 
     #[test]
