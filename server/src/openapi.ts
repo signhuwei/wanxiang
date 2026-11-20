@@ -1,6 +1,7 @@
 import pkg from '../package.json';
 import { personalLoginTokenPattern } from './credentials';
 import { observedAgents } from './observe';
+import { commitPattern, digestPattern, MAX_RELEASE_BYTES } from './release-package';
 
 const text = { type: 'string' };
 const nullableText = { type: ['string', 'null'] };
@@ -46,6 +47,18 @@ const models = { id: text, provider_id: text, upstream_name: text, route_model: 
 const providers = { id: text, name: text, protocol: { type: 'string', enum: ['anthropic', 'openai_chat', 'openai_responses'] }, base_url: text,
   status: text, auth: { enum: ['x_api_key', 'bearer', null] }, proxy: nullableText };
 const releases = { id: text, agent: text, version: text, os: text, arch: text, url: text, sha256: text, size: sequence, status: text };
+const commitId = { ...text, pattern: commitPattern.source };
+const releaseDigest = { ...text, pattern: digestPattern.source };
+const releaseSize = { type: 'integer', minimum: 1, maximum: MAX_RELEASE_BYTES };
+const commitPath = { name: 'commit', in: 'path', required: true, schema: commitId };
+const releaseManifest = object({ commit: commitId, sha256: releaseDigest, size: releaseSize,
+  signature: { ...text, pattern: '^[A-Za-z0-9_-]{86}$' } });
+const rollout = object({ id: text, commit: commitId, expected_commit: commitId, observed_commit: nullableText, actor_id: text,
+  status: { type: 'string', enum: ['queued', 'running', 'succeeded', 'failed'] },
+  error_code: nullableText, created_at: timestamp, started_at: nullableTimestamp, finished_at: nullableTimestamp });
+const optionalRollout = { anyOf: [rollout, { type: 'null' }] };
+const serverRelease = object({ id: commitId, commit: commitId, size: releaseSize, sha256: releaseDigest, created_at: timestamp,
+  uploaded_at: nullableTimestamp, active: { type: 'boolean' }, last_rollout: optionalRollout, actions });
 const desktopOs = { type: 'string', enum: ['darwin', 'windows'] };
 const desktopArch = { type: 'string', enum: ['arm64', 'x64'] };
 const desktopRelease = managed({ id: text, version: text, os: desktopOs, arch: desktopArch,
@@ -187,6 +200,21 @@ export const openapi = {
     ...platformPaths('/v1/platform/providers', providers, ['name', 'protocol', 'base_url', 'secret'], { secret: { ...text, writeOnly: true } }),
     ...platformPaths('/v1/platform/models', models, ['provider_id', 'upstream_name', 'display_name', 'context_window']),
     ...platformPaths('/v1/platform/agent-releases', releases, ['agent', 'version', 'os', 'arch', 'url', 'sha256', 'size']),
+    '/v1/platform/maintenance': { get: { ...detailOf(object({ active_commit: text, runner_ready: { type: 'boolean' },
+      active_rollout: optionalRollout, actions }), false), summary: '平台维护状态' } },
+    '/v1/platform/server-releases': { get: listOf(serverRelease), post: { summary: '登记签名的 Server 发布包',
+      security: bearer, requestBody: requestBody(releaseManifest), responses: { ...status, 200: response('既有发布', serverRelease),
+        201: response('已登记', serverRelease) } } },
+    '/v1/platform/server-releases/{commit}': { get: { ...detailOf(serverRelease, false), parameters: [commitPath] } },
+    '/v1/platform/server-releases/{commit}/artifact': { put: { summary: '上传签名清单对应的 tar.gz',
+      security: bearer, parameters: [commitPath],
+      requestBody: { required: true, content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
+      responses: { ...status, 200: response('大小与摘要通过校验', serverRelease), 404: error('对象不存在'), 413: error('文件超限') } } },
+    '/v1/platform/server-releases/{commit}/deploy': { post: { summary: '提交 Server 部署',
+      security: bearer, parameters: [commitPath, { ...headers[0], required: true }],
+      requestBody: requestBody(object({ expected_commit: commitId })), responses: { ...status, 202: response('持久化部署任务', rollout),
+        404: error('对象不存在') } } },
+    '/v1/platform/server-rollouts/{id}': { get: { ...detailOf(rollout), summary: '查询部署任务及实际生效版本' } },
     '/v1/platform/desktop-releases': { get: listOf(desktopRelease), post: { ...write(object({ version: text, os: desktopOs, arch: desktopArch }, ['version', 'os', 'arch']), desktopRelease, 'create'),
       description: '新建草稿；同一 os/arch/version 已存在时返回 409。' } },
     '/v1/platform/desktop-releases/{id}': { get: { ...detailOf(desktopRelease), description: '上传结果未知时用来重新确认当前修订与摘要。' } },

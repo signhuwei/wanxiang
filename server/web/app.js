@@ -14,6 +14,7 @@ import { groupsPage } from './groups.js'
 import { bindTokenLoginTrigger, renderLogin } from './login.js'
 import { renderMembersPage } from './members.js'
 import { releasesPage } from './releases.js'
+import { serverReleasesPage } from './server-releases.js'
 import { personalTokensPage } from './personal-tokens.js'
 import { formatMilli } from './format.js'
 import { mockEnabled, installMock } from './mock/index.js'
@@ -114,7 +115,7 @@ function renderTop(hash) {
       platformLink.classList.toggle('selected', hash.startsWith('#/platform'))
       domains.appendChild(platformLink)
       if (hash.startsWith('#/platform')) {
-        for (const [path, label] of [['catalog', 'Provider'], ['releases', '安装包发布']]) {
+        for (const [path, label] of [['catalog', 'Provider'], ['maintenance', '维护与发布'], ['releases', 'Edge 安装包']]) {
           const sel = hash === '#/platform/' + path || (path === 'catalog' && hash === '#/platform')
           const link = el('a', sel ? 'selected' : '', label)
           link.href = '#/platform/' + path
@@ -241,7 +242,8 @@ function route() {
       location.replace(defaultHash())
       return
     }
-    if (hash === '#/platform/releases') releasesPage(ws, platformApi, session.globalActions || [])
+    if (hash === '#/platform/maintenance') serverReleasesPage(ws, platformApi, lifecycle.signal)
+    else if (hash === '#/platform/releases') releasesPage(ws, platformApi, session.globalActions || [])
     else catalog(ws, platformApi, session.globalActions || [])
     return
   }

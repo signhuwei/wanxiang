@@ -29,6 +29,10 @@ case "$service" in
     ONEX_RUSTFS_SECRET_KEY=$(<"$home/secrets/rustfs.key")
     export ONEX_RUSTFS_ENDPOINT=http://127.0.0.1:$ONEX_RUSTFS_PORT ONEX_RUSTFS_ACCESS_KEY=onex-sidecar ONEX_RUSTFS_SECRET_KEY
     export ONEX_MASTER_KEY ONEX_AUTH_SECRET
+    unset ONEX_RELEASE_PUBLIC_KEY ONEX_RELEASE_HEARTBEAT
+    if [[ $(uname -s) == Linux && -f $home/secrets/server-release.pub ]]; then
+      export ONEX_RELEASE_PUBLIC_KEY=$home/secrets/server-release.pub ONEX_RELEASE_HEARTBEAT=$home/run/release-worker-heartbeat
+    fi
     cd "$release/server"
     exec "$bin/bun" --no-env-file src/index.ts;;
   *) exit 2;;

@@ -63,3 +63,22 @@ ONEX_ALLOW_LAN_DEV=1
 Only OneX Server binds the selected private address. Valkey and RustFS still listen on `127.0.0.1`. The startup warning appears in the Server log. Verification codes are written only to that log; never share access to it. Web and Edge can use `http://192.168.3.211:18700` directly. HTTP and WebSocket traffic are unencrypted in this setup: restrict access to the trusted MVP network or test Macs with the host firewall and do not expose the port outside the LAN.
 
 To disable LAN development, set `ONEX_HOST=127.0.0.1` and remove `ONEX_ALLOW_LAN_DEV` (or set it to `0`), then run `bash ~/apps/onex/current/deploy/onex.sh stop` followed by `bash ~/apps/onex/current/deploy/onex.sh start`.
+
+## 平台维护与发布
+
+平台管理员在「平台 → 维护与发布」上传已签名的 Server 清单和制品，查看部署状态。Edge 安装包也可以在该入口发布。接口以运行环境的 `/v1/openapi.json` 为准。
+
+初次启用时，部署运维在受信任的打包机器生成 Ed25519 密钥，给 OneX 主机的 `~/apps/onex/secrets/server-release.pub` 安装公钥。安装含维护页和执行器的版本后，OneX 启用 `onex-release-worker.timer`。私钥仅在授权打包环境使用。已有的 SSH 发布命令保留用于首次启用和故障恢复。
+
+Agent 在已提交且通过回归的源码目录运行：
+
+```sh
+ONEX_RELEASE_PRIVATE_KEY=/secure/onex-server-release.key bun deploy/release.ts pack-server /secure/output
+ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token bun deploy/release.ts publish-server https://onex.example /secure/output/COMMIT.json /secure/output/COMMIT.tar.gz
+ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token bun deploy/release.ts publish-edge https://onex.example darwin 1.2.3 /secure/output/OneX.pkg
+ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token bun deploy/release.ts rollout https://onex.example roll_ID
+```
+
+`publish-edge` 的 Windows 对应参数为 `windows VERSION installer.exe`。如已有全局管理会话，使用 `ONEX_RELEASE_TOKEN_FILE`。命令将凭据从文件读入，标准输出返回一条 JSON。Server 发布可通过 `ONEX_EXPECTED_COMMIT` 固定当前版本，`ONEX_RELEASE_REQUEST_ID` 固定幂等键。完成后根据返回的任务状态和 `observed_commit` 验证运行版本。失败任务保留，确认原因后用新幂等键发起重试。
+
+主机日志可按任务 ID 查 `journalctl -u onex-release-worker.service`。业务库备份在 OneX 的 `backups/`。如果候选迁移使上一版无法启动，按备份恢复流程评估恢复时间点。发布制品密钥与 macOS 签名公证独立。

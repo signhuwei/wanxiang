@@ -70,7 +70,7 @@ try {
   assert.equal(await link('下载 OneX Desktop').getAttribute('href'), '/download')
   await account.press('Escape')
   await link('平台').click()
-  await link('安装包发布').click()
+  await link('Edge 安装包').click()
   await page.getByRole('heading', { name: '安装包发布' }).waitFor()
 
   await button('新建发布').click()

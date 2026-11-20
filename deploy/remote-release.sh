@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
-home=$HOME/apps/onex
+home=${ONEX_HOME:-$HOME/apps/onex}
 releases=$home/releases
 current=$home/current
 mkdir -p "$home/run"
@@ -22,9 +22,32 @@ current_commit() {
   elif [[ -e $current ]]; then echo 'Current must be a symlink' >&2; return 1; fi
 }
 
+backup_databases() (
+  set -e
+  shopt -s nullglob
+  local data=$home/data/server output=$home/backups tmp file
+  local files=()
+  for file in "$data"/system.sqlite{,-wal,-shm} "$data"/tenant-*.sqlite "$data"/tenant-*.sqlite-{wal,shm}; do
+    if [[ -f $file && ! -L $file ]]; then files+=("${file##*/}"); fi
+  done
+  [[ ${#files[@]} -gt 0 ]] || return 0
+  mkdir -p "$output" || exit 1
+  tmp=$(mktemp "$output/.server-db.XXXXXXXX") || exit 1
+  trap 'rm -f -- "$tmp"' EXIT
+  tar -czf "$tmp" -C "$data" -- "${files[@]}" || exit 1
+  mv -- "$tmp" "$output/server-db-$(date -u +%Y%m%dT%H%M%S)-$1.tar.gz"
+)
+
 activate() {
   local revision=$1 previous=$2
-  if [[ -n $previous ]]; then ONEX_HOME=$home bash "$releases/$previous/deploy/onex.sh" stop; fi
+  if [[ -n $previous ]]; then
+    ONEX_HOME=$home bash "$releases/$previous/deploy/onex.sh" stop
+    if ! backup_databases "$previous"; then
+      echo 'Could not back up OneX databases; restarting current release' >&2
+      ONEX_HOME=$home bash "$releases/$previous/deploy/onex.sh" start
+      return 1
+    fi
+  fi
   link "releases/$revision"
   if ONEX_HOME=$home bash "$current/deploy/onex.sh" start && check_health "$revision"; then
     printf '%s\n' "$revision" > "$home/run/active-revision"
@@ -71,6 +94,9 @@ previous=$(current_commit)
 case ${1:-} in
   deploy)
     revision=$2 stage=$3
+    if [[ -n ${4:-} && $4 != "$previous" ]]; then
+      echo 'OneX active release changed before activation' >&2; exit 1
+    fi
     [[ $revision =~ ^[0-9a-f]{40}$ && $stage == "$releases/.incoming."* && -d $stage/server/node_modules ]] || exit 2
     if [[ -d $stage/runtime-assets ]]; then
       ONEX_HOME=$home ONEX_ASSET_CACHE=$stage/runtime-assets bash "$stage/deploy/install-deps.sh" --offline

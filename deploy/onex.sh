@@ -115,6 +115,36 @@ ready() {
   echo "$app failed its readiness check; inspect $home/logs" >&2; return 1
 }
 
+install_release_worker() {
+  [[ -f $home/secrets/server-release.pub ]] || return 0
+  local unit_dir=/etc/systemd/system
+  cat > "$unit_dir/onex-release-worker.service" <<EOF
+[Unit]
+Description=OneX Server rollout worker
+After=network.target
+
+[Service]
+Type=oneshot
+UMask=0077
+TimeoutStartSec=30min
+ExecStart=/bin/bash $home/current/deploy/server-release-worker.sh $home
+EOF
+  cat > "$unit_dir/onex-release-worker.timer" <<'EOF'
+[Unit]
+Description=OneX Server rollout queue
+
+[Timer]
+OnBootSec=5s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now onex-release-worker.timer
+}
+
 start_linux() {
   if [[ $(id -u) != 0 ]]; then echo 'Installing OneX system units requires root' >&2; return 1; fi
   local app unit tmp ordering
@@ -136,6 +166,7 @@ start_linux() {
   systemctl daemon-reload
   systemctl enable onex-valkey.service onex-rustfs.service onex-server.service
   for app in "${services[@]}"; do systemctl start "onex-$app.service"; ready "$app"; done
+  install_release_worker
 }
 
 case ${1:-} in

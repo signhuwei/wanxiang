@@ -2,7 +2,6 @@
 // 安装包原始字节不进对象存储（那是诊断日志专用，见 object-storage.ts），而是落在 dataDir 下的私有
 // 持久目录；上传完成并校验通过前，草稿的 size/sha256/artifact_path 都不改，失败或中断也不能让旧草稿
 // 的已验证状态松动（见下面 putArtifact 的临时文件 + 原子改名）。
-import { createHash } from 'node:crypto';
 import { mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -11,6 +10,7 @@ import { serveStatic } from 'hono/bun';
 import { ulid } from 'ulid';
 import { ApiError, field, invalid, json, operation } from './api';
 import { iso } from './credentials';
+import { receiveArtifact } from './artifact-upload';
 import { expectRevision, pagination, platformActor, type ManagementOptions } from './management';
 import type { Store, Transaction } from './store';
 
@@ -165,53 +165,17 @@ export function desktopReleaseRoutes(app: Hono, store: Store, opts: ManagementOp
       expectRevision(revision, row.revision);
       return row;
     });
-    const declared = c.req.header('content-length');
-    const limit = declared === undefined ? DESKTOP_ARTIFACT_MAX_BYTES : Number(declared);
-    if (!c.req.raw.body || !Number.isSafeInteger(limit) || limit <= 0) throw new ApiError('invalid', { fields: ['artifact'] });
-    if (limit > DESKTOP_ARTIFACT_MAX_BYTES) throw new ApiError('too_large', { max_bytes: DESKTOP_ARTIFACT_MAX_BYTES });
     const uploadPath = join(artifactDir(opts.dataDir), `${id}-${ulid()}`);
     const tempPath = `${uploadPath}.part`;
     const finalPath = `${uploadPath}.bin`;
-    const digest = createHash('sha256');
-    let size = 0;
-    let timedOut = false;
-    const file = await open(tempPath, 'wx', 0o600);
+    const { size, sha256 } = await receiveArtifact(c.req.raw, tempPath, DESKTOP_ARTIFACT_MAX_BYTES);
     try {
-      try {
-        const reader = c.req.raw.body.getReader();
-        const timer = setTimeout(() => { timedOut = true; void reader.cancel().catch(() => {}); }, 120_000);
-        try {
-          for (;;) {
-            const chunk = await reader.read();
-            if (timedOut) throw new ApiError('invalid', { fields: ['artifact'], reason: 'upload_timed_out' });
-            if (chunk.done) break;
-            size += chunk.value.byteLength;
-            if (size > DESKTOP_ARTIFACT_MAX_BYTES) throw new ApiError('too_large', { max_bytes: DESKTOP_ARTIFACT_MAX_BYTES });
-            digest.update(chunk.value);
-            let written = 0;
-            while (written < chunk.value.byteLength) {
-              const { bytesWritten } = await file.write(chunk.value, written, chunk.value.byteLength - written);
-              if (bytesWritten === 0) throw new Error('Desktop artifact write made no progress');
-              written += bytesWritten;
-            }
-          }
-        } finally {
-          clearTimeout(timer);
-          void reader.cancel().catch(() => {});
-        }
-        if (size === 0 || (declared !== undefined && size !== limit)) throw new ApiError('invalid', { fields: ['artifact'] });
-        await file.sync();
-      } finally {
-        await file.close();
-      }
-      // 校验只读文件头，完整制品最多 256 MiB。
       checkFormat(claimed.os, await readHeader(tempPath, Math.min(HEADER_PROBE_BYTES, size)), size);
       renameSync(tempPath, finalPath);
     } catch (error) {
       try { unlinkSync(tempPath); } catch {}
       throw error;
     }
-    const sha256 = digest.digest('hex');
     const result = await store.system.write((sql) => {
       requirePlatform(sql, actor);
       const row = sql.get<ReleaseRow>('SELECT * FROM desktop_releases WHERE id = ?', [id]);

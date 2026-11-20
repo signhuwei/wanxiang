@@ -14,6 +14,7 @@ import { openapi } from './openapi';
 import { observationRoutes } from './observe';
 import type { ObjectStorage } from './object-storage';
 import { PendingWork } from './pending';
+import { SERVER_ARTIFACT_UPLOAD_PATH, serverReleaseRoutes, type ReleaseRuntime } from './server-releases';
 import { personalLoginTokenRoutes } from './personal-login-tokens';
 import { platformRoutes } from './platform-management';
 import { tenantRoutes } from './tenant-management';
@@ -34,11 +35,13 @@ type Options = {
   presence: Presence;
   /** 诊断日志包的对象存储；缺省时诊断功能对外报 `not_found`（见 diag.ts）。 */
   objectStorage?: ObjectStorage;
+  releaseRuntime?: ReleaseRuntime;
 };
 
 export async function createServer(opts: Options) {
   const store = new Store(opts.dataDir, opts.tenantCacheSize);
   const now = opts.now ?? Date.now;
+  let closeReleases: (() => void) | undefined;
   try {
     await store.rebuildIndexes();
     const app = new Hono();
@@ -59,7 +62,7 @@ export async function createServer(opts: Options) {
     // The diagnostic and desktop artifact upload routes check auth and draft state, then read their
     // own bounded body directly; every other route keeps the small JSON limit.
     const isRawUpload = (c: { req: { method: string; path: string } }) => c.req.method === 'PUT'
-      && (DIAG_UPLOAD_PATH.test(c.req.path) || DESKTOP_ARTIFACT_UPLOAD_PATH.test(c.req.path));
+      && (DIAG_UPLOAD_PATH.test(c.req.path) || DESKTOP_ARTIFACT_UPLOAD_PATH.test(c.req.path) || SERVER_ARTIFACT_UPLOAD_PATH.test(c.req.path));
     app.use('/v1/*', (c, next) => isRawUpload(c) ? next() : smallBody(c, next));
     app.onError((error, c) => {
       if (error instanceof ApiError) return c.json({ error: error.body() }, error.status);
@@ -82,6 +85,7 @@ export async function createServer(opts: Options) {
     const diag = diagRoutes(app, store, management, opts.objectStorage);
     deviceRoutes(app, store, management, diag);
     desktopReleaseRoutes(app, store, management);
+    closeReleases = serverReleaseRoutes(app, store, management);
     const closeSockets = edgeGateway(app, store, opts.presence, now, opts.heartbeatMs, config, pending, observation.publish, diag);
     let shuttingDown = false;
     const server = Bun.serve({ hostname: opts.hostname, port: opts.port,
@@ -116,11 +120,13 @@ export async function createServer(opts: Options) {
           await pending.drain();
           await store.drain();
           opts.presence.close?.();
+          closeReleases?.();
           store.close();
         })();
       },
     };
   } catch (error) {
+    closeReleases?.();
     store.close();
     throw error;
   }
