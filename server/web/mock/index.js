@@ -343,7 +343,7 @@ export function installMock() {
         if (!m) return err(404, 'not_found', '成员不存在')
         if (role === 'member' && m.target !== session.target) return err(403, 'forbidden', '只能查询自己的配额')
         const q = memberQuotaContext(session.tenantId, m)
-        return json({ scope, id, quota_milli: q.quota_milli, used_milli: q.used_milli, reserved_milli: q.reserved_milli, remaining_milli: q.remaining_milli })
+        return json({ scope, id, quota_milli: q.quota_milli, used_milli: q.used_milli, reserved_milli: q.reserved_milli, remaining_milli: q.remaining_milli, actions: ['read'] })
       }
       if (scope === 'group') {
         const g = findGroup(session.tenantId, id)
@@ -352,7 +352,7 @@ export function installMock() {
         const used = g.settled_milli ?? g.month_used_milli ?? 0
         const reserved = g.reserved_milli || 0
         const remaining = g.quota_milli === null || g.quota_milli === undefined ? null : g.quota_milli - used - reserved
-        return json({ scope, id, quota_milli: g.quota_milli, used_milli: used, reserved_milli: reserved, remaining_milli: remaining })
+        return json({ scope, id, quota_milli: g.quota_milli, used_milli: used, reserved_milli: reserved, remaining_milli: remaining, actions: ['read'] })
       }
       return err(422, 'invalid', 'scope 必须是 member 或 group', { fields: ['scope'] })
     }
