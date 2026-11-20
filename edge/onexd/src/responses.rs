@@ -403,18 +403,24 @@ fn response_failed_event(code: &str, message: &str) -> Bytes {
 /// reasoning item 和非文本 content 跨协议不可靠回放，明确拒绝（不是静默丢弃）。
 fn request_to_chat(req: &Value, upstream_model: &str, stream: bool) -> Result<Value, String> {
     let mut msgs = Vec::new();
-    if let Some(ins) = req.get("instructions").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        msgs.push(json!({"role": "system", "content": ins}));
+    let mut system = Vec::new();
+    if let Some(instructions) = req["instructions"].as_str().filter(|s| !s.is_empty()) {
+        system.push(instructions.to_owned());
     }
     let input = req.get("input").ok_or("请求缺少 input。")?;
     match input {
         Value::String(s) => msgs.push(json!({"role": "user", "content": s})),
         Value::Array(items) => {
             for item in items {
-                responses_item_to_chat(item, &mut msgs)?;
+                responses_item_to_chat(item, &mut msgs, &mut system)?;
             }
         }
         _ => return Err("input 的格式无效。".into()),
+    }
+    // Chat templates such as Qwen accept one system message before the dialogue. Codex
+    // can emit developer context after the user item, including during a resumed turn.
+    if !system.is_empty() {
+        msgs.insert(0, json!({"role": "system", "content": system.join("\n\n")}));
     }
     let mut out = json!({"model": upstream_model, "messages": msgs});
     if let Some(n) = req.get("max_output_tokens") {
@@ -449,7 +455,7 @@ fn request_to_chat(req: &Value, upstream_model: &str, stream: bool) -> Result<Va
     Ok(out)
 }
 
-fn responses_item_to_chat(item: &Value, msgs: &mut Vec<Value>) -> Result<(), String> {
+fn responses_item_to_chat(item: &Value, msgs: &mut Vec<Value>, system: &mut Vec<String>) -> Result<(), String> {
     let kind = item["type"].as_str().unwrap_or("message");
     match kind {
         "message" => {
@@ -459,8 +465,11 @@ fn responses_item_to_chat(item: &Value, msgs: &mut Vec<Value>) -> Result<(), Str
                 let last = assistant_message(msgs);
                 let content = last["content"].as_str().unwrap_or("");
                 last["content"] = if content.is_empty() { text.into() } else { format!("{content}\n\n{text}").into() };
+            } else if matches!(role, "system" | "developer") {
+                if !text.is_empty() {
+                    system.push(text);
+                }
             } else {
-                let role = if role == "developer" { "system" } else { role };
                 msgs.push(json!({"role": role, "content": text}));
             }
         }
@@ -1497,6 +1506,30 @@ mod tests {
                 {"role": "system", "content": "be brief"},
                 {"role": "user", "content": "hello"},
             ], "max_tokens": 64})
+        );
+    }
+
+    #[test]
+    fn chat_templates_get_one_system_message_before_the_conversation() {
+        let req = json!({
+            "instructions": "initial instructions",
+            "input": [
+                {"role":"user", "content":"first prompt"},
+                {"role":"developer", "content":[{"type":"input_text", "text":"environment context"}]},
+                {"role":"assistant", "content":"first answer"},
+                {"role":"system", "content":"later system instructions"},
+                {"role":"user", "content":"follow-up"}
+            ]
+        });
+        let converted = request_to_chat(&req, "Qwen", true).unwrap();
+        assert_eq!(
+            converted["messages"],
+            json!([
+                {"role":"system", "content":"initial instructions\n\nenvironment context\n\nlater system instructions"},
+                {"role":"user", "content":"first prompt"},
+                {"role":"assistant", "content":"first answer"},
+                {"role":"user", "content":"follow-up"}
+            ])
         );
     }
 
