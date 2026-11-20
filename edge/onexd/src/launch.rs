@@ -105,6 +105,7 @@ pub fn prepare(r: &Request) -> Result<Launch> {
     }
     match r.agent {
         "claude-code" => prepare_claude_code(r),
+        "kimi-code" => crate::kimi_launch::prepare_kimi_code(r),
         other => bail!("no managed launch preparer for agent {other}"),
     }
 }
@@ -225,10 +226,40 @@ pub fn finish(home: &Path, launch_id: &str) -> Result<()> {
     if !is_generated_launch_id(launch_id) {
         bail!("bad launch id");
     }
+    let config = remove_kimi_config(home, launch_id);
     let dir = home.join("run").join(launch_id);
-    match std::fs::remove_dir_all(&dir) {
+    let runtime = match std::fs::remove_dir_all(&dir) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             Err(e).with_context(|| format!("remove {}", dir.display()))
+        }
+        _ => Ok(()),
+    };
+    config.and(runtime)
+}
+
+fn kimi_profiles(home: &Path) -> Option<PathBuf> {
+    let mut path = home.to_path_buf();
+    for name in ["agents", "kimi-code", "profiles"] {
+        path.push(name);
+        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+            return None;
+        }
+    }
+    Some(path)
+}
+
+fn remove_kimi_config(home: &Path, launch_id: &str) -> Result<()> {
+    let Some(mut path) = kimi_profiles(home) else { return Ok(()) };
+    for name in [launch_id, "kimi"] {
+        path.push(name);
+        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+            return Ok(());
+        }
+    }
+    let path = path.join("config.toml");
+    match std::fs::remove_file(&path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error).with_context(|| format!("remove {}", path.display()))
         }
         _ => Ok(()),
     }
@@ -237,6 +268,18 @@ pub fn finish(home: &Path, launch_id: &str) -> Result<()> {
 /// daemon 启动时清理上次残留的本次目录：旧的本机令牌已失效，留着也没用。
 pub fn clean_stale(home: &Path) {
     let _ = std::fs::remove_dir_all(home.join("run"));
+    if let Some(profiles) = kimi_profiles(home)
+        && let Ok(entries) = std::fs::read_dir(profiles)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if let Some(id) = name.to_str().filter(|id| is_generated_launch_id(id))
+                && let Err(error) = remove_kimi_config(home, id)
+            {
+                tracing::warn!(%error, "could not remove stale Kimi configuration");
+            }
+        }
+    }
 }
 
 /// 受管 `.claude.json`：跳过首次引导，并认可本次的本机令牌（Claude Code 对环境里的 API key 会先问一次）。

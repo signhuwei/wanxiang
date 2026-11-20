@@ -24,7 +24,7 @@ const MAX_LINE: u64 = 64 * 1024;
 /// 不是同一个名单：后者是「Server 下发的发行记录认哪些 agent 名字」，这里是「onexd 本机真的会
 /// 准备启动」，两者独立演进（例如先接入制品下发，后接入启动准备）。S1 只有 Claude Code；
 /// S2 接入 Codex、Kimi Code 时在这里加名字，并给 `launch.rs` 加对应的 `prepare_<agent>`。
-const LAUNCHABLE_AGENTS: &[&str] = &["claude-code"];
+const LAUNCHABLE_AGENTS: &[&str] = &["claude-code", "kimi-code"];
 
 pub struct Ipc {
     pub state: Arc<State>,
@@ -258,11 +258,11 @@ async fn launch(
     let (Some(ctx), Some(router_addr)) = (&ipc.launch, &ipc.router_addr) else {
         return err("invalid", "这个 onexd 不支持启动 Agent");
     };
-    // `launch::prepare` 目前只实现了 Claude Code 的准备逻辑（S2 起按 `contracts/edge-ws.md`
-    // 多 Agent一节加 Codex、Kimi Code）；这里和它保持同一份名单，不提前放行 `launch::prepare`
-    // 还会报错的 agent。
     if !LAUNCHABLE_AGENTS.contains(&agent) {
         return err("agent_not_allowed", &format!("OneX 暂不支持启动 {agent}"));
+    }
+    if agent != "claude-code" && program.is_some() {
+        return err("agent_not_allowed", "该 Agent 需要使用已批准的受管发行版本");
     }
     if ipc.state.token.borrow().is_none() {
         return err("unauthenticated", "还没有登录，请先登录 OneX");
@@ -361,11 +361,17 @@ async fn launch(
                     stop: stop.clone(),
                     code: code.clone(),
                     session_id: l.session_id.clone(),
-                    token: local_token,
+                    token: local_token.clone(),
                 },
             );
             *ipc.state.active_session.write().unwrap() = Some(l.session_id.clone());
-            tokio::spawn(crate::capture::Capture::new(s, ipc.outbox.clone()).run(stop, code));
+            if agent == "kimi-code" {
+                let capture =
+                    crate::native_capture::LaunchCapture::new(s, ipc.state.clone(), ipc.outbox.clone(), local_token);
+                tokio::spawn(capture.run_kimi(stop, code));
+            } else {
+                tokio::spawn(crate::capture::Capture::new(s, ipc.outbox.clone()).run(stop, code));
+            }
             json!({"ok": true, "launch_id": l.launch_id, "session_id": l.session_id, "program": l.program,
                 "args": l.args, "env": l.env, "cwd": l.cwd, "model": model})
         }

@@ -392,7 +392,7 @@ fn file_identity(path: &Path, _meta: &std::fs::Metadata) -> Result<u64> {
 /// 只接受和受管配置目录同一个所有者创建的文件，拒绝别人（或符号链接指向别处）的文件。
 /// Unix 直接比 uid；Windows 比文件的 owner SID 和当前进程的 token owner SID。
 #[cfg(unix)]
-fn owned_by_same_principal(path: &Path, reference_dir: &Path) -> Result<bool> {
+pub(crate) fn owned_by_same_principal(path: &Path, reference_dir: &Path) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let owner = std::fs::metadata(reference_dir)?.uid();
     Ok(std::fs::symlink_metadata(path)?.uid() == owner)
@@ -402,7 +402,7 @@ fn owned_by_same_principal(path: &Path, reference_dir: &Path) -> Result<bool> {
 /// owner SID（Claude Code 以当前用户身份运行，onexd 也以当前用户身份运行，受管目录由 onexd
 /// 创建，三者是同一个用户主体）。
 #[cfg(windows)]
-fn owned_by_same_principal(path: &Path, reference_dir: &Path) -> Result<bool> {
+pub(crate) fn owned_by_same_principal(path: &Path, reference_dir: &Path) -> Result<bool> {
     let a = windows_owner_sid(path)?;
     let b = windows_owner_sid(reference_dir)?;
     Ok(a == b)

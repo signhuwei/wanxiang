@@ -1,0 +1,40 @@
+{
+  "description": "Structural fixture derived from a Kimi Code 2.2.0 wire protocol 1.5 session. All free text, identifiers, paths and provider/model values are synthetic; no original conversation or credentials.",
+  "records": 126,
+  "record_types": [
+    "agent.message.appended",
+    "agent.turn.ended",
+    "agent.turn.started",
+    "context.append_loop_event",
+    "context.append_message",
+    "context.apply_compaction",
+    "full_compaction.begin",
+    "full_compaction.complete",
+    "interaction.request",
+    "interaction.resolved",
+    "llm.request",
+    "llm.tools_snapshot",
+    "metadata",
+    "permission.record_approval_result",
+    "permission.set_mode",
+    "plugin.session_start",
+    "profile.bind",
+    "prompt.completed",
+    "prompt.steered",
+    "runtime.set_binding",
+    "token_counting.measured",
+    "token_counting.rebased",
+    "token_counting.turn_recorded",
+    "turn.ended",
+    "turn.prompt",
+    "turn.steer",
+    "usage.record"
+  ],
+  "expected_canonical": {
+    "user_text_messages": 4,
+    "assistant_text_messages": 3,
+    "tool_calls": 8,
+    "tool_results": 8
+  },
+  "note": "Canonical public messages agent.message.appended; tool call/result context.append_loop_event. Prompt/context/history/compaction duplicates must not create repeated messages."
+}

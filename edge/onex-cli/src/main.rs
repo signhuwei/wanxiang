@@ -22,7 +22,7 @@ use onex_core::ipc::{Request, SOCKET_NAME};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-/// `onex run` 支持的 agent，以及非 `--managed` 时去 PATH 里找的可执行文件名。
+/// `onex run` 支持的 agent，以及对应的可执行文件名。
 const AGENTS: &[(&str, &str)] = &[("claude-code", "claude"), ("codex", "codex"), ("kimi-code", "kimi")];
 
 const USAGE: &str = "usage:
@@ -121,7 +121,7 @@ async fn cmd_run(agent: &str, args: &[String]) -> Result<()> {
     let binary = agent_binary(agent)?;
     let (model, managed) = parse_run_flags(args)?;
     let env: BTreeMap<String, String> = std::env::vars().collect();
-    let (program, version) = if managed {
+    let (program, version) = if managed || agent != "claude-code" {
         (None, None)
     } else {
         // Windows 的环境变量名大小写不敏感，`std::env::vars()` 多半给出 `Path` 而不是全大写的
@@ -301,18 +301,9 @@ mod tests {
     fn flags_parse_model_and_managed_in_either_order_and_default_to_unmanaged() {
         assert_eq!(parse_run_flags(&args(&[])).unwrap(), (None, false));
         assert_eq!(parse_run_flags(&args(&["--managed"])).unwrap(), (None, true));
-        assert_eq!(
-            parse_run_flags(&args(&["--model", "sonnet"])).unwrap(),
-            (Some("sonnet".into()), false)
-        );
-        assert_eq!(
-            parse_run_flags(&args(&["--managed", "--model", "sonnet"])).unwrap(),
-            (Some("sonnet".into()), true)
-        );
-        assert_eq!(
-            parse_run_flags(&args(&["--model", "sonnet", "--managed"])).unwrap(),
-            (Some("sonnet".into()), true)
-        );
+        assert_eq!(parse_run_flags(&args(&["--model", "sonnet"])).unwrap(), (Some("sonnet".into()), false));
+        assert_eq!(parse_run_flags(&args(&["--managed", "--model", "sonnet"])).unwrap(), (Some("sonnet".into()), true));
+        assert_eq!(parse_run_flags(&args(&["--model", "sonnet", "--managed"])).unwrap(), (Some("sonnet".into()), true));
     }
 
     #[test]
