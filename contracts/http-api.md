@@ -52,7 +52,7 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 | POST | `/invites` | `{role, group_id, max_uses, expires_in_ms}`，返回邀请码（只返回一次） |
 | GET/PUT | `/contract` | 当前租户合约 |
 | GET | `/balance` | 余额、已预留、本月消耗 |
-| GET | `/quota/usage` | 本月配额用量（v0.12）。`?scope=member&id=` 或 `?scope=group&id=`，返回 `{scope, id, quota_milli, used_milli, reserved_milli, remaining_milli}`，`quota_milli` 为 null 时 `remaining_milli` 也为 null。owner、admin 可查全部；group_admin 只能查本组及子组；member 只能查自己 |
+| GET | `/quota/usage` | 本月配额用量（v0.12）。`?scope=member&id=` 或 `?scope=group&id=`，返回 `{scope, id, quota_milli, used_milli, reserved_milli, remaining_milli}`：`used_milli` 只含本月 `settle`，`reserved_milli` 是仍 active 的租约预留，`remaining_milli = quota_milli − used_milli − reserved_milli`（可为负，表示已被超出，最多一个租约）；`quota_milli` 为 null 时 `remaining_milli` 也为 null。台账行和 `/me.quota` 的 `month_used_milli` = `used_milli + reserved_milli`。owner、admin 可查全部；group_admin 只能查本组及子组；member 只能查自己 |
 | GET | `/ledger` | 橡皮流水。 `overage_pending` 单列超租约待核对的差额，`amount_milli` 不计入余额、预留或本月消耗。 |
 | POST | `/platform/ledger/topup` | 平台管理员手工加分，全局令牌，`{tenant_id, amount_milli, note?}` |
 | GET | `/devices`，`/devices/:id` | 设备台账 |
