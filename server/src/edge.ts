@@ -4,7 +4,7 @@ import type { WSContext } from 'hono/ws';
 import { ulid } from 'ulid';
 import { ApiError } from './api';
 import { deviceTtl } from './auth';
-import { initialLease, renewLease } from './billing';
+import { initialLease, renewLease, requestLease } from './billing';
 import type { DiagChannel } from './diag';
 import { ackCursor, eventItems, ingestEvents, ingestUsage, usageItems, type PublishSummary } from './ingest';
 import { int } from './management';
@@ -157,6 +157,10 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             if (!isText(opId)) throw new ApiError('invalid', { fields: ['op_id'] });
             const used = int(msg.used_milli, 'used_milli');
             send({ ...await renewLease(store, tenantId, deviceId, userId, now(), live, msg.lease_id, used, opId), re: msg.id });
+            return;
+          }
+          if (msg.type === 'lease_request' && isText(msg.id)) {
+            send({ ...await requestLease(store, tenantId, deviceId, userId, now(), live), re: msg.id });
             return;
           }
           if (msg.type === 'usage' && isText(msg.id)) {
