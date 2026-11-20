@@ -20,6 +20,12 @@ use crate::state::State;
 /// 一行请求的长度上限，防止本机其他进程塞大包。
 const MAX_LINE: u64 = 64 * 1024;
 
+/// `crate::launch::prepare` 已经实现准备逻辑的 agent。和 `managed_runtime::SUPPORTED_AGENTS`
+/// 不是同一个名单：后者是「Server 下发的发行记录认哪些 agent 名字」，这里是「onexd 本机真的会
+/// 准备启动」，两者独立演进（例如先接入制品下发，后接入启动准备）。S1 只有 Claude Code；
+/// S2 接入 Codex、Kimi Code 时在这里加名字，并给 `launch.rs` 加对应的 `prepare_<agent>`。
+const LAUNCHABLE_AGENTS: &[&str] = &["claude-code"];
+
 pub struct Ipc {
     pub state: Arc<State>,
     pub outbox: Arc<Outbox>,
@@ -252,7 +258,10 @@ async fn launch(
     let (Some(ctx), Some(router_addr)) = (&ipc.launch, &ipc.router_addr) else {
         return err("invalid", "这个 onexd 不支持启动 Agent");
     };
-    if agent != "claude-code" {
+    // `launch::prepare` 目前只实现了 Claude Code 的准备逻辑（S2 起按 `contracts/edge-ws.md`
+    // 多 Agent一节加 Codex、Kimi Code）；这里和它保持同一份名单，不提前放行 `launch::prepare`
+    // 还会报错的 agent。
+    if !LAUNCHABLE_AGENTS.contains(&agent) {
         return err("agent_not_allowed", &format!("OneX 暂不支持启动 {agent}"));
     }
     if ipc.state.token.borrow().is_none() {
@@ -322,6 +331,7 @@ async fn launch(
     };
     let local_token = crate::id::token();
     let r = crate::launch::Request {
+        agent,
         home: &ctx.home,
         router_addr,
         local_token: &local_token,
@@ -367,26 +377,30 @@ fn status(ipc: &Ipc) -> Status {
     let entry = |e: Option<(String, String, i64)>| {
         e.map(|(outcome, request_id, at)| json!({"outcome": outcome, "request_id": request_id, "at": format_ms(at)}))
     };
+    // 按 LAUNCHABLE_AGENTS 逐个查目录（S1 只有 claude-code 这一项，循环本身不改变现有行为）；
+    // `running`/`downloading` 仍是整个 daemon 级别的粗粒度状态，不是按 agent 区分，和此前一致。
     let managed_agents = ipc
         .launch
         .as_ref()
-        .and_then(|ctx| {
+        .map(|ctx| {
             let releases = ipc.state.config.read().unwrap().agents.clone();
             let (os, arch) = (onex_core::ipc::os_name(), onex_core::ipc::arch_name());
-            crate::managed_runtime::cached(&ctx.home, &releases, "claude-code", os, arch)
-        })
-        .map(|(version, is_cached)| {
-            let ctx = ipc.launch.as_ref().expect("catalogue requires launch context");
-            let stage = if !ctx.running.lock().unwrap().is_empty() {
-                "running"
-            } else if ctx.preparing.try_lock().is_err() {
-                "downloading"
-            } else if is_cached {
-                "cached"
-            } else {
-                "available"
-            };
-            vec![ManagedAgent { id: "claude-code".into(), version, status: stage.into() }]
+            LAUNCHABLE_AGENTS
+                .iter()
+                .filter_map(|&agent| {
+                    let (version, is_cached) = crate::managed_runtime::cached(&ctx.home, &releases, agent, os, arch)?;
+                    let stage = if !ctx.running.lock().unwrap().is_empty() {
+                        "running"
+                    } else if ctx.preparing.try_lock().is_err() {
+                        "downloading"
+                    } else if is_cached {
+                        "cached"
+                    } else {
+                        "available"
+                    };
+                    Some(ManagedAgent { id: agent.into(), version, status: stage.into() })
+                })
+                .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     Status {
