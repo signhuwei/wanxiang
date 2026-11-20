@@ -280,7 +280,7 @@ async fn local_installed_agent_receipt() {
     let records: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert_eq!(records.len(), 2);
     assert!(records.iter().all(|record| record.cost_milli > 0 && record.usage_final));
-    assert!(records.iter().any(|record| record.session_id.as_deref() == Some(sid)));
+    assert!(records.iter().all(|record| record.session_id.as_deref() == Some(sid)));
     shutdown.cancel();
     daemon.await.unwrap();
     upstream.abort();

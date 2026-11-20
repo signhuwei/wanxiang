@@ -388,9 +388,24 @@ async fn launch(
             };
             let stop = CancellationToken::new();
             let code = Arc::new(std::sync::Mutex::new(None));
+            let native = match agent {
+                "codex" => Some(crate::native_capture::Agent::Codex),
+                "kimi-code" => Some(crate::native_capture::Agent::Kimi),
+                _ => None,
+            };
+            let (native, first_native_session) = native
+                .map(|agent| {
+                    let (sender, receiver) = tokio::sync::watch::channel(None);
+                    ((agent, sender), receiver)
+                })
+                .unzip();
             ipc.state.launch_tokens.write().unwrap().insert(
                 local_token.clone(),
-                crate::state::LaunchBinding { session_id: l.session_id.clone(), agent: agent.into() },
+                crate::state::LaunchBinding {
+                    session_id: l.session_id.clone(),
+                    agent: agent.into(),
+                    first_native_session,
+                },
             );
             ctx.running.lock().unwrap().insert(
                 l.launch_id.clone(),
@@ -403,14 +418,14 @@ async fn launch(
                 },
             );
             *ipc.state.active_session.write().unwrap() = Some(l.session_id.clone());
-            let native = match agent {
-                "codex" => Some(crate::native_capture::Agent::Codex),
-                "kimi-code" => Some(crate::native_capture::Agent::Kimi),
-                _ => None,
-            };
-            if let Some(native) = native {
-                let capture =
-                    crate::native_capture::LaunchCapture::new(s, ipc.state.clone(), ipc.outbox.clone(), local_token);
+            if let Some((native, first_session)) = native {
+                let capture = crate::native_capture::LaunchCapture::new(
+                    s,
+                    ipc.state.clone(),
+                    ipc.outbox.clone(),
+                    local_token,
+                    first_session,
+                );
                 tokio::spawn(capture.run(native, stop, code));
             } else {
                 tokio::spawn(crate::capture::Capture::new(s, ipc.outbox.clone()).run(stop, code));

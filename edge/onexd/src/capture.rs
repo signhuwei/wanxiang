@@ -44,6 +44,7 @@ const IGNORED_TYPES: &[&str] = &[
     "api-request-shape",
     "api-request-blob",
     "api-request",
+    "cost-state",
     "attachment",
     "system",
 ];

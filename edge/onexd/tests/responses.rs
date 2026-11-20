@@ -531,7 +531,11 @@ async fn managed_codex_forces_stateless_native_requests() {
     let mut env = env_with("openai_responses").await;
     env.state.launch_tokens.write().unwrap().insert(
         "managed-token".into(),
-        onexd::state::LaunchBinding { session_id: "managed-session".into(), agent: "codex".into() },
+        onexd::state::LaunchBinding {
+            session_id: "managed-session".into(),
+            agent: "codex".into(),
+            first_native_session: None,
+        },
     );
     let response = env
         .http

@@ -52,7 +52,8 @@ pub async fn responses(AxState(rt): AxState<Arc<Router>>, headers: HeaderMap, bo
         }
     };
     let managed_codex = binding.as_ref().is_some_and(|binding| binding.agent == "codex");
-    let session_id = binding.map(|binding| binding.session_id);
+    let session_id = binding.as_ref().map(|binding| binding.session_id.clone());
+    let first_native_session = binding.and_then(|binding| binding.first_native_session);
     let Some(model) = req.get("model").and_then(Value::as_str).map(str::to_owned) else {
         return err_before_headers(StatusCode::UNPROCESSABLE_ENTITY, "invalid", "请求缺少 model 字段。");
     };
@@ -201,6 +202,7 @@ pub async fn responses(AxState(rt): AxState<Arc<Router>>, headers: HeaderMap, bo
         ticket: Some(ticket),
         started,
         output_bytes: 0,
+        first_native_session,
     };
 
     let send = client.post(&url).headers(out_headers).body(out_body).send();
@@ -256,6 +258,7 @@ struct ReqCtx {
     output_bytes: usize,
     ticket: Option<crate::lease::Ticket>,
     started: Instant,
+    first_native_session: Option<tokio::sync::watch::Receiver<Option<String>>>,
 }
 
 impl ReqCtx {
@@ -288,7 +291,7 @@ impl ReqCtx {
             u.inflight = u.inflight.saturating_sub(1);
             u.completed += 1;
         }
-        let _ = self.rt.usage_tx.send(rec.clone());
+        self.rt.record_usage(rec.clone(), self.first_native_session.take());
     }
 
     /// 实时花费超过租约额度时返回 Err，调用方应中断这条流。

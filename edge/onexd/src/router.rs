@@ -196,13 +196,9 @@ impl Router {
         });
         let token = presented.ok_or(())?;
         if token.as_bytes().ct_eq(self.local_token.as_bytes()).into() {
-            return Ok(self
-                .state
-                .active_session
-                .read()
-                .unwrap()
-                .clone()
-                .map(|session_id| crate::state::LaunchBinding { session_id, agent: String::new() }));
+            return Ok(self.state.active_session.read().unwrap().clone().map(|session_id| {
+                crate::state::LaunchBinding { session_id, agent: String::new(), first_native_session: None }
+            }));
         }
         self.state.launch_tokens.read().unwrap().get(token).cloned().map(Some).ok_or(())
     }
@@ -259,7 +255,8 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
             "OneX 本机令牌无效。请从 OneX Desktop 重新启动这个 Agent。",
         );
     };
-    let session_id = binding.map(|claim| claim.session_id);
+    let session_id = binding.as_ref().map(|claim| claim.session_id.clone());
+    let first_native_session = binding.and_then(|claim| claim.first_native_session);
 
     let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v @ Value::Object(_)) => v,
@@ -402,7 +399,7 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         duration_ms: 0,
         session_id,
     };
-    let mut req = Req { rt: rt.clone(), rec, meter, ticket, started };
+    let mut req = Req { rt: rt.clone(), rec, meter, ticket, started, first_native_session };
 
     // 只在没收到任何响应头时重试一次，不换路。每次尝试各记一条 usage。
     let mut attempt = 0;
@@ -549,6 +546,7 @@ struct Req {
     meter: Meter,
     ticket: Ticket,
     started: Instant,
+    first_native_session: Option<tokio::sync::watch::Receiver<Option<String>>>,
 }
 
 impl Req {
@@ -583,7 +581,7 @@ impl Req {
         rec.duration_ms = self.started.elapsed().as_millis() as u64;
         info!(request_id = %rec.request_id, retry_of = %self.rec.request_id, "upstream attempt failed before headers; retrying once");
         self.rt.note_upstream(&rec);
-        let _ = self.rt.usage_tx.send(rec);
+        self.rt.record_usage(rec, self.first_native_session.clone());
     }
 
     /// 非流式响应读完后按实际花费检查额度，和流式一样：越过额度的内容不发给客户端。
@@ -598,7 +596,7 @@ impl Req {
     }
 
     fn finish(self) {
-        let Req { rt, mut rec, meter, ticket, started } = self;
+        let Req { rt, mut rec, meter, ticket, started, first_native_session } = self;
         // 用量不完整时只按已见部分计价，标 complete=false，预留绝不当作已发生的花费。
         rec.tokens = meter.final_tokens(rec.usage_final);
         rec.cost_milli = cost_milli(&meter.rate, &rec.tokens);
@@ -624,11 +622,37 @@ impl Req {
             u.inflight = u.inflight.saturating_sub(1);
             u.completed += 1;
         }
-        let _ = rt.usage_tx.send(rec);
+        rt.record_usage(rec, first_native_session);
     }
 }
 
 impl Router {
+    pub(crate) fn record_usage(
+        &self,
+        mut rec: UsageRecord,
+        first_native_session: Option<tokio::sync::watch::Receiver<Option<String>>>,
+    ) {
+        let Some(mut session) = first_native_session else {
+            let _ = self.usage_tx.send(rec);
+            return;
+        };
+        if let Some(id) = session.borrow().clone() {
+            rec.session_id = Some(id);
+            let _ = self.usage_tx.send(rec);
+            return;
+        }
+        // A fast response can finish before the capture loop sees the first transcript.
+        // If no verified session ever appears, preserve the usage under the launch ID.
+        let usage = self.usage_tx.clone();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(1), session.wait_for(Option::is_some)).await;
+            if let Some(id) = session.borrow().clone() {
+                rec.session_id = Some(id);
+            }
+            let _ = usage.send(rec);
+        });
+    }
+
     pub(crate) fn note_upstream(&self, rec: &UsageRecord) {
         let entry = (rec.outcome.as_str(), rec.request_id.clone(), now_ms());
         let mut u = self.state.upstream.lock().unwrap();

@@ -62,10 +62,12 @@ pub struct ConfigSnapshot {
     pub agents: Vec<AgentRelease>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct LaunchBinding {
     pub session_id: String,
     pub agent: String,
+    /// Shared only by requests that arrived before the first native transcript was discovered.
+    pub first_native_session: Option<watch::Receiver<Option<String>>>,
 }
 
 pub struct State {

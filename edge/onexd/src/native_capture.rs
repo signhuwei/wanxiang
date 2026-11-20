@@ -49,10 +49,17 @@ pub(crate) struct LaunchCapture {
     outbox: Arc<Outbox>,
     token: String,
     device: String,
+    first_session: tokio::sync::watch::Sender<Option<String>>,
 }
 
 impl LaunchCapture {
-    pub(crate) fn new(session: capture::Session, state: Arc<State>, outbox: Arc<Outbox>, token: String) -> Self {
+    pub(crate) fn new(
+        session: capture::Session,
+        state: Arc<State>,
+        outbox: Arc<Outbox>,
+        token: String,
+        first_session: tokio::sync::watch::Sender<Option<String>>,
+    ) -> Self {
         let device = state
             .conn
             .lock()
@@ -61,12 +68,20 @@ impl LaunchCapture {
             .clone()
             .or_else(|| state.expected_device_id.read().unwrap().clone())
             .unwrap_or_else(|| state.device_key.public_b64());
-        Self { session, state, outbox, token, device }
+        Self { session, state, outbox, token, device, first_session }
     }
 
     fn bind_usage(&self, id: String) {
+        self.first_session.send_if_modified(|first| {
+            if first.is_some() {
+                return false;
+            }
+            *first = Some(id.clone());
+            true
+        });
         if let Some(current) = self.state.launch_tokens.write().unwrap().get_mut(&self.token) {
             current.session_id = id;
+            current.first_native_session = None;
         }
     }
 
