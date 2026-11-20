@@ -36,7 +36,7 @@ Server 回 `welcome`：
 | `config` | `revision`、`routes[]`、`agents[]`、`rates[]` | 全量配置。Edge 原子替换，回 ack；revision 不大于当前值时忽略。route 字段：`model`（精确名、`前缀*` 或 `*`，按精确、最长前缀、`*` 的顺序匹配）、`model_id`（对应 rates）、`provider_id`、`protocol`、`base_url`、`upstream_model?`、`auth`（`x_api_key` 或 `bearer`）、`proxy?`（见下方“网络代理”） |
 | `secret` | `provider_id`、`ciphertext`、`nonce`、`key_id` | 加密的上游密钥，只在内存解密。算法见下方“密钥下发” |
 | `lease` | `lease_id`、`expires_at`、`budget_milli`、`seq` | 额度租约。Edge 在 `expires_at` 前或已用 80% 时发 `lease_renew` |
-| `cutoff` | `reason`（`balance`、`disabled`、`contract`） | 立即断流：拒绝新请求，中断进行中的流 |
+| `cutoff` | `reason`（`balance`、`quota`、`disabled`、`contract`） | 立即断流：拒绝新请求，中断进行中的流 |
 | `diag` | `diag_id`、`kind`（`logs`、`status`）、`upload_url` | `logs` 将白名单日志打包，经当前控制连接同源的 `/v1/diag/:id/upload` 上传，使用该连接的设备令牌。`status` 直接回 `diag_result` |
 | `agent_cmd` | `agent`、`action`（`stop`） | 管理指令 |
 
@@ -112,3 +112,16 @@ Edge 连 Server 和上游时，默认使用环境变量中的代理设置（`HTT
 - 超租约差额不转入下一份租约。新租约确认旧续租快照已处理，Edge 从本地累计用量中移除完整原始快照，只把快照后产生的实际用量计入新租约。
 - `usage.cost_milli` 保留真实用量，跨租约的请求仍引用放行时的租约。Server 按设备比较实际用量与已结算金额，有差额时保留待结算状态。独立的待核对流水关联旧租约及续租操作。
 - 租约过期后，它的预留一直保留，直到 Edge 回连并报 `used_milli`。S1 不自动释放，以免离线用量超发。监察页列出超过 24 小时未回连的租约，由管理员人工处理（S2 再设计自动处理）。
+
+## 多 Agent 接入（v0.12，S2）
+
+- `agent` 取值：`claude-code`、`codex`、`kimi-code`。合约 `allowed_agents` 与 `agent_releases.agent` 用同一组名字。
+- 本机 router 入口按 Agent 协议区分，共用同一个本机令牌、租约、计价和 usage 上报：
+  - `POST /v1/messages`（及 `/v1/messages/count_tokens`）：Anthropic Messages，Claude Code 与 Kimi Code 使用。
+  - `POST /v1/responses`：OpenAI Responses，Codex 使用。上游 route 为 `openai_responses` 时同协议转发；为 `openai_chat` 时由 Edge 转换为 Chat；为 `anthropic` 时 S2 首批返回 `model_not_allowed`，不做 Responses→Messages。
+- Responses 用量口径：`input_tokens` 含缓存，计费输入 = `input_tokens − input_tokens_details.cached_tokens`；`output_tokens_details.reasoning_tokens` 是输出的子集，只作明细。
+- 拒绝时按入口协议返回错误：Messages 用 Anthropic 错误体；Responses 未发响应头时用 `{"error":{"type","code","message"}}`，已发头时写 `response.failed` 事件。`code` 取 `errors.md`。
+- 会话事件的 `kind` 和 payload 不变，`session_start.agent` 写实际 Agent 名。采集来源：
+  - Codex：受管 `CODEX_HOME/sessions/**/rollout-*.jsonl`，只取 `response_item` 的 user/assistant 可见文本与 function/custom 调用及结果；`event_msg` 与 `compacted` 不生成发言（压缩生成 `compact`）。原生 thread id 只作来源标识。
+  - Kimi Code：受管 `KIMI_CODE_HOME/sessions/**/agents/<agent>/wire.jsonl`，取 `agent.message.appended` 的公开消息与 `context.append_loop_event` 的 `tool.call`/`tool.result`；子 agent 写 `agent_id`。
+  - 未知记录形状一律生成 `gap`，不猜测。细节见 `docs/specs/agents/codex.md`、`docs/specs/agents/kimi-code.md`。

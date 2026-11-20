@@ -77,3 +77,14 @@ S0 和 S1 只运行一个 Server 写进程（SQLite 本身也要求单节点写�
 余额 = `ledger` 中 topup + adjust − settle 的合计，再减去未结算租约的 reserve。Server 在单个事务里写 ledger 和 leases。
 
 `session_events` 和 `usage` 用 (device_id, seq) 做主键，重复回流直接忽略，保证不重。
+
+## 组和个人配额（v0.12，S2）
+
+依据访谈“租户可以把额度分到组和个人，也可以选择不限制”。
+
+- `members.quota_milli`、`groups.quota_milli` 都是**每个自然月**的橡皮上限（毫橡皮），`null` 表示不限。月份按租户时区，S2 仍固定 Asia/Shanghai，与 `month_cost_milli` 同口径。
+- 一个成员的有效上限同时受本人配额、所在组配额、所有祖先组配额约束，先到先停。组配额计的是该组及其全部子组成员的合计。
+- 本月已用 = 本月 `settle` 金额加上**仍在 active 的租约**的 `budget_milli`（按租约的 `user_id` 归属）。也就是预留计入配额，与租户余额同理，保证配额最多被超出一个租约。`overage_pending` 不计入。
+- 签发租约时，额度取 `min(租户可用余额, 合约 lease_budget_milli, 余额的 5%（最低 1）, 本人剩余, 每一级组的剩余)`。任意一级剩余 ≤ 0 时返回 `cutoff{reason:"quota"}`；租户余额 ≤ 0 仍返回 `balance`，两者都满足时报 `balance`。
+- 续租走同样的规则。配额被调低后，已签发的租约照常用完，下一次续租按新值裁决。配额调高或进入新月份后，Edge 下一次续租即可恢复。Server 不主动推送新租约。
+- 配额只限制员工的模型用量，不改变租户扣款、`overage_pending` 或租约结清逻辑。

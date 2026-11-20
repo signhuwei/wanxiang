@@ -976,6 +976,9 @@ fn block_error(b: Block) -> (StatusCode, &'static str, &'static str, &'static st
         Block::Cutoff(CutoffReason::Balance) => {
             (PAY, "billing_error", "balance_exhausted", "OneX 橡皮余额已用完，请联系管理员充值。")
         }
+        Block::Cutoff(CutoffReason::Quota) => {
+            (PAY, "billing_error", "quota_exhausted", "你或所在组的 OneX 橡皮配额已用完，请联系管理员调整配额。")
+        }
         Block::Cutoff(CutoffReason::Disabled) => {
             (StatusCode::FORBIDDEN, "permission_error", "forbidden", "你的 OneX 账号或这台设备已被停用，请联系管理员。")
         }

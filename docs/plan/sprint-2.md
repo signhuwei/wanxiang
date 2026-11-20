@@ -18,6 +18,22 @@
 
 三个 Claude Sonnet 5.5 保持 tmux 交互模式，通过 `mail-wait` 领单和 `mail-send` 交付。Codex 负责[发布契约](../../contracts/desktop-releases.md)、集成和验证。部署候选先过隔离环境；Windows 原生测试以 Windows 环境的结果为准。
 
+## 第二批（2026-11-20 开工）
+
+基线 `main` 已整合审计查询 `a1673cc` 和 Windows 原生候选 `1701e63`，Mac 全量回归通过。Windows 原生编译、测试、打包仍以 Windows 环境的结果为准。契约 v0.12 见 [data-model.md](../../contracts/data-model.md) 配额一节、[edge-ws.md](../../contracts/edge-ws.md) 多 Agent 一节。
+
+| tmux 窗口 | 交付 | 写入范围 |
+| --- | --- | --- |
+| `quota-api` | 组和个人月配额在签发和续租时生效、`cutoff{reason:"quota"}`、`/quota/usage`、台账 `month_used_milli`、`/me.quota` | `server/src/`、`server/migrations/`、`server/test/` |
+| `quota-web` | 成员和组台账显示本月用量与剩余、配额表单校验、`/me.quota` 提示、配额耗尽时的流水和人员页提示 | `server/web/` |
+| `codex` | Codex 受管启动（固定版本制品、私有 `CODEX_HOME`、`config.toml` 生成）、router `/v1/responses` 入口（同协议与转 Chat）、rollout 采集 | `edge/onexd/src/{responses,codex}*.rs`、`launch.rs`、`managed_runtime.rs`、`ipc.rs`、`router.rs` 的入口注册、对应测试 |
+| `kimi` | Kimi Code 受管启动（制品、私有 `KIMI_CODE_HOME`、`config.toml`）、wire.jsonl 采集 | `edge/onexd/src/kimi*.rs`、`capture.rs` 的分发、对应测试 |
+| `review` | 独立验收：配额账务边界（多级组、并发租约、月切换、调低配额）与两个 Agent 采集的形状覆盖 | 只读，报告写 `coord/reports/s2/` |
+
+Edge 已在 `6594f4c` 之后加上 `quota` 断流原因与 `quota_exhausted` 错误提示。`codex` 与 `kimi` 两条线共用 `launch.rs`、`managed_runtime.rs`、`ipc.rs`：`codex` 先改成按 Agent 分派的结构并提交，`kimi` 基于该提交接入，冲突由总督合并。
+
+验收：同一租户下 Claude Code、Codex、Kimi Code 各完成一次受管启动、本机假上游多轮对话、正文与费用回流；配额耗尽时三者都收到 `quota_exhausted`。真实模型和 211 联验由总督在合并后安排。
+
 ## 后续批次
 
 Codex、Kimi Code、组和个人额度、组管角色、可见范围和审计查询仍属于 S2。签名公证、外部发布、升级和回退安排在 S4 或以后。

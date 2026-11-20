@@ -12,6 +12,7 @@ HTTP 和 WS 共用。HTTP 返回 `{"error": {"code": "...", "message": "...", "d
 | `invalid` | 422 | 参数校验失败，`detail.fields` 列出字段 |
 | `seat_limit` | 403 | 租户人数已达合约上限 |
 | `balance_exhausted` | 402 | 橡皮余额不足 |
+| `quota_exhausted` | 402 | 本人或所在组本月配额已用完（v0.12） |
 | `lease_expired` | 402 | Edge 租约过期且无法续约 |
 | `agent_not_allowed` | 403 | 合约不允许该 Agent |
 | `model_not_allowed` | 403 | 合约不允许该模型 |

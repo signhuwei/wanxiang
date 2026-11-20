@@ -44,6 +44,7 @@ use crate::pricing::{format_ms, parse_ms};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CutoffReason {
     Balance,
+    Quota,
     Disabled,
     Contract,
     Other,
@@ -53,6 +54,7 @@ impl CutoffReason {
     pub fn parse(s: &str) -> Self {
         match s {
             "balance" => Self::Balance,
+            "quota" => Self::Quota,
             "disabled" => Self::Disabled,
             "contract" => Self::Contract,
             _ => Self::Other,
@@ -872,6 +874,14 @@ mod tests {
         drop(t);
         assert_eq!(l.snapshot().used_milli, 0);
         assert!(l.take_renew().is_none());
+    }
+
+    #[test]
+    fn quota_cutoff_is_its_own_reason() {
+        let l = ledger();
+        l.grant(&lease("l1", 1, 1000, 600_000)).unwrap();
+        l.cutoff("quota").unwrap();
+        assert_eq!(l.admit(0).err(), Some(Block::Cutoff(CutoffReason::Quota)));
     }
 
     #[tokio::test]
