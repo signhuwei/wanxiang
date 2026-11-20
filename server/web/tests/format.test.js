@@ -1,5 +1,8 @@
 import { test, expect } from 'bun:test'
-import { formatMilli, formatDateTime, formatBytes, roleLabel, memberStatusLabel, tenantStatusLabel } from '../format.js'
+import {
+  formatMilli, formatDateTime, formatBytes, roleLabel, memberStatusLabel, tenantStatusLabel,
+  formatQuotaUsage, quotaUsageLevel, parseQuotaEraserInput, QUOTA_INVALID_MESSAGE
+} from '../format.js'
 
 test('formatMilli renders 毫橡皮 as 橡皮 without floating point noise', () => {
   expect(formatMilli(1500)).toBe('1.5')
@@ -44,4 +47,34 @@ test('role and status labels are Chinese', () => {
   expect(memberStatusLabel('disabled')).toBe('已禁用')
   expect(tenantStatusLabel('active')).toBe('正常')
   expect(tenantStatusLabel('suspended')).toBe('已暂停')
+})
+
+test('formatQuotaUsage shows used / quota, with 不限 for a null cap', () => {
+  expect(formatQuotaUsage(120000, 500000)).toBe('120 / 500')
+  expect(formatQuotaUsage(0, null)).toBe('0 / 不限')
+  expect(formatQuotaUsage(undefined, 500000)).toBe('0 / 500')
+})
+
+test('quotaUsageLevel flags near-limit and over-limit usage, unlimited is always ok', () => {
+  expect(quotaUsageLevel(100000, 500000)).toBe('ok')      // 20%
+  expect(quotaUsageLevel(400000, 500000)).toBe('warn')    // 80%
+  expect(quotaUsageLevel(500000, 500000)).toBe('error')   // 到量
+  expect(quotaUsageLevel(600000, 500000)).toBe('error')   // 超量
+  expect(quotaUsageLevel(999999999, null)).toBe('ok')     // 不限
+})
+
+test('parseQuotaEraserInput accepts non-negative 橡皮 with up to 3 decimals and null for 不限', () => {
+  expect(parseQuotaEraserInput(null)).toEqual({ quotaMilli: null })
+  expect(parseQuotaEraserInput('')).toEqual({ quotaMilli: null })
+  expect(parseQuotaEraserInput(0)).toEqual({ quotaMilli: 0 })
+  expect(parseQuotaEraserInput('500')).toEqual({ quotaMilli: 500000 })
+  expect(parseQuotaEraserInput(500)).toEqual({ quotaMilli: 500000 })
+  expect(parseQuotaEraserInput('123.456')).toEqual({ quotaMilli: 123456 })
+  expect(parseQuotaEraserInput(0.001)).toEqual({ quotaMilli: 1 })
+})
+
+test('parseQuotaEraserInput rejects negative numbers and non-numeric input', () => {
+  for (const bad of [-1, '-1', -0.001, 'abc', NaN]) {
+    expect(parseQuotaEraserInput(bad)).toEqual({ error: QUOTA_INVALID_MESSAGE })
+  }
 })

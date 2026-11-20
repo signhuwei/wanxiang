@@ -75,6 +75,12 @@ export function installMock() {
     return { ...member, actions }
   }
 
+  function withGroupActions(group, session) {
+    const role = callerRole(session)
+    const actions = role === 'owner' || role === 'admin' ? ['read', 'update'] : ['read']
+    return { ...group, actions }
+  }
+
   function listMembers(url, session) {
     const all = db.members[session.tenantId] || []
     const q = (url.searchParams.get('q') || '').trim().toLowerCase()
@@ -94,6 +100,52 @@ export function installMock() {
 
   function findMember(tenantId, id) {
     return (db.members[tenantId] || []).find(m => m.user_id === id)
+  }
+
+  function findGroup(tenantId, id) {
+    return (db.groups[tenantId] || []).find(g => g.id === id)
+  }
+
+  // 祖先链（含自身），从本组到最外层；mock 数据的 group 目前没有 parent_id，链长为 1。
+  function groupChain(tenantId, groupId) {
+    const chain = []
+    let current = groupId ? findGroup(tenantId, groupId) : null
+    while (current) {
+      chain.push(current)
+      current = current.parent_id ? findGroup(tenantId, current.parent_id) : null
+    }
+    return chain
+  }
+
+  // 成员的有效配额：本人与各级祖先组先到先停；返回剩余最小的一方，null 表示不限。
+  // used_milli 只含本月 settle；reserved_milli 是仍 active 的租约预留；两者之和才是配额口径的占用量。
+  function memberQuotaContext(tenantId, member) {
+    const candidates = []
+    if (member.quota_milli !== null && member.quota_milli !== undefined) {
+      candidates.push({ limited_by: 'member', quota_milli: member.quota_milli, consumed_milli: member.month_used_milli || 0 })
+    }
+    for (const g of groupChain(tenantId, member.group_id)) {
+      if (g.quota_milli !== null && g.quota_milli !== undefined) {
+        candidates.push({ limited_by: 'group:' + g.id, quota_milli: g.quota_milli, consumed_milli: g.month_used_milli || 0 })
+      }
+    }
+    const used_milli = member.settled_milli ?? member.month_used_milli ?? 0
+    const reserved_milli = member.reserved_milli ?? 0
+    if (!candidates.length) {
+      return { quota_milli: null, used_milli, reserved_milli, remaining_milli: null, limited_by: null }
+    }
+    let tightest = candidates[0]
+    for (const c of candidates) {
+      const remaining = c.quota_milli - c.consumed_milli
+      if (remaining < tightest.quota_milli - tightest.consumed_milli) tightest = c
+    }
+    return {
+      quota_milli: tightest.quota_milli,
+      used_milli,
+      reserved_milli,
+      remaining_milli: tightest.quota_milli - used_milli - reserved_milli,
+      limited_by: tightest.limited_by
+    }
   }
 
   async function route(url, init) {
@@ -155,7 +207,13 @@ export function installMock() {
       const ms = db.memberships[s.target].find(m => m.tenant_id === s.tenantId)
       const actions = ['owner','admin'].includes(ms?.role) ? ['create_group','create_invite','assign_role:member'] : []
       if (ms?.role === 'owner') actions.push('assign_role:admin','assign_role:group_admin')
-      return json({ user, tenant: t, role: ms?.role, agents: [], is_platform_admin, actions })
+      const selfMember = (db.members[s.tenantId] || []).find(m => m.target === s.target)
+      // /me.quota 口径同台账：month_used_milli = used_milli（本月 settle）+ reserved_milli（active 租约预留）
+      const ctx = selfMember
+        ? memberQuotaContext(s.tenantId, selfMember)
+        : { quota_milli: null, used_milli: 0, reserved_milli: 0, remaining_milli: null, limited_by: null }
+      const quota = { quota_milli: ctx.quota_milli, month_used_milli: ctx.used_milli + ctx.reserved_milli, remaining_milli: ctx.remaining_milli, limited_by: ctx.limited_by }
+      return json({ user, tenant: t, role: ms?.role, agents: [], is_platform_admin, actions, quota })
     }
 
     // ---- 成员与组（租户范围）----
@@ -216,8 +274,87 @@ export function installMock() {
     if (method === 'GET' && path === '/groups') {
       const { session, error } = tenantScoped(sessionOf(init))
       if (error) return error
-      const items = db.groups[session.tenantId] || []
+      const items = (db.groups[session.tenantId] || []).map(g => withGroupActions(g, session))
       return json({ items, next_cursor: null, total: items.length })
+    }
+
+    const groupMatch = path.match(/^\/groups\/([\w-]+)$/)
+    if (groupMatch && method === 'GET') {
+      const { session, error } = tenantScoped(sessionOf(init))
+      if (error) return error
+      const g = findGroup(session.tenantId, groupMatch[1])
+      if (!g) return err(404, 'not_found', '分组不存在')
+      return json(withGroupActions(g, session))
+    }
+    if (groupMatch && method === 'POST') {
+      const { session, error } = tenantScoped(sessionOf(init))
+      if (error) return error
+      const g = findGroup(session.tenantId, groupMatch[1])
+      if (!g) return err(404, 'not_found', '分组不存在')
+      const role = callerRole(session)
+      if (role !== 'owner' && role !== 'admin') return err(403, 'forbidden', '没有修改分组的权限')
+      if (body.revision !== g.revision) {
+        return err(409, 'conflict', '数据已被他人修改，请刷新后重试', { revision: g.revision })
+      }
+      if (body.name !== undefined) g.name = body.name
+      if (body.parent_id !== undefined) g.parent_id = body.parent_id || null
+      if (body.quota_milli !== undefined) {
+        if (body.quota_milli !== null && (!Number.isFinite(body.quota_milli) || body.quota_milli < 0)) {
+          return err(422, 'invalid', '配额必须是不小于 0 的整数（毫橡皮）', { fields: ['quota_milli'] })
+        }
+        g.quota_milli = body.quota_milli
+      }
+      g.revision += 1
+      return json(withGroupActions(g, session))
+    }
+
+    if (method === 'POST' && path === '/groups') {
+      const { session, error } = tenantScoped(sessionOf(init))
+      if (error) return error
+      const role = callerRole(session)
+      if (role !== 'owner' && role !== 'admin') return err(403, 'forbidden', '没有创建分组的权限')
+      if (!body.name) return err(422, 'invalid', '请输入组名', { fields: ['name'] })
+      const quotaMilli = body.quota_milli ?? null
+      if (quotaMilli !== null && (!Number.isFinite(quotaMilli) || quotaMilli < 0)) {
+        return err(422, 'invalid', '配额必须是不小于 0 的整数（毫橡皮）', { fields: ['quota_milli'] })
+      }
+      const g = {
+        id: 'grp_' + Math.random().toString(36).slice(2, 10),
+        name: body.name,
+        parent_id: body.parent_id || null,
+        quota_milli: quotaMilli,
+        month_used_milli: 0,
+        revision: 1,
+        tenant_id: session.tenantId
+      }
+      db.groups[session.tenantId] = db.groups[session.tenantId] || []
+      db.groups[session.tenantId].push(g)
+      return json(withGroupActions(g, session), 201)
+    }
+
+    if (method === 'GET' && path === '/quota/usage') {
+      const { session, error } = tenantScoped(sessionOf(init))
+      if (error) return error
+      const scope = url.searchParams.get('scope')
+      const id = url.searchParams.get('id')
+      const role = callerRole(session)
+      if (scope === 'member') {
+        const m = findMember(session.tenantId, id)
+        if (!m) return err(404, 'not_found', '成员不存在')
+        if (role === 'member' && m.target !== session.target) return err(403, 'forbidden', '只能查询自己的配额')
+        const q = memberQuotaContext(session.tenantId, m)
+        return json({ scope, id, quota_milli: q.quota_milli, used_milli: q.used_milli, reserved_milli: q.reserved_milli, remaining_milli: q.remaining_milli })
+      }
+      if (scope === 'group') {
+        const g = findGroup(session.tenantId, id)
+        if (!g) return err(404, 'not_found', '分组不存在')
+        if (role === 'member') return err(403, 'forbidden', '没有查询分组配额的权限')
+        const used = g.settled_milli ?? g.month_used_milli ?? 0
+        const reserved = g.reserved_milli || 0
+        const remaining = g.quota_milli === null || g.quota_milli === undefined ? null : g.quota_milli - used - reserved
+        return json({ scope, id, quota_milli: g.quota_milli, used_milli: used, reserved_milli: reserved, remaining_milli: remaining })
+      }
+      return err(422, 'invalid', 'scope 必须是 member 或 group', { fields: ['scope'] })
     }
 
     return err(404, 'not_found', '接口不存在（假数据未覆盖）：' + method + ' ' + path)

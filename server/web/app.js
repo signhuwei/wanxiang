@@ -15,6 +15,7 @@ import { bindTokenLoginTrigger, renderLogin } from './login.js'
 import { renderMembersPage } from './members.js'
 import { releasesPage } from './releases.js'
 import { personalTokensPage } from './personal-tokens.js'
+import { formatMilli } from './format.js'
 import { mockEnabled, installMock } from './mock/index.js'
 
 const mockOn = mockEnabled()
@@ -56,6 +57,32 @@ function el(tag, className, text) {
 
 function canReadAudit() {
   return Boolean(session?.tenant && Array.isArray(session.actions) && session.actions.includes('read_audit'))
+}
+
+// 个人菜单的配额提示：remaining_milli 为 null 表示不限；limited_by 为 group:<id> 时异步解出组名。
+function appendQuotaItem(items, quota) {
+  const remainingText = quota.remaining_milli === null || quota.remaining_milli === undefined
+    ? '不限'
+    : formatMilli(quota.remaining_milli) + ' 橡皮'
+  const line = el('div', 'quota-item muted')
+  const label = el('span', null, '本月剩余：')
+  const value = el('span', 'quota-item-value', remainingText)
+  line.append(label, value)
+  const groupId = typeof quota.limited_by === 'string' && quota.limited_by.startsWith('group:')
+    ? quota.limited_by.slice('group:'.length)
+    : null
+  if (groupId) {
+    const note = el('small', 'quota-item-note', '受分组限制')
+    line.appendChild(note)
+    api.get('/groups/' + encodeURIComponent(groupId)).then(g => {
+      note.textContent = '受分组「' + (g.name || groupId) + '」限制'
+    }).catch(() => {
+      // 组详情拉取失败时保留通用提示，不打断菜单渲染
+    })
+  } else if (quota.limited_by === 'member') {
+    line.appendChild(el('small', 'quota-item-note', '受个人配额限制'))
+  }
+  items.appendChild(line)
 }
 
 function renderTop(hash) {
@@ -109,6 +136,7 @@ function renderTop(hash) {
     if (name) summary.appendChild(el('span', 'account-menu-label', '个人菜单'))
     summary.appendChild(el('span', 'account-name', name || '个人菜单'))
     const items = el('div', 'account-items')
+    if (session.tenant && session.quota) appendQuotaItem(items, session.quota)
     const download = el('a', null, '下载 OneX Desktop')
     download.href = '/download'
     const tokens = el('a', null, '令牌管理')
@@ -253,8 +281,10 @@ async function refreshTenantActions(restored) {
   }
   if (session !== restored || me?.tenant?.id !== restored.tenant.id || !Array.isArray(me.actions)) return false
   const existing = new Set(Array.isArray(restored.actions) ? restored.actions : [])
-  if (existing.size === me.actions.length && me.actions.every(action => existing.has(action))) return false
-  session = { ...restored, actions: me.actions }
+  const actionsChanged = existing.size !== me.actions.length || !me.actions.every(action => existing.has(action))
+  const quotaChanged = JSON.stringify(me.quota ?? null) !== JSON.stringify(restored.quota ?? null)
+  if (!actionsChanged && !quotaChanged) return false
+  session = { ...restored, actions: me.actions, quota: me.quota ?? null }
   try { sessionStore.save(session) } catch {
     // 浏览器禁止持久化时，本次页面仍使用刷新后的权限。
   }

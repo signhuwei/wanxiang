@@ -9,7 +9,9 @@ function el(tag, className, text) {
 }
 
 function fieldValueText(field, value) {
-  if (value === null || value === undefined || value === '') return '—'
+  if (value === null || value === undefined || value === '') {
+    return field.nullText !== undefined ? field.nullText : '—'
+  }
   if (field.type === 'select' && field.options) {
     const hit = field.options.find(o => String(o.value) === String(value))
     if (hit) return hit.label
@@ -58,6 +60,7 @@ export function renderForm(body, { sections, values = {}, mode = 'view' }) {
     input.dataset.field = field.key
     input.name = field.key
     wrap.appendChild(input)
+    if (field.hint) wrap.appendChild(el('small', 'field-hint', field.hint))
     return wrap
   }
 

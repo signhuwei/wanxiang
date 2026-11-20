@@ -7,6 +7,35 @@ export function formatMilli(milli) {
   return String(Math.round(v * 1000) / 1000)
 }
 
+// 配额用量：quotaMilli 为 null 表示不限，只显示已用，不判定状态。
+// 否则按用量占比分三档：ok（<80%）、warn（80%~100%）、error（已到或超出）。
+export function quotaUsageLevel(usedMilli, quotaMilli) {
+  if (quotaMilli === null || quotaMilli === undefined) return 'ok'
+  const used = usedMilli || 0
+  if (used >= quotaMilli) return 'error'
+  if (quotaMilli > 0 && used >= quotaMilli * 0.8) return 'warn'
+  return 'ok'
+}
+
+export function formatQuotaUsage(usedMilli, quotaMilli) {
+  const used = formatMilli(usedMilli ?? 0)
+  const quota = quotaMilli === null || quotaMilli === undefined ? '不限' : formatMilli(quotaMilli)
+  return used + ' / ' + quota
+}
+
+export const QUOTA_HINT = '每自然月重置，按 Asia/Shanghai；留空为不限'
+export const QUOTA_INVALID_MESSAGE = '橡皮配额必须是不小于 0 的数字，最多三位小数'
+
+// 配额表单输入是橡皮，最多三位小数；换算成毫橡皮（契约字段 quota_milli，非负整数）后再校验。
+export function parseQuotaEraserInput(value) {
+  if (value === null || value === undefined || value === '') return { quotaMilli: null }
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) return { error: QUOTA_INVALID_MESSAGE }
+  const quotaMilli = Math.round(n * 1000)
+  if (!Number.isInteger(quotaMilli) || quotaMilli < 0) return { error: QUOTA_INVALID_MESSAGE }
+  return { quotaMilli }
+}
+
 export function formatDateTime(rfc3339) {
   if (!rfc3339) return '—'
   const d = new Date(rfc3339)

@@ -5,7 +5,7 @@ import { invitePanel } from './groups.js'
 import { detailPanel } from './panel.js'
 import { openDrill } from './drill.js'
 import { renderForm } from './form.js'
-import { formatMilli, formatDateTime, roleLabel, memberStatusLabel } from './format.js'
+import { formatMilli, formatDateTime, roleLabel, memberStatusLabel, formatQuotaUsage, quotaUsageLevel, QUOTA_HINT, parseQuotaEraserInput } from './format.js'
 import { showToast } from './toast.js'
 
 function el(tag, className, text) {
@@ -36,6 +36,11 @@ export function renderMembersPage(host, { api, actions = [] }) {
   function statusCell(item) {
     const ok = item.status === 'active'
     return el('span', 'status ' + (ok ? 'ok' : 'warn'), memberStatusLabel(item.status))
+  }
+
+  function quotaUsageCell(item) {
+    const level = quotaUsageLevel(item.month_used_milli, item.quota_milli)
+    return el('span', 'status ' + level, formatQuotaUsage(item.month_used_milli, item.quota_milli))
   }
 
   function nameCell(item) {
@@ -102,6 +107,8 @@ export function renderMembersPage(host, { api, actions = [] }) {
       return
     }
 
+    const usage = await api.get('/quota/usage', { params: { scope: 'member', id: userId } }).catch(() => null)
+
     async function paint(mode) {
       body.textContent = ''
       foot.textContent = ''
@@ -113,6 +120,16 @@ export function renderMembersPage(host, { api, actions = [] }) {
         el('span', null, '最近活动'),
         document.createTextNode(formatDateTime(member.last_active_at))
       )
+      if (usage) {
+        kv.append(
+          el('span', null, '本月已结算'),
+          document.createTextNode(formatMilli(usage.used_milli)),
+          el('span', null, '预留'),
+          document.createTextNode(formatMilli(usage.reserved_milli)),
+          el('span', null, '剩余'),
+          document.createTextNode(usage.remaining_milli === null ? '不限' : formatMilli(usage.remaining_milli))
+        )
+      }
 
       const canEditRole = mode !== 'view' && grantable.some(option => option.value === member.role)
       const fields = [
@@ -122,7 +139,9 @@ export function renderMembersPage(host, { api, actions = [] }) {
           ? { key: 'role', label: '角色', type: 'select', options: grantable, allowEmpty: false }
           : { key: 'role', label: '角色', readonly: true, format: roleLabel },
         { key: 'group_id', label: '分组', type: 'select', options: [] },
-        { key: 'quota_eraser', label: '橡皮配额', type: 'number', step: 0.001, placeholder: '不限' },
+        mode === 'view'
+          ? { key: 'quota_eraser', label: '橡皮配额', readonly: true, nullText: '不限' }
+          : { key: 'quota_eraser', label: '橡皮配额', type: 'number', step: 0.001, placeholder: '不限', hint: QUOTA_HINT },
         { key: 'status', label: '状态', readonly: true, format: memberStatusLabel }
       ]
 
@@ -188,13 +207,12 @@ export function renderMembersPage(host, { api, actions = [] }) {
         const cancelBtn = el('button', 'link', '取消')
         saveBtn.addEventListener('click', async () => {
           const v = form.collect()
-          const quotaMilli = v.quota_eraser === null || v.quota_eraser === undefined
-            ? null
-            : Math.round(Number(v.quota_eraser) * 1000)
-          if (quotaMilli !== null && (!Number.isFinite(quotaMilli) || quotaMilli < 0)) {
-            form.setNotice('橡皮配额必须是不小于 0 的数字', 'error')
+          const parsed = parseQuotaEraserInput(v.quota_eraser)
+          if (parsed.error) {
+            form.setNotice(parsed.error, 'error')
             return
           }
+          const quotaMilli = parsed.quotaMilli
           saveBtn.disabled = true
           try {
             member = await api.post('/members/' + encodeURIComponent(member.user_id), {
@@ -256,7 +274,7 @@ export function renderMembersPage(host, { api, actions = [] }) {
       { key: 'role', title: '角色', render: m => roleLabel(m.role) },
       { key: 'group_name', title: '分组', render: m => m.group_name || m.group_id || '—' },
       { key: 'status', title: '状态', render: statusCell },
-      { key: 'quota_milli', title: '橡皮配额', render: m => formatMilli(m.quota_milli) },
+      { key: 'month_used_milli', title: '本月已用 / 配额', render: quotaUsageCell },
       { key: 'last_active_at', title: '最近活动', render: m => formatDateTime(m.last_active_at) }
     ]
   })

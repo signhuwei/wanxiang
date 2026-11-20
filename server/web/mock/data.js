@@ -30,6 +30,12 @@ function makeMembers(rng, count, tenantId, groups) {
     const quota = rng() < 0.4 ? null : Math.floor(rng() * 2000 + 50) * 1000 // 50–2050 橡皮，或不限
     const daysAgo = Math.floor(rng() * 7)
     const lastActive = new Date(Date.now() - daysAgo * 86400000 - Math.floor(rng() * 86400000)).toISOString()
+    // 本月已用：围绕配额上下浮动，制造部分接近/超出配额的样本；不限配额时用一个较小的随机用量。
+    // 已结算 settled + 仍 active 的租约预留 reserved 两部分；台账列和配额口径看两者之和（month_used_milli）。
+    const monthUsed = quota === null
+      ? Math.floor(rng() * 500) * 1000
+      : Math.floor(quota * (rng() * 1.15))
+    const reserved = Math.floor(monthUsed * rng() * 0.3) // 预留占已用的 0~30%
     members.push({
       user_id: 'usr_01J' + pad36(i + 1, 10),
       name,
@@ -39,12 +45,26 @@ function makeMembers(rng, count, tenantId, groups) {
       group_name: g.name,
       status: rng() < 0.06 ? 'disabled' : 'active',
       quota_milli: quota,
+      month_used_milli: monthUsed,
+      settled_milli: monthUsed - reserved,
+      reserved_milli: reserved,
       last_active_at: lastActive,
       revision: 1 + Math.floor(rng() * 3),
       tenant_id: tenantId
     })
   }
   return members
+}
+
+function withGroupQuota(rng, groups, members) {
+  return groups.map(g => {
+    const quota = rng() < 0.3 ? null : Math.floor(rng() * 8000 + 500) * 1000 // 500–8500 橡皮，或不限
+    const own = (members || []).filter(m => m.group_id === g.id)
+    const monthUsed = own.reduce((sum, m) => sum + (m.month_used_milli || 0), 0)
+    const settled = own.reduce((sum, m) => sum + (m.settled_milli || 0), 0)
+    const reserved = own.reduce((sum, m) => sum + (m.reserved_milli || 0), 0)
+    return { ...g, quota_milli: quota, month_used_milli: monthUsed, settled_milli: settled, reserved_milli: reserved, revision: 1 }
+  })
 }
 
 export function buildMockDb() {
@@ -73,26 +93,33 @@ export function buildMockDb() {
   const ownerRow = {
     user_id: 'usr_admin01', name: '万总', target: 'admin@onex.dev', role: 'owner',
     group_id: null, group_name: null, status: 'active', quota_milli: null,
+    month_used_milli: 812000, settled_milli: 760000, reserved_milli: 52000,
     last_active_at: new Date().toISOString(), revision: 1, tenant_id: 'ten_demo01'
   }
   membersA.unshift(ownerRow)
   const demoRow = {
+    // 配额 500 橡皮，已用 460 橡皮（92%：已结算 410 + 预留 50），用于验收接近配额的提示状态。
     user_id: 'usr_demo001', name: '小万', target: 'demo@onex.dev', role: 'member',
     group_id: groupsA[0].id, group_name: groupsA[0].name, status: 'active', quota_milli: 500000,
+    month_used_milli: 460000, settled_milli: 410000, reserved_milli: 50000,
     last_active_at: new Date().toISOString(), revision: 1, tenant_id: 'ten_demo01'
   }
   membersA.unshift(demoRow)
   const adminInB = {
     user_id: 'usr_admin01', name: '万总', target: 'admin@onex.dev', role: 'admin',
     group_id: null, group_name: null, status: 'active', quota_milli: null,
+    month_used_milli: 94000, settled_milli: 84000, reserved_milli: 10000,
     last_active_at: new Date().toISOString(), revision: 1, tenant_id: 'ten_demo02'
   }
   membersB.unshift(adminInB)
 
+  const groupsAWithQuota = withGroupQuota(rngA, groupsA, membersA)
+  const groupsBWithQuota = withGroupQuota(rngB, groupsB, membersB)
+
   return {
     tenants,
     users,
-    groups: { ten_demo01: groupsA, ten_demo02: groupsB },
+    groups: { ten_demo01: groupsAWithQuota, ten_demo02: groupsBWithQuota },
     members: { ten_demo01: membersA, ten_demo02: membersB },
     // token → {target, tenantId}；tenantId 为 null 表示全局令牌
     tokens: new Map(),
