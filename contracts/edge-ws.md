@@ -36,7 +36,7 @@ Server 回 `welcome`：
 | `config` | `revision`、`routes[]`、`agents[]`、`rates[]` | 全量配置。Edge 原子替换，回 ack；revision 不大于当前值时忽略。route 字段：`model`（精确名、`前缀*` 或 `*`，按精确、最长前缀、`*` 的顺序匹配）、`model_id`（对应 rates）、`provider_id`、`protocol`、`base_url`、`upstream_model?`、`auth`（`x_api_key` 或 `bearer`）、`proxy?`（见下方“网络代理”） |
 | `secret` | `provider_id`、`ciphertext`、`nonce`、`key_id` | 加密的上游密钥，只在内存解密。算法见下方“密钥下发” |
 | `lease` | `lease_id`、`expires_at`、`budget_milli`、`seq` | 额度租约。Edge 在 `expires_at` 前或已用 80% 时发 `lease_renew` |
-| `cutoff` | `reason`（`balance`、`quota`、`disabled`、`contract`） | 立即断流：拒绝新请求，中断进行中的流 |
+| `cutoff` | `reason`（`balance`、`quota`、`disabled`、`contract`）、`settled_lease_id?` | 立即断流：拒绝新请求，中断进行中的流。带 `settled_lease_id` 表示该租约已在本次续租中结清（v0.13） |
 | `diag` | `diag_id`、`kind`（`logs`、`status`）、`upload_url` | `logs` 将白名单日志打包，经当前控制连接同源的 `/v1/diag/:id/upload` 上传，使用该连接的设备令牌。`status` 直接回 `diag_result` |
 | `agent_cmd` | `agent`、`action`（`stop`） | 管理指令 |
 
@@ -48,6 +48,7 @@ Server 回 `welcome`：
 | `usage` | `batch[]`：`{seq, request_id, session_id, lease_id, provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_milli, at, status, complete}` | 用量计量。与 events 共用 seq 空间。`status`：`ok`、`upstream_<HTTP 状态码>`、`upstream_error`、`client_cancelled`，以及 Edge 主动断流的 `lease_exhausted`、`lease_expired`、`cutoff`。条目带 `model_id`。`complete=false` 表示流中断、用量不全，cost 按已收到的部分计算，Server 记为待结算，不当作零 |
 | `lease_renew` | `lease_id`、`used_milli`、`op_id` | 续租。`used_milli` 是该租约从签发起累计的绝对值（不是增量），Server 据此在租约上限内幂等扣款。签发新租约或回 `cutoff` |
 | `diag_result` | `diag_id`、`ok`、`detail` | 诊断结果 |
+| `lease_request` | `op_id` | 没有租约时申请新租约（v0.13）。Server 按签发规则回 `lease` 或 `cutoff`，不缓存结果，同一 `op_id` 可重发 |
 | `agent_state` | `agent`、`session_id`、`state`（`started`、`exited`、`crashed`）、`exit_code` | Agent 生命周期 |
 
 ### 会话事件 kind
@@ -125,3 +126,32 @@ Edge 连 Server 和上游时，默认使用环境变量中的代理设置（`HTT
   - Codex：受管 `CODEX_HOME/sessions/**/rollout-*.jsonl`，只取 `response_item` 的 user/assistant 可见文本与 function/custom 调用及结果；`event_msg` 与 `compacted` 不生成发言（压缩生成 `compact`）。原生 thread id 只作来源标识。
   - Kimi Code：受管 `KIMI_CODE_HOME/sessions/**/agents/<agent>/wire.jsonl`，取 `agent.message.appended` 的公开消息与 `context.append_loop_event` 的 `tool.call`/`tool.result`；子 agent 写 `agent_id`。
   - 未知记录形状一律生成 `gap`，不猜测。细节见 `docs/specs/agents/codex.md`、`docs/specs/agents/kimi-code.md`。
+
+## 断流后的恢复（v0.13）
+
+S1 起存在的缺陷：续租回 `cutoff` 后，Edge 保留旧租约并重放同一 `op_id`，Server 返回缓存的 `cutoff`，充值、调高配额或跨月后都无法恢复。改为：
+
+- Server 对 `lease_renew` 的回复如果是 `cutoff`，且旧租约已在这次操作中结清，`cutoff` 带 `settled_lease_id`。`lease_operations` 照常缓存这份回复，重放同一 `op_id` 仍返回它（含 `settled_lease_id`）。`disabled` 在结清前判定，不带该字段。
+- Edge 收到带 `settled_lease_id` 且等于当前租约的 `cutoff`：在同一次落盘中删除当前租约、累计用量和续租快照，保留 `cutoff` 原因。之后 `hello` 不再带 `lease_id`。
+- 处于 `cutoff` 且没有租约的 Edge，在每次连上后和每隔 60 秒（加 ±20% 抖动）发一次 `lease_request`；`onex run` 启动 Agent 时也立即发一次。收到 `lease` 即解除 `cutoff`。
+- Server 处理 `lease_request`：设备不可用回 `cutoff{disabled}`；已有 active 租约直接回该租约；否则按签发规则回 `lease` 或 `cutoff`。不写 `lease_operations`。
+- 不带 `settled_lease_id` 的 `cutoff`（例如 `disabled`、或 Server 主动推送）保持 v0.5 行为：旧租约和快照保留，恢复后重放续租结清。
+
+### 断流原因优先级
+
+签发或续租时依次判断，取第一个命中的：`disabled` > `contract` > `balance` > `quota`。
+
+## 多 Agent 接入补充（v0.13）
+
+- **OneX session_id**：每次受管启动由 onexd 生成一个 UUID，作为该次启动第一个原生会话（Codex thread、Kimi session）的 `session_id`。同一次启动里出现的其他原生会话，`session_id` 取 UUID v5（命名空间为首个 `session_id`，名字为原生 ID），各自先发 `session_start`。router 的本机令牌绑定启动；usage 的 `session_id` 用首个 `session_id`。
+- **payload 公共字段**：`uuid` 取原生记录 ID，没有就填 null；`parentUuid` 同理；`sidechain` 只有子 Agent 为 true；`agent_id` 主会话为 null，子 Agent 填原生子 Agent 名或 ID。Kimi 主 agent 的 `agent_id` 为 null。
+- **系统注入不算发言**：Codex 的 `developer` 消息、`environment_context`、`user_instructions` 等注入，Kimi 的同类注入，不生成 `user_message`，不计入 `turn_count`。
+- **已知忽略清单**：各采集器在代码里显式列出已识别、无需上报的记录类型（如 Codex `session_meta`、`turn_context`、`reasoning`，Kimi 流式分片和 context 重放），列表内的跳过且不生成 `gap`，列表外的未知类型生成 `gap`。清单要有测试。
+- **压缩**：能读到压缩摘要时生成 `compact`；读不到摘要只知道发生过压缩时，生成 `compact` 且 `summary` 为 null。
+
+### Responses 入口补充
+
+- **预留**：有 `max_output_tokens` 时按它计输出；没有时按 4096 输出 token 预留。估算输入照旧。
+- **错误**：未发响应头时，HTTP 状态按 `errors.md`，响应体 `{"error":{"type":"<kind>","code":"<errors.md code>","message":"..."}}`，`kind` 与 Anthropic 错误体同一组取值（`billing_error`、`permission_error`、`invalid_request_error`、`api_error`）。已发头时写一条 `response.failed` 事件（`response.status = "failed"`，`response.error = {code, message}`），然后结束流，不再发 `response.completed`。
+- **字段处理**：同协议转发时原样透传 `previous_response_id`、`store`、`include`、`reasoning` 等字段。转 Chat 时：带 `previous_response_id` 的请求返回 `invalid` 并说明需要关闭服务端会话存储；`reasoning` 输入项丢弃；`include` 忽略；`store` 不转发。onexd 生成的 Codex 配置固定关闭服务端存储。
+- **anthropic 上游**：返回 `model_not_allowed`，`message` 写明“该模型的上游协议暂不支持 Codex，请联系管理员调整路由”。
