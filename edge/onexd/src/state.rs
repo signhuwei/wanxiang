@@ -61,6 +61,12 @@ pub struct ConfigSnapshot {
     pub agents: Vec<AgentRelease>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchBinding {
+    pub session_id: String,
+    pub agent: String,
+}
+
 pub struct State {
     /// device_token。S0 只存内存，重启后需要重新 login。
     pub token: watch::Sender<Option<String>>,
@@ -78,7 +84,7 @@ pub struct State {
     /// 当前受管 Agent 的会话，router 把 usage 记到它名下
     pub active_session: RwLock<Option<String>>,
     /// Each managed launch gets its own loopback route credential.
-    pub launch_tokens: RwLock<HashMap<String, String>>,
+    pub launch_tokens: RwLock<HashMap<String, LaunchBinding>>,
 }
 
 impl Default for State {

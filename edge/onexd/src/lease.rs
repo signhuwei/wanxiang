@@ -426,13 +426,19 @@ impl Ledger {
 
     /// 放行一个新请求。剩余额度必须覆盖本次预留 `reserve`。
     pub fn admit(self: &Arc<Self>, reserve: i64) -> Result<Ticket, Block> {
+        self.admit_with(|_| reserve)
+    }
+
+    pub(crate) fn admit_with(self: &Arc<Self>, reservation: impl FnOnce(i64) -> i64) -> Result<Ticket, Block> {
         let now = Instant::now();
         let mut i = self.inner.lock().unwrap();
+        let budget = i.saved.lease.as_ref().map_or(0, |g| g.budget_milli);
+        let remaining = budget.saturating_sub(i.committed()).max(0);
+        let reserve = reservation(remaining);
         let blocked = i.block(now).or_else(|| {
-            let budget = i.saved.lease.as_ref().map_or(0, |g| g.budget_milli);
             if reserve > budget {
                 Some(Block::TooLarge { reserve, budget })
-            } else if i.committed() + reserve > budget {
+            } else if reserve > remaining {
                 Some(Block::Exhausted)
             } else {
                 None
@@ -554,7 +560,13 @@ impl Ledger {
         }
         let r = self.persist(&next);
         i.saved = next;
-        warn!(reason, settled = settles_current, inflight = i.inflight.len(), unsettled_milli = i.saved.used_milli, "cutoff");
+        warn!(
+            reason,
+            settled = settles_current,
+            inflight = i.inflight.len(),
+            unsettled_milli = i.saved.used_milli,
+            "cutoff"
+        );
         self.check_renew(&i, Instant::now());
         self.check_lease_request(&i, Instant::now());
         drop(i);
@@ -727,7 +739,9 @@ impl Ledger {
         if let (Some(at), Some(wait)) = (i.lease_req.sent_at, i.lease_req.next_wait) {
             next = next.min((at + wait).saturating_duration_since(now));
         }
-        let (Some(g), Some(deadline)) = (i.saved.lease.clone(), i.deadline) else { return next.max(Duration::from_millis(1)) };
+        let (Some(g), Some(deadline)) = (i.saved.lease.clone(), i.deadline) else {
+            return next.max(Duration::from_millis(1));
+        };
         if now >= deadline {
             if !i.expiry_handled {
                 i.expiry_handled = true;

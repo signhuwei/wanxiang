@@ -31,7 +31,7 @@ use crate::{chat, id};
 
 /// Claude Code 带图片和长上下文时请求体可达数十 MB。
 const MAX_BODY: usize = 64 * 1024 * 1024;
-const MAX_UPSTREAM_BODY: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_UPSTREAM_BODY: usize = 64 * 1024 * 1024;
 const MVP_LOCAL_QWEN_PROVIDER_ID: &str = "prv_mvp_local_qwen";
 const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 
@@ -112,21 +112,25 @@ impl UsageRecord {
 }
 
 /// 一次请求的计量。预留只用于放行，不参与任何花费计算。
-struct Meter {
-    rate: Rate,
-    tokens: Tokens,
+pub(crate) struct Meter {
+    pub(crate) rate: Rate,
+    pub(crate) tokens: Tokens,
     /// 从 content_block_delta 估算的输出 token
     est_output: u64,
     /// 上游报过输入侧用量（`input_tokens` 是数字）
     input_reported: bool,
-    reservation: i64,
+    pub(crate) reservation: i64,
 }
 
 impl Meter {
     /// 预留 = max_tokens × 输出单价 + 估算输入 × 输入单价（sprint-1 范围决定）。
-    fn new(rate: Rate, max_tokens: u64, est_input: u64) -> Self {
+    pub(crate) fn new(rate: Rate, max_tokens: u64, est_input: u64) -> Self {
         let reservation = cost_milli(&rate, &Tokens { input: est_input, output: max_tokens, ..Default::default() });
         Self { rate, tokens: Tokens::default(), est_output: 0, input_reported: false, reservation }
+    }
+
+    pub(crate) fn observe_output_bytes(&mut self, total_bytes: usize) {
+        self.est_output = estimate_tokens(total_bytes);
     }
 
     fn seen(&self) -> Tokens {
@@ -134,12 +138,12 @@ impl Meter {
     }
 
     /// 已见用量（含输出字节估算）的花费，越过租约额度就中断流。
-    fn seen_cost(&self) -> i64 {
+    pub(crate) fn seen_cost(&self) -> i64 {
         cost_milli(&self.rate, &self.seen())
     }
 
     /// 结束时的用量：拿到最终用量按实际，否则按已见部分。
-    fn final_tokens(&self, usage_final: bool) -> Tokens {
+    pub(crate) fn final_tokens(&self, usage_final: bool) -> Tokens {
         if usage_final { self.tokens } else { self.seen() }
     }
 }
@@ -155,14 +159,14 @@ fn is_business_error_body(v: &Value) -> bool {
 }
 
 pub struct Router {
-    state: Arc<State>,
+    pub(crate) state: Arc<State>,
     local_token: String,
     /// 遵从环境变量代理的默认客户端
     http: reqwest::Client,
     direct: reqwest::Client,
     /// route.proxy 指定代理时的客户端，按代理地址缓存
     proxied: Mutex<HashMap<String, reqwest::Client>>,
-    usage_tx: mpsc::UnboundedSender<UsageRecord>,
+    pub(crate) usage_tx: mpsc::UnboundedSender<UsageRecord>,
 }
 
 impl Router {
@@ -180,24 +184,31 @@ impl Router {
         AxumRouter::new()
             .route("/v1/messages", post(messages))
             .route(COUNT_TOKENS_PATH, post(messages))
+            .route("/v1/responses", post(crate::responses::responses))
             .layer(DefaultBodyLimit::max(MAX_BODY))
             .with_state(self)
     }
 
-    fn session_for(&self, h: &HeaderMap) -> Result<Option<String>, ()> {
+    pub(crate) fn session_for(&self, h: &HeaderMap) -> Result<Option<crate::state::LaunchBinding>, ()> {
         // Claude Code 用 ANTHROPIC_API_KEY 时发 x-api-key，用 ANTHROPIC_AUTH_TOKEN 时发 Bearer。
         let presented = h.get("x-api-key").and_then(|v| v.to_str().ok()).or_else(|| {
             h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "))
         });
         let token = presented.ok_or(())?;
         if token.as_bytes().ct_eq(self.local_token.as_bytes()).into() {
-            return Ok(self.state.active_session.read().unwrap().clone());
+            return Ok(self
+                .state
+                .active_session
+                .read()
+                .unwrap()
+                .clone()
+                .map(|session_id| crate::state::LaunchBinding { session_id, agent: String::new() }));
         }
         self.state.launch_tokens.read().unwrap().get(token).cloned().map(Some).ok_or(())
     }
 
     /// 回环地址一律直连；`proxy` 为 `"none"` 直连，为 URL 用指定代理；不填用环境变量代理。
-    fn client_for(&self, url: &str, proxy: Option<&str>) -> Result<reqwest::Client, String> {
+    pub(crate) fn client_for(&self, url: &str, proxy: Option<&str>) -> Result<reqwest::Client, String> {
         let host = reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default();
         if matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1") {
             return Ok(self.direct.clone());
@@ -241,13 +252,14 @@ pub fn select_route<'a>(routes: &'a [Route], model: &str) -> Option<&'a Route> {
 async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let started = Instant::now();
     let counts_tokens = uri.path() == COUNT_TOKENS_PATH;
-    let Ok(session_id) = rt.session_for(&headers) else {
+    let Ok(binding) = rt.session_for(&headers) else {
         return anthropic_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             "OneX 本机令牌无效。请从 OneX Desktop 重新启动这个 Agent。",
         );
     };
+    let session_id = binding.map(|claim| claim.session_id);
 
     let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v @ Value::Object(_)) => v,
@@ -509,6 +521,10 @@ async fn forward_count_tokens(
 
 /// 估算请求的输入 token：所有字符串值的字节数按 3 字节 1 个 token 算，跳过图片等 base64 的 `data`。
 fn estimate_input(req: &Value) -> u64 {
+    estimate_request_fields(req, &["system", "messages", "tools"])
+}
+
+pub(crate) fn estimate_request_fields(req: &Value, fields: &[&str]) -> u64 {
     fn walk(v: &Value, n: &mut usize) {
         match v {
             Value::String(s) => *n += s.len(),
@@ -518,8 +534,8 @@ fn estimate_input(req: &Value) -> u64 {
         }
     }
     let mut n = 0;
-    for k in ["system", "messages", "tools"] {
-        if let Some(v) = req.get(k) {
+    for &key in fields {
+        if let Some(v) = req.get(key) {
             walk(v, &mut n);
         }
     }
@@ -613,7 +629,7 @@ impl Req {
 }
 
 impl Router {
-    fn note_upstream(&self, rec: &UsageRecord) {
+    pub(crate) fn note_upstream(&self, rec: &UsageRecord) {
         let entry = (rec.outcome.as_str(), rec.request_id.clone(), now_ms());
         let mut u = self.state.upstream.lock().unwrap();
         if rec.outcome == Outcome::UpstreamError {
@@ -946,7 +962,7 @@ fn apply_usage(t: &mut Tokens, u: &Value) {
 }
 
 /// (HTTP 状态, Anthropic error.type, errors.md 的 code, 中文说明)
-fn block_error(b: Block) -> (StatusCode, &'static str, &'static str, &'static str) {
+pub(crate) fn block_error(b: Block) -> (StatusCode, &'static str, &'static str, &'static str) {
     const PAY: StatusCode = StatusCode::PAYMENT_REQUIRED;
     match b {
         Block::NoLease => (
@@ -1013,7 +1029,7 @@ fn forward_headers(h: &HeaderMap) -> HeaderMap {
     out
 }
 
-fn response_headers(h: &reqwest::header::HeaderMap) -> HeaderMap {
+pub(crate) fn response_headers(h: &reqwest::header::HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (k, v) in h {
         let n = k.as_str();
@@ -1027,13 +1043,13 @@ fn response_headers(h: &reqwest::header::HeaderMap) -> HeaderMap {
     out
 }
 
-fn header_value(s: &str) -> HeaderValue {
+pub(crate) fn header_value(s: &str) -> HeaderValue {
     let mut v = HeaderValue::from_str(s).unwrap_or_else(|_| HeaderValue::from_static(""));
     v.set_sensitive(true);
     v
 }
 
-async fn read_limited(mut resp: reqwest::Response, max: usize) -> anyhow::Result<Bytes> {
+pub(crate) async fn read_limited(mut resp: reqwest::Response, max: usize) -> anyhow::Result<Bytes> {
     let mut buf = Vec::new();
     while let Some(c) = resp.chunk().await.map_err(|e| e.without_url())? {
         if buf.len() + c.len() > max {
@@ -1044,7 +1060,9 @@ async fn read_limited(mut resp: reqwest::Response, max: usize) -> anyhow::Result
     Ok(buf.into())
 }
 
-fn tokio_stream_from<T: Send + 'static>(mut rx: mpsc::Receiver<T>) -> impl futures_util::Stream<Item = T> + Send {
+pub(crate) fn tokio_stream_from<T: Send + 'static>(
+    mut rx: mpsc::Receiver<T>,
+) -> impl futures_util::Stream<Item = T> + Send {
     futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
 }
 

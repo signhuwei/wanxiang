@@ -126,7 +126,12 @@ async fn status_login_shutdown() {
     let l = c.call(&launch(None)).await;
     assert_eq!((l["ok"].as_bool(), l["model"].as_str()), (Some(true), Some("Qwen3.8-27B")));
     assert_eq!(
-        state.launch_tokens.read().unwrap().get(l["env"]["ANTHROPIC_API_KEY"].as_str().unwrap()).map(String::as_str),
+        state
+            .launch_tokens
+            .read()
+            .unwrap()
+            .get(l["env"]["ANTHROPIC_API_KEY"].as_str().unwrap())
+            .map(|binding| binding.session_id.as_str()),
         l["session_id"].as_str()
     );
     assert_eq!(l["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:1");
@@ -363,7 +368,7 @@ async fn launch_without_program_downloads_the_managed_release() {
     {
         let tokens = state.launch_tokens.read().unwrap();
         assert!(!tokens.contains_key(first_token));
-        assert_eq!(tokens.get(second_token).map(String::as_str), second["session_id"].as_str());
+        assert_eq!(tokens.get(second_token).map(|binding| binding.session_id.as_str()), second["session_id"].as_str());
     }
     let s = c.call(r#"{"cmd":"status"}"#).await;
     assert_eq!(s["managed_agents"], json!([{"id":"claude-code","version":"2.1.311","status":"running"}]));
@@ -384,14 +389,17 @@ async fn launch_requests_a_lease_immediately_when_cut_off_without_one() {
     state.config.write().unwrap().routes = vec![wild];
 
     // 模拟 Server 续租回 cutoff 且结清：没有租约，处于 cutoff
-    state.lease.grant(&onex_core::ws::Lease {
-        id: "m1".into(),
-        re: None,
-        lease_id: "lse_1".into(),
-        expires_at: onexd::pricing::format_ms(onexd::outbox::now_ms() + 600_000),
-        budget_milli: 100,
-        seq: 1,
-    }).unwrap();
+    state
+        .lease
+        .grant(&onex_core::ws::Lease {
+            id: "m1".into(),
+            re: None,
+            lease_id: "lse_1".into(),
+            expires_at: onexd::pricing::format_ms(onexd::outbox::now_ms() + 600_000),
+            budget_milli: 100,
+            seq: 1,
+        })
+        .unwrap();
     state.lease.cutoff("balance", Some("lse_1")).unwrap();
     assert!(state.lease.lease_id().is_none());
     assert!(state.lease.take_lease_request().is_some(), "cutoff 本身已经排好了第一次申请");
@@ -405,7 +413,7 @@ async fn launch_requests_a_lease_immediately_when_cut_off_without_one() {
     let cwd = dir.path().to_string_lossy().to_string();
     let req = json!({"cmd":"launch","agent":"claude-code","program":program,"cwd":cwd,
         "env":{"PATH":path_env},"model":null})
-        .to_string();
+    .to_string();
     let l = c.call(&req).await;
     assert_eq!(l["ok"], true, "{l}");
     // 启动触发了一次立即申请，不受上一次窗口限制

@@ -1,7 +1,7 @@
 //! Bind native sessions discovered inside one managed launch to durable OneX IDs.
 
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{capture, kimi_capture, outbox::Outbox, state::State};
+use crate::{capture, codex_capture, kimi_capture, outbox::Outbox, state::State};
 
 fn uuid_v5(namespace: Uuid, name: &str) -> Uuid {
     let mut hash = Sha1::new();
@@ -26,6 +26,21 @@ fn uuid_v5(namespace: Uuid, name: &str) -> Uuid {
 
 fn session_id(device: &str, agent: &str, native: &str) -> String {
     uuid_v5(uuid_v5(Uuid::NAMESPACE_DNS, device), &format!("{agent}:{native}")).to_string()
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Agent {
+    Codex,
+    Kimi,
+}
+
+impl Agent {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Kimi => "kimi-code",
+        }
+    }
 }
 
 pub(crate) struct LaunchCapture {
@@ -51,27 +66,41 @@ impl LaunchCapture {
 
     fn bind_usage(&self, id: String) {
         if let Some(current) = self.state.launch_tokens.write().unwrap().get_mut(&self.token) {
-            *current = id;
+            current.session_id = id;
         }
     }
 
-    fn capture_kimi(&self, ending: bool, code: Option<i32>) {
+    fn capture(&self, agent: Agent, ending: bool, code: Option<i32>) {
+        let sources = match agent {
+            Agent::Codex => codex_sources(&self.session.config_dir, &self.session.cwd),
+            Agent::Kimi => kimi_sources(&self.session.config_dir, &self.session.cwd),
+        };
         let mut last: Option<(SystemTime, String)> = None;
-        for (native, path, modified) in kimi_sources(&self.session.config_dir, &self.session.cwd) {
-            let id = session_id(&self.device, "kimi-code", &native);
-            let capture = kimi_capture::Capture::new(
-                kimi_capture::Session {
-                    session_id: id.clone(),
-                    session_dir: path,
-                    agent_version: self.session.agent_version.clone(),
-                    model: self.session.model.clone(),
-                    cwd: self.session.cwd.clone(),
-                },
-                self.outbox.clone(),
-            );
-            let result = if ending { capture.end(code) } else { capture.pass().map(|_| ()) };
+        for (native, path, modified) in sources {
+            let id = session_id(&self.device, agent.id(), &native);
+            let result = match agent {
+                Agent::Codex => {
+                    let mut session = self.session.clone();
+                    session.session_id.clone_from(&id);
+                    let capture = codex_capture::Capture::new(session, path, self.outbox.clone());
+                    if ending { capture.end(code) } else { capture.pass() }
+                }
+                Agent::Kimi => {
+                    let capture = kimi_capture::Capture::new(
+                        kimi_capture::Session {
+                            session_id: id.clone(),
+                            session_dir: path,
+                            agent_version: self.session.agent_version.clone(),
+                            model: self.session.model.clone(),
+                            cwd: self.session.cwd.clone(),
+                        },
+                        self.outbox.clone(),
+                    );
+                    if ending { capture.end(code) } else { capture.pass().map(|_| ()) }
+                }
+            };
             if let Err(error) = result {
-                warn!(%error, session_id = %id, "Kimi native capture failed");
+                warn!(%error, agent = agent.id(), session_id = %id, "native capture failed");
             } else if last.as_ref().is_none_or(|(at, _)| modified >= *at) {
                 last = Some((modified, id));
             }
@@ -81,11 +110,11 @@ impl LaunchCapture {
         }
     }
 
-    pub(crate) async fn run_kimi(self, stop: CancellationToken, exit: Arc<Mutex<Option<i32>>>) {
+    pub(crate) async fn run(self, agent: Agent, stop: CancellationToken, exit: Arc<Mutex<Option<i32>>>) {
         let capture = Arc::new(self);
         loop {
             let current = capture.clone();
-            let _ = tokio::task::spawn_blocking(move || current.capture_kimi(false, None)).await;
+            let _ = tokio::task::spawn_blocking(move || current.capture(agent, false, None)).await;
             tokio::select! {
                 _ = stop.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {}
@@ -93,7 +122,7 @@ impl LaunchCapture {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
         let code = *exit.lock().unwrap();
-        let _ = tokio::task::spawn_blocking(move || capture.capture_kimi(true, code)).await;
+        let _ = tokio::task::spawn_blocking(move || capture.capture(agent, true, code)).await;
     }
 }
 
@@ -107,6 +136,67 @@ fn child_dirs(dir: &Path) -> impl Iterator<Item = PathBuf> {
         .flatten()
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
+}
+
+fn codex_sources(home: &Path, cwd: &Path) -> Vec<(String, PathBuf, SystemTime)> {
+    let Ok(cwd) = fs::canonicalize(cwd) else { return Vec::new() };
+    if !fs::symlink_metadata(home).is_ok_and(|meta| meta.is_dir()) {
+        return Vec::new();
+    }
+    let mut pending = vec![(home.join("sessions"), 0)];
+    let mut rollouts = Vec::new();
+    while let Some((dir, depth)) = pending.pop() {
+        if !fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_dir() && depth < 6 {
+                pending.push((path, depth + 1));
+            } else if kind.is_file()
+                && let Some((id, at)) = codex_identity(&path, home, &cwd)
+            {
+                rollouts.push((id, path, at));
+            }
+        }
+    }
+    rollouts.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
+    // A thread has one canonical rollout. Retain the latest if the runtime copied it.
+    let mut seen = std::collections::HashSet::new();
+    rollouts.reverse();
+    rollouts.retain(|(id, _, _)| seen.insert(id.clone()));
+    rollouts
+}
+
+fn codex_identity(path: &Path, home: &Path, cwd: &Path) -> Option<(String, SystemTime)> {
+    let name = path.file_name()?.to_str()?.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    let info = fs::symlink_metadata(path).ok()?;
+    if !info.is_file() || !capture::owned_by_same_principal(path, home).ok()? {
+        return None;
+    }
+    let source = File::open(path).ok()?.take(256 * 1024);
+    let mut header = Vec::new();
+    BufReader::new(source).read_until(b'\n', &mut header).ok()?;
+    if !header.ends_with(b"\n") {
+        return None;
+    }
+    let meta: Value = serde_json::from_slice(&header).ok()?;
+    if meta["type"] != "session_meta" {
+        return None;
+    }
+    let payload = &meta["payload"];
+    if payload["source"].get("subagent").is_some() {
+        return None;
+    }
+    let id = Uuid::parse_str(payload["id"].as_str()?).ok()?.to_string();
+    if !name.strip_suffix(&id).is_some_and(|prefix| prefix.ends_with('-'))
+        || fs::canonicalize(payload["cwd"].as_str()?).ok()? != cwd
+    {
+        return None;
+    }
+    Some((id, info.modified().ok()?))
 }
 
 fn kimi_sources(home: &Path, cwd: &Path) -> Vec<(String, PathBuf, SystemTime)> {
@@ -164,6 +254,28 @@ mod tests {
         assert_ne!(first, session_id("device-b", "kimi-code", "session-x"));
         assert_ne!(first, session_id("device-a", "codex", "session-x"));
         assert_eq!(Uuid::parse_str(&first).unwrap().get_version_num(), 5);
+    }
+
+    #[test]
+    fn codex_discovery_binds_multiple_verified_threads_and_rejects_mismatches() {
+        let profile = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let sessions = profile.path().join("sessions/2026/11/20");
+        fs::create_dir_all(&sessions).unwrap();
+        let first = "00000000-0000-4000-8000-000000000041";
+        let second = "00000000-0000-4000-8000-000000000042";
+        let write = |name: &str, id: &str, cwd: &Path| {
+            let header = serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":cwd}});
+            fs::write(sessions.join(format!("rollout-time-{name}.jsonl")), format!("{header}\n")).unwrap();
+        };
+        write(first, second, cwd.path());
+        write(second, second, profile.path());
+        assert!(codex_sources(profile.path(), cwd.path()).is_empty());
+        write(first, first, cwd.path());
+        write(second, second, cwd.path());
+        let mut ids: Vec<String> = codex_sources(profile.path(), cwd.path()).into_iter().map(|(id, _, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, [first, second]);
     }
 
     #[test]

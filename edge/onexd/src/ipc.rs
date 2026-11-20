@@ -24,7 +24,7 @@ const MAX_LINE: u64 = 64 * 1024;
 /// 不是同一个名单：后者是「Server 下发的发行记录认哪些 agent 名字」，这里是「onexd 本机真的会
 /// 准备启动」，两者独立演进（例如先接入制品下发，后接入启动准备）。S1 只有 Claude Code；
 /// S2 接入 Codex、Kimi Code 时在这里加名字，并给 `launch.rs` 加对应的 `prepare_<agent>`。
-const LAUNCHABLE_AGENTS: &[&str] = &["claude-code", "kimi-code"];
+const LAUNCHABLE_AGENTS: &[&str] = &["claude-code", "codex", "kimi-code"];
 
 pub struct Ipc {
     pub state: Arc<State>,
@@ -331,6 +331,7 @@ async fn launch(
             }
         },
     };
+    let agent_version = approved.as_ref().map(|release| release.version.as_str()).or(agent_version);
     let local_token = crate::id::token();
     let r = crate::launch::Request {
         agent,
@@ -354,7 +355,10 @@ async fn launch(
             };
             let stop = CancellationToken::new();
             let code = Arc::new(std::sync::Mutex::new(None));
-            ipc.state.launch_tokens.write().unwrap().insert(local_token.clone(), l.session_id.clone());
+            ipc.state.launch_tokens.write().unwrap().insert(
+                local_token.clone(),
+                crate::state::LaunchBinding { session_id: l.session_id.clone(), agent: agent.into() },
+            );
             ctx.running.lock().unwrap().insert(
                 l.launch_id.clone(),
                 Running {
@@ -365,10 +369,15 @@ async fn launch(
                 },
             );
             *ipc.state.active_session.write().unwrap() = Some(l.session_id.clone());
-            if agent == "kimi-code" {
+            let native = match agent {
+                "codex" => Some(crate::native_capture::Agent::Codex),
+                "kimi-code" => Some(crate::native_capture::Agent::Kimi),
+                _ => None,
+            };
+            if let Some(native) = native {
                 let capture =
                     crate::native_capture::LaunchCapture::new(s, ipc.state.clone(), ipc.outbox.clone(), local_token);
-                tokio::spawn(capture.run_kimi(stop, code));
+                tokio::spawn(capture.run(native, stop, code));
             } else {
                 tokio::spawn(crate::capture::Capture::new(s, ipc.outbox.clone()).run(stop, code));
             }

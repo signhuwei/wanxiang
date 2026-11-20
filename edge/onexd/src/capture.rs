@@ -307,7 +307,7 @@ impl Capture {
     }
 }
 
-fn tool_output(c: &Value) -> (String, bool) {
+pub(crate) fn tool_output(c: &Value) -> (String, bool) {
     let s = match c {
         Value::String(s) => s.clone(),
         Value::Array(a) => a
@@ -332,15 +332,15 @@ fn tool_output(c: &Value) -> (String, bool) {
     (s[..end].to_string(), true)
 }
 
-fn truncate(s: &str, n: usize) -> String {
+pub(crate) fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn read_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     f.seek(SeekFrom::Start(offset))?;
@@ -349,7 +349,7 @@ fn read_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn find_newline(path: &Path, mut from: u64) -> Result<Option<u64>> {
+pub(crate) fn find_newline(path: &Path, mut from: u64) -> Result<Option<u64>> {
     loop {
         let buf = read_range(path, from, 1024 * 1024)?;
         if buf.is_empty() {
@@ -366,7 +366,7 @@ fn find_newline(path: &Path, mut from: u64) -> Result<Option<u64>> {
 /// （按 outbox 游标里 `"ino"` 这个既有字段名存，不是跨平台契约字段，不需要迁移）。换了设备号
 /// 极少见但理论上可能导致误判"没换"，这里接受这个已知的小概率，和此前只看 `ino` 的精度一致。
 #[cfg(unix)]
-fn file_identity(_path: &Path, meta: &std::fs::Metadata) -> Result<u64> {
+pub(crate) fn file_identity(_path: &Path, meta: &std::fs::Metadata) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
     Ok(meta.ino())
 }
@@ -376,7 +376,7 @@ fn file_identity(_path: &Path, meta: &std::fs::Metadata) -> Result<u64> {
 /// 只看路径或时间戳会被"同名新文件刚好同一秒创建"骗过，必须经句柄查询真正的文件系统身份。
 /// 不含卷序列号：同一次采集过程里文件不会跨卷，加进去只会增加误判"换了"的概率。
 #[cfg(windows)]
-fn file_identity(path: &Path, _meta: &std::fs::Metadata) -> Result<u64> {
+pub(crate) fn file_identity(path: &Path, _meta: &std::fs::Metadata) -> Result<u64> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
     let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;

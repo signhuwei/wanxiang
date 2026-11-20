@@ -63,6 +63,18 @@ fn client_env_get<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'
     env.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v)
 }
 
+pub(crate) fn terminal_env(client: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    for key in PASS_ENV {
+        if let Some(value) = client_env_get(client, key) {
+            env.insert((*key).into(), value.clone());
+        }
+    }
+    let path = client_env_get(client, "PATH").cloned().unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+    env.insert("PATH".into(), path);
+    env
+}
+
 #[derive(Debug, Clone)]
 pub struct Request<'a> {
     /// `claude-code`、`codex`、`kimi-code`（`contracts/edge-ws.md` 多 Agent 一节的同一组名字）
@@ -105,6 +117,7 @@ pub fn prepare(r: &Request) -> Result<Launch> {
     }
     match r.agent {
         "claude-code" => prepare_claude_code(r),
+        "codex" => crate::codex_launch::prepare(r),
         "kimi-code" => crate::kimi_launch::prepare_kimi_code(r),
         other => bail!("no managed launch preparer for agent {other}"),
     }
@@ -136,20 +149,10 @@ fn prepare_claude_code(r: &Request) -> Result<Launch> {
     let settings_path = run_dir.join("settings.json");
     write_private(&settings_path, serde_json::to_string_pretty(&settings)?.as_bytes())?;
 
-    let mut env = BTreeMap::new();
-    for k in PASS_ENV {
-        if let Some(v) = client_env_get(r.client_env, k) {
-            env.insert(k.to_string(), v.clone());
-        }
-    }
-    // Windows 的进程环境块本身大小写不敏感（`Path`、`USERPROFILE` 等常以非全大写形式出现），
-    // 但 `client_env` 是普通 `BTreeMap`，精确匹配不到真实的 PATH 就会被当成"没设"，所以查找走
-    // `client_env_get`（大小写不敏感），不是直接 `.get("PATH")`。
-    let path = client_env_get(r.client_env, "PATH").cloned().unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+    let mut env = terminal_env(r.client_env);
     let set = |env: &mut BTreeMap<String, String>, k: &str, v: &str| {
         env.insert(k.into(), v.into());
     };
-    set(&mut env, "PATH", &path);
     set(&mut env, "HOME", &user_home.to_string_lossy());
     set(&mut env, "CLAUDE_CONFIG_DIR", &config_dir.to_string_lossy());
     set(&mut env, "TMPDIR", &format!("{}/", tmp.to_string_lossy()));
@@ -307,7 +310,7 @@ fn init_claude_json(config_dir: &Path, token: &str) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn private_dir(d: &Path) -> Result<()> {
+pub(crate) fn private_dir(d: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
     std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
@@ -317,13 +320,13 @@ fn private_dir(d: &Path) -> Result<()> {
 /// Windows 没有权限位；目录继承 `ONEX_HOME`（`%LOCALAPPDATA%\OneX`）本身的 ACL，
 /// 已经是当前用户私有，不需要额外收紧。
 #[cfg(windows)]
-fn private_dir(d: &Path) -> Result<()> {
+pub(crate) fn private_dir(d: &Path) -> Result<()> {
     std::fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
     Ok(())
 }
 
 #[cfg(unix)]
-fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let _ = std::fs::remove_file(path);
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
@@ -333,7 +336,7 @@ fn write_private(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     let _ = std::fs::remove_file(path);
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     f.write_all(data)?;
@@ -341,7 +344,7 @@ fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn uuid_v4() -> String {
+pub(crate) fn uuid_v4() -> String {
     let mut b: [u8; 16] = rand::random();
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
@@ -577,7 +580,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let env = BTreeMap::new();
         let r = Request {
-            agent: "codex",
+            agent: "unknown-agent",
             home: home.path(),
             router_addr: "127.0.0.1:1",
             local_token: "t",

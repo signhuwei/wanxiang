@@ -4,9 +4,29 @@
 
 下文提到的 `coord/reports/s2/` 报告和交接说明，在仓库里有一份副本：[docs/handoff/s2b/](s2b/)（`quota-review.test.ts` 存为 `.txt`，避免被 `bun test` 捡到）。
 
+## Codex 接手后的本地进度
+
+- 监察页按 Claude Code、Codex 和 Kimi Code 在服务端筛选会话，分页总数随筛选更新。人员台账展示月用量和个人配额。提交 `4b159fd`。
+- Kimi Code 受管启动采用独立的 `KIMI_CODE_HOME`，退出时清理令牌配置。原生会话按设备和会话 ID 生成稳定 UUID，正文、工具事件和压缩事件增量回流。提交 `d96df18`。
+- Codex 受管启动采用独立的 `CODEX_HOME`，本机令牌仅提供给 Codex 主进程，Edge 强制关闭受管请求的服务端存储。Responses 支持原生转发和 Chat 转译，涵盖命名空间与并行工具，以及断流前的实时计量。Rollout 只采集受管目录内已核验的 thread。
+- macOS arm64 已用官方 Codex 0.164.0 和 Kimi Code 2.3.0 通过实际 IPC 启动及回环假上游联验。Codex 完成工具调用和后续回复，验证了工具子进程环境过滤。Kimi 完成同一会话两轮对话，验证了配置清理。两者均验证了 Edge 会话正文、费用和退出事件。
+- Server、Web 和 Desktop 前端共 133 项通过，包含真实 Valkey。macOS Rust 工作区 308 项通过，Codex 和 Kimi 原生假上游用例单独执行。
+- 211 第二批待联验。Windows x64 编译、打包和原生验收等待 Windows 环境回执。RC3 完整手测由用户安排，签名公证按原计划挂起。
+
+在 macOS 用已核验的原生二进制复跑：
+
+```sh
+ONEX_SMOKE_AGENT=codex ONEX_SMOKE_BINARY=/absolute/path/to/codex \
+  cargo test --manifest-path edge/Cargo.toml -p onexd --test native_smoke -- --ignored --nocapture
+ONEX_SMOKE_AGENT=kimi-code ONEX_SMOKE_BINARY=/absolute/path/to/kimi \
+  cargo test --manifest-path edge/Cargo.toml -p onexd --test native_smoke -- --ignored --nocapture
+```
+
+以下保留 Claude 移交时的记录。
+
 ## 基线
 
-- 本地 `main` 是本文所在提交，比公开 `origin/main`（`0877496`）领先 70 多个提交，没有推送。原因见 Hulu 记录：GitHub 仓库是 public，内测源码是否外推要用户决定。
+- Claude 移交时本地 `main` 为 `24d420a`，比公开 `origin/main`（`0877496`）领先 70 多个提交，没有推送。原因见 Hulu 记录：GitHub 仓库是 public，内测源码是否外推要用户决定。
 - 211 仍运行 `2dcf5d3`。第二批没有部署。
 - `main` 全量回归：Server 82 通过 1 跳过、Web 48、Desktop 前端 1、Edge 246 通过 1 跳过，全部 0 失败（2026-11-20 11:25）。
 
