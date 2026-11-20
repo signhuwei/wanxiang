@@ -358,7 +358,8 @@ async fn launch_without_program_downloads_the_managed_release() {
     let l = c.call(&req).await;
     assert_eq!(l["ok"], true, "{l}");
     let program = l["program"].as_str().unwrap();
-    assert!(program.contains("/agents/claude-code/releases/"), "{program}");
+    let expected_cache = dir.path().join("agents").join("claude-code").join("releases");
+    assert!(std::path::Path::new(program).starts_with(expected_cache), "{program}");
     assert_eq!(std::fs::read(program).unwrap(), body);
 
     let second = c.call(&req).await;

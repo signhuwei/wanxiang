@@ -115,9 +115,10 @@ try {
     }
 
     Assert-X64 (Join-Path $releaseDir 'onex-desktop.exe')
-    $installer = @(Get-ChildItem -LiteralPath (Join-Path $releaseDir 'bundle\nsis') -Filter '*-setup.exe' -File |
+    $installers = @(Get-ChildItem -LiteralPath (Join-Path $releaseDir 'bundle\nsis') -Filter '*-setup.exe' -File |
         Where-Object { $_.LastWriteTimeUtc -ge $buildStarted })
-    if ($installer.Count -ne 1) { throw "Expected exactly one fresh NSIS installer, got $($installer.Count)." }
+    if ($installers.Count -ne 1) { throw "Expected exactly one fresh NSIS installer, got $($installers.Count)." }
+    $installer = $installers[0]
     $sha256 = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     "$sha256  $($installer.Name)" | Set-Content -LiteralPath "$($installer.FullName).sha256" -Encoding Ascii
 

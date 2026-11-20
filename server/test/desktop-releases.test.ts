@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from '../src/server';
+import { receiveArtifact } from '../src/artifact-upload';
 import { DESKTOP_ARTIFACT_MAX_BYTES } from '../src/desktop-releases';
 import { seedTenant } from '../src/seed';
 import { MemoryPresence } from '../src/presence';
@@ -11,19 +12,24 @@ import { MemoryPresence } from '../src/presence';
 // Every HTTP client we tried (fetch, node:http) recomputes Content-Length from the real body it was
 // given, so the only way to make a server actually see a declared length that outruns the real bytes
 // is to write the request line and headers onto a raw TCP socket ourselves.
-function rawPut(base: URL, path: string, token: string, declaredLength: number, body: Uint8Array) {
-  return new Promise<number>((resolve, reject) => {
+function rawPut(base: URL, path: string, token: string, declaredLength: number, body: Uint8Array, truncate = false) {
+  return new Promise<number | null>((resolve, reject) => {
     const socket = connect(Number(base.port), base.hostname, () => {
       socket.write(`PUT ${path} HTTP/1.1\r\nHost: ${base.hostname}\r\nAuthorization: Bearer ${token}\r\n` +
         `Content-Type: application/octet-stream\r\nContent-Length: ${declaredLength}\r\nConnection: close\r\n\r\n`);
-      socket.write(body);
+      if (truncate) socket.end(body);
+      else socket.write(body);
     });
     let data = '';
     socket.on('data', (chunk) => { data += chunk.toString('latin1'); });
-    socket.on('error', reject);
+    socket.setTimeout(3_000, () => socket.destroy(new Error('Raw upload socket timed out')));
+    socket.on('error', (error: NodeJS.ErrnoException) => {
+      // A server can reset the peer after receiving an incomplete HTTP request.
+      if (!truncate || error.code !== 'ECONNRESET') reject(error);
+    });
     socket.on('close', () => {
-      const status = Number(/^HTTP\/1\.[01] (\d{3})/.exec(data)?.[1]);
-      resolve(status);
+      const status = /^HTTP\/1\.[01] (\d{3})/.exec(data)?.[1];
+      resolve(status ? Number(status) : null);
     });
   });
 }
@@ -55,11 +61,10 @@ async function fixture() {
     const full = path.startsWith('/v1/') || path.startsWith('/download') ? path : `/v1${path}`;
     return fetch(new URL(full, service.server.url), { method, headers, body: body && JSON.stringify(body) });
   }
-  async function putArtifact(id: string, revision: number, bytes: Uint8Array | ReadableStream<Uint8Array>, token?: string, contentLength?: number) {
+  async function putArtifact(id: string, revision: number, bytes: Uint8Array | ReadableStream<Uint8Array>, token?: string) {
     const headers = new Headers();
     if (token) headers.set('authorization', `Bearer ${token}`);
     headers.set('content-type', 'application/octet-stream');
-    if (contentLength !== undefined) headers.set('content-length', String(contentLength));
     return fetch(new URL(`/v1/platform/desktop-releases/${id}/artifact?revision=${revision}`, service.server.url),
       { method: 'PUT', headers, body: bytes });
   }
@@ -172,19 +177,20 @@ test('rejects a connection that is cut short of its declared Content-Length, lea
   const a = await f.admin('admin-mismatch@example.test');
   const draft = await (await f.request('/platform/desktop-releases', { version: '1.0.0', os: 'darwin', arch: 'arm64' }, a.token, 'c1')).json() as Release;
   const bytes = xarBytes();
-  // A streaming body that ends (and closes the connection) well before the declared Content-Length
-  // is satisfied — undici/fetch always sends an accurate Content-Length for a plain buffer body, so a
-  // truncated transfer is the only realistic way a declared length can outrun what's actually received.
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) { controller.enqueue(bytes.subarray(0, bytes.length - 5)); controller.close(); },
+  const fragment = bytes.subarray(0, bytes.length - 5);
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(fragment); controller.close(); },
   });
-  const res = await fetch(new URL(`/v1/platform/desktop-releases/${draft.id}/artifact?revision=${draft.revision}`, f.server.url), {
-    method: 'PUT', duplex: 'half',
-    headers: { authorization: `Bearer ${a.token}`, 'content-type': 'application/octet-stream', 'content-length': String(bytes.length) },
-    body: stream,
-  } as RequestInit);
-  expect(res.status).toBe(422);
-  // The draft must be untouched: still a pristine draft, no size/sha recorded.
+  // Assert the upload handler rejects and removes a partial file even when an HTTP runtime
+  // discards an incomplete request before it reaches the route.
+  const stage = join(f.dataDir, 'truncated-upload');
+  await expect(receiveArtifact({ body, headers: new Headers({ 'content-length': String(bytes.length) }) },
+    stage, DESKTOP_ARTIFACT_MAX_BYTES)).rejects.toMatchObject({ code: 'invalid' });
+  expect(existsSync(stage)).toBe(false);
+
+  const status = await rawPut(f.server.url, `/v1/platform/desktop-releases/${draft.id}/artifact?revision=${draft.revision}`,
+    a.token, bytes.length, fragment, true);
+  expect([null, 400, 422]).toContain(status);
   const after = await (await f.request(`/platform/desktop-releases/${draft.id}`, undefined, a.token)).json() as Release;
   expect(after).toMatchObject({ status: 'draft', size: null, sha256: null, revision: 1 });
 });
