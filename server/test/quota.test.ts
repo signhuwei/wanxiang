@@ -296,3 +296,48 @@ test('/quota/usage enforces owner/admin/group_admin/member scoping and 404s on a
   expect((await f.request(`/quota/usage?scope=member&id=nonexistent`, undefined, owner)).status).toBe(404);
   expect((await f.request(`/quota/usage?scope=group&id=nonexistent`, undefined, owner)).status).toBe(404);
 });
+
+test('a one-milli remaining quota issues a one-milli lease instead of a cutoff', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1000);
+  const member = await f.join('boundary-one@example.test');
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, quota_milli: 1 }, owner)).status).toBe(200);
+  const edge = await linkedEdge(f, member.scoped);
+  // 配额剩余正好是 1（> 0）：按额度签发一份 budget_milli=1 的租约，不是 cutoff
+  const lease = await edge.nextOf('lease');
+  expect(lease).toMatchObject({ type: 'lease', budget_milli: 1 });
+  // 用满这 1 之后，剩余才真正到 0，下一次续租才 cutoff
+  edge.send({ type: 'lease_renew', id: 'renew-1', op_id: 'op-1', lease_id: lease.lease_id, used_milli: 1 });
+  expect(await edge.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'quota', re: 'renew-1' });
+});
+
+test('reassigning a member to another group moves their settled usage with them immediately', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1000);
+  const oldGroup = await (await f.request('/groups', { name: 'Old group', quota_milli: 100 }, owner)).json() as { id: string };
+  const newGroup = await (await f.request('/groups', { name: 'New group', quota_milli: 100 }, owner)).json() as { id: string };
+  const member = await f.join('reassigned@example.test');
+  // 本人配额刚好等于首租约的额度：结清后本人剩余归零，续租直接 cutoff，不会再留一份预留混进这个断言
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, group_id: oldGroup.id, quota_milli: 50 }, owner)).status).toBe(200);
+  const edge = await linkedEdge(f, member.scoped);
+  const lease = await edge.nextOf('lease');
+  expect(lease).toMatchObject({ type: 'lease', budget_milli: 50 });
+  edge.send({ type: 'lease_renew', id: 'renew-1', op_id: 'op-1', lease_id: lease.lease_id, used_milli: lease.budget_milli });
+  expect(await edge.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  // 本月已经结算了 lease.budget_milli，没有活跃租约再预留；这笔用量按当前归属（旧组）算
+  expect(await (await f.request(`/quota/usage?scope=group&id=${oldGroup.id}`, undefined, owner)).json())
+    .toMatchObject({ used_milli: lease.budget_milli });
+  expect(await (await f.request(`/quota/usage?scope=group&id=${newGroup.id}`, undefined, owner)).json())
+    .toMatchObject({ used_milli: 0 });
+  // 换组：usage 的归属口径是 members 当前的 group_id，不是历史快照，所以已结算的用量立刻跟着member转移到新组，
+  // 旧组立刻归零（members.group_id 改变后，data-model.md 配额一节的"本月已用"按当前归属重新计算，不保留按组切分的历史）
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 2, group_id: newGroup.id }, owner)).status).toBe(200);
+  expect(await (await f.request(`/quota/usage?scope=group&id=${oldGroup.id}`, undefined, owner)).json())
+    .toMatchObject({ used_milli: 0 });
+  expect(await (await f.request(`/quota/usage?scope=group&id=${newGroup.id}`, undefined, owner)).json())
+    .toMatchObject({ used_milli: lease.budget_milli });
+});
