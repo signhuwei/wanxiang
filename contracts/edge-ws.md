@@ -163,6 +163,12 @@ S1 起存在的缺陷：续租回 `cutoff` 后，Edge 保留旧租约并重放�
 - **同协议转发**：URL 拼接规则同 Chat（`base_url` 以 `/v1` 结尾时直接接 `/responses`）。只转发白名单请求头（`content-type`、`accept`、`openai-beta`、`user-agent`），认证头换成上游密钥。
 - **anthropic 上游**：返回 `model_not_allowed`，`message` 写明“该模型的上游协议暂不支持 Codex，请联系管理员调整路由”。
 
+### 桌面 Agent 的 Chat Completions 入口
+
+- `POST /v1/chat/completions` 校验受管桌面 Agent 专用本机 Bearer。关联会话以 daemon 签发时的绑定为准。仅允许合约生效的 `openai_chat` 路由，认证头由 daemon 按渠道重建。
+- 支持单候选的 JSON 和 SSE，保留工具调用 ID、参数和原始输出帧。流式要求上游返回 usage，且由 `[DONE]` 结束；异常时返回 Chat 错误并结束流。共用租约预留、实时中断和用量结算。
+- 平台暂存的完整安装包须先通过对应版本和操作系统的原生运行验证，之后才可进入 Edge 的可启动发行目录。
+
 ## Server 缓存制品（v0.14）
 
 - 支持新缓存协议的 Edge 在 `hello` 加 `agent_cache: true`。Server 在对应 `config` 回传 `agent_cache: true`，且 `agents` 仅带当前设备平台、架构及能力合约允许的已缓存启用发行。

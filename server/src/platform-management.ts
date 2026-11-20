@@ -1,6 +1,6 @@
 import type { SQLQueryBindings } from 'bun:sqlite';
 import type { Context, Hono } from 'hono';
-import { AGENT_ARTIFACT_MAX_BYTES, hasArtifact, managedAgents, officialArtifactSource, releaseIdentity } from './agent-catalog';
+import { AGENT_ARTIFACT_MAX_BYTES, DESKTOP_AGENT_PART_BYTES, artifactFormat, hasArtifact, managedAgents, officialArtifactSource, releaseIdentity, requiresDesktopQualification } from './agent-catalog';
 import { ulid } from 'ulid';
 import { ApiError, field, invalid, json, operation } from './api';
 import type { platformCreateActions } from './actions';
@@ -114,9 +114,12 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
     search: "agent || ' ' || version || ' ' || os || ' ' || arch", prefix: 'rel', action: 'create_agent_release',
     project: (row) => {
       const artifact_cached = hasArtifact(opts.dataDir, { sha256: String(row.sha256), size: Number(row.size) });
-      return { ...row, artifact_cached, actions: ['read', 'update', 'upload_artifact',
-        ...(officialArtifactSource({ agent: String(row.agent), url: String(row.url) }) ? ['pull_artifact'] : []),
-        ...(row.status === 'active' ? ['disable'] : artifact_cached ? ['activate'] : [])] };
+      const qualification_required = requiresDesktopQualification(String(row.agent));
+      return { ...row, artifact_cached, qualification_required, part_bytes: qualification_required ? DESKTOP_AGENT_PART_BYTES : null,
+        format: artifactFormat({ agent: String(row.agent), os: String(row.os), arch: String(row.arch) }),
+        actions: ['read', 'update', 'upload_artifact',
+          ...(officialArtifactSource({ agent: String(row.agent), url: String(row.url) }) ? ['pull_artifact'] : []),
+          ...(row.status === 'active' ? ['disable'] : artifact_cached && !qualification_required ? ['activate'] : [])] };
     },
     parse: (body, row, sql) => {
       const sha256 = text(body, row, 'sha256').toLowerCase();
@@ -128,6 +131,10 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
         url: urlField(value(body, row, 'url'), 'url'), sha256, size: number(body, row, 'size', 1), status: status(body, row),
       };
       if (next.size > AGENT_ARTIFACT_MAX_BYTES) invalid('size');
+      if (!artifactFormat(next)) invalid('os', 'arch');
+      if (requiresDesktopQualification(next.agent) && next.status === 'active') {
+        throw new ApiError('conflict', { reason: 'desktop_qualification_required' });
+      }
       if (row && releaseIdentity.some(key => key !== 'id' && row[key] !== next[key])) {
         throw new ApiError('conflict', { reason: 'release_identity_immutable' });
       }

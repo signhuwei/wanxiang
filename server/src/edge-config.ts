@@ -10,7 +10,9 @@ const prefix = Buffer.from('302a300506032b656e032100', 'hex');
 const info = Buffer.from('onex-edge-secret-v1');
 type Subscription = { tenant: string; agentCache: boolean; live: () => boolean; send: (value: Record<string, unknown>) => void };
 type RouteRow = { model_id: string; route_model: string | null; upstream_model: string; provider_id: string; protocol: string;
-  base_url: string; auth: string | null; proxy: string | null };
+  base_url: string; auth: string | null; proxy: string | null; name: string;
+  input_milli_per_mtok: number; output_milli_per_mtok: number; cache_read_milli_per_mtok: number;
+  cache_write_milli_per_mtok: number; effective_from: string };
 type Participant = { os: string; arch: string; public_key: string | null };
 
 export function encryptEdgeSecret(publicKey: string, providerId: string, plaintext: Uint8Array) {
@@ -32,6 +34,27 @@ export function encryptEdgeSecret(publicKey: string, providerId: string, plainte
     shared.fill(0);
     key.fill(0);
   }
+}
+
+export function effectiveModelConfig(store: Store, contract: { allowed_models_json: string; lease_budget_milli: number } | null, now: number) {
+  const allowed = contract && contract.lease_budget_milli > 0 ? contract.allowed_models_json : '[]';
+  const rows = store.system.all<RouteRow>(`SELECT m.id AS model_id, m.route_model, m.upstream_name AS upstream_model,
+    m.display_name AS name, p.id AS provider_id, p.protocol, p.base_url, p.auth, p.proxy,
+    r.input_milli_per_mtok, r.output_milli_per_mtok, r.cache_read_milli_per_mtok, r.cache_write_milli_per_mtok, r.effective_from
+    FROM models m JOIN providers p ON p.id = m.provider_id
+    JOIN rates r ON r.model_id = m.id AND r.effective_from = (
+      SELECT max(r2.effective_from) FROM rates r2 WHERE r2.model_id = m.id AND r2.effective_from <= ?
+    ) WHERE m.status = 'active' AND p.status = 'active' AND p.protocol IN ('anthropic', 'openai_chat')
+    AND m.id IN (SELECT value FROM json_each(?)) ORDER BY m.id`, [iso(now), allowed]);
+  const routes = rows.map(({ model_id, route_model, upstream_model, provider_id, protocol, base_url, auth, proxy }) =>
+    ({ model_id, model: route_model ?? upstream_model, upstream_model, provider_id, protocol, base_url,
+      auth: auth ?? (protocol === 'anthropic' ? 'x_api_key' : 'bearer'), ...(proxy && { proxy }) }));
+  const rates = rows.map(({ model_id, input_milli_per_mtok, output_milli_per_mtok, cache_read_milli_per_mtok,
+    cache_write_milli_per_mtok, effective_from }) =>
+    ({ model_id, input_milli_per_mtok, output_milli_per_mtok, cache_read_milli_per_mtok, cache_write_milli_per_mtok, effective_from }));
+  const models = rows.map((row, i) => ({ model_id: row.model_id, name: row.name, model: routes[i]!.model,
+    provider_id: row.provider_id, protocol: row.protocol, rate: rates[i]! }));
+  return { routes, rates, models };
 }
 
 export function configPublisher(store: Store, dataDir: string, now: () => number, masterKey?: Uint8Array) {
@@ -56,18 +79,7 @@ export function configPublisher(store: Store, dataDir: string, now: () => number
       sub.send({ type: 'cutoff', id: `msg_${ulid()}`, reason: 'contract' });
       return;
     }
-    const allowedModels = contract && contract.lease_budget_milli > 0 ? contract.allowed_models_json : '[]';
-    const at = iso(now());
-    const candidates = store.system.all<RouteRow>(`SELECT m.id AS model_id, m.route_model, m.upstream_name AS upstream_model,
-      p.id AS provider_id, p.protocol, p.base_url, p.auth, p.proxy FROM models m JOIN providers p ON p.id = m.provider_id
-      WHERE m.status = 'active' AND p.status = 'active' AND p.protocol IN ('anthropic', 'openai_chat')
-      AND m.id IN (SELECT value FROM json_each(?))
-      AND EXISTS (SELECT 1 FROM rates r WHERE r.model_id = m.id AND r.effective_from <= ?) ORDER BY m.id`, [allowedModels, at]);
-    const routes = candidates.map(({ route_model, auth, proxy, ...row }) => ({ ...row, model: route_model ?? row.upstream_model,
-      auth: auth ?? (row.protocol === 'anthropic' ? 'x_api_key' : 'bearer'), ...(proxy && { proxy }) }));
-    const rates = routes.map(({ model_id }) => store.system.get(`SELECT model_id, input_milli_per_mtok, output_milli_per_mtok,
-      cache_read_milli_per_mtok, cache_write_milli_per_mtok, effective_from FROM rates WHERE model_id = ? AND effective_from <= ?
-      ORDER BY effective_from DESC LIMIT 1`, [model_id, at])!);
+    const { routes, rates } = effectiveModelConfig(store, contract || null, now());
     const agents = allowedAgentReleases(store, dataDir, contract || null, participant.os, participant.arch, sub.agentCache)
       .map(({ id, agent, version, os, arch, url, sha256, size }) => ({
         id, agent, version, os, arch, url: sub.agentCache ? artifactDownloadPath(id) : url, sha256, size,

@@ -17,6 +17,11 @@ const object = (properties: Record<string, unknown>, required = Object.keys(prop
 const loginResponse = object({ token, user: ref('User'), tenants: { type: 'array', items: ref('Tenant') } });
 const response = (description: string, schema?: object) => ({ description, ...(schema && { content: { 'application/json': { schema } } }) });
 const error = (description: string) => response(description, ref('Error'));
+const statisticsParameters = [
+  { name: 'from', in: 'query', schema: { type: 'string', format: 'date' } },
+  { name: 'to', in: 'query', schema: { type: 'string', format: 'date' } },
+  { name: 'agent', in: 'query', schema: { type: 'string', enum: [...observedAgents, 'unknown'] } },
+];
 const status = { 401: error('凭据无效或已过期'), 403: error('无权限或租户已满'), 409: error('版本不一致或幂等键已用于不同请求'), 422: error('参数无效'), 500: error('内部错误') };
 const bearer = [{ SessionToken: [] }];
 const headers = [{ name: 'Idempotency-Key', in: 'header', schema: { type: 'string', minLength: 1, maxLength: 128 }, description: '在记录有效期内重放成功结果。' }];
@@ -77,6 +82,8 @@ const quotaUsage = object({ scope: { type: 'string', enum: ['member', 'group'] }
   used_milli: sequence, reserved_milli: sequence, remaining_milli: { type: ['integer', 'null'] }, actions });
 const meQuota = object({ quota_milli: { type: ['integer', 'null'], minimum: 0 }, month_used_milli: sequence,
   remaining_milli: { type: ['integer', 'null'] }, limited_by: { type: ['string', 'null'] } });
+const releaseSupply = { artifact_cached: { type: 'boolean' }, qualification_required: { type: 'boolean' }, part_bytes: { type: ['integer', 'null'], minimum: 1 },
+  format: { type: ['string', 'null'], enum: ['executable', 'dmg', 'nsis', null] } };
 const contractInput = { seat_limit: sequence, allowed_agents: { type: 'array', items: text }, allowed_models: { type: 'array', items: text },
   lease_minutes: sequence, lease_budget_milli: sequence, visibility: { type: 'object' } };
 const agentPin = { id: text, agent: text, version: text, os: text, arch: text, sha256: releaseDigest, size: sequence };
@@ -174,6 +181,18 @@ export const openapi = {
     '/v1/contract': { get: detailOf(contract, false), put: write(object({
       ...contractInput, revision: sequence, agent_release_ids: { type: 'array', items: text },
     }, [...Object.keys(contractInput), 'revision']), contract, 'update') },
+    '/v1/contract/effective': { get: { summary: '查看指定设备实际可用的 Agent 和当前生效的模型倍率',
+      security: bearer, parameters: [
+        { name: 'os', in: 'query', required: true, schema: { ...text, enum: ['darwin', 'linux', 'win32'] } },
+        { name: 'arch', in: 'query', required: true, schema: { ...text, enum: ['arm64', 'x64'] } },
+      ], responses: { ...status, 200: response('生效配置', object({ revision, os: text, arch: text, actions,
+        agents: { type: 'array', items: object({ agent: text,
+          status: { ...text, enum: ['available', 'unavailable', 'qualification_required'] },
+          releases: { type: 'array', items: object(agentPin) } }) },
+        models: { type: 'array', items: object({ model_id: text, name: text, model: text, provider_id: text, protocol: text,
+          rate: object({ model_id: text, input_milli_per_mtok: sequence, output_milli_per_mtok: sequence,
+            cache_read_milli_per_mtok: sequence, cache_write_milli_per_mtok: sequence, effective_from: text }) }) },
+      })) } } },
     '/v1/contract/agent-releases': { get: { ...listOf(object(agentPin)), summary: '能力合约可固定的已启用缓存发行' } },
     '/v1/balance': { get: detailOf(managed({ balance_milli: sequence, reserved_milli: sequence, month_used_milli: sequence }), false) },
     '/v1/quota/usage': { get: { summary: '本月配额用量', security: bearer,
@@ -189,6 +208,12 @@ export const openapi = {
     '/v1/observe/people': { get: listOf(managed({ user_id: text, name: text, session_count: sequence, cost_milli: sequence,
       month_cost_milli: sequence, last_active_at: nullableText, last_agent: nullableText,
       quota_milli: memberInput.quota_milli, month_used_milli: sequence })) },
+    '/v1/observe/statistics': { get: { summary: '按北京时间读取会话与计量统计', security: bearer,
+      parameters: statisticsParameters, responses: { 200: { description: '选定区间的整体、每日及按 Agent 统计' }, 401: status[401], 403: status[403], 422: status[422] } } },
+    '/v1/observe/statistics/parquet': { get: { summary: '导出当前可见范围的 Parquet 汇总并记录审计', security: bearer,
+      parameters: statisticsParameters, responses: { 200: { description: '按日期及 Agent 汇总', content: {
+        'application/vnd.apache.parquet': { schema: { type: 'string', format: 'binary' } },
+      } }, 401: status[401], 403: status[403], 422: status[422] } } },
     '/v1/observe/sessions': { get: listOf(managed({ id: text, device_id: text, user_id: text, agent: text, agent_version: text, model: nullableText,
       started_at: text, ended_at: nullableText, event_count: sequence, turn_count: sequence, cost_milli: sequence, input_tokens: sequence, output_tokens: sequence,
       cache_read_tokens: sequence, cache_write_tokens: sequence, pending_usage_count: sequence }), [
@@ -205,24 +230,26 @@ export const openapi = {
     ...platformPaths('/v1/platform/providers', providers, ['name', 'protocol', 'base_url', 'secret'], { secret: { ...text, writeOnly: true } }),
     ...platformPaths('/v1/platform/models', models, ['provider_id', 'upstream_name', 'display_name', 'context_window']),
     ...platformPaths('/v1/platform/agent-releases', releases, ['agent', 'version', 'os', 'arch', 'url', 'sha256', 'size'], {},
-      { artifact_cached: { type: 'boolean' } }),
+      releaseSupply),
     '/v1/platform/agent-releases/{id}': {
-      get: detailOf(managed({ ...releases, artifact_cached: { type: 'boolean' } })),
-      post: write(object({ revision, url: text, status: text }, ['revision']), managed({ ...releases, artifact_cached: { type: 'boolean' } }), 'update', true),
-      patch: write(object({ revision, url: text, status: text }, ['revision']), managed({ ...releases, artifact_cached: { type: 'boolean' } }), 'update', true),
+      get: detailOf(managed({ ...releases, ...releaseSupply })),
+      post: write(object({ revision, url: text, status: text }, ['revision']), managed({ ...releases, ...releaseSupply }), 'update', true),
+      patch: write(object({ revision, url: text, status: text }, ['revision']), managed({ ...releases, ...releaseSupply }), 'update', true),
     },
     '/v1/platform/agent-releases/{id}/artifact': { put: { summary: '校验并缓存受管 Agent 制品',
-      security: bearer, parameters: [idPath],
+      security: bearer, parameters: [idPath, { name: 'part', in: 'query', schema: sequence },
+        { name: 'revision', in: 'query', schema: revision }],
       requestBody: { required: true, content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } },
         'application/gzip': { schema: { type: 'string', format: 'binary' } } } },
       responses: { ...status, 200: response('制品校验通过', object({ sha256: releaseDigest, size: sequence,
         artifact_cached: { const: true }, download_url: text })),
+        202: response('已暂存分段', object({ artifact_cached: { const: false }, part: sequence, count: sequence })),
         404: error('发行不存在'), 413: error('文件超限') } } },
     '/v1/platform/agent-releases/{id}/pull': { post: { summary: '从登记的官方源拉取受管 Agent 制品',
       security: bearer, parameters: [idPath], responses: { ...status,
         200: response('制品校验通过', object({ sha256: releaseDigest, size: sequence, artifact_cached: { const: true }, download_url: text })),
         404: error('发行不存在') } } },
-    '/v1/agent-artifacts/{sha256}': { get: { summary: '平台管理员下载已启用的受管 Agent 制品', security: bearer,
+    '/v1/agent-artifacts/{sha256}': { get: { summary: '平台管理员下载已启用制品或暂存的桌面安装包', security: bearer,
       parameters: [{ name: 'sha256', in: 'path', required: true, schema: releaseDigest }],
       responses: { 200: { description: '制品原始字节', content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
         401: status[401], 403: status[403], 404: error('制品未缓存或发行已撤销') } } },

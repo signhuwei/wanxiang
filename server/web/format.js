@@ -60,8 +60,7 @@ const MEMBER_STATUS = { active: '正常', disabled: '已禁用' }
 const TENANT_STATUS = { active: '正常', suspended: '已暂停' }
 export const DESKTOP_RELEASE_STATUS = { draft: '草稿', published: '已发布', unlisted: '已下架' }
 export const DESKTOP_OS_LABELS = { darwin: 'macOS', windows: 'Windows' }
-// 契约 edge-ws.md：agent 取值 claude-code、codex、kimi-code。
-export const AGENT_LABELS = { 'claude-code': 'Claude Code', codex: 'Codex', 'kimi-code': 'Kimi Code' }
+export const AGENT_LABELS = { 'claude-code': 'Claude Code', codex: 'Codex', 'kimi-code': 'Kimi Code', workbuddy: 'WorkBuddy', 'deepseek-desktop': 'DeepSeek Harness Desktop' }
 export const AGENT_OPTIONS = Object.entries(AGENT_LABELS).map(([value, label]) => ({ value, label }))
 
 export function roleLabel(role) {

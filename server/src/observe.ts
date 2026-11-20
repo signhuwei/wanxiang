@@ -1,5 +1,6 @@
 import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
+import { managedAgents } from './agent-catalog';
 import { ApiError, field, invalid } from './api';
 import { monthUsageByUser } from './billing';
 import { iso, monthBounds } from './credentials';
@@ -12,7 +13,7 @@ const groupFilter = `group_id IN (WITH RECURSIVE subtree(id) AS (VALUES (?) UNIO
   SELECT g.id FROM groups g JOIN subtree s ON g.parent_id = s.id) SELECT id FROM subtree)`;
 const encoder = new TextEncoder();
 const readable = ['read'];
-export const observedAgents = ['claude-code', 'codex', 'kimi-code'] as const;
+export const observedAgents = managedAgents;
 
 type Scope = { group: string | null; self: string | null };
 function permission(actor: ReturnType<typeof tenantActor>, body: boolean): Scope {
@@ -31,6 +32,13 @@ function scoped(scope: Scope, column: string) {
   if (scope.self !== null) return { sql: `AND ${column} = ?`, params: [scope.self] };
   if (scope.group === null) return { sql: '', params: [] };
   return { sql: `AND ${column} IN (SELECT user_id FROM members WHERE ${groupFilter})`, params: [scope.group] };
+}
+
+export function summaryPeople(actor: ReturnType<typeof tenantActor>) {
+  const scope = permission(actor, false);
+  if (scope.self !== null) return [scope.self];
+  if (scope.group === null) return null;
+  return actor.db.all<{ user_id: string }>(`SELECT user_id FROM members WHERE ${groupFilter} ORDER BY user_id`, [scope.group]).map(row => row.user_id);
 }
 
 function pageNumber(value: string | undefined, name: string) {

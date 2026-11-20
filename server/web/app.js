@@ -6,6 +6,7 @@ import { createSessionStore } from './session.js'
 import { showToast } from './toast.js'
 import { devicesPage } from './devices.js'
 import { observePage } from './observation.js'
+import { statisticsPage } from './statistics.js'
 import { billingPage } from './billing.js'
 import { auditPage } from './audit.js'
 import { agentReleasesPage } from './agent-releases.js'
@@ -102,7 +103,7 @@ function renderTop(hash) {
     tenantLink.classList.toggle('selected', hash.startsWith('#/tenant'))
     domains.appendChild(tenantLink)
     if (session.tenant && hash.startsWith('#/tenant')) {
-      const pages = [['members','成员'], ['groups','分组'], ['contract','合约'], ['billing','橡皮'], ['observe','监察'], ['devices','设备']]
+      const pages = [['members','成员'], ['groups','分组'], ['contract','合约'], ['billing','橡皮'], ['observe','监察'], ['statistics','统计'], ['devices','设备']]
       if (canReadAudit()) pages.push(['audit', '审计'])
       for (const [path, label] of pages) {
         const link = el('a', hash === '#/tenant/' + path ? 'selected' : '', label)
@@ -258,6 +259,7 @@ function route() {
     if (hash === '#/tenant/groups') groupsPage(ws, api, session.actions || [])
     else if (hash === '#/tenant/devices') devicesPage(ws, api, lifecycle.signal, mockOn)
     else if (hash === '#/tenant/observe') observePage(ws, api, session, lifecycle.signal)
+    else if (hash === '#/tenant/statistics') statisticsPage(ws, api, lifecycle.signal)
     else if (hash === '#/tenant/billing') billingPage(ws, api, platformApi, session)
     else if (hash === '#/tenant/contract') contractPage(ws, api)
     else if (hash === '#/tenant/audit') {

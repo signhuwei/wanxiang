@@ -1,5 +1,5 @@
-import { createReadStream, mkdirSync, renameSync } from 'node:fs';
-import { unlink } from 'node:fs/promises';
+import { createReadStream, lstatSync, mkdirSync, renameSync } from 'node:fs';
+import { rm, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { createGunzip } from 'node:zlib';
@@ -8,7 +8,7 @@ import { ulid } from 'ulid';
 import { ApiError, invalid } from './api';
 import { receiveArtifact } from './artifact-upload';
 import { bearer, hash, iso } from './credentials';
-import { AGENT_ARTIFACT_MAX_BYTES, agentDigest, allowedAgentReleases, artifactPath, hasArtifact, officialArtifactSource, readAgentPolicy, type AgentRelease } from './agent-catalog';
+import { AGENT_ARTIFACT_MAX_BYTES, DESKTOP_AGENT_PART_BYTES, agentDigest, allowedAgentReleases, artifactFormat, artifactPath, hasArtifact, officialArtifactSource, readAgentPolicy, requiresDesktopQualification, type AgentRelease } from './agent-catalog';
 import { DESKTOP_ARTIFACT_MAX_BYTES } from './desktop-releases';
 import { platformActor, type ManagementOptions } from './management';
 import type { Store } from './store';
@@ -18,8 +18,18 @@ export const AGENT_ARTIFACT_DOWNLOAD_PATH = /^\/v1\/(?:edge\/)?agent-artifacts\/
 
 export function agentArtifactRoutes(app: Hono, store: Store, opts: ManagementOptions) {
   const dir = join(opts.dataDir, 'agent-artifacts');
-  const active = "status = 'active'";
   const pulls = new Set<string>();
+  const uploadingParts = new Set<string>();
+  const cached = (c: Context, row: AgentRelease) =>
+    c.json({ sha256: row.sha256, size: row.size, artifact_cached: true, download_url: `/v1/agent-artifacts/${row.sha256}` });
+  const partDir = (row: AgentRelease) => join(dir, '.chunks', row.id);
+
+  function joinedParts(paths: string[]) {
+    async function* read() {
+      for (const path of paths) for await (const chunk of createReadStream(path)) yield chunk;
+    }
+    return { body: Readable.toWeb(Readable.from(read(), { objectMode: false })) as ReadableStream<Uint8Array>, headers: new Headers() };
+  }
 
   function getRelease(id: string) {
     const row = store.system.get<AgentRelease>('SELECT * FROM agent_releases WHERE id = ?', [id]);
@@ -28,7 +38,7 @@ export function agentArtifactRoutes(app: Hono, store: Store, opts: ManagementOpt
     return row;
   }
 
-  async function storeArtifact(c: Context, row: AgentRelease, actor: string, input: Request | Response, unpack: boolean, source: string) {
+  async function storeArtifact(c: Context, row: AgentRelease, actor: string, input: Pick<Request, 'body' | 'headers'>, unpack: boolean, source: string) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const temp = join(dir, `.${ulid()}.part`);
     const compressed = temp + '.gz';
@@ -37,6 +47,10 @@ export function agentArtifactRoutes(app: Hono, store: Store, opts: ManagementOpt
         ? await receiveCompressed(input, compressed, temp, row.size)
         : await receiveArtifact(input, temp, AGENT_ARTIFACT_MAX_BYTES, row.size);
       if (artifact.sha256 !== row.sha256) invalid('artifact');
+      const format = artifactFormat(row);
+      const file = Bun.file(temp);
+      if (!format || (format === 'dmg' && (file.size < 512 || await file.slice(-512, -508).text() !== 'koly'))
+        || (format === 'nsis' && await file.slice(0, 2).text() !== 'MZ')) invalid('artifact');
       platformActor(store, c, opts.now());
       await store.system.write((sql) => {
         if (!sql.get('SELECT 1 FROM platform_admins WHERE user_id = ?', [actor])) throw new ApiError('forbidden');
@@ -47,16 +61,46 @@ export function agentArtifactRoutes(app: Hono, store: Store, opts: ManagementOpt
           [`aud_${ulid()}`, actor, 'agent_release.artifact', row.id, JSON.stringify({ ...artifact, source }), iso(opts.now())]);
       });
       opts.onConfigChange?.();
-      return c.json({ ...artifact, artifact_cached: true, download_url: `/v1/agent-artifacts/${row.sha256}` });
+      return cached(c, row);
     } finally {
       await Promise.all([unlink(temp).catch(() => {}), unlink(compressed).catch(() => {})]);
     }
   }
 
-  app.put('/v1/platform/agent-releases/:id/artifact', (c) => {
+  app.put('/v1/platform/agent-releases/:id/artifact', async (c) => {
     const actor = platformActor(store, c, opts.now());
     const row = getRelease(c.req.param('id'));
-    return storeArtifact(c, row, actor, c.req.raw, c.req.header('content-type') === 'application/gzip', 'upload');
+    const uploadPart = c.req.query('part');
+    if (uploadPart === undefined) {
+      return storeArtifact(c, row, actor, c.req.raw, c.req.header('content-type') === 'application/gzip', 'upload');
+    }
+    const count = Math.ceil(row.size / DESKTOP_AGENT_PART_BYTES);
+    const index = Number(uploadPart);
+    if (!requiresDesktopQualification(row.agent) || !/^(0|[1-9]\d*)$/.test(uploadPart) || index >= count) invalid('part');
+    if (String(row.revision) !== c.req.query('revision')) throw new ApiError('conflict', { revision: row.revision });
+    if (hasArtifact(opts.dataDir, row)) return cached(c, row);
+    if (uploadingParts.has(row.id)) throw new ApiError('conflict', { reason: 'upload_in_progress' });
+    uploadingParts.add(row.id);
+    const directory = partDir(row);
+    const temp = join(directory, `.${ulid()}.part`);
+    try {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      const paths = Array.from({ length: count }, (_, part) => join(directory, String(part)));
+      const size = Math.min(DESKTOP_AGENT_PART_BYTES, row.size - index * DESKTOP_AGENT_PART_BYTES);
+      await receiveArtifact(c.req.raw, temp, size, size);
+      platformActor(store, c, opts.now());
+      if (getRelease(row.id).revision !== row.revision) throw new ApiError('conflict');
+      renameSync(temp, paths[index]!);
+      if (!paths.every(path => lstatSync(path, { throwIfNoEntry: false })?.isFile())) {
+        return c.json({ artifact_cached: false, part: index, count }, 202);
+      }
+      try {
+        return await storeArtifact(c, row, actor, joinedParts(paths), false, 'multipart');
+      } finally { await rm(directory, { recursive: true, force: true }); }
+    } finally {
+      await unlink(temp).catch(() => {});
+      uploadingParts.delete(row.id);
+    }
   });
 
   app.post('/v1/platform/agent-releases/:id/pull', async (c) => {
@@ -64,9 +108,7 @@ export function agentArtifactRoutes(app: Hono, store: Store, opts: ManagementOpt
     const row = getRelease(c.req.param('id'));
     const url = officialArtifactSource(row);
     if (!url) throw new ApiError('invalid', { fields: ['url'], reason: 'unsupported_official_source' });
-    if (hasArtifact(opts.dataDir, row)) {
-      return c.json({ sha256: row.sha256, size: row.size, artifact_cached: true, download_url: `/v1/agent-artifacts/${row.sha256}` });
-    }
+    if (hasArtifact(opts.dataDir, row)) return cached(c, row);
     if (pulls.has(row.id)) throw new ApiError('conflict', { reason: 'pull_in_progress' });
     pulls.add(row.id);
     try {
@@ -80,11 +122,13 @@ export function agentArtifactRoutes(app: Hono, store: Store, opts: ManagementOpt
     } finally { pulls.delete(row.id); }
   });
 
-  const download = (row: Pick<AgentRelease, 'sha256' | 'size'>) => {
+  const download = (row: AgentRelease) => {
     if (!hasArtifact(opts.dataDir, row)) throw new ApiError('not_found');
+    const format = artifactFormat(row);
+    const filename = format === 'dmg' ? 'onex-agent.dmg' : format === 'nsis' ? 'onex-agent.exe' : 'onex-agent';
     return new Response(Bun.file(artifactPath(opts.dataDir, row.sha256)), { headers: {
       'cache-control': 'no-store', 'content-type': 'application/octet-stream',
-      'content-disposition': 'attachment; filename="onex-agent"', 'content-length': String(row.size),
+      'content-disposition': `attachment; filename="${filename}"`, 'content-length': String(row.size),
       'x-content-type-options': 'nosniff',
     } });
   };
@@ -93,7 +137,8 @@ export function agentArtifactRoutes(app: Hono, store: Store, opts: ManagementOpt
     platformActor(store, c, opts.now());
     const sha256 = c.req.param('sha256');
     if (!agentDigest.test(sha256)) throw new ApiError('not_found');
-    const row = store.system.get<AgentRelease>(`SELECT * FROM agent_releases WHERE sha256 = ? AND ${active} LIMIT 1`, [sha256]);
+    const rows = store.system.all<AgentRelease>('SELECT * FROM agent_releases WHERE sha256 = ? ORDER BY id', [sha256]);
+    const row = rows.find(row => row.status === 'active' || requiresDesktopQualification(row.agent));
     if (!row) throw new ApiError('not_found');
     return download(row);
   });

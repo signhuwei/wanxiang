@@ -39,11 +39,14 @@ onex-server-release-v1
 | --- | --- |
 | `GET/POST /v1/platform/agent-releases` | 服务端分页与发行登记。管理页以 `status: disabled` 新建 |
 | `GET/PATCH /v1/platform/agent-releases/{id}` | 制品状态 `artifact_cached`、当前修订与可执行操作。修改来源或启用状态 |
-| `PUT /v1/platform/agent-releases/{id}/artifact` | 上传原始可执行文件。传输上限 256 MiB。使用 `application/gzip` 可上传单文件压缩制品，解压上限 512 MiB |
-| `POST /v1/platform/agent-releases/{id}/pull` | 从登记且匹配厂商白名单的 HTTPS 地址拉取原始可执行文件，拒绝重定向。缓存已就绪时重试返回原摘要 |
-| `GET /v1/agent-artifacts/{sha256}` | 平台管理员核取仍启用的制品 |
+| `PUT /v1/platform/agent-releases/{id}/artifact` | 上传原始可执行文件或桌面安装包。单请求上限 256 MiB。使用 `application/gzip` 可上传单文件压缩制品，解压上限 512 MiB。桌面原始包可分段上传 |
+| `POST /v1/platform/agent-releases/{id}/pull` | 从登记且匹配厂商白名单的 HTTPS 地址拉取完整原始制品，拒绝重定向。缓存已就绪时重试返回原摘要 |
+| `GET /v1/agent-artifacts/{sha256}` | 平台管理员核取仍启用的受管制品或暂存的桌面安装包 |
 | `GET /v1/edge/agent-artifacts/{id}` | 凭设备令牌取能力合约当前允许的制品 |
 
 上传和拉取均在私有暂存文件中校验原始字节数及 SHA-256，验证通过后原子发布，并记录审计。
 厂商地址受限时，平台管理员可上传手头的已批准制品。同一发行允许在启用前上传或拉取。
 支持缓存协议的 Edge 使用它当前连接的 OneX Server 作为下载服务器，跟随同一协议、主机和端口。厂商源地址供 Server 入库。旧 Edge 的兼容规则见 [Edge ↔ Server 协议](edge-ws.md)。
+
+
+WorkBuddy 和 DeepSeek Harness Desktop 的原厂安装包可登记、校验并缓存。发行保留 `status: disabled`，响应包含 `qualification_required: true` 和包格式。平台管理员可下载进行原生测试。运行资格待对应系统及版本通过原生窗口、模型路径、租约和同会话回流验证。 桌面包分段上传沿用 PUT，传 `?part=<从 0 起的段号>&revision=<当前修订>`，段大小取发行返回的 `part_bytes`（32 MiB），最后一段取余数，整包最多 512 MiB。待分段齐全返回 202；合并后完成整包大小、SHA-256 和容器标记校验返回 200。同段可重传。校验完成前，文件不能下载。

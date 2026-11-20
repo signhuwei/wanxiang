@@ -21,6 +21,7 @@ import { platformRoutes } from './platform-management';
 import { tenantRoutes } from './tenant-management';
 import type { Presence } from './presence';
 import { Store } from './store';
+import { statisticsRoutes } from './statistics';
 
 type Options = {
   dataDir: string;
@@ -42,6 +43,7 @@ type Options = {
 export async function createServer(opts: Options) {
   const store = new Store(opts.dataDir, opts.tenantCacheSize);
   const now = opts.now ?? Date.now;
+  let closeStatistics: (() => void) | undefined;
   let closeReleases: (() => void) | undefined;
   try {
     await store.rebuildIndexes();
@@ -84,6 +86,7 @@ export async function createServer(opts: Options) {
     agentArtifactRoutes(app, store, management);
     billingRoutes(app, store, management);
     const observation = observationRoutes(app, store, now);
+    closeStatistics = statisticsRoutes(app, store, { ...opts, now, pending });
     const diag = diagRoutes(app, store, management, opts.objectStorage);
     deviceRoutes(app, store, management, diag);
     desktopReleaseRoutes(app, store, management);
@@ -118,6 +121,7 @@ export async function createServer(opts: Options) {
           void server.stop().catch(() => {});
           observation.close();
           await closeSockets();
+          closeStatistics?.();
           await pending.drain();
           await store.drain();
           opts.presence.close?.();
@@ -127,6 +131,7 @@ export async function createServer(opts: Options) {
       },
     };
   } catch (error) {
+    closeStatistics?.();
     closeReleases?.();
     store.close();
     throw error;

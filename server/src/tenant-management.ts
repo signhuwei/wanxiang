@@ -1,10 +1,11 @@
 import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
 import { tenantAuditActions } from './actions';
-import { agentTarget, hasArtifact, matchesPin, releaseIdentity, type AgentPin, type AgentRelease } from './agent-catalog';
+import { agentTarget, allowedAgentReleases, hasArtifact, matchesPin, releaseIdentity, requiresDesktopQualification, type AgentPin, type AgentRelease } from './agent-catalog';
 import { ApiError, field, invalid, json, operation } from './api';
 import { groupMonthUsage, monthUsageByGroup, monthUsageByUser, selfMonthUsage } from './billing';
 import { day, hash, iso, randomToken } from './credentials';
+import { effectiveModelConfig } from './edge-config';
 import { enumField, expectRevision, int, pagination, tenantActor, type ManagementOptions } from './management';
 import { indexInvite, indexMember, type Member, type Store, type Transaction } from './store';
 import { defaultVisibility, visibility } from './visibility';
@@ -58,7 +59,8 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
       const saved = previous.find(pin => pin.id === id);
       const release = releaseById(id);
       if (saved && allowed.includes(saved.agent)) return saved;
-      if (!release || !allowed.includes(release.agent) || release.status !== 'active' || !hasArtifact(opts.dataDir, release)) {
+      if (!release || !allowed.includes(release.agent) || requiresDesktopQualification(release.agent)
+        || release.status !== 'active' || !hasArtifact(opts.dataDir, release)) {
         throw new ApiError('invalid', { fields: ['agent_release_ids'], reason: 'artifact_unavailable', release_id: id });
       }
       return Object.fromEntries(releaseIdentity.map(key => [key, release[key]])) as AgentPin;
@@ -262,13 +264,31 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     if (!row) throw new ApiError('not_found');
     return c.json(contractView(row, role));
   });
+  app.get('/v1/contract/effective', (c) => {
+    const at = opts.now();
+    const { db } = tenantActor(store, c, at);
+    const contract = readContract(db);
+    if (!contract) throw new ApiError('not_found');
+    const os = enumField(c.req.query('os'), 'os', ['darwin', 'linux', 'win32'] as const);
+    const arch = enumField(c.req.query('arch'), 'arch', ['arm64', 'x64'] as const);
+    const available = allowedAgentReleases(store, opts.dataDir, contract, os, arch, true);
+    const { models } = effectiveModelConfig(store, contract, at);
+    const agents = (JSON.parse(contract.allowed_agents_json) as string[]).map(agent => ({
+      agent,
+      status: requiresDesktopQualification(agent) ? 'qualification_required'
+        : (available.some(row => row.agent === agent) ? 'available' : 'unavailable'),
+      releases: available.filter(row => row.agent === agent).map(row =>
+        Object.fromEntries(releaseIdentity.map(key => [key, row[key]]))),
+    }));
+    return c.json({ revision: contract.revision, os, arch, agents, models, actions: ['read'] });
+  });
   app.get('/v1/contract/agent-releases', (c) => {
     const actor = tenantActor(store, c, opts.now());
     if (!canManage(actor.role)) throw new ApiError('forbidden');
     const p = pagination(c);
     const rows = store.system.all<AgentPin>(`SELECT id, agent, version, os, arch, sha256, size FROM agent_releases
       WHERE status = 'active' AND instr(lower(agent || ' ' || version || ' ' || os || ' ' || arch), lower(?)) > 0
-      ORDER BY agent, os, arch, version, id`, [p.query]).filter(row => hasArtifact(opts.dataDir, row));
+      ORDER BY agent, os, arch, version, id`, [p.query]).filter(row => !requiresDesktopQualification(row.agent) && hasArtifact(opts.dataDir, row));
     return c.json(p.page(rows.slice(p.offset, p.offset + p.limit), rows.length));
   });
 

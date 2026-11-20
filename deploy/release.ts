@@ -41,7 +41,11 @@ async function packServer(output: string, revision = 'HEAD') {
     mkdirSync(tree, { mode: 0o700 });
     await run(['git', 'archive', '--format=tar', `--output=${join(temp, 'source.tar')}`, commit, 'server', 'deploy']);
     await run(['tar', '-xf', join(temp, 'source.tar'), '-C', tree]);
-    await run([process.execPath, 'install', '--cwd', join(tree, 'server'), '--frozen-lockfile', '--production', '--ignore-scripts']);
+    await run([process.execPath, 'install', '--cwd', join(tree, 'server'), '--frozen-lockfile', '--production', '--ignore-scripts', '--os=linux', '--cpu=x64']);
+    const duckdb = join(tree, 'server/node_modules/@duckdb/node-bindings-linux-x64');
+    if (!await Bun.file(join(duckdb, 'duckdb.node')).exists() || !await Bun.file(join(duckdb, 'libduckdb.so')).exists()) {
+      throw new Error('Package requires the Linux x64 DuckDB bindings');
+    }
     const bundle = join(temp, 'bundle.tar.gz');
     await run(['python3', join(import.meta.dir, 'server-release-pack.py'), tree, bundle, timestamp]);
     const manifest = signManifest(key, { commit, ...await digest(bundle) });

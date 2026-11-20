@@ -552,3 +552,71 @@ async fn managed_codex_forces_stateless_native_requests() {
     assert_eq!(env.upstream.seen.lock().unwrap().body.as_ref().unwrap()["store"], false);
     assert_eq!(env.usage().await.session_id.as_deref(), Some("managed-session"));
 }
+
+#[tokio::test]
+async fn desktop_chat_uses_launch_binding_and_preserves_chat_tools() {
+    let mut env = env_with("openai_chat").await;
+    let chat = env.url.replace("/v1/responses", "/v1/chat/completions");
+    let launch_token = "desktop-launch-token";
+    env.state.launch_tokens.write().unwrap().insert(
+        launch_token.into(),
+        onexd::state::LaunchBinding {
+            session_id: "desktop-session".into(),
+            agent: "deepseek-desktop".into(),
+            first_native_session: None,
+        },
+    );
+
+    let send = |token: &str, scenario: &str, stream| {
+        env.http.post(&chat).bearer_auth(token).header("x-onex-session", "untrusted-session").json(&json!({
+            "model": "codex-model", "stream": stream, "store": true,
+            "stream_options": {"include_usage": false},
+            "messages": [{"role": "user", "content": format!("scenario:{scenario}")}]
+        }))
+    };
+    assert_eq!(send(LOCAL, "chat", false).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        env.http
+            .post(&env.url)
+            .bearer_auth(launch_token)
+            .json(&json!({"model": "codex-model"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(env.calls(), 0);
+
+    let reply = send(launch_token, "chat", false).send().await.unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+    assert_eq!(reply.json::<Value>().await.unwrap()["choices"][0]["message"]["content"], "hi there");
+
+    let reply = send(launch_token, "chat_stream_tool", true).send().await.unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+    let reply = reply.text().await.unwrap();
+    assert!(reply.contains("\"id\":\"call_1\""));
+    assert!(reply.contains("\"finish_reason\":\"tool_calls\""));
+    assert!(reply.ends_with(CHAT_DONE));
+
+    let failed = send(launch_token, "chat_stream_error", true).send().await.unwrap().text().await.unwrap();
+    assert!(failed.contains("\"content\":\"partial\""));
+    assert!(!failed.contains(CHAT_DONE));
+    let seen = env.upstream.seen.lock().unwrap();
+    assert_eq!(seen.body.as_ref().unwrap()["stream_options"]["include_usage"], true);
+    assert_eq!(seen.body.as_ref().unwrap()["store"], false);
+    assert_eq!(seen.headers.as_ref().unwrap()["authorization"], format!("Bearer {KEY}"));
+    assert!(seen.headers.as_ref().unwrap().get("x-onex-session").is_none());
+    drop(seen);
+
+    for (input, output) in [(10, 5), (7, 5)] {
+        let usage = env.usage().await;
+        assert_eq!(usage.session_id.as_deref(), Some("desktop-session"));
+        assert_eq!(usage.tokens.input, input);
+        assert_eq!(usage.tokens.output, output);
+        assert!(usage.usage_final);
+    }
+    let incomplete = env.usage().await;
+    assert!(!incomplete.usage_final);
+    assert_eq!(incomplete.outcome.as_str(), "upstream_error");
+}

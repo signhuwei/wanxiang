@@ -1,4 +1,5 @@
-//! `POST /v1/responses`：OpenAI Responses，Codex 使用（`contracts/edge-ws.md` 多 Agent 一节）。
+//! OpenAI 入口：Codex 的 Responses 及受管桌面 Agent 的 Chat Completions。
+//! Chat 直通仅接受设备为桌面 Agent 启动所签发的本机令牌。
 //!
 //! 和 `/v1/messages` 共用本机令牌、租约、计价和 usage 上报（见 `router.rs`），只是入口协议、
 //! 请求/响应形状和错误体不同：
@@ -35,7 +36,21 @@ use crate::router::{
 };
 use crate::sse::{Event, Splitter};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wire {
+    Responses,
+    Chat,
+}
+
 pub async fn responses(AxState(rt): AxState<Arc<Router>>, headers: HeaderMap, body: Bytes) -> Response {
+    openai_request(rt, headers, body, Wire::Responses).await
+}
+
+pub async fn chat_completions(AxState(rt): AxState<Arc<Router>>, headers: HeaderMap, body: Bytes) -> Response {
+    openai_request(rt, headers, body, Wire::Chat).await
+}
+
+async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: Wire) -> Response {
     let started = Instant::now();
     let Ok(binding) = rt.session_for(&headers) else {
         return err_before_headers(
@@ -44,6 +59,11 @@ pub async fn responses(AxState(rt): AxState<Arc<Router>>, headers: HeaderMap, bo
             "OneX 本机令牌无效。请从 OneX Desktop 重新启动这个 Agent。",
         );
     };
+
+    let desktop = binding.as_ref().is_some_and(|binding| crate::state::is_desktop_agent(&binding.agent));
+    if desktop != (wire == Wire::Chat) || (desktop && headers.contains_key("x-api-key")) {
+        return err_before_headers(StatusCode::FORBIDDEN, "forbidden", "这个本机令牌无权使用该模型接口。");
+    }
 
     let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v @ Value::Object(_)) => v,
@@ -72,21 +92,21 @@ pub async fn responses(AxState(rt): AxState<Arc<Router>>, headers: HeaderMap, bo
             &format!("OneX 没有为模型 {model} 配置路由，请联系管理员开通，或换用已开通的模型。"),
         );
     };
-    let to_chat = match route.protocol.as_str() {
-        "openai_responses" => false,
-        "openai_chat" => true,
-        "anthropic" => {
+    let to_chat = match (wire, route.protocol.as_str()) {
+        (Wire::Chat, "openai_chat") | (Wire::Responses, "openai_responses") => false,
+        (Wire::Responses, "openai_chat") => true,
+        (Wire::Responses, "anthropic") => {
             return err_before_headers(
                 StatusCode::FORBIDDEN,
                 "model_not_allowed",
                 "该模型的上游协议暂不支持 Codex，请联系管理员调整路由。",
             );
         }
-        other => {
+        (_, other) => {
             return err_before_headers(
                 StatusCode::FORBIDDEN,
                 "model_not_allowed",
-                &format!("OneX Edge 的 Responses 入口暂不支持 {other} 协议的上游。"),
+                &format!("此模型接口不支持 {other} 协议的上游。"),
             );
         }
     };
@@ -108,7 +128,26 @@ pub async fn responses(AxState(rt): AxState<Arc<Router>>, headers: HeaderMap, bo
 
     let upstream_model = route.upstream_model.clone().unwrap_or_else(|| model.clone());
     let kinds = if to_chat { chat_tool_kinds(&req) } else { HashMap::new() };
-    let (url, out_body) = if to_chat {
+    let (url, out_body) = if wire == Wire::Chat {
+        if !req["messages"].as_array().is_some_and(|messages| !messages.is_empty())
+            || req.get("n").is_some_and(|n| !n.is_null() && n.as_u64() != Some(1))
+        {
+            return err_before_headers(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid",
+                "请求须提供 messages，且每次生成一条回复。",
+            );
+        }
+        if stream && !req["stream_options"].is_object() {
+            req["stream_options"] = json!({});
+        }
+        if stream {
+            req["stream_options"]["include_usage"] = true.into();
+        }
+        req["model"] = Value::String(upstream_model.clone());
+        req["store"] = false.into();
+        (chat::chat_url(&route.base_url), Bytes::from(serde_json::to_vec(&req).unwrap()))
+    } else if to_chat {
         if req.get("previous_response_id").is_some_and(|value| !value.is_null()) {
             return err_before_headers(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -144,7 +183,7 @@ pub async fn responses(AxState(rt): AxState<Arc<Router>>, headers: HeaderMap, bo
     };
 
     let mut out_headers = HeaderMap::new();
-    if !to_chat {
+    if !to_chat && wire == Wire::Responses {
         for name in ["content-type", "accept", "openai-beta", "user-agent"] {
             if let Some(value) = headers.get(name) {
                 out_headers.insert(name, value.clone());
@@ -155,20 +194,24 @@ pub async fn responses(AxState(rt): AxState<Arc<Router>>, headers: HeaderMap, bo
     out_headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {key}")));
     out_headers.insert(header::ACCEPT_ENCODING, "identity".parse().unwrap());
 
-    let est_input = crate::router::estimate_request_fields(&req, &["instructions", "input", "tools"]);
-    let max_output = match req.get("max_output_tokens") {
-        Some(value) if !value.is_null() => {
-            let Some(tokens) = value.as_u64().filter(|tokens| *tokens > 0) else {
+    let (input, output_fields): (&[&str], &[&str]) = match wire {
+        Wire::Responses => (&["instructions", "input", "tools"], &["max_output_tokens"]),
+        Wire::Chat => (&["messages", "tools", "functions"], &["max_completion_tokens", "max_tokens"]),
+    };
+    let est_input = crate::router::estimate_request_fields(&req, input);
+    let mut max_output = None;
+    for field in output_fields {
+        if let Some(value) = req.get(field).filter(|value| !value.is_null()) {
+            let Some(tokens) = value.as_u64().filter(|tokens| *tokens > 0 && max_output.is_none()) else {
                 return err_before_headers(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "invalid",
-                    "max_output_tokens 必须是正整数。",
+                    &format!("{field} 必须是正整数，且只能指定一个输出上限。"),
                 );
             };
-            Some(tokens)
+            max_output = Some(tokens);
         }
-        _ => None,
-    };
+    }
     let ticket = match rt.state.lease.admit_with(|remaining| {
         let output = max_output.unwrap_or_else(|| output_reservation(&rate, est_input, remaining));
         Meter::new(rate.clone(), output, est_input).reservation
@@ -246,7 +289,7 @@ pub async fn responses(AxState(rt): AxState<Arc<Router>>, headers: HeaderMap, bo
     if to_chat {
         return chat_backed_response(req_ctx, resp, status, is_sse, stream, kinds).await;
     }
-    native_response(req_ctx, resp, status, is_sse, resp_headers).await
+    native_response(req_ctx, resp, status, is_sse, resp_headers, wire).await
 }
 
 /// 进行中的请求：计量、租约票据和收尾。和 `router::Req` 结构类似，但 Responses 的用量口径
@@ -674,14 +717,23 @@ async fn native_response(
     status: StatusCode,
     is_sse: bool,
     resp_headers: HeaderMap,
+    wire: Wire,
 ) -> Response {
     if status.is_success() && is_sse {
         let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
-        tokio::spawn(native_pump(req, resp, tx));
+        tokio::spawn(native_pump(req, resp, tx, wire));
         let body = Body::from_stream(tokio_stream_from(rx));
         return (status, resp_headers, body).into_response();
     }
-    let bytes = match read_limited(resp, MAX_UPSTREAM_BODY).await {
+    let body = tokio::select! {
+        body = read_limited(resp, MAX_UPSTREAM_BODY) => body,
+        block = req.ticket().stopped() => {
+            req.rec.outcome = Outcome::Stopped(block);
+            req.finish();
+            return err_before_headers_block(block);
+        }
+    };
+    let bytes = match body {
         Ok(b) => b,
         Err(e) => {
             warn!(request_id = %req.rec.request_id, error = %e, "responses upstream body read failed");
@@ -693,9 +745,15 @@ async fn native_response(
         req.rec.outcome = Outcome::Ok;
         if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
             req.rec.message_id = v.get("id").and_then(Value::as_str).map(str::to_owned);
-            req.rec.usage_final = req.observe_usage(&v["usage"]);
+            req.rec.usage_final = match wire {
+                Wire::Responses => req.observe_usage(&v["usage"]),
+                Wire::Chat => observe_chat_usage(&mut req, &v["usage"]),
+            };
             if !req.rec.usage_final {
-                req.observe_output(output_bytes(&v["output"]));
+                match wire {
+                    Wire::Responses => req.observe_output(output_bytes(&v["output"])),
+                    Wire::Chat => req.observe_output(chat_output_bytes(&v["choices"], "message")),
+                }
             }
         }
         if !req.rec.usage_final {
@@ -719,7 +777,12 @@ async fn native_response(
 
 /// 同协议 SSE 的旁路计量：不改写任何字节，只在 `response.completed`/`incomplete`/`failed` 的
 /// `response.usage` 里取用量；没见过终态就 EOF 判为截断。
-async fn native_pump(mut req: ReqCtx, mut resp: reqwest::Response, tx: mpsc::Sender<Result<Bytes, std::io::Error>>) {
+async fn native_pump(
+    mut req: ReqCtx,
+    mut resp: reqwest::Response,
+    tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
+    wire: Wire,
+) {
     let mut split = Splitter::default();
     let mut stopped_by: Option<Block> = None;
     let mut native_failure = false;
@@ -736,7 +799,11 @@ async fn native_pump(mut req: ReqCtx, mut resp: reqwest::Response, tx: mpsc::Sen
                 let mut terminal = None;
                 let mut previous = 0;
                 for (end, ev) in &batch.events {
-                    terminal = observe_native(&mut req, ev);
+                    let boundary_before_error = previous;
+                    terminal = match wire {
+                        Wire::Responses => observe_native(&mut req, ev),
+                        Wire::Chat => observe_native_chat(&mut req, ev),
+                    };
                     if let Err(block) = req.check_budget() {
                         stopped_by = Some(block);
                         boundary = previous;
@@ -744,7 +811,11 @@ async fn native_pump(mut req: ReqCtx, mut resp: reqwest::Response, tx: mpsc::Sen
                     }
                     previous = *end;
                     if terminal.is_some() {
-                        boundary = *end;
+                        boundary = if wire == Wire::Chat && terminal == Some(Outcome::UpstreamError) {
+                            boundary_before_error
+                        } else {
+                            *end
+                        };
                         break;
                     }
                 }
@@ -771,7 +842,7 @@ async fn native_pump(mut req: ReqCtx, mut resp: reqwest::Response, tx: mpsc::Sen
                     break Outcome::Stopped(block);
                 }
                 if let Some(outcome) = terminal {
-                    native_failure = outcome == Outcome::UpstreamError;
+                    native_failure = wire == Wire::Responses && outcome == Outcome::UpstreamError;
                     break outcome;
                 }
                 if batch.oversized {
@@ -794,18 +865,71 @@ async fn native_pump(mut req: ReqCtx, mut resp: reqwest::Response, tx: mpsc::Sen
         let (_, _, code, msg) = block_error(b);
         let _ = tokio::time::timeout(
             Duration::from_secs(1),
-            tx.send(Ok(response_failed_event(code, &format!("{msg}本次回复已被中断。")))),
+            tx.send(Ok(native_failed_event(wire, code, &format!("{msg}本次回复已被中断。")))),
         )
         .await;
     } else if outcome == Outcome::UpstreamError && !native_failure {
         let _ = tokio::time::timeout(
             Duration::from_secs(1),
-            tx.send(Ok(response_failed_event("upstream_error", "上游模型服务的连接中断，本次回复不完整，请重试。"))),
+            tx.send(Ok(native_failed_event(
+                wire,
+                "upstream_error",
+                "上游模型服务的连接中断，本次回复不完整，请重试。",
+            ))),
         )
         .await;
     }
     req.rec.outcome = outcome;
     req.finish();
+}
+
+fn native_failed_event(wire: Wire, code: &str, message: &str) -> Bytes {
+    match wire {
+        Wire::Responses => response_failed_event(code, message),
+        Wire::Chat => Bytes::from(format!("data: {}\n\n", err_body(error_kind(code), code, message))),
+    }
+}
+
+fn observe_chat_usage(req: &mut ReqCtx, usage: &Value) -> bool {
+    chat_usage_complete(usage) && req.observe_usage(&chat_usage_to_responses(usage))
+}
+
+fn observe_native_chat(req: &mut ReqCtx, ev: &Event) -> Option<Outcome> {
+    if ev.data.trim() == "[DONE]" {
+        return Some(Outcome::Ok);
+    }
+    let value: Value = serde_json::from_str(&ev.data).ok()?;
+    if req.rec.message_id.is_none() {
+        req.rec.message_id = value["id"].as_str().map(str::to_owned);
+    }
+    if observe_chat_usage(req, &value["usage"]) {
+        req.rec.usage_final = true;
+    }
+    req.observe_output(chat_output_bytes(&value["choices"], "delta"));
+    value.get("error").filter(|error| !error.is_null()).map(|_| Outcome::UpstreamError)
+}
+
+fn chat_output_bytes(choices: &Value, field: &str) -> usize {
+    let bytes = |value: &Value| value.as_str().map_or(0, str::len);
+    choices
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|choice| {
+            let message = &choice[field];
+            let tools = message["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|tool| bytes(&tool["function"]["name"]) + bytes(&tool["function"]["arguments"]))
+                .sum::<usize>();
+            bytes(&message["content"])
+                + bytes(&message["reasoning_content"])
+                + bytes(&message["refusal"])
+                + tools
+                + bytes(&message["function_call"]["arguments"])
+        })
+        .sum()
 }
 
 fn observe_native(req: &mut ReqCtx, ev: &Event) -> Option<Outcome> {

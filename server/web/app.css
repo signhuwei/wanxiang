@@ -256,3 +256,14 @@ details.section > summary .muted { font-weight: 400; margin-left: 8px; }
   .row-sub { display: none; }
   .top-tools .tenant-name { display: none; }
 }
+.statistics-filters { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+.statistics-filters label { display: grid; gap: 4px; }
+.statistics-filters input, .statistics-filters select { min-height: 34px; }
+.statistics-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin: 16px 0; }
+.statistics-totals div { border: 1px solid var(--line, #dfe3ea); border-radius: 6px; padding: 10px 12px; }
+.statistics-totals dd { font-size: 1.3em; font-weight: 600; margin: 5px 0 0; }
+.statistics-table { margin: 18px 0; }
+.statistics-scroll { overflow-x: auto; }
+.statistics-table table { border-collapse: collapse; width: 100%; white-space: nowrap; }
+.statistics-table th, .statistics-table td { padding: 8px; text-align: right; border-bottom: 1px solid var(--line, #dfe3ea); }
+.statistics-table th:first-child { text-align: left; }

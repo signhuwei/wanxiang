@@ -1,6 +1,6 @@
 import { createLedger } from './ledger.js'
 import { button, detailPanel, editForm, el } from './panel.js'
-import { formatBytes } from './format.js'
+import { AGENT_LABELS, formatBytes } from './format.js'
 import { idempotencyKey } from './idempotency.js'
 
 const path = '/platform/agent-releases'
@@ -8,7 +8,7 @@ const options = values => values.map(value => ({ value, label: value }))
 const select = (key, label, values) => ({ key, label, type: 'select', allowEmpty: false, options: options(values) })
 const source = { key: 'url', label: '厂商源地址（供 Server 拉取）', placeholder: 'https://…' }
 const fields = [
-  select('agent', 'Agent', ['claude-code','codex','kimi-code']), { key: 'version', label: '版本' },
+  { ...select('agent', 'Agent', Object.keys(AGENT_LABELS)), options: Object.entries(AGENT_LABELS).map(([value,label]) => ({ value, label })) }, { key: 'version', label: '版本' },
   select('os', '系统', ['darwin','win32','linux']), select('arch', '架构', ['arm64','x64']), source,
   { key: 'sha256', label: 'SHA-256', wide: true }, { key: 'size', label: '原始大小（字节）', type: 'number' },
 ]
@@ -40,22 +40,34 @@ export function agentReleasesPage(host, api, signal) {
       function render() {
         pane.body.classList.remove('child-ledger')
         editForm(pane, { mode: 'view', values: { ...record, size: formatBytes(record.size),
-          status_text: record.status === 'active' ? '已启用' : '未启用',
+          status_text: record.qualification_required ? '待原生运行验证' : record.status === 'active' ? '已启用' : '未启用',
           cache_text: record.artifact_cached ? '已校验并缓存' : '待缓存' }, fields: [
           ...fields, { key: 'status_text', label: '发行状态' }, { key: 'cache_text', label: 'Server 制品' },
         ] })
         pane.body.append(notice)
         if (record.actions.includes('upload_artifact')) {
-          const label = el('label', 'field wide', '原始可执行文件或它的 .gz')
+          const label = el('label', 'field wide', record.qualification_required ? '原厂完整安装包' : '原始可执行文件或它的 .gz')
           const input = el('input')
           input.type = 'file'
           const upload = button('上传并校验', () => {
             const file = input.files?.[0]
             if (!file) { notify('请选择制品文件', true); return }
             notify('正在上传并校验…')
-            return update(upload, () => api.putBinary(detail() + '/artifact', file, {
-              contentType: file.name.endsWith('.gz') ? 'application/gzip' : 'application/octet-stream',
-            }), 'Server 缓存已就绪')
+            return update(upload, async () => {
+              const endpoint = detail() + '/artifact'
+              if (!record.part_bytes) return api.putBinary(endpoint, file, {
+                contentType: file.name.endsWith('.gz') ? 'application/gzip' : 'application/octet-stream',
+              })
+              if (file.size !== record.size) throw new Error('安装包大小与登记值不符')
+              const count = Math.ceil(file.size / record.part_bytes)
+              for (let part = 0; part < count; part++) {
+                notify(`正在上传第 ${part + 1} / ${count} 段…`)
+                const result = await api.putBinary(endpoint, file.slice(part * record.part_bytes, (part + 1) * record.part_bytes),
+                  { params: { part, revision: record.revision } })
+                if (result.artifact_cached) return
+              }
+              throw new Error('Server 尚未完成整包校验')
+            }, 'Server 缓存已就绪')
           })
           label.append(input)
           pane.body.append(label)
@@ -94,7 +106,7 @@ export function agentReleasesPage(host, api, signal) {
       { key: 'agent', title: 'Agent' }, { key: 'version', title: '版本' },
       { title: '系统 / 架构', render: row => row.os + ' / ' + row.arch },
       { title: 'Server 制品', render: row => row.artifact_cached ? '已缓存' : '待缓存' },
-      { title: '发行状态', render: row => row.status === 'active' ? '已启用' : '未启用' },
+      { title: '发行状态', render: row => row.qualification_required ? '待原生运行验证' : row.status === 'active' ? '已启用' : '未启用' },
     ],
     fetchPage: ({ q, limit, cursor, signal }) => api.get(path, { params: { q, limit, cursor }, signal }),
   })

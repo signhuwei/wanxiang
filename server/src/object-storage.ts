@@ -10,7 +10,7 @@ export type ObjectStorageOptions = { endpoint: string; region?: string; bucket: 
 export interface ObjectStorage {
   /** 确保桶存在；重复调用是幂等的，已存在时 RustFS 返回的冲突也当作成功。 */
   ensureBucket(): Promise<void>;
-  put(key: string, body: Uint8Array): Promise<void>;
+  put(key: string, body: Uint8Array, type?: string): Promise<void>;
   /** 对象是否存在，用于保留期届满后核对是否真的已被清理。 */
   exists(key: string): Promise<boolean>;
   /** 拿到可下载的文件引用；调用者负责决定是否转发给调用方。 */
@@ -58,8 +58,8 @@ export class RustfsObjectStorage implements ObjectStorage {
 
   async ensureBucket() { await createBucket(this.opts); }
 
-  async put(key: string, body: Uint8Array) {
-    await this.client.write(key, body, { type: 'application/x-tar' });
+  async put(key: string, body: Uint8Array, type = 'application/x-tar') {
+    await this.client.write(key, body, { type });
   }
 
   exists(key: string) { return this.client.exists(key); }

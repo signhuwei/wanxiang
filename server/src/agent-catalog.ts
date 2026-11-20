@@ -3,8 +3,19 @@ import { join } from 'node:path';
 import type { Store } from './store';
 
 export const AGENT_ARTIFACT_MAX_BYTES = 512 * 1024 * 1024;
+export const DESKTOP_AGENT_PART_BYTES = 32 * 1024 * 1024;
 export const agentDigest = /^[0-9a-f]{64}$/;
-export const managedAgents = ['claude-code', 'codex', 'kimi-code'] as const;
+const cliAgents = ['claude-code', 'codex', 'kimi-code'] as const;
+const desktopAgents = ['workbuddy', 'deepseek-desktop'] as const;
+export const managedAgents = [...cliAgents, ...desktopAgents] as const;
+export const requiresDesktopQualification = (agent: string) => (desktopAgents as readonly string[]).includes(agent);
+
+export function artifactFormat({ agent, os, arch }: { agent: string; os: string; arch: string }) {
+  if (!requiresDesktopQualification(agent)) return 'executable';
+  if (os === 'win32' && arch === 'x64') return 'nsis';
+  if (os === 'darwin' && (arch === 'arm64' || (arch === 'x64' && agent === 'workbuddy'))) return 'dmg';
+  return null;
+}
 export const releaseIdentity = ['id', 'agent', 'version', 'os', 'arch', 'sha256', 'size'] as const;
 
 export type AgentPin = { id: string; agent: string; version: string; os: string; arch: string; sha256: string; size: number };
@@ -47,6 +58,7 @@ export function allowedAgentReleases(store: Store, dataDir: string, policy: Agen
     WHERE status = 'active' AND os = ? AND arch = ? AND agent IN (SELECT value FROM json_each(?))
     ORDER BY id`, [os, arch, policy.allowed_agents_json]);
   return rows.filter(row => {
+    if (requiresDesktopQualification(row.agent)) return false;
     const pin = pins.get(agentTarget(row));
     if (pin && !matchesPin(row, pin)) return false;
     return (requireCache || pin) ? hasArtifact(dataDir, row) : true;
@@ -57,10 +69,14 @@ const sourceHosts: Record<string, string> = {
   'claude-code': 'downloads.claude.ai',
   codex: 'releases.openai.com',
   'kimi-code': 'code.kimi.com',
+  workbuddy: 'download.codebuddy.cn',
+  'deepseek-desktop': 'download.deepseek.com',
 };
 
 export function officialArtifactSource(release: Pick<AgentRelease, 'agent' | 'url'>) {
   const url = URL.parse(release.url);
   return url && url.protocol === 'https:' && url.hostname === sourceHosts[release.agent]
-    && !url.username && !url.password && !url.port && !url.search && !url.hash ? url : null;
+    && !url.username && !url.password && !url.port && !url.search && !url.hash
+    && (release.agent !== 'workbuddy' || url.pathname.startsWith('/workbuddy/saas/'))
+    && (release.agent !== 'deepseek-desktop' || /^\/(dsh-desk|desktop)\//.test(url.pathname)) ? url : null;
 }

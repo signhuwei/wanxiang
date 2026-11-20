@@ -185,6 +185,7 @@ impl Router {
             .route("/v1/messages", post(messages))
             .route(COUNT_TOKENS_PATH, post(messages))
             .route("/v1/responses", post(crate::responses::responses))
+            .route("/v1/chat/completions", post(crate::responses::chat_completions))
             .layer(DefaultBodyLimit::max(MAX_BODY))
             .with_state(self)
     }
@@ -255,6 +256,9 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
             "OneX 本机令牌无效。请从 OneX Desktop 重新启动这个 Agent。",
         );
     };
+    if binding.as_ref().is_some_and(|claim| crate::state::is_desktop_agent(&claim.agent)) {
+        return anthropic_error(StatusCode::FORBIDDEN, "permission_error", "这个 Agent 使用 Chat Completions 协议。");
+    }
     let session_id = binding.as_ref().map(|claim| claim.session_id.clone());
     let first_native_session = binding.and_then(|claim| claim.first_native_session);
 

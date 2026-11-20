@@ -1,6 +1,13 @@
 # OneX 移交说明
 
-> **2026-11-20 更新**：本文是 MVP 阶段的移交。之后的 Mac 内测、S2 第一批和第二批进展见 [S2 第二批移交](docs/handoff/s2-batch2.md)，运行状态以那份为准。
+> **2026-11-20 更新**：本文是 MVP 阶段的移交。之后的 Mac 内测、S2 第一批和第二批进展见 [S2 第二批移交](docs/handoff/s2-batch2.md)，MVP 和 S2 的运行记录见该移交。
+
+## S3 开发进度（2026-11-21）
+
+- 统计页支持日期与 Agent 筛选、租户角色范围和带审计的 Parquet 导出。DuckDB 读取 Parquet，SQLite 继续承接在线写入。运行基准使用 `bun --no-env-file tests/e2e/statistics/load.ts`，100 人、30 天、12 万笔请求下，最终本机 p95 为缓存命中 92 ms、重建快照 758 ms。
+- 租户合约可按设备平台查看生效的 Agent 发行、模型及倍率。平台可登记、拉取或分段上传两款桌面 Agent 的原厂包，并以完整 SHA-256 核对。Edge 的 Chat Completions 已通过假上游的流式工具、租约和用量归属测试。
+- WorkBuddy 和 DeepSeek Harness Desktop 仍需完成原厂 GUI 的纳管运行。本地令牌必须绑定实际原生会话，原生记录须可恢复、补传，并核对同会话的费用。WorkBuddy 还需验证厂商登录后受管模型选择持续生效。两款待验证的发行保持暂存状态；Windows 原生编译、安装和验收在 Windows 环境执行。
+- 211 保持 S2 内测版本。
 
 移交时间：2026-11-19 16:40。移交时 `main` 已包含全部开发分支，测试全部通过（Server 27 通过 1 跳过、管理端 26、Desktop 前端 1、Edge 161）。开发规则和测试命令见 [AGENTS.md](AGENTS.md)。
 

@@ -1,5 +1,6 @@
 import { el, button } from './panel.js'
 import { renderForm } from './form.js'
+import { AGENT_LABELS } from './format.js'
 import { idempotencyKey } from './idempotency.js'
 
 const visibilityRoles = [['admin','管理员'], ['group_admin','组管（本组及子组）']]
@@ -18,6 +19,48 @@ export async function contractPage(host, api) {
   try {
     let contract = await api.get('/contract'), tab, draft, editing, form
     let choices
+    let target = 'darwin/arm64'
+    const targets = [['darwin/arm64','macOS · Apple Silicon'], ['darwin/x64','macOS · Intel'], ['win32/x64','Windows · x64'], ['linux/x64','Linux · x64'], ['linux/arm64','Linux · ARM64']]
+    function effective(section, kind) {
+      const heading = el('label', 'field', '设备系统和架构')
+      const systems = el('select')
+      systems.setAttribute('aria-label', '设备系统和架构')
+      for (const [value, text] of targets) {
+        const item = el('option', null, text)
+        item.value = value
+        systems.append(item)
+      }
+      systems.value = target
+      heading.append(systems)
+      const list = el('div')
+      section.append(heading, list)
+      let serial = 0
+      async function load() {
+        const request = ++serial
+        target = systems.value
+        const [os, arch] = target.split('/')
+        list.textContent = '正在核对实际可用配置…'
+        try {
+          const result = await api.get('/contract/effective', { params:{os,arch} })
+          if (!list.isConnected || serial !== request) return
+          const rows = kind === 'agents' ? result.agents.map(row => {
+            const label = AGENT_LABELS[row.agent] || row.agent
+            const value = row.status === 'available' ? row.releases.map(release => release.version).join('、')
+              : row.status === 'qualification_required' ? '待原生运行验证' : '当前设备无可用发行'
+            return label + ' · ' + value
+          }) : result.models.map(row => {
+            const {input_milli_per_mtok, output_milli_per_mtok, cache_read_milli_per_mtok, cache_write_milli_per_mtok} = row.rate
+            return row.name + ' · ' + row.model + ' · ' + row.protocol + ' · 输入 ' + input_milli_per_mtok + ' / 输出 '
+              + output_milli_per_mtok + ' / 缓存读 ' + cache_read_milli_per_mtok + ' / 缓存写 ' + cache_write_milli_per_mtok + ' 毫橡皮/百万 token'
+          })
+          list.replaceChildren(...(rows.length ? rows.map(text => el('p', null, text)) : [el('p', 'muted', '当前没有可用配置')]))
+        } catch (error) {
+          if (serial === request) list.replaceChildren(el('p', 'error-row', error.message))
+        }
+      }
+      systems.addEventListener('change', load)
+      void load()
+    }
     async function availableReleases() {
       const items = []; let cursor
       do {
@@ -97,6 +140,12 @@ export async function contractPage(host, api) {
             body.querySelector('[name="allowed_agents"]')?.addEventListener('input', () => paintPins(section, items))
           }).catch(error => { section.textContent = error.message })
         }
+      }
+      if (!editing && (tab === 1 || tab === 2)) {
+        const section = el('div', 'form-grid')
+        section.append(el('h3', null, tab === 1 ? '设备实际可用版本' : '已生效的模型与倍率'))
+        body.append(section)
+        effective(section, tab === 1 ? 'agents' : 'models')
       }
       foot.replaceChildren()
       if (!editing) {

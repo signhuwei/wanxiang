@@ -62,6 +62,10 @@ pub struct ConfigSnapshot {
     pub agents: Vec<AgentRelease>,
 }
 
+pub(crate) fn is_desktop_agent(agent: &str) -> bool {
+    matches!(agent, "workbuddy" | "deepseek-desktop")
+}
+
 #[derive(Clone, Debug)]
 pub struct LaunchBinding {
     pub session_id: String,

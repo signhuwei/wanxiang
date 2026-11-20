@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DESKTOP_AGENT_PART_BYTES } from '../src/agent-catalog';
 import { createServer } from '../src/server';
 import { seedTenant } from '../src/seed';
 import { seedMvp } from '../src/seed-mvp';
@@ -700,6 +701,15 @@ test('configuration scopes model routes and encrypts provider secrets to the reg
     input_milli_per_mtok: 1, output_milli_per_mtok: 2, cache_read_milli_per_mtok: 0, cache_write_milli_per_mtok: 0 }, global)).status).toBe(201);
   const update = { revision: 1, seat_limit: 2, allowed_agents: ['claude-code'], allowed_models: [model.id], lease_minutes: 10, lease_budget_milli: 2000, visibility: {} };
   expect((await f.request('/contract', update, scoped, undefined, 'PUT')).status).toBe(200);
+  const effective = '/contract/effective?os=darwin&arch=arm64';
+  expect((await f.request(effective, undefined, global)).status).toBe(403);
+  const effectiveReply = await f.request(effective, undefined, scoped);
+  expect(effectiveReply.status).toBe(200);
+  const view = await effectiveReply.json();
+  expect(view).toMatchObject({ revision: 2, models: [{ model_id: model.id, provider_id: provider.id, model: 'managed-*',
+    protocol: 'anthropic', rate: { input_milli_per_mtok: 1 } }] });
+  expect(JSON.stringify(view)).not.toContain('test-only-provider-key');
+  expect(JSON.stringify(view)).not.toContain('127.0.0.1');
   const keys = generateKeyPairSync('x25519');
   const raw = keys.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
   const device = await (await f.request('/devices', { ...f.device, public_key: raw.toString('base64') }, scoped)).json() as DeviceReply;
@@ -1003,4 +1013,97 @@ test('an offline lease is settled on return and late usage reconciles without a 
   expect(rows).toEqual([{ model: 'fake', model_id: 'mod_fake', cost_milli: 3, settlement_status: 'reconciled' },
     { model: 'fake', model_id: 'mod_fake', cost_milli: 2, settlement_status: 'pending' }]);
   expect(await (await f.request('/balance', undefined, scoped)).json()).toMatchObject({ month_used_milli: 3 });
+});
+
+test('statistics exports scoped daily aggregates without conversation bodies', async () => {
+  const f = await fixture(15_000, Date.parse('2027-01-31T16:30:00.000Z'));
+  const owner = await f.select(await f.login());
+  const invited = await f.request('/invites', { role: 'member', max_uses: 1, expires_in_ms: 60_000 }, owner);
+  const { invite_code } = await invited.json() as { invite_code: string };
+  const target = 'statistics-employee@example.test';
+  const logged = await f.request('/auth/login', { target, code: await f.code(target), invite_code });
+  const employeeAuth = await logged.json() as { token: string; user: { id: string } };
+  const employee = await f.select(employeeAuth.token);
+  const ownDevice = await (await f.request('/devices', f.device, owner)).json() as DeviceReply;
+  const memberDevice = await (await f.request('/devices', f.device, employee)).json() as DeviceReply;
+  await f.store.tenant(f.tenantId).write(sql => {
+    const initial = '2027-01-31T15:59:59.999Z';
+    const later = '2027-01-31T16:00:00.000Z';
+    for (const [id, device, user, agent, at, cost] of [
+      ['test-owned', ownDevice.device_id, f.userId, 'claude-code', initial, 7],
+      ['test-employee', memberDevice.device_id, employeeAuth.user.id, 'kimi-code', later, 11],
+    ] as const) {
+      sql.run('INSERT INTO agent_sessions (id, device_id, user_id, agent, agent_version, started_at) VALUES (?, ?, ?, ?, ?, ?)',
+        [id, device, user, agent, 'fixture', at]);
+      sql.run(`INSERT INTO session_events (session_id, device_id, seq, kind, at, payload_json)
+        VALUES (?, ?, 1, 'user_message', ?, ?), (?, ?, 3, 'user_message', ?, ?)`,
+      [id, device, at, '{"content":"private message"}', id, device, at, '{"content":"unacknowledged"}']);
+      sql.run('INSERT INTO ingest_cursors (device_id, ack_seq) VALUES (?, 2)', [device]);
+      sql.run(`INSERT INTO usage (device_id, seq, request_id, session_id, model_id, input_tokens, output_tokens, cache_read_tokens,
+        cache_write_tokens, cost_milli, status, at, complete, settlement_status)
+        VALUES (?, 2, ?, ?, 'fake-model', 5, 3, 1, 0, ?, 'ok', ?, 1, 'reconciled')`, [device, id, id, cost, at]);
+    }
+  });
+  const path = '/observe/statistics?from=2027-01-31&to=2027-02-01';
+  expect(await (await f.request(path, undefined, owner)).json()).toMatchObject({
+    totals: { active_people: 2, sessions: 2, events: 2, turns: 2, cost_milli: 18 },
+    daily: [{ day: '2027-01-31', cost_milli: 7 }, { day: '2027-02-01', cost_milli: 11 }],
+  });
+  expect(await (await f.request(path, undefined, employee)).json()).toMatchObject({
+    totals: { active_people: 1, sessions: 1, cost_milli: 11 },
+    daily: [{ day: '2027-02-01', cost_milli: 11 }],
+  });
+  expect(await (await f.request(path + '&agent=claude-code', undefined, employee)).json()).toMatchObject({ totals: { cost_milli: 0 }, daily: [] });
+  expect((await f.request('/observe/statistics?from=2027-02-30', undefined, owner)).status).toBe(422);
+  const exportFile = await f.request('/observe/statistics/parquet?from=2027-01-31&to=2027-02-01', undefined, employee);
+  expect(exportFile.status).toBe(200);
+  const parquet = Buffer.from(await exportFile.arrayBuffer());
+  expect(parquet.subarray(0, 4).toString()).toBe('PAR1');
+  expect(parquet.toString().includes('private message')).toBe(false);
+  expect(f.store.tenant(f.tenantId).get("SELECT actor FROM audit WHERE action = 'observe.statistics.export'")).toEqual({ actor: employeeAuth.user.id });
+});
+
+test('complete desktop installers can be staged and verified without enabling an unqualified runtime', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const tenant = await f.select(global);
+  await f.store.system.write(sql => sql.run('INSERT INTO platform_admins VALUES (?)', [f.userId]));
+  const diskImage = new Uint8Array(DESKTOP_AGENT_PART_BYTES + 512);
+  diskImage.set(new TextEncoder().encode('koly'), DESKTOP_AGENT_PART_BYTES);
+  const definition = { agent: 'workbuddy', version: 'fixture', os: 'darwin', arch: 'arm64',
+    url: 'https://download.codebuddy.cn/workbuddy/saas/fixture.dmg',
+    sha256: createHash('sha256').update(diskImage).digest('hex'), size: diskImage.length };
+  const route = '/platform/agent-releases';
+  const denied = await f.request(route, { ...definition, status: 'active' }, global);
+  expect(denied.status).toBe(409);
+  expect(await denied.json()).toMatchObject({ error: { detail: { reason: 'desktop_qualification_required' } } });
+  const stage = await f.request(route, { ...definition, status: 'disabled' }, global);
+  expect(stage.status).toBe(201);
+  const release = await stage.json() as { id: string; revision: number };
+  expect(release).toMatchObject({ format: 'dmg', qualification_required: true, artifact_cached: false });
+  const putPart = (part: number, body: Uint8Array<ArrayBuffer>, revision = release.revision) =>
+    fetch(new URL(`/v1${route}/${release.id}/artifact?part=${part}&revision=${revision}`, f.server.url),
+      { method: 'PUT', headers: { authorization: 'Bearer ' + global, 'content-type': 'application/octet-stream' }, body });
+  const tail = diskImage.subarray(DESKTOP_AGENT_PART_BYTES);
+  expect((await putPart(1, tail, release.revision + 1)).status).toBe(409);
+  expect((await putPart(1, tail)).status).toBe(202);
+  expect((await f.request('/agent-artifacts/' + definition.sha256, undefined, global)).status).toBe(404);
+  expect((await putPart(0, diskImage.subarray(0, DESKTOP_AGENT_PART_BYTES))).status).toBe(200);
+  expect(await (await putPart(1, tail)).json()).toMatchObject({ artifact_cached: true, sha256: definition.sha256 });
+  const artifact = '/agent-artifacts/' + definition.sha256;
+  const downloaded = await f.request(artifact, undefined, global);
+  expect(downloaded.status).toBe(200);
+  expect(downloaded.headers.get('content-length')).toBe(String(diskImage.length));
+  expect(createHash('sha256').update(Buffer.from(await downloaded.arrayBuffer())).digest('hex')).toBe(definition.sha256);
+  expect((await f.request(artifact, undefined, tenant)).status).toBe(403);
+  const current = await (await f.request('/contract', undefined, tenant)).json() as Record<string, unknown>;
+  const allow = { ...current, allowed_agents: ['claude-code', 'workbuddy'] };
+  expect((await f.request('/contract', { ...allow, agent_release_ids: [release.id] }, tenant, undefined, 'PUT')).status).toBe(422);
+  expect((await f.request('/contract', allow, tenant, undefined, 'PUT')).status).toBe(200);
+  const view = await f.request('/contract/effective?os=darwin&arch=arm64', undefined, tenant);
+  expect(await view.json()).toMatchObject({ agents: [
+    { agent: 'claude-code', status: 'unavailable', releases: [] },
+    { agent: 'workbuddy', status: 'qualification_required', releases: [] },
+  ] });
+  expect((await f.request(route + '/' + release.id, { status: 'active', revision: release.revision }, global)).status).toBe(409);
 });

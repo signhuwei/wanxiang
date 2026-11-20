@@ -99,4 +99,11 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 - `GET /v1/contract/agent-releases?q=&cursor=&limit=` 向租户 owner/admin 分页返回启用且已缓存的可选发行。
 - owner 写 `PUT /v1/contract` 时可传 `agent_release_ids`，每个 Agent、系统、架构组合最多固定一项。所选 Agent 必须出现在 `allowed_agents`。空数组清除固定版本，缺省保留现有准许 Agent 的固定条目。
 - 保存合约时冻结原始发行身份并写审计。没有固定版本的目标跟随平台已启用的缓存发行。固定发行不可用时该目标暂停供给。固定发行的平台要求支持 Server 制品缓存的 Edge。
+- `GET /v1/contract/effective?os=&arch=` 向已选择租户的成员返回合约修订、指定平台实际可用的受管发行及当前生效的模型和倍率。Agent 状态为 `available`、`unavailable` 或 `qualification_required`。模型及倍率与 Edge 下发使用同一解析，响应省略上游 URL、代理和密钥。
 - 设备下载及平台管理接口见 [维护与发布](maintenance-releases.md)。
+
+## 监察统计与 Parquet
+
+- `GET /v1/observe/statistics?from=YYYY-MM-DD&to=YYYY-MM-DD&agent=`。按北京时间自然日（两端含当日），缺省为最近 30 天，支持近 90 天以内不超过 30 日的区间。返回 `totals`、`daily`、`agents`、`as_of` 和 `actions`。计量包括新增会话、事件、用户轮次、请求、输入输出与缓存 token、毫橡皮及待结算请求。孤立用量归到 `unknown`。活跃人数按查询范围内去重，不能相加合计。
+- `GET /v1/observe/statistics/parquet` 使用相同过滤条件，返回按日期及 Agent 汇总的 Parquet。成功导出写入租户审计 `observe.statistics.export`。
+- 统计与会话摘要使用相同的当前可见范围。统计和导出只提供汇总字段，不返回正文、身份标识或原始用量单据。私有快照按租户隔离，从 SQLite 生成。配置 RustFS 时，每 15 分钟将活跃租户的最新快照同步至私有存储。DuckDB 执行 Parquet 查询，在线事件及计费仍写 SQLite。
