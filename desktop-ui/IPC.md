@@ -22,6 +22,8 @@
 {"version":"0.1.0-demo","phase":"ready","user":{"name":"示例员工"},"tenant":{"id":"ten_demo","name":"示例租户"},"tenants":[],"connection":"connected","agents":[{"id":"claude-code","name":"Claude Code","version":"demo","status":"available","actions":["launch"]}],"settings":{"server_origin":"https://onex.example.invalid","hide_on_close":true}}
 ```
 
+macOS 桌面一键启动 Codex 的默认工作目录是 `~/OneX Workspace`。通过终端在其他项目目录运行 `onex run codex` 时，保留该终端的工作目录。
+
 `phase`：`signed_out | choose_tenant | ready`。登录前 `user/tenant` 为 null，目录为空。选择态 `tenants:[{id,name}]`、`tenant:null`；包括单租户，用户确认后再进入。`ready` 目录仅含当前身份允许查看的 Agent。`connection: idle | connecting | connected | backoff`；短时失联不是注销。顶层 `version` 是 Desktop 应用版本（不是 daemon 或 Agent 版本），所有阶段均返回，设置页展示。`agents[].status: available | update_available | downloading | verifying | starting | running | failed`；`update_available` 在 S1 仅作提示，`actions:[]`，页面不提供启动或更新。失败可带中文 `message`。仅 `actions` 含 `launch` 才提供启动，不按连接状态猜授权。快照不含验证码、令牌、安装路径、Provider 密钥、对话内容或完整日志；`server_origin` 无用户信息/query/fragment。错误用契约码及可展示中文，桥不可将敏感原始异常转发给 UI。
 
 ### UI 中文文案（只按枚举选取，不展示自由文本）
