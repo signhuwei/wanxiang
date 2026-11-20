@@ -642,3 +642,53 @@ test('a disabled member is dropped at hello time and never reaches a quota or ba
   const edge = connect(f, token.device_token);
   expect(await edge.opened).toBe(false);
 });
+
+test('a 200-row page of /members and /groups reports the same month_used_milli as a per-row query', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  const tenantDb = f.store.tenant(f.tenantId);
+  // 直接写库造 200 个成员、一棵组树和穿插的 settle/active 租约，跳过逐个登录注册，只验证批量聚合和逐行查询算出同一个数。
+  const groupCount = 10;
+  const groups = Array.from({ length: groupCount }, (_, i) => `grp_bulk_${i}`);
+  await tenantDb.write((sql) => {
+    for (let i = 0; i < groupCount; i++) {
+      const parent_id = i === 0 ? null : groups[Math.floor((i - 1) / 2)];
+      sql.run('INSERT INTO groups (id, name, parent_id, quota_milli) VALUES (?, ?, ?, ?)', [groups[i], `Bulk ${i}`, parent_id, null]);
+    }
+    const now = f.now();
+    for (let i = 0; i < 200; i++) {
+      const userId = `usr_bulk_${i}`;
+      const groupId = groups[i % groupCount];
+      sql.run('INSERT INTO members (user_id, role, status, group_id) VALUES (?, ?, ?, ?)', [userId, 'member', 'active', groupId]);
+      // 每个成员结一笔本月 settle；每三个成员再加一台设备和一份 active 租约，制造 settle+reserve 混合的场景
+      sql.run('INSERT INTO ledger (id, kind, amount_milli, user_id, at) VALUES (?, ?, ?, ?, ?)', [`led_bulk_${i}`, 'settle', 7 + i, userId, new Date(now).toISOString()]);
+      if (i % 3 === 0) {
+        const deviceId = `dev_bulk_${i}`;
+        sql.run(`INSERT INTO devices (id, user_id, name, os, arch, public_key, token_hash, token_expires_at, status)
+          VALUES (?, ?, ?, 'darwin', 'arm64', 'k', ?, ?, 'active')`, [deviceId, userId, `Bulk ${i}`, `hash_${i}`, new Date(now + 86_400_000).toISOString()]);
+        sql.run(`INSERT INTO leases (id, device_id, user_id, budget_milli, expires_at, status) VALUES (?, ?, ?, ?, ?, 'active')`,
+          [`lse_bulk_${i}`, deviceId, userId, 11 + i, new Date(now + 600_000).toISOString()]);
+      }
+    }
+  });
+  // 逐行基准：对每个成员和每个组单独查一次 /quota/usage（口径和 /members、/groups 的 month_used_milli 相同：used_milli + reserved_milli）
+  const memberExpected = new Map<string, number>();
+  for (let i = 0; i < 200; i++) {
+    const userId = `usr_bulk_${i}`;
+    const row = await (await f.request(`/quota/usage?scope=member&id=${userId}`, undefined, owner)).json() as { used_milli: number; reserved_milli: number };
+    memberExpected.set(userId, row.used_milli + row.reserved_milli);
+  }
+  const groupExpected = new Map<string, number>();
+  for (const groupId of groups) {
+    const row = await (await f.request(`/quota/usage?scope=group&id=${groupId}`, undefined, owner)).json() as { used_milli: number; reserved_milli: number };
+    groupExpected.set(groupId, row.used_milli + row.reserved_milli);
+  }
+  // 批量台账：翻两页（limit 200 的上限）拿全部 200 个成员，和逐行基准逐一比对
+  const page = await (await f.request('/members?limit=200', undefined, owner)).json() as { items: { id: string; month_used_milli: number }[], total: number };
+  expect(page.total).toBeGreaterThanOrEqual(200);
+  for (const row of page.items) if (memberExpected.has(row.id)) expect(row.month_used_milli).toBe(memberExpected.get(row.id)!);
+  const groupPage = await (await f.request('/groups?limit=200', undefined, owner)).json() as { items: { id: string; month_used_milli: number }[] };
+  for (const row of groupPage.items) if (groupExpected.has(row.id)) expect(row.month_used_milli).toBe(groupExpected.get(row.id)!);
+  expect(groupExpected.size).toBe(groupCount);
+});
