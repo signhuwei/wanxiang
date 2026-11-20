@@ -28,11 +28,12 @@
 | `quota-web` | 成员和组台账显示本月用量与剩余、配额表单校验、`/me.quota` 提示、配额耗尽时的流水和人员页提示 | `server/web/` |
 | `codex` | Codex 受管启动（固定版本制品、私有 `CODEX_HOME`、`config.toml` 生成）、router `/v1/responses` 入口（同协议与转 Chat）、rollout 采集 | `edge/onexd/src/{responses,codex}*.rs`、`launch.rs`、`managed_runtime.rs`、`ipc.rs`、`router.rs` 的入口注册、对应测试 |
 | `kimi` | Kimi Code 受管启动（制品、私有 `KIMI_CODE_HOME`、`config.toml`）、wire.jsonl 采集 | `edge/onexd/src/kimi*.rs`、`capture.rs` 的分发、对应测试 |
+| `lease` | 断流后的恢复（契约 v0.13，独立验收发现的 S1 遗留缺陷）：Edge 丢弃已结清租约、`lease_request`、重启恢复；Server 侧由 `quota-api` 实现 | `edge/onexd/src/{lease,ws,ipc}.rs`、`edge/onex-core/src/ws.rs`、`edge/onexd/tests/` |
 | `review` | 独立验收：配额账务边界（多级组、并发租约、月切换、调低配额）与两个 Agent 采集的形状覆盖 | 只读，报告写 `coord/reports/s2/` |
 
 Edge 已在 `6594f4c` 之后加上 `quota` 断流原因与 `quota_exhausted` 错误提示。`codex` 与 `kimi` 两条线共用 `launch.rs`、`managed_runtime.rs`、`ipc.rs`：`codex` 先改成按 Agent 分派的结构并提交，`kimi` 基于该提交接入，冲突由总督合并。
 
-验收：同一租户下 Claude Code、Codex、Kimi Code 各完成一次受管启动、本机假上游多轮对话、正文与费用回流；配额耗尽时三者都收到 `quota_exhausted`。真实模型和 211 联验由总督在合并后安排。
+验收：同一租户下 Claude Code、Codex、Kimi Code 各完成一次受管启动、本机假上游多轮对话、正文与费用回流；配额耗尽时，三者在续租拿到 `cutoff{quota}` 之后都收到 `quota_exhausted`（续租之前本机租约剩余不足的提示是 `balance_exhausted`，文案已说明正在续约）。充值、调高配额或进入新月份后不用重新登录即可恢复。真实模型和 211 联验由总督在合并后安排。
 
 ## 后续批次
 
