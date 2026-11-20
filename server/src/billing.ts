@@ -194,20 +194,20 @@ export function billingRoutes(app: Hono, store: Store, opts: ManagementOptions) 
     const scope = enumField(c.req.query('scope') ?? '', 'scope', ['member', 'group']);
     const id = field(c.req.query('id') ?? '', 'id');
     const [from, to] = monthBounds(at);
+    // 无权查看和不存在一律 404，不借由 403/404 的区别探测 id 是否存在（v0.13 契约修订）。
     if (scope === 'member') {
       const member = db.get<{ quota_milli: number | null; group_id: string | null }>('SELECT quota_milli, group_id FROM members WHERE user_id = ?', [id]);
-      if (!member) throw new ApiError('not_found');
-      if (role === 'member' && id !== actor.userId) throw new ApiError('forbidden');
-      if (role === 'group_admin' && !(id === actor.userId || (actor.group_id && db.get(
-        `SELECT 1 FROM members WHERE user_id = ? AND group_id IN (${groupSubtree})`, [id, actor.group_id])))) throw new ApiError('forbidden');
+      const allowed = role !== 'member' || id === actor.userId;
+      const groupAllowed = role !== 'group_admin' || id === actor.userId || (actor.group_id && db.get(
+        `SELECT 1 FROM members WHERE user_id = ? AND group_id IN (${groupSubtree})`, [id, actor.group_id]));
+      if (!member || !allowed || !groupAllowed) throw new ApiError('not_found');
       const { settled, reserved } = usageByUsers(db, '?', [id], from, to);
       return c.json({ scope, id, quota_milli: member.quota_milli, used_milli: settled, reserved_milli: reserved,
         remaining_milli: member.quota_milli === null ? null : member.quota_milli - settled - reserved, actions: ['read'] });
     }
     const group = db.get<{ quota_milli: number | null }>('SELECT quota_milli FROM groups WHERE id = ?', [id]);
-    if (!group) throw new ApiError('not_found');
-    if (role === 'member') throw new ApiError('forbidden');
-    if (role === 'group_admin' && !(actor.group_id && db.get(`SELECT 1 FROM (${groupSubtree}) WHERE id = ?`, [actor.group_id, id]))) throw new ApiError('forbidden');
+    const groupAllowed = role !== 'member' && (role !== 'group_admin' || (actor.group_id && db.get(`SELECT 1 FROM (${groupSubtree}) WHERE id = ?`, [actor.group_id, id])));
+    if (!group || !groupAllowed) throw new ApiError('not_found');
     const members = `SELECT user_id FROM members WHERE group_id IN (${groupSubtree})`;
     const { settled, reserved } = usageByUsers(db, members, [id], from, to);
     return c.json({ scope, id, quota_milli: group.quota_milli, used_milli: settled, reserved_milli: reserved,

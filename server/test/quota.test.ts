@@ -60,7 +60,8 @@ async function fixture(testTime?: number) {
   }
   const publicKey = Buffer.alloc(32, 5).toString('base64');
   async function registerDevice(scoped: string, name = 'Mac') {
-    const res = await request('/devices', { name, os: 'darwin', arch: 'arm64', public_key: publicKey }, scoped, `device-${name}-${Math.random()}`);
+    // Idempotency-Key 不接受空格；设备名允许带空格，所以键单独生成，不拼进 name。
+    const res = await request('/devices', { name, os: 'darwin', arch: 'arm64', public_key: publicKey }, scoped, `device-${Math.random()}`);
     expect(res.status).toBe(201);
     return await res.json() as DeviceReply;
   }
@@ -273,7 +274,7 @@ test('balance and quota exhausted together still report balance', async () => {
   expect(await edge.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'balance', re: 'renew-1' });
 });
 
-test('/quota/usage enforces owner/admin/group_admin/member scoping and 404s on an unknown object', async () => {
+test('/quota/usage enforces owner/admin/group_admin/member scoping, hiding both unauthorized and unknown objects behind 404', async () => {
   const f = await fixture();
   const ownerToken = (await f.login()).token;
   const owner = await f.select(ownerToken);
@@ -289,10 +290,11 @@ test('/quota/usage enforces owner/admin/group_admin/member scoping and 404s on a
   expect((await f.request(`/quota/usage?scope=group&id=${group.id}`, undefined, owner)).status).toBe(200);
   expect((await f.request(`/quota/usage?scope=member&id=${memberAccount.userId}`, undefined, groupAdminAccount.scoped)).status).toBe(200);
   expect((await f.request(`/quota/usage?scope=group&id=${group.id}`, undefined, groupAdminAccount.scoped)).status).toBe(200);
-  expect((await f.request(`/quota/usage?scope=group&id=${other.id}`, undefined, groupAdminAccount.scoped)).status).toBe(403);
+  // v0.13：无权查看一个真实存在的对象也回 404，不借由 403/404 的区别探测 id 是否存在
+  expect((await f.request(`/quota/usage?scope=group&id=${other.id}`, undefined, groupAdminAccount.scoped)).status).toBe(404);
   expect((await f.request(`/quota/usage?scope=member&id=${memberAccount.userId}`, undefined, memberAccount.scoped)).status).toBe(200);
-  expect((await f.request(`/quota/usage?scope=member&id=${groupAdminAccount.userId}`, undefined, memberAccount.scoped)).status).toBe(403);
-  expect((await f.request(`/quota/usage?scope=group&id=${group.id}`, undefined, memberAccount.scoped)).status).toBe(403);
+  expect((await f.request(`/quota/usage?scope=member&id=${groupAdminAccount.userId}`, undefined, memberAccount.scoped)).status).toBe(404);
+  expect((await f.request(`/quota/usage?scope=group&id=${group.id}`, undefined, memberAccount.scoped)).status).toBe(404);
   expect((await f.request(`/quota/usage?scope=member&id=nonexistent`, undefined, owner)).status).toBe(404);
   expect((await f.request(`/quota/usage?scope=group&id=nonexistent`, undefined, owner)).status).toBe(404);
 });
@@ -520,4 +522,123 @@ test('limited_by breaks ties in favor of the member, then the nearest group', as
   // 去掉本人配额：并列的子组和祖先组之间，取离成员最近的（子组）
   expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 2, quota_milli: null }, owner)).status).toBe(200);
   expect(await (await f.request('/me', undefined, member.scoped)).json()).toMatchObject({ quota: { limited_by: `group:${child.id}` } });
+});
+
+// 复核独立验收草稿（coord/reports/s2/quota-review.test.ts）里和 Server 相关的用例，用自己的 fixture 重放确认。
+
+test('a lease issued last month and still active counts as this month reserve; its settle lands in this month', async () => {
+  const f = await fixture(Date.parse('2026-11-30T15:55:00.000Z')); // 上海 11 月 30 日 23:55
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1_000_000);
+  const member = await f.join('prior-month-lease@example.test');
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, quota_milli: 3000 }, owner)).status).toBe(200);
+  const edge = await linkedEdge(f, member.scoped);
+  const lease = await edge.nextOf('lease');
+  expect(lease).toMatchObject({ type: 'lease', budget_milli: 2000 }); // 合约 lease_budget_milli 默认 2000 更紧
+  f.advance(15 * 60_000); // 上海 12 月 1 日 00:10，跨月但这份租约仍 active
+  expect(await (await f.request(`/quota/usage?scope=member&id=${member.userId}`, undefined, owner)).json())
+    .toMatchObject({ used_milli: 0, reserved_milli: 2000, remaining_milli: 1000 });
+  edge.send({ type: 'lease_renew', id: 'renew-1', op_id: 'op-1', lease_id: lease.lease_id, used_milli: 1500 });
+  expect(await edge.nextOf('lease')).toMatchObject({ type: 'lease', budget_milli: 1500 });
+  // settle 落在新月份（12 月），不是租约签发时的 11 月
+  expect(await (await f.request(`/quota/usage?scope=member&id=${member.userId}`, undefined, owner)).json())
+    .toMatchObject({ used_milli: 1500, reserved_milli: 1500, remaining_milli: 0 });
+});
+
+test('lowering a quota with two outstanding leases can be overshot by both leases together', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1_000_000);
+  const member = await f.join('two-leases@example.test');
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, quota_milli: 10_000 }, owner)).status).toBe(200);
+  const [e1, e2] = await Promise.all([linkedEdge(f, member.scoped, 'D1'), linkedEdge(f, member.scoped, 'D2')]);
+  const [l1, l2] = await Promise.all([e1.next(), e2.next()]);
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 2, quota_milli: 1000 }, owner)).status).toBe(200);
+  e1.send({ type: 'lease_renew', id: 'r1', op_id: 'r1', lease_id: l1.lease_id, used_milli: l1.budget_milli });
+  expect(await e1.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  e2.send({ type: 'lease_renew', id: 'r2', op_id: 'r2', lease_id: l2.lease_id, used_milli: l2.budget_milli });
+  expect(await e2.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  // 两份都结清后，合计超出的是两份租约的额度之和（l1.budget_milli + l2.budget_milli），不是单份
+  expect(await (await f.request(`/quota/usage?scope=member&id=${member.userId}`, undefined, owner)).json())
+    .toMatchObject({ used_milli: l1.budget_milli + l2.budget_milli, reserved_milli: 0, remaining_milli: 1000 - l1.budget_milli - l2.budget_milli });
+});
+
+test('overage_pending and the released remainder do not count toward the quota', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1_000_000);
+  const member = await f.join('overage-not-quota@example.test');
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, quota_milli: 5000 }, owner)).status).toBe(200);
+  const edge = await linkedEdge(f, member.scoped);
+  const l1 = await edge.nextOf('lease');
+  expect(l1).toMatchObject({ type: 'lease', budget_milli: 2000 }); // 合约默认额度 2000 比配额剩余 5000 更紧
+  // 实报超过这份额度：按额度 2000 实扣，差额 600 单列 overage_pending，不计入配额已用
+  edge.send({ type: 'lease_renew', id: 'r1', op_id: 'r1', lease_id: l1.lease_id, used_milli: 2600 });
+  const l2 = await edge.nextOf('lease');
+  expect(l2).toMatchObject({ type: 'lease', budget_milli: 2000 });
+  expect(await (await f.request(`/quota/usage?scope=member&id=${member.userId}`, undefined, owner)).json())
+    .toMatchObject({ used_milli: 2000, reserved_milli: 2000, remaining_milli: 1000 });
+  edge.send({ type: 'lease_renew', id: 'r2', op_id: 'r2', lease_id: l2.lease_id, used_milli: 300 });
+  // settle 2300、release 1700；剩余 2700，合约 2000 仍更紧
+  const l3 = await edge.nextOf('lease');
+  expect(l3).toMatchObject({ type: 'lease', budget_milli: 2000 });
+  edge.send({ type: 'lease_renew', id: 'r3', op_id: 'r3', lease_id: l3.lease_id, used_milli: 2600 });
+  // settle 累计 4300，剩 700 → 新租约只能是 700；这次的 overage 600 同样不计
+  const l4 = await edge.nextOf('lease');
+  expect(l4).toMatchObject({ type: 'lease', budget_milli: 700 });
+  edge.send({ type: 'lease_renew', id: 'r4', op_id: 'r4', lease_id: l4.lease_id, used_milli: 900 });
+  expect(await edge.nextOf('cutoff')).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  expect(await (await f.request(`/quota/usage?scope=member&id=${member.userId}`, undefined, owner)).json())
+    .toMatchObject({ used_milli: 5000, reserved_milli: 0, remaining_milli: 0 });
+  expect(f.store.tenant(f.tenantId).get("SELECT sum(amount_milli) AS n FROM ledger WHERE kind = 'overage_pending'")).toEqual({ n: 1400 });
+  const row = (await (await f.request('/members', undefined, owner)).json() as { items: { id: string; month_used_milli: number }[] })
+    .items.find((item) => item.id === member.userId);
+  expect(row?.month_used_milli).toBe(5000);
+});
+
+test('/balance.month_used_milli uses Asia/Shanghai even while /members already rolled over', async () => {
+  const f = await fixture(Date.parse('2026-10-31T16:30:00.000Z')); // 上海 11 月 1 日 00:30
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 1_000_000);
+  const member = await f.join('balance-shanghai@example.test');
+  const edge = await linkedEdge(f, member.scoped);
+  const lease = await edge.nextOf('lease');
+  edge.send({ type: 'lease_renew', id: 'r1', op_id: 'r1', lease_id: lease.lease_id, used_milli: 1500 });
+  await edge.nextOf('lease');
+  // /members 的 month_used_milli 是配额口径（结算 + 预留），已经按上海 11 月计：结算 1500 + 新租约预留 2000
+  const members = (await (await f.request('/members', undefined, owner)).json() as { items: { id: string; month_used_milli: number }[] }).items;
+  expect(members.find((item) => item.id === member.userId)?.month_used_milli).toBe(3500);
+  // /balance.month_used_milli 只含 settle（不含预留），同样按 Asia/Shanghai：这笔 10 月底发生、上海已跨月的结算算进了新的自然月
+  expect(await (await f.request('/balance', undefined, owner)).json()).toMatchObject({ month_used_milli: 1500 });
+});
+
+test('quota_milli rejects negative, fractional, non-numeric and unsafe-integer values on members and groups', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  const member = await f.join('validation@example.test');
+  for (const bad of [-1, 1.5, '100', Number.MAX_SAFE_INTEGER + 2]) {
+    expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, quota_milli: bad as never }, owner)).status).toBe(422);
+  }
+  for (const bad of [-1, 1.5, '100']) {
+    expect((await f.request('/groups', { name: `bad-${bad}`, quota_milli: bad as never }, owner)).status).toBe(422);
+  }
+});
+
+test('a disabled member is dropped at hello time and never reaches a quota or balance cutoff', async () => {
+  const f = await fixture();
+  const ownerToken = (await f.login()).token;
+  const owner = await f.select(ownerToken);
+  await f.fund(ownerToken, 40); // 5% 下限是 2，不影响这个用例关心的停用判定
+  const member = await f.join('disabled-at-hello@example.test');
+  const token = await f.registerDevice(member.scoped, 'Disabled device');
+  expect((await f.request(`/members/${member.userId}`, { role: 'member', revision: 1, status: 'disabled' }, owner)).status).toBe(200);
+  // /v1/edge/ws 升级前就要求成员 active（deviceQuery 里的 m.status = 'active'）：停用成员的设备连不上，
+  // 根本不会走到 hello，更不会先收到任何 lease 或 cutoff。
+  const edge = connect(f, token.device_token);
+  expect(await edge.opened).toBe(false);
 });
