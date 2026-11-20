@@ -2,6 +2,7 @@ import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
 import { tenantAuditActions } from './actions';
 import { ApiError, field, invalid, json, operation } from './api';
+import { groupMonthUsage, selfMonthUsage } from './billing';
 import { day, hash, iso, randomToken } from './credentials';
 import { enumField, expectRevision, int, pagination, tenantActor, type ManagementOptions } from './management';
 import { indexInvite, indexMember, type Member, type Store, type Transaction } from './store';
@@ -41,10 +42,10 @@ function stringList(value: unknown, name: string) {
 
 export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
   const profile = (id: string) => store.system.get<Profile>('SELECT id, name, email, phone FROM platform_users WHERE id = ?', [id]);
-  const memberView = (row: MemberRow, role: string) => {
+  const memberView = (row: MemberRow, role: string, month_used_milli: number) => {
     const user = profile(row.user_id);
     return { ...row, id: row.user_id, name: user?.name ?? row.user_id, email: user?.email ?? null, phone: user?.phone ?? null,
-      actions: canEditMember(role, row.role) ? ['read', 'update'] : ['read'] };
+      month_used_milli, actions: canEditMember(role, row.role) ? ['read', 'update'] : ['read'] };
   };
   function manager(c: Context, at: number) {
     const actor = tenantActor(store, c, at);
@@ -100,13 +101,15 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
     const { n } = db.get<{ n: number }>(`SELECT count(*) AS n FROM members ${where}`, params)!;
     const rows = db.all<MemberRow>(`SELECT * FROM members ${where} ORDER BY user_id LIMIT ? OFFSET ?`, [...params, p.limit, p.offset]);
-    return c.json(p.page(rows.map((row) => memberView(row, role)), n, ['create_member']));
+    const at = opts.now();
+    return c.json(p.page(rows.map((row) => memberView(row, role, selfMonthUsage(db, row.user_id, at))), n, ['create_member']));
   });
   app.get('/v1/members/:id', (c) => {
-    const { db, role } = manager(c, opts.now());
+    const at = opts.now();
+    const { db, role } = manager(c, at);
     const row = db.get<MemberRow>('SELECT * FROM members WHERE user_id = ?', [c.req.param('id')]);
     if (!row) throw new ApiError('not_found');
-    return c.json(memberView(row, role));
+    return c.json(memberView(row, role, selfMonthUsage(db, row.user_id, at)));
   });
   // CONTRACT-PENDING: POST creates from a known user_id; POST/PATCH /:id updates.
   const writeMember = async (c: Context) => {
@@ -139,7 +142,7 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
       const member = { user_id: id, role, status, group_id, quota_milli, revision };
       if (previous) sql.run('UPDATE members SET role = ?, status = ?, group_id = ?, quota_milli = ?, revision = ? WHERE user_id = ?', [role, status, group_id, quota_milli, revision, id]);
       else sql.run('INSERT INTO members (user_id, role, status, group_id, quota_milli) VALUES (?, ?, ?, ?, ?)', [id, role, status, group_id, quota_milli]);
-      return { member, response: op.complete(sql, { status: previous ? 200 : 201, payload: memberView(member, actorRole) }) };
+      return { member, response: op.complete(sql, { status: previous ? 200 : 201, payload: memberView(member, actorRole, selfMonthUsage(sql, id, at)) }) };
     });
     if (result.member) {
       await store.system.write((sql) => indexMember(sql, actor.id, result.member!));
@@ -150,19 +153,22 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
   app.post('/v1/members', writeMember);
   app.on(['POST', 'PATCH'], '/v1/members/:id', writeMember);
 
-  const groupView = (group: Group) => ({ ...group, actions: ['read', 'update'] });
+  const groupView = (group: Group, month_used_milli: number) => ({ ...group, month_used_milli, actions: ['read', 'update'] });
   app.get('/v1/groups', (c) => {
-    const { db } = manager(c, opts.now());
+    const at = opts.now();
+    const { db } = manager(c, at);
     const p = pagination(c);
     const where = 'WHERE instr(lower(name), lower(?)) > 0';
     const { n } = db.get<{ n: number }>(`SELECT count(*) AS n FROM groups ${where}`, [p.query])!;
-    return c.json(p.page(db.all<Group>(`SELECT * FROM groups ${where} ORDER BY id LIMIT ? OFFSET ?`, [p.query, p.limit, p.offset]).map(groupView), n, ['create_group']));
+    const rows = db.all<Group>(`SELECT * FROM groups ${where} ORDER BY id LIMIT ? OFFSET ?`, [p.query, p.limit, p.offset]);
+    return c.json(p.page(rows.map((row) => groupView(row, groupMonthUsage(db, row.id, at))), n, ['create_group']));
   });
   app.get('/v1/groups/:id', (c) => {
-    const { db } = manager(c, opts.now());
+    const at = opts.now();
+    const { db } = manager(c, at);
     const row = db.get<Group>('SELECT * FROM groups WHERE id = ?', [c.req.param('id')]);
     if (!row) throw new ApiError('not_found');
-    return c.json(groupView(row));
+    return c.json(groupView(row, groupMonthUsage(db, row.id, at)));
   });
   const writeGroup = async (c: Context) => {
     const body = await json(c);
@@ -186,7 +192,7 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
       const revision = (previous?.revision ?? 0) + 1;
       if (previous) sql.run('UPDATE groups SET name = ?, parent_id = ?, quota_milli = ?, revision = ? WHERE id = ?', [name, parent_id, quota_milli, revision, id]);
       else sql.run('INSERT INTO groups (id, name, parent_id, quota_milli) VALUES (?, ?, ?, ?)', [id, name, parent_id, quota_milli]);
-      return op.complete(sql, { status: previous ? 200 : 201, payload: groupView({ id, name, parent_id, quota_milli, revision }) });
+      return op.complete(sql, { status: previous ? 200 : 201, payload: groupView({ id, name, parent_id, quota_milli, revision }, groupMonthUsage(sql, id, at)) });
     });
   };
   app.post('/v1/groups', writeGroup);

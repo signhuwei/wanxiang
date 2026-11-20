@@ -18,3 +18,12 @@ export function normalizedTarget(value: unknown) {
 export function bearer(header?: string | null) {
   return /^Bearer ([A-Za-z0-9_-]{43})$/i.exec(header ?? '')?.[1];
 }
+
+// 租户月份口径固定 Asia/Shanghai（S2 仍未做按租户时区配置），config observe.month_cost_milli 和配额都走这个函数。
+const shanghaiOffset = 8 * 60 * 60_000;
+export function monthBounds(now: number): [string, string] {
+  const local = new Date(now + shanghaiOffset);
+  const year = local.getUTCFullYear();
+  const month = local.getUTCMonth();
+  return [iso(Date.UTC(year, month, 1) - shanghaiOffset), iso(Date.UTC(year, month + 1, 1) - shanghaiOffset)];
+}

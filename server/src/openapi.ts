@@ -56,9 +56,13 @@ const tenantFields = { id: tenantId, name: text, owner_user_id: text, status: { 
 const rates = { model_id: text, effective_from: { ...text, format: 'date-time' }, input_milli_per_mtok: sequence,
   output_milli_per_mtok: sequence, cache_read_milli_per_mtok: sequence, cache_write_milli_per_mtok: sequence };
 const memberInput = { user_id: text, role, group_id: nullableText, status: text, quota_milli: { type: ['integer', 'null'], minimum: 0 } };
-const member = managed({ id: text, name: text, email: nullableText, phone: nullableText, ...memberInput });
+const member = managed({ id: text, name: text, email: nullableText, phone: nullableText, month_used_milli: sequence, ...memberInput });
 const groupInput = { name: text, parent_id: nullableText, quota_milli: memberInput.quota_milli };
-const group = managed({ id: text, ...groupInput });
+const group = managed({ id: text, month_used_milli: sequence, ...groupInput });
+const quotaUsage = object({ scope: { type: 'string', enum: ['member', 'group'] }, id: text, quota_milli: { type: ['integer', 'null'], minimum: 0 },
+  used_milli: sequence, reserved_milli: sequence, remaining_milli: { type: ['integer', 'null'] }, actions });
+const meQuota = object({ quota_milli: { type: ['integer', 'null'], minimum: 0 }, month_used_milli: sequence,
+  remaining_milli: { type: ['integer', 'null'] }, limited_by: { type: ['string', 'null'] } });
 const contractInput = { seat_limit: sequence, allowed_agents: { type: 'array', items: text }, allowed_models: { type: 'array', items: text },
   lease_minutes: sequence, lease_budget_milli: sequence, visibility: { type: 'object' } };
 const contract = managed({ ...contractInput, updated_by: text, updated_at: text });
@@ -121,7 +125,7 @@ export const openapi = {
       responses: { 204: response('退出成功'), 401: status[401], 422: status[422], 500: status[500] } } },
     '/v1/me': { get: { summary: '当前用户与权限范围', security: bearer, responses: {
       200: response('用户与当前租户', object({ user: ref('User'), tenant: { anyOf: [ref('Tenant'), { type: 'null' }] },
-        role: { anyOf: [role, { type: 'null' }] }, agents: { type: 'array', items: text }, is_platform_admin: { type: 'boolean' }, actions })), 401: status[401], 403: status[403], 500: status[500],
+        role: { anyOf: [role, { type: 'null' }] }, agents: { type: 'array', items: text }, is_platform_admin: { type: 'boolean' }, actions, quota: meQuota })), 401: status[401], 403: status[403], 500: status[500],
     } } },
     '/v1/devices': { post: { summary: '注册设备，需要租户令牌', security: bearer, parameters: headers,
       requestBody: requestBody(object({ name: { ...text, maxLength: 128 }, os: { ...text, maxLength: 32 }, arch: { ...text, maxLength: 32 },
@@ -153,6 +157,11 @@ export const openapi = {
       description: '首次成功返回邀请码；幂等重放返回 code_returned:false 且不再披露邀请码。' } },
     '/v1/contract': { get: detailOf(contract, false), put: write(object({ ...contractInput, revision: sequence }), contract, 'update') },
     '/v1/balance': { get: detailOf(managed({ balance_milli: sequence, reserved_milli: sequence, month_used_milli: sequence }), false) },
+    '/v1/quota/usage': { get: { summary: '本月配额用量', security: bearer,
+      parameters: [{ name: 'scope', in: 'query', required: true, schema: { type: 'string', enum: ['member', 'group'] } },
+        { name: 'id', in: 'query', required: true, schema: text }],
+      responses: { 200: response('配额用量', quotaUsage), 401: status[401], 403: status[403], 404: error('对象不存在'), 422: status[422] },
+      description: 'owner、admin 可查全部；group_admin 只能查本组及子组；member 只能查自己。' } },
     '/v1/ledger': { get: listOf(ledger) },
     '/v1/audit': { get: { ...listOf(audit, [{ name: 'action', in: 'query', schema: text, description: '动作精确匹配。' }]),
       summary: '本租户审计台账，仅限本租户 owner', description: 'q 在动作、操作者和目标上按字面搜索。按 at、id 依次倒序排列。' } },

@@ -3,6 +3,7 @@ import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
 import { ApiError, field, invalid, json, operation } from './api';
 import { platformCreateActions, tenantActions } from './actions';
+import { quotaBinding, selfMonthUsage } from './billing';
 import { bearer, day, hash, hmac, iso, normalizedTarget, personalLoginTokenPattern, randomToken } from './credentials';
 import { ensureUser, findUser, type User } from './seed';
 import { indexDevice, indexMember, type Member, type Store, type Transaction } from './store';
@@ -247,8 +248,11 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
       actions: is_platform_admin ? platformCreateActions : [] });
     const { t, m } = await requireMember(s.tenant_id, s.user_id);
     const contract = store.tenant(t.id).get<{ allowed_agents_json: string }>('SELECT allowed_agents_json FROM contract ORDER BY revision DESC LIMIT 1');
+    const binding = quotaBinding(store.tenant(t.id), s.user_id, now());
+    const quota = { quota_milli: binding?.quota_milli ?? null, month_used_milli: binding?.used_milli ?? selfMonthUsage(store.tenant(t.id), s.user_id, now()),
+      remaining_milli: binding?.remaining_milli ?? null, limited_by: binding?.limited_by ?? null };
     return c.json({ user: publicUser(u), tenant: publicTenant(t, m), role: m.role, agents: contract ? JSON.parse(contract.allowed_agents_json) : [], is_platform_admin,
-      actions: tenantActions(m.role) });
+      actions: tenantActions(m.role), quota });
   });
 
   app.post('/v1/devices', async (c) => {

@@ -2,14 +2,14 @@ import type { Hono } from 'hono';
 import { ulid } from 'ulid';
 import { ApiError, field, invalid, json, operation } from './api';
 import { isTenantId } from './auth';
-import { day, iso } from './credentials';
-import { int, pagination, platformActor, tenantActor, type ManagementOptions } from './management';
+import { day, iso, monthBounds } from './credentials';
+import { enumField, int, pagination, platformActor, tenantActor, type ManagementOptions } from './management';
 import type { Store, Transaction } from './store';
 
 type Reader = Pick<Transaction, 'get'>;
 type LedgerKind = 'topup' | 'reserve' | 'settle' | 'release' | 'overage_pending';
 type LeaseRow = { id: string; device_id: string; user_id: string; budget_milli: number; used_milli: number; expires_at: string; status: string; seq: number };
-export type Cutoff = { type: 'cutoff'; id: string; reason: 'balance' | 'contract' | 'disabled' };
+export type Cutoff = { type: 'cutoff'; id: string; reason: 'balance' | 'contract' | 'disabled' | 'quota' };
 type Lease = { type: 'lease'; id: string; lease_id: string; expires_at: string; budget_milli: number; seq: number };
 type LeaseReply = Cutoff | Lease;
 const leaseView = (row: LeaseRow): Lease => ({ type: 'lease', id: `msg_${ulid()}`, lease_id: row.id,
@@ -24,6 +24,71 @@ export function balance(sql: Reader, now: number) {
     coalesce(sum(CASE WHEN kind = 'settle' AND at >= ? THEN amount_milli ELSE 0 END), 0) AS month_used_milli FROM ledger`, [month])!;
   const { reserved_milli } = sql.get<{ reserved_milli: number }>("SELECT coalesce(sum(budget_milli), 0) AS reserved_milli FROM leases WHERE status = 'active'")!;
   return { balance_milli: credits - reserved_milli, reserved_milli, month_used_milli };
+}
+
+// 组和个人月配额（v0.12）：本月已用 = 本月 settle（按 user_id 归属）+ 仍在 active 的租约的 budget_milli，
+// 月份边界同 observe.ts 的 month_cost_milli（Asia/Shanghai），overage_pending 不计。
+const groupSubtree = `WITH RECURSIVE subtree(id) AS (VALUES (?) UNION
+  SELECT g.id FROM groups g JOIN subtree s ON g.parent_id = s.id) SELECT id FROM subtree`;
+
+function usageByUsers(sql: Reader, usersSql: string, usersParams: string[], from: string, to: string) {
+  const { settled } = sql.get<{ settled: number }>(`SELECT coalesce(sum(amount_milli), 0) AS settled FROM ledger
+    WHERE kind = 'settle' AND at >= ? AND at < ? AND user_id IN (${usersSql})`, [from, to, ...usersParams])!;
+  const { reserved } = sql.get<{ reserved: number }>(`SELECT coalesce(sum(budget_milli), 0) AS reserved FROM leases
+    WHERE status = 'active' AND user_id IN (${usersSql})`, usersParams)!;
+  return { settled, reserved };
+}
+function usedByUsers(sql: Reader, usersSql: string, usersParams: string[], from: string, to: string) {
+  const { settled, reserved } = usageByUsers(sql, usersSql, usersParams, from, to);
+  return settled + reserved;
+}
+
+export type QuotaLevel = { limited_by: string; quota_milli: number; used_milli: number; remaining_milli: number };
+
+/** 本人剩余与祖先组（含本组）每一级剩余，只含设了配额（非 null）的级别，按限制力度（remaining 升序）排好。 */
+export function quotaLevels(sql: Reader, userId: string, at: number): QuotaLevel[] {
+  const [from, to] = monthBounds(at);
+  const member = sql.get<{ quota_milli: number | null; group_id: string | null }>(
+    'SELECT quota_milli, group_id FROM members WHERE user_id = ?', [userId]);
+  if (!member) return [];
+  const levels: QuotaLevel[] = [];
+  if (member.quota_milli !== null) {
+    const used = usedByUsers(sql, '?', [userId], from, to);
+    levels.push({ limited_by: 'member', quota_milli: member.quota_milli, used_milli: used, remaining_milli: member.quota_milli - used });
+  }
+  let groupId = member.group_id;
+  const chain: string[] = [];
+  while (groupId) {
+    chain.push(groupId);
+    const row = sql.get<{ parent_id: string | null }>('SELECT parent_id FROM groups WHERE id = ?', [groupId]);
+    groupId = row?.parent_id ?? null;
+  }
+  for (const id of chain) {
+    const group = sql.get<{ quota_milli: number | null }>('SELECT quota_milli FROM groups WHERE id = ?', [id]);
+    if (!group || group.quota_milli === null) continue;
+    const members = `SELECT user_id FROM members WHERE group_id IN (${groupSubtree})`;
+    const used = usedByUsers(sql, members, [id], from, to);
+    levels.push({ limited_by: `group:${id}`, quota_milli: group.quota_milli, used_milli: used, remaining_milli: group.quota_milli - used });
+  }
+  return levels.sort((a, b) => a.remaining_milli - b.remaining_milli);
+}
+
+/** 当前生效的限制：剩余最小的一级；没有任何配额时返回 null（不限）。 */
+export function quotaBinding(sql: Reader, userId: string, at: number): QuotaLevel | null {
+  return quotaLevels(sql, userId, at)[0] ?? null;
+}
+
+/** 本人本月已用（供 /me.quota 在不限时也能展示用量），不区分是否被某一级配额限制。 */
+export function selfMonthUsage(sql: Reader, userId: string, at: number) {
+  const [from, to] = monthBounds(at);
+  return usedByUsers(sql, '?', [userId], from, to);
+}
+
+/** 组及其全部子组成员的本月已用合计，供台账展示（口径同配额）。 */
+export function groupMonthUsage(sql: Reader, groupId: string, at: number) {
+  const [from, to] = monthBounds(at);
+  const members = `SELECT user_id FROM members WHERE group_id IN (${groupSubtree})`;
+  return usedByUsers(sql, members, [groupId], from, to);
 }
 
 function entry(sql: Transaction, kind: LedgerKind, amount_milli: number, at: number, options: {
@@ -49,8 +114,12 @@ function issue(sql: Transaction, deviceId: string, userId: string, at: number): 
   const outstanding = sql.get<LeaseRow>("SELECT * FROM leases WHERE device_id = ? AND status = 'active'", [deviceId]);
   if (outstanding) return leaseView(outstanding);
   const { balance_milli: available } = balance(sql, at);
+  // 余额和配额都耗尽时报 balance（合约优先级见 data-model.md 配额一节）。
   if (available <= 0) return cutoff('balance');
-  const budget = Math.min(available, contract.lease_budget_milli, Math.max(1, Math.floor(available / 20)));
+  const binding = quotaBinding(sql, userId, at);
+  if (binding && binding.remaining_milli <= 0) return cutoff('quota');
+  const budget = Math.min(available, contract.lease_budget_milli, Math.max(1, Math.floor(available / 20)),
+    ...(binding ? [binding.remaining_milli] : []));
   const last = sql.get<{ seq: number }>('SELECT seq FROM leases WHERE device_id = ? ORDER BY seq DESC LIMIT 1', [deviceId]);
   const row: LeaseRow = { id: `lse_${ulid()}`, device_id: deviceId, user_id: userId, budget_milli: budget, used_milli: 0,
     expires_at: iso(at + contract.lease_minutes * 60_000), status: 'active', seq: (last?.seq ?? 0) + 1 };
@@ -106,6 +175,32 @@ export function renewLease(store: Store, tenantId: string, deviceId: string, use
 }
 
 export function billingRoutes(app: Hono, store: Store, opts: ManagementOptions) {
+  app.get('/v1/quota/usage', (c) => {
+    const at = opts.now();
+    const actor = tenantActor(store, c, at);
+    const { db, role } = actor;
+    const scope = enumField(c.req.query('scope') ?? '', 'scope', ['member', 'group']);
+    const id = field(c.req.query('id') ?? '', 'id');
+    const [from, to] = monthBounds(at);
+    if (scope === 'member') {
+      const member = db.get<{ quota_milli: number | null; group_id: string | null }>('SELECT quota_milli, group_id FROM members WHERE user_id = ?', [id]);
+      if (!member) throw new ApiError('not_found');
+      if (role === 'member' && id !== actor.userId) throw new ApiError('forbidden');
+      if (role === 'group_admin' && !(id === actor.userId || (actor.group_id && db.get(
+        `SELECT 1 FROM members WHERE user_id = ? AND group_id IN (${groupSubtree})`, [id, actor.group_id])))) throw new ApiError('forbidden');
+      const { settled, reserved } = usageByUsers(db, '?', [id], from, to);
+      return c.json({ scope, id, quota_milli: member.quota_milli, used_milli: settled, reserved_milli: reserved,
+        remaining_milli: member.quota_milli === null ? null : member.quota_milli - settled - reserved, actions: ['read'] });
+    }
+    const group = db.get<{ quota_milli: number | null }>('SELECT quota_milli FROM groups WHERE id = ?', [id]);
+    if (!group) throw new ApiError('not_found');
+    if (role === 'member') throw new ApiError('forbidden');
+    if (role === 'group_admin' && !(actor.group_id && db.get(`SELECT 1 FROM (${groupSubtree}) WHERE id = ?`, [actor.group_id, id]))) throw new ApiError('forbidden');
+    const members = `SELECT user_id FROM members WHERE group_id IN (${groupSubtree})`;
+    const { settled, reserved } = usageByUsers(db, members, [id], from, to);
+    return c.json({ scope, id, quota_milli: group.quota_milli, used_milli: settled, reserved_milli: reserved,
+      remaining_milli: group.quota_milli === null ? null : group.quota_milli - settled - reserved, actions: ['read'] });
+  });
   app.get('/v1/balance', (c) => {
     const at = opts.now();
     const { db, role } = tenantActor(store, c, at);

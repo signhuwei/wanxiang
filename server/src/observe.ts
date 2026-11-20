@@ -1,19 +1,11 @@
 import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
 import { ApiError, field, invalid } from './api';
-import { iso } from './credentials';
+import { iso, monthBounds } from './credentials';
 import type { IngestSummary } from './ingest';
 import { int, pagination, tenantActor } from './management';
 import type { Store } from './store';
 import { visibility } from './visibility';
-
-const shanghaiOffset = 8 * 60 * 60_000;
-function monthBounds(now: number) {
-  const local = new Date(now + shanghaiOffset);
-  const year = local.getUTCFullYear();
-  const month = local.getUTCMonth();
-  return [iso(Date.UTC(year, month, 1) - shanghaiOffset), iso(Date.UTC(year, month + 1, 1) - shanghaiOffset)];
-}
 
 const groupFilter = `group_id IN (WITH RECURSIVE subtree(id) AS (VALUES (?) UNION
   SELECT g.id FROM groups g JOIN subtree s ON g.parent_id = s.id) SELECT id FROM subtree)`;
