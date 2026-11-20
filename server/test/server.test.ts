@@ -84,6 +84,9 @@ test('health, OpenAPI, one-use codes, tenant selection and logout', async () => 
   expect((await fetch(new URL('/tests/package.json', f.server.url))).status).toBe(404);
   expect(Object.keys(spec.paths)).toContain('/v1/auth/login');
   expect(Object.keys(spec.paths)).toContain('/v1/platform/providers');
+  expect(spec.paths).toMatchObject({ '/v1/audit': { get: { security: [{ SessionToken: [] }],
+    parameters: expect.arrayContaining([expect.objectContaining({ name: 'action', in: 'query' })]),
+  } } });
   const code = await f.code(f.owner);
   const body = { target: f.owner, code, kind: 'desktop' };
   const res = await f.request('/auth/login', body, undefined, 'one-login');
@@ -122,6 +125,109 @@ test('expired and over-attempted codes cannot log in; code issuance is rate-limi
   expect((await f.request('/auth/login', { target: f.owner, code: fresh })).status).toBe(401);
 });
 
+test('tenant audit requires an active scoped owner and isolates rows and counts', async () => {
+  const f = await fixture();
+  const second = await seedTenant(f.store, { target: f.owner, name: 'Other', platformAdmin: true });
+  const global = await f.login();
+  const owner = await f.select(global);
+  const otherSelection = await f.request('/auth/select-tenant', { tenant_id: second.tenantId }, global);
+  expect(otherSelection.status).toBe(200);
+  const other = (await otherSelection.json() as { token: string }).token;
+  const at = new Date(f.now()).toISOString();
+  const db = f.store.tenant(f.tenantId);
+  await db.write((sql) => sql.run('INSERT INTO audit (id, actor, action, target, detail_json, at) VALUES (?, ?, ?, ?, ?, ?)',
+    ['aud-own', f.userId, 'test.action', 'own', '{}', at]));
+  await f.store.tenant(second.tenantId).write((sql) => {
+    for (const id of ['aud-other-1', 'aud-other-2']) {
+      sql.run('INSERT INTO audit (id, actor, action, target, detail_json, at) VALUES (?, ?, ?, ?, ?, ?)',
+        [id, f.userId, 'test.action', 'other', '{}', at]);
+    }
+  });
+
+  expect((await f.request('/audit')).status).toBe(401);
+  expect((await f.request('/audit', undefined, global)).status).toBe(403);
+  const ownRows = await f.request(`/audit?action=test.action&tenant_id=${second.tenantId}`, undefined, owner);
+  expect(ownRows.status).toBe(200);
+  expect(await ownRows.json()).toEqual({ items: [{ id: 'aud-own', actor: f.userId, action: 'test.action', target: 'own', at, revision: 1, actions: ['read'] }],
+    total: 1, next_cursor: null, actions: ['read_audit'] });
+  expect(await (await f.request('/audit?action=test.action', undefined, other)).json()).toMatchObject({
+    items: [{ id: 'aud-other-2' }, { id: 'aud-other-1' }], total: 2,
+  });
+
+  const target = 'audit-reader@example.test';
+  const joined = await f.request('/auth/login', { target, code: await f.code(target), invite_code: f.inviteCode });
+  expect(joined.status).toBe(200);
+  const member = await joined.json() as { token: string; user: { id: string } };
+  const scopedMember = await f.select(member.token);
+  expect((await f.request('/audit', undefined, scopedMember)).status).toBe(403);
+  const group = await f.request('/groups', { name: 'Audit test group' }, owner);
+  expect(group.status).toBe(201);
+  const { id: group_id } = await group.json() as { id: string };
+  for (const [role, revision] of [['admin', 1], ['group_admin', 2]] as const) {
+    const updated = await f.request(`/members/${member.user.id}`, { role, revision, group_id }, owner);
+    expect(updated.status).toBe(200);
+    expect((await f.request('/audit', undefined, scopedMember)).status).toBe(403);
+    expect(await (await f.request('/me', undefined, scopedMember)).json()).toMatchObject({
+      role, actions: expect.not.arrayContaining(['read_audit']),
+    });
+  }
+
+  await db.write((sql) => sql.run("UPDATE members SET status = 'disabled' WHERE user_id = ?", [f.userId]));
+  expect((await f.request('/audit', undefined, owner)).status).toBe(403);
+  await f.store.system.write((sql) => sql.run("UPDATE tenants SET status = 'suspended' WHERE id = ?", [second.tenantId]));
+  expect((await f.request('/audit', undefined, other)).status).toBe(403);
+  f.advance(8 * 86_400_000);
+  expect((await f.request('/audit', undefined, owner)).status).toBe(401);
+});
+
+test('tenant audit paginates stable literal matches and omits private audit data', async () => {
+  const f = await fixture();
+  const owner = await f.select(await f.login());
+  const db = f.store.tenant(f.tenantId);
+  const action = 'observe.events.read';
+  const older = '2026-11-19T00:00:00.000Z';
+  const newer = '2026-11-20T00:00:00.000Z';
+  const detail = JSON.stringify({ note: 'private-note', content: 'private-transcript' });
+  await db.write((sql) => {
+    for (const row of [
+      ['aud-a', 'Actor-Find', action, 'sess-old', older],
+      ['aud-b', f.userId, action, 'sess-%_Mixed', newer],
+      ['aud-c', f.userId, action, 'sess-XZMixed', newer],
+      ['aud-d', f.userId, `${action}.extra`, 'sess-extra', newer],
+    ]) {
+      sql.run('INSERT INTO audit (id, actor, action, target, at, detail_json) VALUES (?, ?, ?, ?, ?, ?)', [...row, detail]);
+    }
+  });
+  async function list(query: Record<string, string>) {
+    const response = await f.request(`/audit?${new URLSearchParams(query)}`, undefined, owner);
+    expect(response.status).toBe(200);
+    return await response.json() as {
+      items: { id: string; actor: string; action: string; target: string; at: string; revision: number; actions: string[] }[];
+      total: number; next_cursor: string | null; actions: string[];
+    };
+  }
+
+  const first = await list({ action, limit: '2' });
+  expect(first.items.map(({ id }) => id)).toEqual(['aud-c', 'aud-b']);
+  expect(first.total).toBe(3);
+  expect(first.next_cursor).toBeString();
+  const second = await list({ action, limit: '2', cursor: first.next_cursor! });
+  expect(second).toMatchObject({ items: [{ id: 'aud-a' }], total: 3, next_cursor: null });
+  expect((await list({ q: 'EVENTS.READ' })).items.map(({ id }) => id)).toEqual(['aud-d', 'aud-c', 'aud-b', 'aud-a']);
+  expect((await list({ action, q: 'actor-FIND' })).items.map(({ id }) => id)).toEqual(['aud-a']);
+  expect(await list({ action, q: '%_mixed' })).toEqual({
+    items: [{ id: 'aud-b', actor: f.userId, action, target: 'sess-%_Mixed', at: newer, revision: 1, actions: ['read'] }],
+    total: 1, next_cursor: null, actions: ['read_audit'],
+  });
+  for (const q of ['private-note', 'private-transcript', 'aud-a', older]) {
+    expect(await list({ q })).toEqual({ items: [], total: 0, next_cursor: null, actions: ['read_audit'] });
+  }
+  for (const query of ['limit=201', 'cursor=!', `q=${'A'.repeat(201)}`]) {
+    expect((await f.request(`/audit?${query}`, undefined, owner)).status).toBe(422);
+  }
+  expect(db.get('SELECT count(*) AS n FROM audit')).toEqual({ n: 4 });
+});
+
 test('racing invite redemptions cannot exceed seats and the loser does not consume a use', async () => {
   const f = await fixture();
   const targets = ['a@example.test', '+8613800000000'];
@@ -139,7 +245,7 @@ test('tenant management enforces scope, revisions, pagination, and one-time invi
   const scoped = await f.select(global);
   expect((await f.request('/members', undefined, global)).status).toBe(403);
   expect(await (await f.request('/me', undefined, scoped)).json()).toMatchObject({
-    actions: ['create_member', 'create_group', 'create_invite', 'update_contract', 'assign_role:admin', 'assign_role:group_admin', 'assign_role:member'],
+    actions: ['create_member', 'create_group', 'create_invite', 'update_contract', 'assign_role:admin', 'assign_role:group_admin', 'assign_role:member', 'read_audit'],
   });
   expect(await (await f.request('/members?role=member&status=disabled', undefined, scoped)).json()).toMatchObject({
     items: [], total: 0, actions: ['create_member'],

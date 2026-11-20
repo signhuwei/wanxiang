@@ -54,6 +54,7 @@ const group = managed({ id: text, ...groupInput });
 const contractInput = { seat_limit: sequence, allowed_agents: { type: 'array', items: text }, allowed_models: { type: 'array', items: text },
   lease_minutes: sequence, lease_budget_milli: sequence, visibility: { type: 'object' } };
 const contract = managed({ ...contractInput, updated_by: text, updated_at: text });
+const audit = managed({ id: text, actor: text, action: text, target: text, at: { ...text, format: 'date-time' } });
 const inviteInput = { role, group_id: nullableText, max_uses: sequence, expires_in_ms: sequence };
 const invite = object({ id: text, role, group_id: nullableText, max_uses: sequence, used: sequence, expires_at: text,
   created_by: text, revision, actions, code_returned: { type: 'boolean' }, invite_code: text },
@@ -131,6 +132,8 @@ export const openapi = {
     '/v1/contract': { get: detailOf(contract, false), put: write(object({ ...contractInput, revision: sequence }), contract, 'update') },
     '/v1/balance': { get: detailOf(managed({ balance_milli: sequence, reserved_milli: sequence, month_used_milli: sequence }), false) },
     '/v1/ledger': { get: listOf(ledger) },
+    '/v1/audit': { get: { ...listOf(audit, [{ name: 'action', in: 'query', schema: text, description: '动作精确匹配。' }]),
+      summary: '本租户审计台账，仅限本租户 owner', description: 'q 在动作、操作者和目标上按字面搜索。按 at、id 依次倒序排列。' } },
     '/v1/platform/ledger/topup': { post: write(object({ tenant_id: tenantId, amount_milli: { ...sequence, minimum: 1 }, note: text },
       ['tenant_id', 'amount_milli']), { allOf: [ledger, object({ tenant_id: tenantId })] }, 'create') },
     '/v1/observe/people': { get: listOf(managed({ user_id: text, name: text, session_count: sequence, cost_milli: sequence, month_cost_milli: sequence, last_active_at: nullableText })) },
