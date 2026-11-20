@@ -93,6 +93,42 @@ export function groupMonthUsage(sql: Reader, groupId: string, at: number) {
   return usedByUsers(sql, members, [groupId], from, to);
 }
 
+/** 一次查询取全体成员本月已用（settle + 活跃预留），供 /members 台账批量展示，避免逐行查询。 */
+export function monthUsageByUser(sql: Pick<Transaction, 'all'>, at: number): Map<string, number> {
+  const [from, to] = monthBounds(at);
+  const usage = new Map<string, number>();
+  for (const { user_id, settled } of sql.all<{ user_id: string; settled: number }>(
+    "SELECT user_id, sum(amount_milli) AS settled FROM ledger WHERE kind = 'settle' AND at >= ? AND at < ? GROUP BY user_id", [from, to])) {
+    usage.set(user_id, (usage.get(user_id) ?? 0) + settled);
+  }
+  for (const { user_id, reserved } of sql.all<{ user_id: string; reserved: number }>(
+    "SELECT user_id, sum(budget_milli) AS reserved FROM leases WHERE status = 'active' GROUP BY user_id")) {
+    usage.set(user_id, (usage.get(user_id) ?? 0) + reserved);
+  }
+  return usage;
+}
+
+/** 一次查询取全体组本月已用（含子组成员合计），供 /groups 台账批量展示，避免逐行查询和逐组的子树查询。 */
+export function monthUsageByGroup(sql: Pick<Transaction, 'all'>, at: number): Map<string, number> {
+  const byUser = monthUsageByUser(sql, at);
+  const parentOf = new Map<string, string | null>();
+  for (const { id, parent_id } of sql.all<{ id: string; parent_id: string | null }>('SELECT id, parent_id FROM groups')) {
+    parentOf.set(id, parent_id);
+  }
+  const usage = new Map<string, number>([...parentOf.keys()].map((id) => [id, 0]));
+  for (const { user_id, group_id } of sql.all<{ user_id: string; group_id: string | null }>('SELECT user_id, group_id FROM members')) {
+    const spent = byUser.get(user_id);
+    if (!spent || group_id === null) continue;
+    // 从成员所在组一路加到每一级祖先，等价于逐组做子树聚合，但只走一遍成员列表。
+    let current: string | null = group_id;
+    while (current !== null && usage.has(current)) {
+      usage.set(current, usage.get(current)! + spent);
+      current = parentOf.get(current) ?? null;
+    }
+  }
+  return usage;
+}
+
 function entry(sql: Transaction, kind: LedgerKind, amount_milli: number, at: number, options: {
   lease?: Pick<LeaseRow, 'id' | 'user_id'>; requestRef?: string; actor?: string; note?: string;
 } = {}) {

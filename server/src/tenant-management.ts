@@ -2,7 +2,7 @@ import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
 import { tenantAuditActions } from './actions';
 import { ApiError, field, invalid, json, operation } from './api';
-import { groupMonthUsage, selfMonthUsage } from './billing';
+import { groupMonthUsage, monthUsageByGroup, monthUsageByUser, selfMonthUsage } from './billing';
 import { day, hash, iso, randomToken } from './credentials';
 import { enumField, expectRevision, int, pagination, tenantActor, type ManagementOptions } from './management';
 import { indexInvite, indexMember, type Member, type Store, type Transaction } from './store';
@@ -102,7 +102,9 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     const { n } = db.get<{ n: number }>(`SELECT count(*) AS n FROM members ${where}`, params)!;
     const rows = db.all<MemberRow>(`SELECT * FROM members ${where} ORDER BY user_id LIMIT ? OFFSET ?`, [...params, p.limit, p.offset]);
     const at = opts.now();
-    return c.json(p.page(rows.map((row) => memberView(row, role, selfMonthUsage(db, row.user_id, at))), n, ['create_member']));
+    // 一次聚合查询取全体成员本月已用，避免每行各发两条查询（N+1）。
+    const usage = monthUsageByUser(db, at);
+    return c.json(p.page(rows.map((row) => memberView(row, role, usage.get(row.user_id) ?? 0)), n, ['create_member']));
   });
   app.get('/v1/members/:id', (c) => {
     const at = opts.now();
@@ -161,7 +163,9 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     const where = 'WHERE instr(lower(name), lower(?)) > 0';
     const { n } = db.get<{ n: number }>(`SELECT count(*) AS n FROM groups ${where}`, [p.query])!;
     const rows = db.all<Group>(`SELECT * FROM groups ${where} ORDER BY id LIMIT ? OFFSET ?`, [p.query, p.limit, p.offset]);
-    return c.json(p.page(rows.map((row) => groupView(row, groupMonthUsage(db, row.id, at))), n, ['create_group']));
+    // 子树汇总在内存里做一次，避免每行各发子树 + 成员查询（N+1）。
+    const usage = monthUsageByGroup(db, at);
+    return c.json(p.page(rows.map((row) => groupView(row, usage.get(row.id) ?? 0)), n, ['create_group']));
   });
   app.get('/v1/groups/:id', (c) => {
     const at = opts.now();
