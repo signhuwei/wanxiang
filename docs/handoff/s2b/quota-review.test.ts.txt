@@ -1,0 +1,539 @@
+// S2B-R1 配额独立验收草稿。只读复核 68132c7，不属于产品测试。
+// 运行：bun --no-env-file test /Users/HHH/Code/OneX/coord/reports/s2/quota-review.test.ts
+// 标 DEFECT 的用例断言的是实际行为，用来固定缺陷现场，不是期望行为。
+import { afterEach, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createServer } from '/Users/HHH/Code/OneX/wt/s2b-review/server/src/server';
+import { seedTenant } from '/Users/HHH/Code/OneX/wt/s2b-review/server/src/seed';
+import { MemoryPresence } from '/Users/HHH/Code/OneX/wt/s2b-review/server/src/presence';
+
+const clean: (() => void | Promise<void>)[] = [];
+afterEach(async () => { for (const dispose of clean.splice(0).reverse()) await dispose(); });
+
+const MID_NOV = Date.parse('2026-11-15T04:00:00.000Z');
+
+async function fixture(start = MID_NOV) {
+  const dataDir = mkdtempSync(join(tmpdir(), 'onex-quota-review-'));
+  clean.push(() => rmSync(dataDir, { recursive: true, force: true }));
+  const codes = new Map<string, string>();
+  let time = start;
+  const service = await createServer({
+    dataDir, hostname: '127.0.0.1', port: 0, tenantCacheSize: 2, heartbeatMs: 15_000, commit: 'test',
+    codeSecret: 'test-only-secret', masterKey: Buffer.alloc(32, 41), deliverCode: (t, c) => { codes.set(t, c); },
+    now: () => time, presence: new MemoryPresence(),
+  });
+  clean.push(() => service.close());
+  const seeded = await seedTenant(service.store, { target: 'owner@example.test', seats: 20, maxUses: 20, now: time });
+  const request = (path: string, body?: unknown, token?: string, method = body ? 'POST' : 'GET') => {
+    const headers = new Headers({ 'idempotency-key': `k-${Math.random()}` });
+    if (token) headers.set('authorization', `Bearer ${token}`);
+    if (body) headers.set('content-type', 'application/json');
+    return fetch(new URL(`/v1${path}`, service.server.url), { method, headers, body: body && JSON.stringify(body) });
+  };
+  async function login(target: string, invite?: string) {
+    await request('/auth/code', { target });
+    const res = await request('/auth/login', { target, code: codes.get(target), kind: 'desktop', invite_code: invite });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { token: string; user: { id: string } };
+    const sel = await request('/auth/select-tenant', { tenant_id: seeded.tenantId }, body.token);
+    return { userId: body.user.id, global: body.token, scoped: (await sel.json() as { token: string }).token };
+  }
+  const owner = await login('owner@example.test');
+  await service.store.system.write((sql) => sql.run('INSERT OR IGNORE INTO platform_admins VALUES (?)', [seeded.userId]));
+  const fund = async (amount: number) =>
+    expect((await request('/platform/ledger/topup', { tenant_id: seeded.tenantId, amount_milli: amount }, owner.global)).status).toBe(201);
+  const revisions = new Map<string, number>();
+  async function member(target: string, patch: Record<string, unknown> = {}) {
+    const m = await login(target, seeded.inviteCode);
+    revisions.set(m.userId, 1);
+    if (Object.keys(patch).length) await setMember(m.userId, patch);
+    return m;
+  }
+  async function setMember(id: string, patch: Record<string, unknown>) {
+    const res = await request(`/members/${id}`, { role: 'member', revision: revisions.get(id), ...patch }, owner.scoped);
+    expect(res.status).toBe(200);
+    revisions.set(id, (await res.json() as { revision: number }).revision);
+  }
+  async function group(name: string, quota_milli: number | null, parent_id?: string) {
+    const res = await request('/groups', { name, quota_milli, parent_id }, owner.scoped);
+    expect(res.status).toBe(201);
+    return (await res.json() as { id: string }).id;
+  }
+  async function device(scoped: string, name: string) {
+    const res = await request('/devices', { name, os: 'darwin', arch: 'arm64', public_key: Buffer.alloc(32, 5).toString('base64') }, scoped);
+    expect(res.status).toBe(201);
+    return await res.json() as { device_id: string; device_token: string };
+  }
+  const json = async (path: string, token = owner.scoped) => (await request(path, undefined, token)).json() as Promise<any>;
+  const db = () => service.store.tenant(seeded.tenantId);
+  return { ...service, seeded, owner, request, fund, member, setMember, group, device, json, db,
+    advance: (ms: number) => { time += ms; }, set: (t: number) => { time = t; } };
+}
+type F = Awaited<ReturnType<typeof fixture>>;
+
+async function until(p: () => boolean) {
+  const deadline = Date.now() + 1_500;
+  while (!p()) { if (Date.now() > deadline) throw new Error('timeout'); await Bun.sleep(5); }
+}
+
+function connect(f: F, token: string) {
+  const ws = new WebSocket(`ws://${f.server.hostname}:${f.server.port}/v1/edge/ws`, {
+    headers: { Authorization: `Bearer ${token}`, 'OneX-Edge-Version': '0.1.0', 'OneX-Protocol': '0' } });
+  clean.push(() => ws.close());
+  const queue: any[] = [];
+  ws.onmessage = (e) => queue.push(JSON.parse(String(e.data)));
+  const opened = new Promise<boolean>((r) => { ws.onopen = () => r(true); ws.onerror = () => r(false); });
+  const send = (m: unknown) => ws.send(JSON.stringify(m));
+  // 跳过 config、secret；返回第一条计费相关回复（lease、cutoff 或 ack）
+  async function billing() {
+    for (;;) {
+      await until(() => queue.length > 0);
+      const m = queue.shift();
+      if (m.type !== 'config' && m.type !== 'secret') return m;
+    }
+  }
+  // 等某个请求的回复，跳过中间的主动推送
+  async function reply(re: string) {
+    for (;;) {
+      const m = await billing();
+      if (m.re === re) return m;
+    }
+  }
+  return { ws, queue, opened, send, billing, reply,
+    hello: (lease_id?: string) => send({ type: 'hello', id: 'h', edge_version: '0.1.0', os: 'darwin', arch: 'arm64',
+      config_revision: 0, outbox_last_seq: 0, lease_id }),
+    renew: (id: string, lease_id: string, used_milli: number, op_id = id) => send({ type: 'lease_renew', id, op_id, lease_id, used_milli }) };
+}
+
+async function online(f: F, token: string, leaseId?: string) {
+  const e = connect(f, token);
+  expect(await e.opened).toBe(true);
+  e.hello(leaseId);
+  expect(await e.billing()).toMatchObject({ type: 'welcome' });
+  return e;
+}
+
+// C1：Edge 实际的恢复路径。onexd 收到回应续租的 cutoff 后保留旧 lease_id 和续租快照，
+// 重连时 hello 带旧 lease_id，并原样重放同一 op_id（edge/onexd/src/lease.rs:489-500,649）。
+const request = (e: ReturnType<typeof connect>, id: string, op_id = id) => e.send({ type: 'lease_request', id, op_id });
+
+test('C1 (v0.13): renew cutoff names the settled lease; replay keeps it; raising the quota recovers via lease_request', async () => {
+  const f = await fixture();
+  await f.fund(1_000_000);
+  const a = await f.member('a@example.test', { quota_milli: 3000 });
+  const d = await f.device(a.scoped, 'D1');
+  const e = await online(f, d.device_token);
+  const lease = await e.billing();
+  expect(lease).toMatchObject({ type: 'lease', budget_milli: 2000 });
+  e.renew('r1', lease.lease_id, 2000, 'op-1');
+  const l2 = await e.billing();
+  expect(l2).toMatchObject({ type: 'lease', budget_milli: 1000 });
+  e.renew('r2', l2.lease_id, 1000, 'op-2');
+  const cut = await e.billing();
+  expect(cut).toMatchObject({ type: 'cutoff', reason: 'quota', re: 'r2', settled_lease_id: l2.lease_id });
+  // 配额没变时 lease_request 仍是 quota，且不带 settled_lease_id
+  request(e, 'q0');
+  const still = await e.billing();
+  expect(still).toMatchObject({ type: 'cutoff', reason: 'quota', re: 'q0' });
+  expect(still.settled_lease_id).toBeUndefined();
+
+  // Edge 回连前崩溃、没来得及落盘：带旧 lease_id 重放同一 op_id，回包与第一次相同（含 settled_lease_id）
+  e.ws.close();
+  const back = await online(f, d.device_token, l2.lease_id);
+  back.renew('r2-replay', l2.lease_id, 1000, 'op-2');
+  expect(await back.billing()).toEqual({ ...cut, re: 'r2-replay' });
+  expect(back.queue.filter((m) => m.type === 'lease')).toEqual([]);
+
+  // 调高配额后 lease_request 拿到新租约；不写 lease_operations；settle 不重复
+  await f.setMember(a.userId, { quota_milli: 100_000 });
+  const ops = f.db().get<{ n: number }>('SELECT count(*) AS n FROM lease_operations')!.n;
+  request(back, 'q1', 'same-op');
+  const l3 = await back.billing();
+  expect(l3).toMatchObject({ type: 'lease', budget_milli: 2000, re: 'q1', seq: 3 });
+  // 已有 active 租约：同一 op_id 或新 op_id 都回同一份租约，不另签
+  request(back, 'q2', 'same-op');
+  expect(await back.billing()).toEqual({ ...l3, id: expect.any(String), re: 'q2' });
+  request(back, 'q3', 'other-op');
+  expect(await back.billing()).toMatchObject({ type: 'lease', lease_id: l3.lease_id, re: 'q3' });
+  expect(f.db().get<{ n: number }>('SELECT count(*) AS n FROM lease_operations')!.n).toBe(ops);
+  expect(f.db().get("SELECT count(*) AS n FROM leases WHERE status = 'active'")).toEqual({ n: 1 });
+  expect(f.db().get("SELECT sum(amount_milli) AS s FROM ledger WHERE kind = 'settle'")).toEqual({ s: 3000 });
+});
+
+test('C1 (v0.13): a new month recovers via lease_request', async () => {
+  const f = await fixture(Date.parse('2026-11-30T15:00:00.000Z'));
+  await f.fund(40);
+  const a = await f.member('a@example.test', { quota_milli: 2 });
+  const d = await f.device(a.scoped, 'D1');
+  const e = await online(f, d.device_token);
+  const lease = await e.billing();
+  expect(lease).toMatchObject({ budget_milli: 2 });
+  e.renew('r1', lease.lease_id, 2, 'op-1');
+  expect(await e.billing()).toMatchObject({ type: 'cutoff', reason: 'quota', settled_lease_id: lease.lease_id });
+  f.set(Date.parse('2026-11-30T16:00:00.000Z')); // 上海 12 月 1 日 00:00
+  request(e, 'q1');
+  const l2 = await e.billing();
+  expect(l2).toMatchObject({ type: 'lease', budget_milli: 1 }); // 余额 38 的 5% 向下取整 = 1
+});
+
+test('C1 (v0.13): balance cutoff recovers via lease_request after a top-up', async () => {
+  const f = await fixture();
+  await f.fund(1);
+  const a = await f.member('a@example.test');
+  const e = await online(f, (await f.device(a.scoped, 'D1')).device_token);
+  const lease = await e.billing();
+  e.renew('r1', lease.lease_id, 1);
+  expect(await e.billing()).toMatchObject({ type: 'cutoff', reason: 'balance', settled_lease_id: lease.lease_id });
+  request(e, 'q0');
+  expect(await e.billing()).toMatchObject({ type: 'cutoff', reason: 'balance', re: 'q0' });
+  await f.fund(1000);
+  request(e, 'q1');
+  expect(await e.billing()).toMatchObject({ type: 'lease', budget_milli: 50, re: 'q1' });
+});
+
+test('C1 (v0.13): lease_request from a disabled member is cutoff{disabled} without settled_lease_id', async () => {
+  const f = await fixture();
+  await f.fund(1000);
+  const a = await f.member('a@example.test');
+  const e = await online(f, (await f.device(a.scoped, 'D1')).device_token);
+  const lease = await e.billing();
+  e.renew('r1', lease.lease_id, 10);
+  await e.billing();
+  await f.setMember(a.userId, { status: 'disabled' });
+  request(e, 'q1');
+  const reply = await e.reply('q1');
+  expect(reply).toMatchObject({ type: 'cutoff', reason: 'disabled', re: 'q1' });
+  expect(reply.settled_lease_id).toBeUndefined();
+  // 停用时续租在结清前判定：不结清、不带 settled_lease_id
+  const active = f.db().get<{ id: string }>("SELECT id FROM leases WHERE status = 'active'")!;
+  e.renew('r2', active.id, 5);
+  const renewReply = await e.reply('r2');
+  expect(renewReply).toMatchObject({ type: 'cutoff', reason: 'disabled' });
+  expect(renewReply.settled_lease_id).toBeUndefined();
+  expect(f.db().get('SELECT status FROM leases WHERE id = ?', [active.id])).toEqual({ status: 'active' });
+});
+
+test('C7 (v0.13): contract beats balance beats quota, and contract cutoff on renew names the settled lease', async () => {
+  const f = await fixture();
+  await f.fund(1000);
+  const a = await f.member('a@example.test', { quota_milli: 0 });
+  const b = await f.member('b@example.test');
+  const eb = await online(f, (await f.device(b.scoped, 'B')).device_token);
+  const lb = await eb.billing();
+  // 合约额度改为 0：contract 优先于 quota
+  const contract = await f.json('/contract');
+  const put = await f.request('/contract', { ...contract, revision: contract.revision, lease_budget_milli: 0 }, f.owner.scoped, 'PUT');
+  expect(put.status).toBe(200);
+  expect(await (await online(f, (await f.device(a.scoped, 'A')).device_token)).billing()).toMatchObject({ type: 'cutoff', reason: 'contract' });
+  eb.renew('b1', lb.lease_id, 5);
+  expect(await eb.reply('b1')).toMatchObject({ type: 'cutoff', reason: 'contract', settled_lease_id: lb.lease_id });
+});
+
+// 主动推送的 cutoff 不带 settled_lease_id，Edge 保留租约（v0.5 行为）。Edge 只在已有花费时才发最终续租
+// （lease.rs renew_due：cutoff 时要求 used_milli > 0），lease_request 又只在没有租约时才发。
+// 下面验证 Server 一侧：Edge 没花钱、带旧 lease_id 回连时，Server 有没有办法把它放出来。
+test('GAP: after a pushed contract cutoff with no spend, a reconnect with lease_id gets nothing until the Edge renews with 0', async () => {
+  const f = await fixture();
+  await f.fund(1000);
+  const a = await f.member('a@example.test');
+  const d = await f.device(a.scoped, 'D1');
+  const e = await online(f, d.device_token);
+  const lease = await e.billing();
+  const contract = await f.json('/contract');
+  expect((await f.request('/contract', { ...contract, lease_budget_milli: 0 }, f.owner.scoped, 'PUT')).status).toBe(200);
+  for (;;) { const m = await e.billing(); if (m.type === 'cutoff') { expect(m).toMatchObject({ reason: 'contract' }); expect(m.settled_lease_id).toBeUndefined(); break; } }
+  const restored = await f.json('/contract');
+  expect((await f.request('/contract', { ...restored, lease_budget_milli: 2000 }, f.owner.scoped, 'PUT')).status).toBe(200);
+  e.ws.close();
+  const back = await online(f, d.device_token, lease.lease_id);
+  await Bun.sleep(100);
+  // 回连后 Server 只推 config，不推 lease，也不推解除；租约在 Server 侧仍 active
+  expect(back.queue.filter((m) => m.type === 'lease' || m.type === 'cutoff')).toEqual([]);
+  expect(f.db().get('SELECT status FROM leases WHERE id = ?', [lease.lease_id])).toEqual({ status: 'active' });
+  // 只有 Edge 发 lease_request（Server 回已有租约）或 used=0 的续租才能解开
+  request(back, 'q1');
+  expect(await back.reply('q1')).toMatchObject({ type: 'lease', lease_id: lease.lease_id });
+});
+
+test('Q2 multi-level groups: leaf, middle and root quotas each bind in turn', async () => {
+  const f = await fixture();
+  await f.fund(1_000_000);
+  const root = await f.group('Root', 6000);
+  const mid = await f.group('Mid', null, root);
+  const leaf = await f.group('Leaf', 4000, mid);
+  const a = await f.member('a@example.test', { group_id: leaf });
+  const b = await f.member('b@example.test', { group_id: mid });
+  const ea = await online(f, (await f.device(a.scoped, 'A')).device_token);
+  const la1 = await ea.billing();
+  const eb = await online(f, (await f.device(b.scoped, 'B')).device_token);
+  const lb1 = await eb.billing();
+  expect([la1.budget_milli, lb1.budget_milli]).toEqual([2000, 2000]);
+  ea.renew('a1', la1.lease_id, 2000);
+  const la2 = await ea.billing();
+  expect(la2).toMatchObject({ type: 'lease', budget_milli: 2000 }); // Root 已用 2000 + 2000 + 新 2000 = 6000
+  eb.renew('b1', lb1.lease_id, 500);
+  const lb2 = await eb.billing();
+  // Root 已用 = settle 2500 + 预留 A 2000 = 4500，剩 1500
+  expect(lb2).toMatchObject({ type: 'lease', budget_milli: 1500 });
+  ea.renew('a2', la2.lease_id, 2000);
+  // Leaf 已用 4000 → quota；同时 Root 已用 4000 + 1500 = 5500
+  expect(await ea.billing()).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  eb.renew('b2', lb2.lease_id, 1500);
+  expect(await eb.billing()).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  expect(await f.json(`/quota/usage?scope=group&id=${leaf}`)).toMatchObject({ used_milli: 4000, reserved_milli: 0, remaining_milli: 0 });
+  expect(await f.json(`/quota/usage?scope=group&id=${mid}`)).toMatchObject({ used_milli: 6000, remaining_milli: null });
+  expect(await f.json(`/quota/usage?scope=group&id=${root}`)).toMatchObject({ used_milli: 6000, reserved_milli: 0, remaining_milli: 0 });
+  const groups = (await f.json('/groups')).items as { id: string; month_used_milli: number }[];
+  expect(Object.fromEntries(groups.map((g) => [g.id, g.month_used_milli]))).toEqual({ [root]: 6000, [mid]: 6000, [leaf]: 4000 });
+  expect(f.db().get("SELECT sum(amount_milli) AS n FROM ledger WHERE kind = 'settle'")).toEqual({ n: 6000 });
+  expect(f.db().get("SELECT sum(amount_milli) AS n FROM ledger WHERE kind = 'release'")).toEqual({ n: 1500 });
+  expect(await f.json('/me', a.scoped)).toMatchObject({ quota: { limited_by: `group:${leaf}`, remaining_milli: 0 } });
+});
+
+test('Q6/Q7 concurrent devices of one member and two members of one group stay inside the quota', async () => {
+  const f = await fixture();
+  await f.fund(1_000_000);
+  const g = await f.group('G', 3000);
+  const a = await f.member('a@example.test', { group_id: g });
+  const b = await f.member('b@example.test', { group_id: g });
+  const devices = await Promise.all([f.device(a.scoped, 'A1'), f.device(a.scoped, 'A2'), f.device(b.scoped, 'B1')]);
+  const edges = await Promise.all(devices.map((d) => online(f, d.device_token)));
+  const replies = await Promise.all(edges.map((e) => e.billing()));
+  const granted = replies.filter((r) => r.type === 'lease').map((r) => r.budget_milli).sort();
+  expect(granted).toEqual([1000, 2000]);
+  expect(replies.filter((r) => r.type === 'cutoff').map((r) => r.reason)).toEqual(['quota']);
+  // 两份租约同时续租：都结清，组内合计不超 3000
+  const held = replies.map((r, i) => [r, edges[i]] as const).filter(([r]) => r.type === 'lease');
+  for (const [r, e] of held) e.renew(`r-${r.lease_id}`, r.lease_id, r.budget_milli);
+  const after = await Promise.all(held.map(([, e]) => e.billing()));
+  expect(after.map((r) => r.reason)).toEqual(['quota', 'quota']);
+  expect(await f.json(`/quota/usage?scope=group&id=${g}`)).toMatchObject({ used_milli: 3000, reserved_milli: 0, remaining_milli: 0 });
+});
+
+test('Q8/Q9 month boundary is Asia/Shanghai to the millisecond', async () => {
+  const f = await fixture(Date.parse('2026-11-30T15:58:00.000Z'));
+  await f.fund(1_000_000);
+  const a = await f.member('a@example.test', { quota_milli: 2000 });
+  const d1 = await f.device(a.scoped, 'D1');
+  const e = await online(f, d1.device_token);
+  const l = await e.billing();
+  e.renew('r1', l.lease_id, 2000);
+  expect(await e.billing()).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  f.set(Date.parse('2026-11-30T15:59:59.999Z'));
+  const d2 = await f.device(a.scoped, 'D2');
+  expect(await (await online(f, d2.device_token)).billing()).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  f.set(Date.parse('2026-11-30T16:00:00.000Z'));
+  const d3 = await f.device(a.scoped, 'D3');
+  expect(await (await online(f, d3.device_token)).billing()).toMatchObject({ type: 'lease', budget_milli: 2000 });
+  expect(await f.json(`/quota/usage?scope=member&id=${a.userId}`)).toMatchObject({ used_milli: 0, reserved_milli: 2000, remaining_milli: 0 });
+});
+
+test('Q9 a settle at 01:00 Shanghai on the 1st counts in the new month', async () => {
+  const f = await fixture(Date.parse('2026-10-31T16:30:00.000Z'));
+  await f.fund(1_000_000);
+  const a = await f.member('a@example.test', { quota_milli: 5000 });
+  const e = await online(f, (await f.device(a.scoped, 'D1')).device_token);
+  const l = await e.billing();
+  f.set(Date.parse('2026-10-31T17:00:00.000Z')); // 上海 11 月 1 日 01:00，UTC 仍是 10 月
+  e.renew('r1', l.lease_id, 1500);
+  await e.billing();
+  f.set(Date.parse('2026-11-01T02:00:00.000Z')); // 不跳到月中，网页会话会过期
+  expect(await f.json(`/quota/usage?scope=member&id=${a.userId}`)).toMatchObject({ used_milli: 1500 });
+});
+
+test('C5 (fixed in 9ea17be): /balance.month_used_milli uses the Shanghai month like quotas', async () => {
+  const f = await fixture(Date.parse('2026-10-31T16:30:00.000Z'));
+  await f.fund(1_000_000);
+  const a = await f.member('a@example.test');
+  const e = await online(f, (await f.device(a.scoped, 'D1')).device_token);
+  const l = await e.billing();
+  f.set(Date.parse('2026-10-31T17:00:00.000Z'));
+  e.renew('r1', l.lease_id, 1500);
+  await e.billing();
+  // 上海已是 11 月：/members 显示本人本月 1500 + 新租约 2000；/balance 按 UTC 仍算 10 月
+  const row = (await f.json('/members')).items.find((m: any) => m.id === a.userId);
+  expect(row.month_used_milli).toBe(3500);
+  // 上海 11 月 1 日 01:00（UTC 仍是 10 月 31 日）：/balance 已经按 11 月算
+  expect(await f.json('/balance')).toMatchObject({ month_used_milli: 1500 });
+  f.set(Date.parse('2026-11-01T01:00:00.000Z')); // 上海 11 月 1 日 09:00，UTC 也进了 11 月
+  expect(await f.json('/balance')).toMatchObject({ month_used_milli: 1500 });
+  expect(await f.json(`/quota/usage?scope=member&id=${a.userId}`)).toMatchObject({ used_milli: 1500 });
+});
+
+test('Q10 a lease issued last month and still active counts as this month reserve; its settle lands in this month', async () => {
+  const f = await fixture(Date.parse('2026-11-30T15:55:00.000Z'));
+  await f.fund(1_000_000);
+  const a = await f.member('a@example.test', { quota_milli: 3000 });
+  const e = await online(f, (await f.device(a.scoped, 'D1')).device_token);
+  const l = await e.billing();
+  f.set(Date.parse('2026-11-30T16:10:00.000Z'));
+  expect(await f.json(`/quota/usage?scope=member&id=${a.userId}`)).toMatchObject({ used_milli: 0, reserved_milli: 2000, remaining_milli: 1000 });
+  e.renew('r1', l.lease_id, 1500);
+  expect(await e.billing()).toMatchObject({ type: 'lease', budget_milli: 1500 });
+  expect(await f.json(`/quota/usage?scope=member&id=${a.userId}`)).toMatchObject({ used_milli: 1500, reserved_milli: 1500, remaining_milli: 0 });
+});
+
+test('Q11 lowering a quota with two outstanding leases overshoots by both leases (C3)', async () => {
+  const f = await fixture();
+  await f.fund(1_000_000);
+  const a = await f.member('a@example.test', { quota_milli: 10_000 });
+  const e1 = await online(f, (await f.device(a.scoped, 'D1')).device_token);
+  const e2 = await online(f, (await f.device(a.scoped, 'D2')).device_token);
+  const [l1, l2] = [await e1.billing(), await e2.billing()];
+  await f.setMember(a.userId, { quota_milli: 1000 });
+  e1.renew('r1', l1.lease_id, 2000);
+  expect(await e1.billing()).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  e2.renew('r2', l2.lease_id, 2000);
+  expect(await e2.billing()).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  expect(await f.json(`/quota/usage?scope=member&id=${a.userId}`)).toMatchObject({ used_milli: 4000, reserved_milli: 0, remaining_milli: -3000 });
+  expect(await f.json('/balance')).toMatchObject({ balance_milli: 996_000 });
+});
+
+test('Q14 op_id replay returns the cached reply even after the quota is raised, and settles once', async () => {
+  const f = await fixture();
+  await f.fund(1_000_000);
+  const a = await f.member('a@example.test', { quota_milli: 3000 });
+  const e = await online(f, (await f.device(a.scoped, 'D1')).device_token);
+  const l = await e.billing();
+  e.renew('r1', l.lease_id, 2000, 'X');
+  const first = await e.billing();
+  expect(first).toMatchObject({ type: 'lease', budget_milli: 1000 });
+  await f.setMember(a.userId, { quota_milli: 10_000 });
+  e.renew('r1b', l.lease_id, 2000, 'X');
+  expect(await e.billing()).toEqual({ ...first, re: 'r1b' });
+  expect(f.db().get("SELECT count(*) AS n, sum(amount_milli) AS s FROM ledger WHERE kind = 'settle'")).toEqual({ n: 1, s: 2000 });
+  expect(await f.json(`/quota/usage?scope=member&id=${a.userId}`)).toMatchObject({ used_milli: 2000, reserved_milli: 1000, remaining_milli: 7000 });
+  e.renew('r1c', l.lease_id, 2000, 'Y');
+  expect(await e.billing()).toMatchObject({ type: 'ack', ok: false, error: { code: 'conflict' } });
+});
+
+test('Q16–Q19 cutoff reason priority', async () => {
+  const f = await fixture();
+  await f.fund(40); // 5% → 2
+  const b = await f.member('b@example.test');
+  const a = await f.member('a@example.test', { quota_milli: 0 });
+  // 只有配额触发
+  expect(await (await online(f, (await f.device(a.scoped, 'A1')).device_token)).billing()).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  // B 用光租户余额
+  const eb = await online(f, (await f.device(b.scoped, 'B1')).device_token);
+  let lease = await eb.billing();
+  while (lease.type === 'lease') { eb.renew(`b-${lease.lease_id}`, lease.lease_id, lease.budget_milli); lease = await eb.billing(); }
+  expect(lease).toMatchObject({ type: 'cutoff', reason: 'balance' });
+  // 余额与配额同时 → balance
+  expect(await (await online(f, (await f.device(a.scoped, 'A2')).device_token)).billing()).toMatchObject({ type: 'cutoff', reason: 'balance' });
+  // 停用优先：停用成员的设备在 hello 阶段就被关闭（1008），不会拿到 quota 或 balance
+  const a3 = await f.device(a.scoped, 'A3');
+  await f.setMember(a.userId, { status: 'disabled' });
+  const disabled = connect(f, a3.device_token);
+  const closed = new Promise<CloseEvent>((r) => { disabled.ws.onclose = r; });
+  if (await disabled.opened) disabled.hello();
+  expect([1008, 1006, 1002]).toContain((await closed).code);
+  expect(disabled.queue.filter((m) => m.type === 'cutoff' && m.reason !== 'disabled')).toEqual([]);
+});
+
+test('Q20/Q21/Q22 overage_pending and release do not count toward the quota', async () => {
+  const f = await fixture();
+  await f.fund(1_000_000);
+  const a = await f.member('a@example.test', { quota_milli: 5000 });
+  const e = await online(f, (await f.device(a.scoped, 'D1')).device_token);
+  const l1 = await e.billing();
+  e.renew('r1', l1.lease_id, 2600);
+  const l2 = await e.billing();
+  expect(l2).toMatchObject({ type: 'lease', budget_milli: 2000 }); // 合约 2000 最紧，这一步区分不了是否误计 overage；下面的 /quota/usage 和 l4 能区分
+  expect(await f.json(`/quota/usage?scope=member&id=${a.userId}`)).toMatchObject({ used_milli: 2000, reserved_milli: 2000, remaining_milli: 1000 });
+  e.renew('r2', l2.lease_id, 300);
+  const l3 = await e.billing();
+  // settle 2300、release 1700；剩 2700，合约 2000 更紧
+  expect(l3).toMatchObject({ type: 'lease', budget_milli: 2000 });
+  e.renew('r3', l3.lease_id, 2600);
+  // settle 4300，剩 700 → 新租约 700；overage 600 不计
+  const l4 = await e.billing();
+  expect(l4).toMatchObject({ type: 'lease', budget_milli: 700 });
+  e.renew('r4', l4.lease_id, 900);
+  expect(await e.billing()).toMatchObject({ type: 'cutoff', reason: 'quota' });
+  expect(await f.json(`/quota/usage?scope=member&id=${a.userId}`)).toMatchObject({ used_milli: 5000, reserved_milli: 0, remaining_milli: 0 });
+  expect(f.db().get("SELECT sum(amount_milli) AS n FROM ledger WHERE kind = 'overage_pending'")).toEqual({ n: 1400 });
+  const row = (await f.json('/members')).items.find((m: any) => m.id === a.userId);
+  expect(row.month_used_milli).toBe(5000);
+});
+
+test('Q23 an expired lease that never reconnected keeps reserving quota', async () => {
+  const f = await fixture();
+  await f.fund(1_000_000);
+  const a = await f.member('a@example.test', { quota_milli: 3000 });
+  const e1 = await online(f, (await f.device(a.scoped, 'D1')).device_token);
+  expect(await e1.billing()).toMatchObject({ budget_milli: 2000 });
+  e1.ws.close();
+  f.advance(60 * 60_000);
+  const e2 = await online(f, (await f.device(a.scoped, 'D2')).device_token);
+  expect(await e2.billing()).toMatchObject({ type: 'lease', budget_milli: 1000 });
+});
+
+test('C4 moving a member between groups moves the whole month of usage with them', async () => {
+  const f = await fixture();
+  await f.fund(1_000_000);
+  const g1 = await f.group('G1', 10_000);
+  const g2 = await f.group('G2', 5000);
+  const a = await f.member('a@example.test', { group_id: g1 });
+  const b = await f.member('b@example.test', { group_id: g2 });
+  const ea = await online(f, (await f.device(a.scoped, 'A')).device_token);
+  let l = await ea.billing();
+  ea.renew('a1', l.lease_id, 2000); l = await ea.billing();
+  ea.renew('a2', l.lease_id, 2000); l = await ea.billing(); // A：settle 4000 + 预留 2000
+  const eb = await online(f, (await f.device(b.scoped, 'B')).device_token);
+  const lb = await eb.billing();
+  expect(lb).toMatchObject({ budget_milli: 2000 }); // G2：预留 2000
+  await f.setMember(a.userId, { group_id: g2 });
+  expect(await f.json(`/quota/usage?scope=group&id=${g1}`)).toMatchObject({ used_milli: 0, reserved_milli: 0, remaining_milli: 10_000 });
+  expect(await f.json(`/quota/usage?scope=group&id=${g2}`)).toMatchObject({ used_milli: 4000, reserved_milli: 4000, remaining_milli: -3000 });
+  // 换组之后 B 的下一次续租立刻被 A 在 G1 花掉的钱卡住
+  eb.renew('b1', lb.lease_id, 100);
+  expect(await eb.billing()).toMatchObject({ type: 'cutoff', reason: 'quota' });
+});
+
+test('/quota/usage lets a member and a group_admin probe which ids exist (404 before 403)', async () => {
+  const f = await fixture();
+  await f.fund(1000);
+  const g = await f.group('G', 100);
+  const other = await f.group('Other', 100);
+  const ga = await f.member('ga@example.test', { role: 'group_admin', group_id: g });
+  const m = await f.member('m@example.test', { group_id: g });
+  const outsider = await f.member('o@example.test', { group_id: other });
+  const status = async (q: string, token: string) => (await f.request(`/quota/usage?${q}`, undefined, token)).status;
+  // member：存在的他人 403，不存在的 404
+  expect(await status(`scope=member&id=${outsider.userId}`, m.scoped)).toBe(403);
+  expect(await status('scope=member&id=usr_does_not_exist', m.scoped)).toBe(404);
+  expect(await status(`scope=group&id=${other}`, m.scoped)).toBe(403);
+  expect(await status('scope=group&id=grp_does_not_exist', m.scoped)).toBe(404);
+  // group_admin：组外成员 403，组外不存在 404
+  expect(await status(`scope=member&id=${outsider.userId}`, ga.scoped)).toBe(403);
+  expect(await status(`scope=member&id=${m.userId}`, ga.scoped)).toBe(200);
+  expect(await status(`scope=group&id=${g}`, ga.scoped)).toBe(200);
+});
+
+test('/me.quota shows a plain member the whole group total when the group binds', async () => {
+  const f = await fixture();
+  await f.fund(1_000_000);
+  const g = await f.group('G', 3000);
+  const a = await f.member('a@example.test', { group_id: g });
+  const b = await f.member('b@example.test', { group_id: g });
+  const eb = await online(f, (await f.device(b.scoped, 'B')).device_token);
+  const lb = await eb.billing();
+  eb.renew('b1', lb.lease_id, 1200); await eb.billing();
+  // A 自己没花钱，看到的是 B 的 1200 + B 新租约 1800
+  expect(await f.json('/me', a.scoped)).toMatchObject({ quota: { quota_milli: 3000, month_used_milli: 3000, remaining_milli: 0, limited_by: `group:${g}` } });
+});
+
+test('Q29 quota validation', async () => {
+  const f = await fixture();
+  const a = await f.member('a@example.test');
+  for (const bad of [-1, 1.5, '100', Number.MAX_SAFE_INTEGER + 2]) {
+    const res = await f.request(`/members/${a.userId}`, { role: 'member', revision: 1, quota_milli: bad }, f.owner.scoped);
+    expect(res.status).toBe(422);
+  }
+  for (const bad of [-1, 1.5, '100']) {
+    expect((await f.request('/groups', { name: `g${bad}`, quota_milli: bad }, f.owner.scoped)).status).toBe(422);
+  }
+});

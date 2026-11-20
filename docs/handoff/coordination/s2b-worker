@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# S2 第二批交互式 Claude 工作会话。用法：s2b-worker <角色>，在 tmux 窗口里运行。
+set -euo pipefail
+umask 077
+
+root=/Users/HHH/Code/OneX
+coord=$root/coord
+role=${1:-}
+supervisor=governor
+mail_send=$coord/bin/mail-send
+mail_wait=$coord/bin/mail-wait
+model=custom/claude-sonnet-5-5
+checkout=$root/wt/$role
+
+case "$role" in
+  s2b-quota-api) owned=('server/src/**' 'server/migrations/**' 'server/test/**' 'tests/e2e/**' 'edge/onex-cli/**') ;;
+  s2b-quota-web) owned=('server/web/**') ;;
+  s2b-lease) owned=('edge/onexd/src/lease.rs' 'edge/onexd/src/ws.rs' 'edge/onex-core/src/ws.rs' 'edge/onexd/src/ipc.rs' 'edge/onexd/tests/**' 'tests/e2e/lease-server.ts') ;;
+  s2b-codex|s2b-kimi) owned=('edge/onexd/**' 'edge/onex-core/**' 'edge/onex-cli/**' 'edge/Cargo.lock' 'tests/e2e/fake-upstream/**') ;;
+  s2b-review) owned=(); model=custom/claude-opus-5-5 ;;
+  *) printf 'Unknown OneX role: %s\n' "$role" >&2; exit 2 ;;
+esac
+[[ -t 0 && -t 1 ]] || { printf 'Run in an interactive tmux pane.\n' >&2; exit 2; }
+cd "$checkout"
+
+resume=${RESUME:-}
+unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT RESUME HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+# 各 Rust 线用各自的缓存目录（APFS 克隆自同一份已编译依赖，几乎不占额外空间）。
+# 共用一个目录时，同名 crate 的 rmeta 会被另一棵 worktree 的版本覆盖，导致跨线编译错误。
+case "$role" in
+  s2b-codex|s2b-kimi|s2b-lease|s2b-quota-api) export CARGO_TARGET_DIR="$coord/.build/$role" ;;
+  *) export CARGO_TARGET_DIR="$coord/.build/s1-cargo-integrate" ;;
+esac
+export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_NET_OFFLINE=true
+
+allowed=(
+  Read Glob Grep
+  'Bash(git status*)' 'Bash(git diff*)' 'Bash(git log*)' 'Bash(git show*)' 'Bash(git rev-parse*)'
+  'Bash(git branch --show-current)'
+  'Bash(bun test*)' 'Bash(bun --no-env-file test*)' 'Bash(bun --version)' 'Bash(bunx tsc*)'
+  'Bash(cargo test*)' 'Bash(cargo check*)' 'Bash(cargo build*)' 'Bash(cargo fmt*)' 'Bash(cargo clippy*)'
+  'Bash(curl http://127.0.0.1*)' 'Bash(curl http://localhost*)'
+  "Bash($mail_send $supervisor $role *)" "Bash($mail_wait $role *)"
+)
+if [[ "$role" == s2b-review ]]; then
+  allowed+=("Edit(/$coord/reports/s2/**)")
+else
+  allowed+=('Bash(git add *)' 'Bash(git commit *)')
+  for entry in "${owned[@]}"; do allowed+=("Edit(/$checkout/$entry)"); done
+fi
+restricted=(
+  'Bash(git push*)' 'Bash(git -C*)' 'Bash(git checkout*)' 'Bash(git switch*)' 'Bash(git merge*)'
+  'Bash(git rebase*)' 'Bash(git reset*)' 'Bash(ssh*)' 'Bash(scp*)' 'Bash(sudo*)' 'Bash(rm -rf*)'
+  'Bash(pkill*)' 'Bash(killall*)' 'Bash(kill *)' 'Bash(env*)' 'Bash(printenv*)'
+)
+
+printf 'OneX %s · %s · %s\n' "$role" "$model" "$checkout"
+"$mail_send" "$supervisor" "$role" "WORKER_STARTED branch=$(git branch --show-current || true) base=$(git rev-parse --short HEAD) model=$model"
+prompt="你的邮箱是 ${role}，总督邮箱是 ${supervisor}。先用 ${mail_wait} ${role} 540 领取任务，再按工作会话规则执行和回报。"
+[[ -n "$resume" ]] && prompt="总督重启了你的会话，改为每条 Rust 线独立编译缓存（CARGO_TARGET_DIR=${CARGO_TARGET_DIR}）。之前的跨 worktree 编译错误由此修复。继续手头的任务，先用 cargo test 确认编译恢复正常。"
+exec /opt/homebrew/bin/claude --name "onex-$role" ${resume:+--resume "$resume"} --model "$model" --effort medium \
+  --permission-mode dontAsk --settings "$coord/analyst-settings.json" --add-dir "$coord" \
+  --tools 'Read,Glob,Grep,Edit,Write,Bash' --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+  --allowedTools "${allowed[@]}" --disallowedTools "${restricted[@]}" \
+  --append-system-prompt "$(<"$coord/briefs/s2b-common.md")" \
+  -- "$prompt"
