@@ -59,7 +59,9 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 | GET | `/diag/:id` | 查询状态。日志包可取回时返回 OneX 同源 `download_url` |
 | PUT | `/diag/:id/upload` | 指定设备以有效设备令牌上送 `application/x-tar` 日志包 |
 | GET | `/diag/:id/download` | 对发起诊断有权限的身份下载未过期日志包，通过 OneX API 鉴权。对象存储保持私有 |
-| GET | `/audit` | 审计 |
+| GET | `/audit` | 本租户审计台账。仅限持有本租户令牌的 owner。支持 `action` 精确筛选、`q` 在动作、操作者和目标上按字面搜索，以及通用分页。 |
+
+审计按 `at` 倒序，再按 `id` 倒序。记录返回 `id`、`actor`、`action`、`target`、`at`、`revision: 1` 和 `actions: ["read"]`。列表和 `/me` 通过 `read_audit` 声明入口权限。读取台账不新增审计记录。详情字段、备注和对话内容不进入返回值或搜索范围。
 
 ## 监察
 

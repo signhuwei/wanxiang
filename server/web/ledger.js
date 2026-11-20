@@ -15,7 +15,10 @@ export function createLedger(host, {
   columns,          // [{key, title, render?(item), width?}]
   fetchPage,        // async ({q, filters, cursor, limit, signal}) => {items, next_cursor, total}
   rowKey = 'id',
-  filters = [],     // [{key, label, options:[{value,label}], value}]
+  filters = [],     // [{key, label, options?:[{value,label}], value}]；缺省 options 时用文本筛选
+  searchLabel = '查询',
+  literalSearch = false,
+  signal: routeSignal,
   onOpen,           // (item) => void；有对应 action 时行可点击
   openAction = 'read',
   noOpenText = '',
@@ -35,20 +38,25 @@ export function createLedger(host, {
   toolbar.append(titleEl, countEl)
   const searchInput = el('input', 'search')
   searchInput.type = 'search'
-  searchInput.placeholder = '查询'
-  searchInput.setAttribute('aria-label', '查询')
+  searchInput.placeholder = searchLabel
+  searchInput.setAttribute('aria-label', searchLabel)
   const filterSelects = {}
   for (const f of filters) {
-    const sel = el('select')
-    sel.setAttribute('aria-label', f.label)
-    for (const o of f.options) {
-      const opt = el('option', null, o.label)
-      opt.value = o.value
-      sel.appendChild(opt)
+    const control = f.options ? el('select') : el('input', 'filter-search')
+    control.setAttribute('aria-label', f.label)
+    if (f.options) {
+      for (const o of f.options) {
+        const opt = el('option', null, o.label)
+        opt.value = o.value
+        control.appendChild(opt)
+      }
+    } else {
+      control.type = 'search'
+      control.placeholder = f.label
     }
-    sel.value = f.value ?? ''
-    filterSelects[f.key] = sel
-    toolbar.appendChild(sel)
+    control.value = f.value ?? ''
+    filterSelects[f.key] = control
+    toolbar.appendChild(control)
   }
   if (searchable) toolbar.appendChild(searchInput)
   const createBtn = onCreate ? el('button', 'primary keep', createLabel) : null
@@ -172,6 +180,7 @@ export function createLedger(host, {
   }
 
   async function load() {
+    if (routeSignal?.aborted) return
     if (abort) abort.abort()
     const ctrl = new AbortController()
     abort = ctrl
@@ -216,21 +225,27 @@ export function createLedger(host, {
     load()
   }
 
-  searchInput.addEventListener('input', () => {
+  function applyFilters() {
     clearTimeout(debounceTimer)
-    debounceTimer = setTimeout(() => {
-      q = searchInput.value.trim()
-      pager.reset()
-      load()
-    }, 300)
-  })
-  for (const [key, sel] of Object.entries(filterSelects)) {
-    sel.addEventListener('change', () => {
-      filterVals[key] = sel.value
-      pager.reset()
-      load()
-    })
+    q = literalSearch ? searchInput.value : searchInput.value.trim()
+    for (const [key, control] of Object.entries(filterSelects)) filterVals[key] = control.value
+    refresh()
   }
+
+  function queueFilters() {
+    clearTimeout(debounceTimer)
+    debounceTimer = setTimeout(applyFilters, 300)
+  }
+
+  searchInput.addEventListener('input', queueFilters)
+  for (const control of Object.values(filterSelects)) {
+    if (control.tagName === 'SELECT') control.addEventListener('change', applyFilters)
+    else control.addEventListener('input', queueFilters)
+  }
+  routeSignal?.addEventListener('abort', () => {
+    clearTimeout(debounceTimer)
+    abort?.abort()
+  }, { once: true })
   prevBtn.addEventListener('click', () => { if (pager.prev()) load() })
   nextBtn.addEventListener('click', () => { if (pager.next()) load() })
 

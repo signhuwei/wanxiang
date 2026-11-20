@@ -7,6 +7,7 @@ import { showToast } from './toast.js'
 import { devicesPage } from './devices.js'
 import { observePage } from './observation.js'
 import { billingPage } from './billing.js'
+import { auditPage } from './audit.js'
 import { catalog } from './catalog.js'
 import { contractPage } from './contract.js'
 import { groupsPage } from './groups.js'
@@ -21,6 +22,7 @@ if (mockOn) installMock()
 
 const sessionStore = createSessionStore({ key: mockOn ? 'onex.session.mock' : 'onex.session' })
 let session = sessionStore.load()
+let checkingAuditPermission = Boolean(session?.tenant)
 let pendingToken = null // 登录流程中、选租户之前的全局令牌
 let openLoginTokenForm
 
@@ -52,6 +54,10 @@ function el(tag, className, text) {
   return n
 }
 
+function canReadAudit() {
+  return Boolean(session?.tenant && Array.isArray(session.actions) && session.actions.includes('read_audit'))
+}
+
 function renderTop(hash) {
   const top = el('div', 'top')
   const loginPage = !session && hash === '#/login'
@@ -67,7 +73,9 @@ function renderTop(hash) {
     tenantLink.classList.toggle('selected', hash.startsWith('#/tenant'))
     domains.appendChild(tenantLink)
     if (session.tenant && hash.startsWith('#/tenant')) {
-      for (const [path, label] of [['members','成员'], ['groups','分组'], ['contract','合约'], ['billing','橡皮'], ['observe','监察'], ['devices','设备']]) {
+      const pages = [['members','成员'], ['groups','分组'], ['contract','合约'], ['billing','橡皮'], ['observe','监察'], ['devices','设备']]
+      if (canReadAudit()) pages.push(['audit', '审计'])
+      for (const [path, label] of pages) {
         const link = el('a', hash === '#/tenant/' + path ? 'selected' : '', label)
         link.href = '#/tenant/' + path
         domains.append(link)
@@ -220,6 +228,11 @@ function route() {
     else if (hash === '#/tenant/observe') observePage(ws, api, session, lifecycle.signal)
     else if (hash === '#/tenant/billing') billingPage(ws, api, platformApi, session)
     else if (hash === '#/tenant/contract') contractPage(ws, api)
+    else if (hash === '#/tenant/audit') {
+      if (checkingAuditPermission) ws.appendChild(el('p', 'empty', '正在确认审计权限…'))
+      else if (canReadAudit()) auditPage(ws, api, lifecycle.signal)
+      else ws.appendChild(el('p', 'empty', '当前账号没有审计查询权限'))
+    }
     else renderMembersPage(ws, { api, actions: session.actions || [] })
     return
   }
@@ -227,5 +240,33 @@ function route() {
   location.replace(defaultHash())
 }
 
+async function refreshTenantActions(restored) {
+  let me
+  const ctrl = new AbortController()
+  const timeout = setTimeout(() => ctrl.abort(), 5000)
+  try {
+    me = await api.get('/me', { signal: ctrl.signal })
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timeout)
+  }
+  if (session !== restored || me?.tenant?.id !== restored.tenant.id || !Array.isArray(me.actions)) return false
+  const existing = new Set(Array.isArray(restored.actions) ? restored.actions : [])
+  if (existing.size === me.actions.length && me.actions.every(action => existing.has(action))) return false
+  session = { ...restored, actions: me.actions }
+  try { sessionStore.save(session) } catch {
+    // 浏览器禁止持久化时，本次页面仍使用刷新后的权限。
+  }
+  return true
+}
+
 window.addEventListener('hashchange', route)
+const restored = session?.tenant ? session : null
 route()
+if (restored) {
+  refreshTenantActions(restored).then(changed => {
+    checkingAuditPermission = false
+    if (changed || location.hash === '#/tenant/audit') route()
+  })
+}

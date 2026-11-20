@@ -1,5 +1,6 @@
 import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
+import { tenantAuditActions } from './actions';
 import { ApiError, field, invalid, json, operation } from './api';
 import { day, hash, iso, randomToken } from './credentials';
 import { enumField, expectRevision, int, pagination, tenantActor, type ManagementOptions } from './management';
@@ -11,6 +12,7 @@ type Profile = { id: string; name: string; email: string | null; phone: string |
 type Group = { id: string; name: string; parent_id: string | null; quota_milli: number | null; revision: number };
 type Contract = { revision: number; seat_limit: number; allowed_agents_json: string; allowed_models_json: string;
   lease_minutes: number; lease_budget_milli: number; visibility_json: string; updated_by: string; updated_at: string };
+type AuditRow = { id: string; actor: string; action: string; target: string; at: string };
 const roles = ['admin', 'group_admin', 'member'] as const;
 const statuses = ['active', 'disabled'] as const;
 const readContract = (sql: Pick<Transaction, 'get'>) => sql.get<Contract>('SELECT * FROM contract ORDER BY revision DESC LIMIT 1');
@@ -57,6 +59,28 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     }
     return member.role;
   }
+
+  app.get('/v1/audit', (c) => {
+    const { db, role } = tenantActor(store, c, opts.now());
+    if (role !== 'owner') throw new ApiError('forbidden');
+    const p = pagination(c);
+    const action = c.req.query('action');
+    const filters: string[] = [];
+    const params: string[] = [];
+    if (action !== undefined) {
+      filters.push('action = ?');
+      params.push(action);
+    }
+    if (p.query) {
+      filters.push('(instr(lower(action), lower(?)) > 0 OR instr(lower(actor), lower(?)) > 0 OR instr(lower(target), lower(?)) > 0)');
+      params.push(p.query, p.query, p.query);
+    }
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    const { n } = db.get<{ n: number }>(`SELECT count(*) AS n FROM audit ${where}`, params)!;
+    const rows = db.all<AuditRow>(`SELECT id, actor, action, target, at FROM audit ${where}
+      ORDER BY at DESC, id DESC LIMIT ? OFFSET ?`, [...params, p.limit, p.offset]);
+    return c.json(p.page(rows.map((row) => ({ ...row, revision: 1, actions: ['read'] })), n, tenantAuditActions));
+  });
 
   app.get('/v1/members', (c) => {
     const { db, role } = manager(c, opts.now());
