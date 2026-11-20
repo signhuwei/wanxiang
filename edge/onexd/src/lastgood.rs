@@ -92,7 +92,7 @@ fn keep_bad(path: &Path, cur: &[u8]) -> Result<()> {
 fn replace(path: &Path, data: &[u8]) -> Result<()> {
     let dir = path.parent().context("state file has no parent dir")?;
     let tmp = with_suffix(path, &format!(".tmp-{}", std::process::id()));
-    let r = (|| {
+    let r = (|| -> std::io::Result<()> {
         let mut f = private_open().write(true).create(true).truncate(true).open(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
