@@ -83,7 +83,9 @@ install -m 0755 "$daemon" "$resources/onex/bin/onexd"
 for launcher in onex-run-claude.command onex-run-codex.command onex-run-kimi.command; do
   install -m 0755 "$scripts/$launcher" "$resources/$launcher"
 done
-install -m 0755 "$scripts/postinstall" "$stage/scripts/postinstall"
+for hook in preinstall postinstall; do
+  install -m 0755 "$scripts/$hook" "$stage/scripts/$hook"
+done
 
 cat > "$launch_agents/$agent.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

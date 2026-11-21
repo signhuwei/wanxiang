@@ -64,6 +64,10 @@ Only OneX Server binds the selected private address. Valkey and RustFS still lis
 
 To disable LAN development, set `ONEX_HOST=127.0.0.1` and remove `ONEX_ALLOW_LAN_DEV` (or set it to `0`), then run `bash ~/apps/onex/current/deploy/onex.sh stop` followed by `bash ~/apps/onex/current/deploy/onex.sh start`.
 
+## Mac 安装 Git 前置检查
+
+OneX 的 Mac `.pkg` 在写入安装文件前会实际检查 Git，支持 Apple 命令行工具、Xcode 和常用 Homebrew 安装路径。已安装可用 Git 时继续安装。缺少 Git 时会打开 Apple 的命令行工具安装窗口。用户确认并完成 Apple 安装后，重新打开 OneX 安装包。Apple 的安装独立完成，已有 OneX 安装不受这次中止影响。 [Apple 命令行工具安装流程](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools)
+
 ## 平台维护与发布
 
 平台管理员在「平台 → 维护与发布」上传已签名的 Server 清单和制品，查看部署状态。Edge 安装包也可以在该入口发布。接口以运行环境的 `/v1/openapi.json` 为准。

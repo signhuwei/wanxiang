@@ -1,0 +1,72 @@
+#!/bin/bash
+set -eu
+
+run_as_console_user() {
+  if [[ $(/usr/bin/id -u) != 0 ]]; then
+    "$@"
+  elif [[ $console_user -gt 0 ]]; then
+    /usr/bin/sudo -n -H -u "#$console_user" -- "$@"
+  else
+    /usr/bin/sudo -n -H -u nobody -- "$@"
+  fi
+}
+
+git_works() {
+  local version
+  [[ -x $1 ]] && version=$(run_as_console_user "$1" --version 2>/dev/null) && [[ $version == 'git version '* ]]
+}
+
+active_developer_directory() {
+  /usr/bin/xcode-select --print-path 2>/dev/null
+}
+
+git_available() {
+  local developer git
+  # On a clean Mac, /usr/bin/git is an executable stub. Checking it directly
+  # would open the system prompt even on a Mac that already has Homebrew Git.
+  developer=$(active_developer_directory) || developer=
+  if [[ -n $developer && -x $developer/usr/bin/git ]] && git_works /usr/bin/git; then
+    return 0
+  fi
+  for git in /opt/homebrew/bin/git /usr/local/bin/git; do
+    if git_works "$git"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+request_apple_installation() {
+  [[ $console_user -gt 0 ]] || return 1
+  /bin/launchctl asuser "$console_user" /usr/bin/sudo -n -H -u "#$console_user" -- /usr/bin/xcode-select --install
+}
+
+main() {
+  local target=${3:-/}
+  if [[ $target != / ]]; then
+    # Do not open an install prompt or modify the host for an offline volume.
+    if [[ -x $target/Library/Developer/CommandLineTools/usr/bin/git ||
+          -x $target/Applications/Xcode.app/Contents/Developer/usr/bin/git ]]; then
+      return 0
+    fi
+    echo 'OneX 需要目标系统已安装 Git。请启动该系统后重新运行 OneX 安装包。' >&2
+    return 1
+  fi
+
+  unset DEVELOPER_DIR
+  console_user=$(/usr/bin/stat -f %u /dev/console)
+  if git_available; then
+    return 0
+  fi
+  if request_apple_installation; then
+    echo 'OneX 已打开 Apple 命令行工具安装窗口。请点击安装，完成后重新运行此安装包。' >&2
+  else
+    echo 'OneX 需要可用的 Git。请在已登录的 macOS 桌面运行此安装包，或先完成 Apple 命令行工具的安装并重试。' >&2
+  fi
+  # Let Installer end this transaction before the Apple package installs.
+  return 1
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
