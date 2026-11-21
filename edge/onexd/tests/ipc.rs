@@ -117,12 +117,15 @@ async fn status_login_shutdown() {
             .to_string()
     };
     assert_eq!(c.call(&launch(None)).await["error"]["code"], "model_not_allowed");
-    state.config.write().unwrap().routes = vec![route("claude-*")];
+    let mut responses_only = route("responses-only");
+    responses_only.protocol = "openai_responses".into();
+    state.config.write().unwrap().routes = vec![responses_only.clone(), route("claude-*")];
+    assert_eq!(c.call(&launch(Some("responses-only"))).await["error"]["code"], "model_not_allowed");
     assert_eq!(c.call(&launch(Some("kimi-k3"))).await["error"]["code"], "model_not_allowed");
     // server MVP seed 的形状：通配路由固定上游模型，默认别名取它
     let mut wild = route("*");
     wild.upstream_model = Some("Qwen3.8-27B".into());
-    state.config.write().unwrap().routes = vec![wild];
+    state.config.write().unwrap().routes = vec![responses_only, wild];
     let l = c.call(&launch(None)).await;
     assert_eq!((l["ok"].as_bool(), l["model"].as_str()), (Some(true), Some("Qwen3.8-27B")));
     assert_eq!(
@@ -345,8 +348,12 @@ async fn launch_without_program_downloads_the_managed_release() {
         size: body.len() as u64,
     };
     *state.config.write().unwrap() = onexd::state::ConfigSnapshot {
+        tools: vec![],
         agent_cache: false,
         revision: 1,
+        capability_contract: Some(onex_core::ws::CapabilityContract { platform_revision: 1, tenant_revision: 0 }),
+        policy: None,
+        policy_blocked: false,
         routes: vec![wild],
         rates: vec![],
         agents: vec![release],
@@ -365,6 +372,8 @@ async fn launch_without_program_downloads_the_managed_release() {
     let second = c.call(&req).await;
     assert_eq!(second["ok"], true);
     assert_eq!(second["program"], l["program"]);
+    let running = c.call(r#"{"cmd":"status"}"#).await;
+    assert_eq!(running["managed_agents"][0]["instance_count"], 2);
     let first_token = l["env"]["ANTHROPIC_API_KEY"].as_str().unwrap();
     let second_token = second["env"]["ANTHROPIC_API_KEY"].as_str().unwrap();
     assert_ne!(first_token, second_token);
@@ -377,11 +386,41 @@ async fn launch_without_program_downloads_the_managed_release() {
         assert_eq!(tokens.get(second_token).map(|binding| binding.session_id.as_str()), second["session_id"].as_str());
     }
     let s = c.call(r#"{"cmd":"status"}"#).await;
-    assert_eq!(s["managed_agents"], json!([{"id":"claude-code","version":"2.1.311","status":"running"}]));
+    assert_eq!(
+        s["managed_agents"],
+        json!([{"id":"claude-code","version":"2.1.311","status":"running","instance_count":1}])
+    );
     let finish = json!({"cmd":"launch_done","launch_id":second["launch_id"],"exit_code":0}).to_string();
     assert_eq!(c.call(&finish).await["ok"], true);
     let s = c.call(r#"{"cmd":"status"}"#).await;
-    assert_eq!(s["managed_agents"], json!([{"id":"claude-code","version":"2.1.311","status":"cached"}]));
+    assert_eq!(
+        s["managed_agents"],
+        json!([{"id":"claude-code","version":"2.1.311","status":"cached","instance_count":0}])
+    );
+    assert_eq!(s["capability_contract"], json!({"platform_revision":1,"tenant_revision":0}));
+
+    std::fs::remove_file(program).unwrap();
+    assert_eq!(c.call(r#"{"cmd":"download","agent":"claude-code"}"#).await["ok"], true);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let status = c.call(r#"{"cmd":"status"}"#).await;
+            if status["managed_agents"][0]["status"] == "cached" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(program).unwrap(), body);
+
+    state.config.write().unwrap().agents.clear();
+    assert_eq!(c.call(&req).await["error"]["code"], "agent_not_allowed");
+    let legacy = json!({"cmd":"launch","agent":"claude-code","program":program,"cwd":cwd,"env":{"PATH":"/usr/bin"}});
+    assert_eq!(c.call(&legacy.to_string()).await["error"]["code"], "agent_not_allowed");
+    let s = c.call(r#"{"cmd":"status"}"#).await;
+    assert_eq!(s["managed_agents"], json!([]));
+    assert!(std::path::Path::new(program).exists());
 }
 
 /// v0.13：处于 cutoff 且没有租约时，`onex run` 启动 Agent 立即申请一次租约，不等下一个周期。
@@ -398,6 +437,8 @@ async fn launch_requests_a_lease_immediately_when_cut_off_without_one() {
     state
         .lease
         .grant(&onex_core::ws::Lease {
+            model_budgets: Default::default(),
+            commerce_plan_id: None,
             id: "m1".into(),
             re: None,
             lease_id: "lse_1".into(),

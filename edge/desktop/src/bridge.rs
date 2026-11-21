@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use onex_core::ipc::{Request, Status};
+use onex_core::ipc::{ArtifactProgress, LocalUsage, Request, Status};
+use onex_core::ws::{PolicyDisplayItem, PolicyNotice, PolicySummary};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -58,6 +59,9 @@ pub enum Op {
     Launch {
         agent_id: String,
     },
+    Download {
+        agent_id: String,
+    },
     Settings {
         hide_on_close: bool,
     },
@@ -81,7 +85,20 @@ pub struct Snapshot {
     pub tenants: Vec<Tenant>,
     pub connection: String,
     pub agents: Vec<Agent>,
+    pub policy: Option<PolicyView>,
+    pub policy_pending: bool,
+    pub notices: Vec<PolicyNotice>,
+    pub local_usage: Option<LocalUsage>,
     pub settings: Settings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyView {
+    pub config_revision: i64,
+    pub policy_revision: u64,
+    pub platform_revision: u64,
+    pub tenant_revision: Option<u64>,
+    pub display: Vec<PolicyDisplayItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +117,10 @@ pub struct Agent {
     pub id: String,
     pub name: String,
     pub version: String,
+    pub vendor: String,
+    pub runtime_kind: String,
+    pub instance_count: u64,
+    pub progress: Option<ArtifactProgress>,
     pub status: String,
     pub actions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,31 +166,53 @@ struct Inner {
 }
 
 struct AgentLauncher {
+    gui: bool,
     id: &'static str,
     name: &'static str,
+    vendor: &'static str,
     #[cfg(target_os = "macos")]
     script: &'static str,
 }
 
 const AGENT_LAUNCHERS: &[AgentLauncher] = &[
     AgentLauncher {
+        gui: false,
         id: "claude-code",
         name: "Claude Code",
+        vendor: "Anthropic",
         #[cfg(target_os = "macos")]
         script: "onex-run-claude.command",
     },
     AgentLauncher {
+        gui: false,
         id: "codex",
         name: "Codex",
+        vendor: "OpenAI",
         #[cfg(target_os = "macos")]
         script: "onex-run-codex.command",
     },
     AgentLauncher {
+        gui: false,
         id: "kimi-code",
         name: "Kimi Code",
+        vendor: "月之暗面",
         #[cfg(target_os = "macos")]
         script: "onex-run-kimi.command",
     },
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    AgentLauncher {
+        gui: true,
+        id: "deepseek-desktop",
+        name: "DeepSeek Harness Desktop",
+        vendor: "DeepSeek",
+        script: "",
+    },
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    AgentLauncher { gui: true, id: "workbuddy", name: "WorkBuddy", vendor: "腾讯", script: "" },
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    AgentLauncher { gui: true, id: "codex-desktop", name: "Codex Desktop", vendor: "OpenAI", script: "" },
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    AgentLauncher { gui: true, id: "claude-desktop", name: "Claude Desktop", vendor: "Anthropic", script: "" },
 ];
 
 fn agent_launcher(id: &str) -> Option<&'static AgentLauncher> {
@@ -214,6 +257,7 @@ impl Bridge {
             Op::Login { target, code, invite_code } => self.login(target, code, invite_code).await,
             Op::SelectTenant { tenant_id } => self.select_tenant(tenant_id).await,
             Op::Launch { agent_id } => self.launch(agent_id).await,
+            Op::Download { agent_id } => self.download(agent_id).await,
             Op::Settings { hide_on_close } => self.settings(hide_on_close).await,
             Op::Logout => self.logout().await,
         }
@@ -411,12 +455,59 @@ impl Bridge {
         if already_launching {
             return self.state().await;
         }
-        let result = spawn_managed_cli(launcher).await.map_err(|_| unavailable());
+        let result = if launcher.gui {
+            self.start_native_desktop(launcher.id).await
+        } else {
+            spawn_managed_cli(launcher).await.map_err(|_| unavailable())
+        };
         if result.is_err() {
             self.inner.lock().unwrap().launching = None;
         }
         result?;
         self.state().await
+    }
+
+    async fn download(&self, agent_id: String) -> Reply {
+        let status = self.ipc_call(&Request::Status).await.map_err(|_| unavailable())?;
+        {
+            let inner = self.inner.lock().unwrap();
+            if inner.phase != Phase::Ready || !same_device(&status, &inner) {
+                return Err(forbidden());
+            }
+            if !self
+                .ready_agents(Some(&status), &inner)
+                .iter()
+                .any(|agent| agent.id == agent_id && agent.actions.iter().any(|action| action == "download"))
+            {
+                return Err(ErrorBody { code: "agent_not_allowed".into(), message: "此发行不可下载".into() });
+            }
+        }
+        self.ipc_call(&Request::Download { agent: agent_id }).await.map_err(|_| unavailable())?;
+        self.state().await
+    }
+
+    async fn start_native_desktop(&self, agent: &str) -> Result<(), ErrorBody> {
+        let request = Request::Launch {
+            agent: agent.to_owned(),
+            cwd: String::new(),
+            env: Default::default(),
+            program: None,
+            model: None,
+            agent_version: None,
+        };
+        let reply = tokio::time::timeout(Duration::from_secs(420), ipc_call_with(&self.socket_path, &request))
+            .await
+            .map_err(|_| unavailable())?
+            .map_err(|_| unavailable())?;
+        if reply["ok"] == true {
+            return Ok(());
+        }
+        let error = &reply["error"];
+        let Some(code) = error["code"].as_str().filter(|code| KNOWN_CODES.contains(code)) else {
+            return Err(unavailable());
+        };
+        let Some(message) = error["message"].as_str() else { return Err(unavailable()) };
+        Err(ErrorBody { code: code.into(), message: message.into() })
     }
 
     async fn settings(&self, hide_on_close: bool) -> Reply {
@@ -477,6 +568,7 @@ impl Bridge {
 
     fn ready_agents(&self, status: Option<&Value>, inner: &Inner) -> Vec<Agent> {
         let starting = inner.launching.filter(|(_, until)| *until > Instant::now()).map(|(id, _)| id);
+        let has_policy = status.is_some_and(|state| !state["policy"].is_null());
         status
             .filter(|s| same_device(s, inner))
             .and_then(|s| s["managed_agents"].as_array())
@@ -485,22 +577,38 @@ impl Bridge {
             .filter_map(|a| {
                 let launcher = agent_launcher(a["id"].as_str()?)?;
                 let version = a["version"].as_str()?.to_owned();
-                let status = match a["status"].as_str()? {
+                let raw_status = a["status"].as_str()?;
+                let status = match raw_status {
                     "available" | "cached" if starting == Some(launcher.id) => "starting",
+                    "available" if has_policy => "not_downloaded",
                     "available" | "cached" => "available",
-                    "downloading" => "downloading",
+                    "preparing" if starting == Some(launcher.id) => "starting",
+                    "preparing" | "downloading" => "downloading",
+                    "verifying" => "verifying",
+                    "download_failed" => "download_failed",
+                    "starting" => "starting",
                     "running" => "running",
+                    "policy_pending" => "policy_pending",
                     _ => return None,
                 };
-                let actions = if matches!(status, "available" | "running") && starting.is_none() {
-                    vec!["launch".into()]
-                } else {
-                    vec![]
-                };
+                let mut actions = vec![];
+                if starting.is_none()
+                    && (status == "available" || (status == "running" && !launcher.gui))
+                    && (raw_status != "available" || !has_policy)
+                {
+                    actions.push("launch".into());
+                }
+                if has_policy && starting.is_none() && matches!(raw_status, "available" | "download_failed") {
+                    actions.push("download".into());
+                }
                 Some(Agent {
                     id: launcher.id.into(),
                     name: launcher.name.into(),
                     version,
+                    vendor: launcher.vendor.into(),
+                    runtime_kind: if launcher.gui { "gui" } else { "cli" }.into(),
+                    instance_count: a["instance_count"].as_u64().unwrap_or_default(),
+                    progress: serde_json::from_value(a["progress"].clone()).ok(),
                     status: status.into(),
                     actions,
                     message: None,
@@ -539,6 +647,27 @@ impl Bridge {
             .map(|p| p.tenants.iter().map(|(id, name)| Tenant { id: id.clone(), name: name.clone() }).collect())
             .unwrap_or_default();
         let agents = if inner.phase == Phase::Ready { self.ready_agents(status, &inner) } else { vec![] };
+        let status = status.filter(|s| inner.phase == Phase::Ready && same_device(s, &inner));
+        let policy = status.and_then(|status| {
+            let summary: PolicySummary = serde_json::from_value(status.get("policy")?.clone()).ok()?;
+            if Some(summary.tenant_id.as_str()) != inner.tenant.as_ref().map(|tenant| tenant.id.as_str())
+                || Some(summary.device_id.as_str()) != inner.device_id.as_deref()
+            {
+                return None;
+            }
+            Some(PolicyView {
+                config_revision: status["config_revision"].as_i64()?,
+                policy_revision: summary.policy_revision,
+                platform_revision: summary.platform_revision,
+                tenant_revision: summary.tenant_revision,
+                display: summary.display,
+            })
+        });
+        let notices = status
+            .filter(|_| policy.is_some())
+            .and_then(|status| serde_json::from_value(status["notices"].clone()).ok())
+            .unwrap_or_default();
+        let local_usage = status.and_then(|status| serde_json::from_value(status["local_usage"].clone()).ok());
         Ok(Snapshot {
             version: env!("CARGO_PKG_VERSION").into(),
             phase,
@@ -547,6 +676,10 @@ impl Bridge {
             tenants,
             connection,
             agents,
+            policy_pending: status.is_some_and(|status| status["policy_blocked"] == true),
+            policy,
+            notices,
+            local_usage,
             settings: Settings { server_origin, hide_on_close: inner.hide_on_close },
         })
     }
@@ -717,5 +850,34 @@ mod tests {
 
         status["device_id"] = json!("dev_other");
         assert!(bridge.ready_agents(Some(&status), &inner).is_empty());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn desktop_projects_newly_available_native_releases_from_the_daemon() {
+        let bridge = Bridge::new(PathBuf::new());
+        let inner = Inner { device_id: Some("dev_a".into()), ..Default::default() };
+        let mut status = json!({"logged_in": true, "ws": "connected", "device_id": "dev_a",
+            "managed_agents": []});
+        assert!(bridge.ready_agents(Some(&status), &inner).is_empty());
+
+        status["managed_agents"] = json!([
+            {"id": "codex-desktop", "version": "26.1117.41037", "status": "available"},
+            {"id": "claude-desktop", "version": "6.28899.6", "status": "cached"}
+        ]);
+        let agents = bridge.ready_agents(Some(&status), &inner);
+        assert_eq!(
+            agents.iter().map(|agent| (agent.name.as_str(), agent.version.as_str())).collect::<Vec<_>>(),
+            [("Codex Desktop", "26.1117.41037"), ("Claude Desktop", "6.28899.6")]
+        );
+        assert!(
+            agents
+                .iter()
+                .all(|agent| agent.status == "available" && agent.runtime_kind == "gui" && agent.actions == ["launch"])
+        );
+        status["policy"] = json!({});
+        let agents = bridge.ready_agents(Some(&status), &inner);
+        assert_eq!(agents[0].actions, ["download"]);
+        assert_eq!(agents[1].actions, ["launch"]);
     }
 }

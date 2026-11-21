@@ -88,7 +88,7 @@ pub(crate) fn prepare(r: &Request) -> Result<Launch> {
     })
 }
 
-fn quote(value: &str) -> String {
+pub(crate) fn quote(value: &str) -> String {
     // JSON string escapes used here are valid TOML basic string escapes.
     serde_json::to_string(value).expect("string serialization").replace('\u{7f}', "\\u007f")
 }
@@ -101,7 +101,7 @@ fn require_absent(path: &Path) -> Result<()> {
     }
 }
 
-fn validate_project(cwd: &Path) -> Result<()> {
+pub(crate) fn validate_project(cwd: &Path) -> Result<()> {
     let canonical = cwd.canonicalize()?;
     let git_root = canonical.ancestors().find(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok());
     let project = git_root.unwrap_or(&canonical);

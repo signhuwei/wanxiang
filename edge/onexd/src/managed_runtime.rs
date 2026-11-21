@@ -10,9 +10,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
+use onex_core::ipc::ArtifactProgress;
 use onex_core::ws::AgentRelease;
 use sha2::{Digest, Sha256};
 
+use crate::desktop_bundle::{Bundle, RuntimeBundle};
 use crate::id;
 
 /// `contracts/edge-ws.md` 多 Agent 一节定下的三个名字。Server 下发的目录里混进别的 agent
@@ -64,7 +66,13 @@ pub fn select<'a>(
 /// Server 下发记录本身的合法性：不是「能不能下载成功」，是「这条记录像不像是正常的发行记录」。
 /// 真正的内容完整性仍然只认重新算出来的 SHA-256（见 `verify`），这里只挡明显畸形的输入。
 fn validate(r: &AgentRelease) -> Result<(), ResolveError> {
-    if !SUPPORTED_AGENTS.contains(&r.agent.as_str()) {
+    let desktop = crate::desktop_bundle::Bundle::manages(&r.agent);
+    if !SUPPORTED_AGENTS.contains(&r.agent.as_str())
+        && !(desktop
+            && cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && crate::desktop_bundle::Bundle::for_release(r).is_some()
+            && is_server_artifact(r))
+    {
         return Err(ResolveError::BadRelease("unsupported agent"));
     }
     if r.sha256.len() != 64 || !r.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -73,7 +81,8 @@ fn validate(r: &AgentRelease) -> Result<(), ResolveError> {
     if r.size == 0 {
         return Err(ResolveError::BadRelease("size must be greater than zero"));
     }
-    if r.size > 512 * 1024 * 1024 {
+    let max_mib = if desktop { 768 } else { 512 };
+    if r.size > max_mib * 1024 * 1024 {
         return Err(ResolveError::BadRelease("size is outside the supported artifact limit"));
     }
     if !is_server_artifact(r) {
@@ -94,6 +103,7 @@ pub(crate) fn is_server_artifact(release: &AgentRelease) -> bool {
         && release.url.strip_prefix("/v1/edge/agent-artifacts/") == Some(release.id.as_str())
 }
 
+#[derive(Clone, Copy)]
 pub struct ArtifactAccess<'a> {
     pub origin: &'a str,
     pub device_token: &'a str,
@@ -126,7 +136,13 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 /// `<home>/agents/<agent>/releases/<sha256>/<binary name>`。按摘要分目录，换版本不覆盖旧缓存，
 /// 旧版本缓存留着也没关系（S1 不做清理）。
 fn cache_path(home: &Path, agent: &str, release: &AgentRelease) -> PathBuf {
-    let name = if release.os == "win32" { format!("{agent}.exe") } else { agent.to_string() };
+    let name = if crate::desktop_bundle::Bundle::manages(agent) {
+        format!("{agent}.dmg")
+    } else if release.os == "win32" {
+        format!("{agent}.exe")
+    } else {
+        agent.to_string()
+    };
     home.join("agents").join(agent).join("releases").join(&release.sha256).join(name)
 }
 
@@ -135,9 +151,21 @@ fn cache_path(home: &Path, agent: &str, release: &AgentRelease) -> PathBuf {
 /// 真正要用它启动时 `resolve` 一定会再做一次完整的 `verify`。
 pub fn cached(home: &Path, releases: &[AgentRelease], agent: &str, os: &str, arch: &str) -> Option<(String, bool)> {
     let release = select(releases, agent, os, arch).ok()?;
-    let path = cache_path(home, agent, release);
-    let cached = std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == release.size);
-    Some((release.version.clone(), cached))
+    Some((release.version.clone(), cache_ready(home, release)))
+}
+
+pub(crate) fn cache_ready(home: &Path, release: &AgentRelease) -> bool {
+    let path = cache_path(home, &release.agent, release);
+    let has_size = |path: &Path, size| path.symlink_metadata().is_ok_and(|meta| meta.is_file() && meta.len() == size);
+    if !has_size(&path, release.size) {
+        return false;
+    }
+    if !Bundle::manages(&release.agent) {
+        return true;
+    }
+    Bundle::for_release(release).is_some_and(|bundle| {
+        bundle.runtime.is_none_or(|engine| has_size(&claude_engine_path(&path, engine), engine.bytes))
+    })
 }
 
 /// 解析出一个已校验好的可执行文件绝对路径：命中且复核通过就直接用，否则下载。命中缓存也会重新算一遍
@@ -151,77 +179,146 @@ pub async fn resolve(
     arch: &str,
     access: Option<ArtifactAccess<'_>>,
 ) -> Result<PathBuf> {
+    resolve_with_progress(home, http, releases, agent, os, arch, access, |_| {}).await
+}
+
+pub(crate) async fn resolve_with_progress(
+    home: &Path,
+    http: &reqwest::Client,
+    releases: &[AgentRelease],
+    agent: &str,
+    os: &str,
+    arch: &str,
+    access: Option<ArtifactAccess<'_>>,
+    progress: impl Fn(ArtifactProgress),
+) -> Result<PathBuf> {
     let release = select(releases, agent, os, arch)?;
     let path = cache_path(home, agent, release);
-    if path.is_file() && verify(&path, release).is_ok() {
-        return Ok(path);
+    let engine = Bundle::for_release(release).and_then(|bundle| bundle.runtime);
+    let total_bytes = release.size + engine.map_or(0, |e| e.bytes);
+    if verify(&path, release.size, &release.sha256).is_err() {
+        let request = artifact_request(http, release, access)?;
+        download_and_verify(request, &path, release.size, &release.sha256, |downloaded_bytes, verifying| {
+            progress(ArtifactProgress { downloaded_bytes, total_bytes, verifying })
+        })
+        .await?;
     }
-    download_and_verify(http, release, &path, access).await?;
+    if let Some(engine) = engine {
+        resolve_engine(&path, release, engine, access, |received, verifying| {
+            progress(ArtifactProgress { downloaded_bytes: release.size + received, total_bytes, verifying })
+        })
+        .await?;
+    }
+    Ok(path)
+}
+
+fn claude_engine_path(bundle: &Path, engine: RuntimeBundle) -> PathBuf {
+    let version = engine.version;
+    bundle.with_file_name(format!("claude-code-{version}.tar.zst"))
+}
+
+pub(crate) async fn resolve_claude_engine(
+    home: &Path,
+    release: &AgentRelease,
+    access: Option<ArtifactAccess<'_>>,
+) -> Result<(PathBuf, RuntimeBundle)> {
+    anyhow::ensure!(release.agent == "claude-desktop", "runtime must belong to Claude Desktop");
+    validate(release)?;
+    let engine = Bundle::for_release(release)
+        .and_then(|bundle| bundle.runtime)
+        .context("missing pinned Claude Desktop runtime")?;
+    let path = resolve_engine(&cache_path(home, &release.agent, release), release, engine, access, |_, _| {}).await?;
+    Ok((path, engine))
+}
+
+async fn resolve_engine(
+    bundle: &Path,
+    release: &AgentRelease,
+    engine: RuntimeBundle,
+    access: Option<ArtifactAccess<'_>>,
+    notify: impl Fn(u64, bool),
+) -> Result<PathBuf> {
+    let path = claude_engine_path(bundle, engine);
+    if verify(&path, engine.bytes, engine.digest).is_err() {
+        let request = server_request(&format!("{}/runtime", release.url), access)?;
+        download_and_verify(request, &path, engine.bytes, engine.digest, notify).await?;
+    }
     Ok(path)
 }
 
 /// 重新计算整份文件的 SHA-256 和大小，和发行记录比对。
-fn verify(path: &Path, release: &AgentRelease) -> Result<()> {
-    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    if meta.len() != release.size {
-        bail!("cached artifact size mismatch: want {} got {}", release.size, meta.len());
+fn verify(path: &Path, bytes: u64, digest: &str) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !meta.is_file() || meta.len() != bytes {
+        bail!("cached artifact size mismatch: want {bytes} got {}", meta.len());
     }
     let mut f = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut f, &mut hasher)?;
     let got = hex(&hasher.finalize());
-    if !got.eq_ignore_ascii_case(&release.sha256) {
-        bail!("cached artifact sha256 mismatch: want {} got {got}", release.sha256);
+    if !got.eq_ignore_ascii_case(digest) {
+        bail!("cached artifact sha256 mismatch: want {digest} got {got}");
     }
     Ok(())
+}
+
+fn artifact_request(
+    http: &reqwest::Client,
+    release: &AgentRelease,
+    access: Option<ArtifactAccess<'_>>,
+) -> Result<reqwest::RequestBuilder> {
+    if is_server_artifact(release) {
+        return server_request(&release.url, access);
+    }
+    let url = reqwest::Url::parse(&release.url).context("parse approved artifact URL")?;
+    if loopback_http(&url) {
+        Ok(reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?
+            .get(url))
+    } else {
+        Ok(http.get(url))
+    }
+}
+
+fn server_request(path: &str, access: Option<ArtifactAccess<'_>>) -> Result<reqwest::RequestBuilder> {
+    let access = access.context("device credentials are required for the server cache")?;
+    let origin = crate::ipc::normalize_origin(access.origin).context("invalid OneX Server origin")?;
+    let url = reqwest::Url::parse(&format!("{origin}{path}"))?;
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(300));
+    if url.scheme() == "http" {
+        // Use the direct route for the configured HTTP control plane.
+        builder = builder.no_proxy();
+    }
+    Ok(builder.build()?.get(url).bearer_auth(access.device_token))
 }
 
 /// 下载到同目录的临时文件，边下边算摘要；大小或摘要不符就删临时文件并报错，绝不把未经校验的文件
 /// 暴露在最终路径上。校验通过后 `rename` 原子落地并加可执行权限。
 async fn download_and_verify(
-    http: &reqwest::Client,
-    release: &AgentRelease,
+    request: reqwest::RequestBuilder,
     dest: &Path,
-    access: Option<ArtifactAccess<'_>>,
+    bytes: u64,
+    digest: &str,
+    notify: impl Fn(u64, bool),
 ) -> Result<()> {
+    notify(0, false);
     let dir = dest.parent().context("artifact cache path has no parent")?;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-
-    let request = if is_server_artifact(release) {
-        let access = access.context("device credentials are required for the server cache")?;
-        let origin = crate::ipc::normalize_origin(access.origin).context("invalid OneX Server origin")?;
-        let url = reqwest::Url::parse(&format!("{origin}{}", release.url))?;
-        let mut builder = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(300));
-        if url.scheme() == "http" {
-            // Use the direct route for the configured HTTP control plane.
-            builder = builder.no_proxy();
-        }
-        builder.build()?.get(url).bearer_auth(access.device_token)
-    } else {
-        let url = reqwest::Url::parse(&release.url).context("parse approved artifact URL")?;
-        if loopback_http(&url) {
-            reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(30))
-                .build()?
-                .get(url)
-        } else {
-            http.get(url)
-        }
-    };
     let resp = request.send().await.map_err(reqwest::Error::without_url)?;
     let status = resp.status();
     if !status.is_success() {
         bail!("download failed: HTTP {status}");
     }
     if let Some(len) = resp.content_length()
-        && len != release.size
+        && len != bytes
     {
-        bail!("download size mismatch before transfer: manifest says {}, server says {len}", release.size);
+        bail!("download size mismatch before transfer: manifest says {}, server says {len}", bytes);
     }
 
     let tmp = dir.join(format!(".tmp-{}", id::new("dl")));
@@ -240,21 +337,23 @@ async fn download_and_verify(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(reqwest::Error::without_url).context("read download stream")?;
         written += chunk.len() as u64;
-        if written > release.size {
-            bail!("download exceeded manifest size {}", release.size);
+        if written > bytes {
+            bail!("download exceeded manifest size {}", bytes);
         }
         hasher.update(&chunk);
         file.write_all(&chunk).context("write downloaded artifact")?;
+        notify(written, false);
     }
+    notify(written, true);
     file.sync_all()?;
     drop(file);
 
-    if written != release.size {
-        bail!("downloaded {written} bytes, manifest says {}", release.size);
+    if written != bytes {
+        bail!("downloaded {written} bytes, manifest says {}", bytes);
     }
     let got = hex(&hasher.finalize());
-    if !got.eq_ignore_ascii_case(&release.sha256) {
-        bail!("downloaded artifact sha256 mismatch: want {}, got {got}", release.sha256);
+    if !got.eq_ignore_ascii_case(digest) {
+        bail!("downloaded artifact sha256 mismatch: want {}, got {got}", digest);
     }
     // Windows 的可执行权限不是文件属性而是文件扩展名（`.exe`）；`cache_path` 对 `win32` 已经
     // 带了 `.exe` 后缀，这里不需要额外设置任何位。
@@ -342,6 +441,66 @@ mod tests {
         task.abort();
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[tokio::test]
+    async fn claude_engine_requires_a_pinned_server_release_and_checks_its_download() {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+
+        let app = axum::Router::new().route(
+            "/v1/edge/agent-artifacts/rel_claude/runtime",
+            get(|headers: HeaderMap| async move {
+                if headers.get("authorization").and_then(|value| value.to_str().ok())
+                    != Some("Bearer fake-device-token")
+                {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                Bytes::from_static(b"not the pinned engine").into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let mut release = AgentRelease {
+            id: "rel_claude".into(),
+            agent: "claude-desktop".into(),
+            version: "6.28899.6".into(),
+            os: "darwin".into(),
+            arch: "arm64".into(),
+            url: "/v1/edge/agent-artifacts/rel_claude".into(),
+            sha256: "a1226d5e7072a713f7eab74d06d1745fc47aa57eae3ba202a103032d1329530f".into(),
+            size: 402202476,
+        };
+        let access = Some(ArtifactAccess { origin: &origin, device_token: "fake-device-token" });
+        let anonymous = resolve_claude_engine(home.path(), &release, None).await.unwrap_err();
+        assert!(anonymous.to_string().contains("device credentials"));
+        let wrong_asset = resolve_claude_engine(home.path(), &release, access).await.unwrap_err();
+        assert!(wrong_asset.to_string().contains("download size mismatch"));
+        let bundle = cache_path(home.path(), &release.agent, &release);
+        let engine = Bundle::for_release(&release).unwrap().runtime.unwrap();
+        let dest = claude_engine_path(&bundle, engine);
+        assert!(!dest.exists());
+        std::fs::File::create(bundle).unwrap().set_len(release.size).unwrap();
+        let releases = std::slice::from_ref(&release);
+        assert_eq!(
+            cached(home.path(), releases, "claude-desktop", "darwin", "arm64"),
+            Some(("6.28899.6".into(), false))
+        );
+        std::fs::File::create(dest).unwrap().set_len(engine.bytes).unwrap();
+        assert_eq!(
+            cached(home.path(), releases, "claude-desktop", "darwin", "arm64"),
+            Some(("6.28899.6".into(), true))
+        );
+
+        release.url = format!("{origin}/v1/edge/agent-artifacts/rel_claude");
+        assert_eq!(
+            resolve_claude_engine(home.path(), &release, access).await.unwrap_err().downcast::<ResolveError>().unwrap(),
+            ResolveError::BadRelease("unsupported agent")
+        );
+        task.abort();
+    }
+
     async fn serve(body: Vec<u8>, hits: Arc<Mutex<u32>>) -> String {
         let app = axum::Router::new().route(
             "/claude",
@@ -366,7 +525,31 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let http = reqwest::Client::new();
 
-        let p1 = resolve(home.path(), &http, &[rel.clone()], "claude-code", "darwin", "arm64", None).await.unwrap();
+        let updates = Mutex::new(Vec::new());
+        let p1 = resolve_with_progress(
+            home.path(),
+            &http,
+            &[rel.clone()],
+            "claude-code",
+            "darwin",
+            "arm64",
+            None,
+            |progress| {
+                updates.lock().unwrap().push(progress);
+            },
+        )
+        .await
+        .unwrap();
+        let updates = updates.into_inner().unwrap();
+        assert_eq!(updates.first().map(|progress| progress.downloaded_bytes), Some(0));
+        assert_eq!(
+            updates.last().copied(),
+            Some(ArtifactProgress {
+                downloaded_bytes: body.len() as u64,
+                total_bytes: body.len() as u64,
+                verifying: true,
+            })
+        );
         assert_eq!(std::fs::read(&p1).unwrap(), body);
         #[cfg(unix)]
         {

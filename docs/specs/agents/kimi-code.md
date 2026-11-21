@@ -18,7 +18,7 @@ Agent→router 是 **Anthropic Messages**，入口 `/v1/messages`，认证来自
 
 原生对话取受管 `$KIMI_CODE_HOME/sessions/.../session_<uuid>/agents/<agent>/wire.jsonl`，并以 `state.json` 验证 native session、cwd 和目录归属；原生 ID 只作来源，不覆盖可信 launch 主体。依据：`contracts/poc-01/kimi-transcript.md:3-25`；`edge/src/lifecycle/session_history.rs:60-120,190,522`。2.2.0 wire 1.5 的契约不是 2.3.0 所有记录都兼容的证明。
 
-对 `agent.message.appended` 只取公开 user/assistant 消息；以 `context.append_loop_event` 的 `tool.call`、`tool.result` 配对工具；原始 call ID 加 native session 与 agent 域。忽略已识别的流片、context 重放和压缩快照，未知形状显式报缺口。按文件偏移读完整行，记录来源、原生时间、稳定事件 ID；截断与 ID 冲突不覆盖已收记录。事件、游标、outbox 同事务，重启/重传不重发模型请求；只有同一主体重新登录才可补传。模型观察单列用量，不从 prompt token 反推轮数。依据：同契约 `:25-49`。
+富记录优先采用 `agent.message.appended` 的公开消息。对只写原生 wire 1.5 的 CLI，使用 `turn.prompt` 中标记为用户的输入，并按轮合并 `context.append_loop_event` 中 `content.part` 的公开 text。逐文件持久保存未完成轮次和偏移，跳过上下文注入与思考部分，避免富记录重复计数。以 `context.append_loop_event` 的 `tool.call`、`tool.result` 配对工具；原始 call ID 加 native session 与 agent 域。忽略已识别的流片、context 重放和压缩快照，未知形状显式报缺口。按文件偏移读完整行，记录来源、原生时间、稳定事件 ID；截断与 ID 冲突不覆盖已收记录。事件、游标、outbox 同事务，重启/重传不重发模型请求；只有同一主体重新登录才可补传。模型观察单列用量，不从 prompt token 反推轮数。依据：同契约 `:25-49`。
 
 运行前登记身份和私有 home，以 PTY 承载交互；独立心跳，不让控制 RPC 等待前台输出。实际退出以 daemon 持有的进程状态、退出码、清理结果为准，断管不自动重启。正常退出后同 cwd、正确历史锁且为纯聊天会话，可用 `--session <原生ID>` 续聊；旧会话存在保存任务时不自动恢复，避免重放有副作用的工作；清理未知或占用时不得显式续入。同 `edge/src/lifecycle/session_history.rs:303-309,325-378,500`；`docs/reports/c-si-bus-poc-20261025/windows-kimi-daemon-lost-20261027.md:7-21`。
 

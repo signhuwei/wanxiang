@@ -7,7 +7,7 @@
 //! Agent——主 Agent 和子 Agent——各一份）。只有 `metadata.protocol_version` 为 `"1.5"` 才按
 //! 本模块的字段读；不是就记 gap，不能按 1.5 的字段去猜别的版本。
 //!
-//! 公开发言和工具事件只来自两种记录：
+//! 富记录和原生记录采用以下来源：
 //! - `agent.message.appended`：真实路径是 `message.message.{role,content}`（不是
 //!   `message.{role,content}`，外面还包一层 `message`/`meta`）。`role` 为 `user`/`assistant`
 //!   生成发言；`tool` 是压缩/重放产生的副本（和 `context.append_loop_event` 的 `tool.result`
@@ -19,6 +19,8 @@
 //!   `toolCallId`/`name`/`args`/`uuid`；为 `tool.result` 读
 //!   `toolCallId`/`result.{output,note,isError}`/`parentUuid`；`step.begin`/`step.end`/
 //!   `content.part` 是循环内部记录，静默跳过。
+//! - 仅写原生 wire 的 CLI 通过 `turn.prompt` 提供公开用户输入，通过 `content.part` 的 text 部分提供公开回答。
+//!   按 promptId 与归一化消息去重；未完成轮次和文件偏移同事务持久化，允许分批读取及重启续采。
 //! - `context.apply_compaction`：生成 `compact`，带 `summary`。
 //!
 //! 已知忽略清单（IGNORED_TOP_LEVEL_TYPES）：已识别、明确不生成事件也不记 gap 的顶层记录类型，
@@ -206,10 +208,12 @@ impl Capture {
             events.push(self.gap(agent_id, "file_replaced", None, offset));
             offset = 0;
             cur["protocol"] = Value::Null;
+            cur["native_turn"] = Value::Null;
         } else if meta.len() < offset {
             events.push(self.gap(agent_id, "file_truncated", None, offset));
             offset = 0;
             cur["protocol"] = Value::Null;
+            cur["native_turn"] = Value::Null;
         }
         cur["ino"] = identity.into();
         if meta.len() == offset {
@@ -292,6 +296,16 @@ impl Capture {
             out.push(self.gap(agent_id, "protocol_unsupported", Self::record_time(&v), offset));
             return;
         }
+        if cur["protocol"] == "1.5" {
+            if ty == "agent.message.appended"
+                && cur["native_turn"]["user_emitted"] == true
+                && v["message"]["message"]["role"] == "user"
+                && v["message"]["meta"]["promptId"] == cur["native_turn"]["id"]
+            {
+                return;
+            }
+            self.native_turn(&v, ty, agent_id, offset, cur, out);
+        }
         if IGNORED_TOP_LEVEL_TYPES.contains(&ty) {
             return;
         }
@@ -310,6 +324,110 @@ impl Capture {
                 offset,
             )),
         }
+    }
+
+    // Some wire-1.5 writers emit only native turn records. A writer can also include normalized
+    // agent.message.appended records. Prefer the latter when present and emit each side once.
+    fn native_turn(
+        &self,
+        v: &Value,
+        ty: &str,
+        agent_id: Option<&str>,
+        offset: u64,
+        cur: &mut Value,
+        out: &mut Vec<Value>,
+    ) {
+        if ty == "turn.prompt" {
+            self.finish_native_turn(&mut cur["native_turn"], agent_id, out);
+            let Some(id) = v["promptId"].as_str() else { return };
+            if v["origin"]["kind"] != "user" {
+                return;
+            }
+            let (content, _) = public_text(&v["input"]);
+            let mut payload = self.common(&json!({"uuid":id}), agent_id);
+            payload["content"] = content.clone().into();
+            let user =
+                (!content.is_empty()).then(|| self.base("user_message", payload, Self::record_time(v), Some(offset)));
+            cur["native_turn"] = json!({"id":id,"user":user,"text":"","rich_assistant":false});
+            return;
+        }
+        let turn = &mut cur["native_turn"];
+        if !turn.is_object() {
+            return;
+        }
+        match ty {
+            "agent.message.appended" => {
+                let m = &v["message"]["message"];
+                match m["role"].as_str() {
+                    Some("user") if v["message"]["meta"]["promptId"] == turn["id"] => {
+                        turn["user"] = Value::Null;
+                    }
+                    Some("assistant") if !public_text(&m["content"]).0.is_empty() => {
+                        turn["rich_assistant"] = true.into();
+                        turn["text"] = "".into();
+                    }
+                    _ => {}
+                }
+            }
+            "llm.request" => {
+                turn["model"] = v["model"].clone();
+            }
+            "context.append_loop_event" => {
+                let event = &v["event"];
+                if event["type"] == "step.begin" && !turn["user"].is_null() {
+                    out.push(turn["user"].take());
+                    turn["user_emitted"] = true.into();
+                }
+                let part = &event["part"];
+                if event["type"] != "content.part" || part["type"] != "text" || turn["rich_assistant"] == true {
+                    return;
+                }
+                let Some(chunk) = part["text"].as_str() else {
+                    return;
+                };
+                if turn["at"].is_null() {
+                    turn["at"] = v["time"].clone();
+                    turn["offset"] = offset.into();
+                    turn["uuid"] = event["uuid"].clone();
+                }
+                if let Value::String(text) = &mut turn["text"] {
+                    // Limit an unfinished turn stored in the durable per-file cursor.
+                    let room = (256usize * 1024).saturating_sub(text.len());
+                    let mut end = room.min(chunk.len());
+                    while !chunk.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.push_str(&chunk[..end]);
+                    if end != chunk.len() {
+                        turn["truncated"] = true.into();
+                    }
+                }
+            }
+            "prompt.completed" if v["promptId"] == turn["id"] => {
+                self.finish_native_turn(turn, agent_id, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_native_turn(&self, slot: &mut Value, agent_id: Option<&str>, out: &mut Vec<Value>) {
+        let mut turn = slot.take();
+        if !turn.is_object() {
+            return;
+        }
+        if !turn["user"].is_null() {
+            out.push(turn["user"].take());
+        }
+        if turn["rich_assistant"] == true || turn["text"].as_str().is_none_or(str::is_empty) {
+            return;
+        }
+        let mut p = self.common(&json!({"uuid":turn["uuid"]}), agent_id);
+        p["content"] = turn["text"].take();
+        p["model"] = turn["model"].take();
+        if turn["truncated"] == true {
+            p["truncated"] = true.into();
+        }
+        out.push(self.base("assistant_message", p, turn["at"].as_i64(), turn["offset"].as_u64()));
     }
 
     fn message(&self, v: &Value, agent_id: Option<&str>, offset: u64, out: &mut Vec<Value>) {
@@ -409,6 +527,12 @@ impl Capture {
         if cur["ended"] == true {
             return Ok(());
         }
+        let mut events = Vec::new();
+        if let Some(files) = cur["files"].as_object_mut() {
+            for (id, file) in files {
+                self.finish_native_turn(&mut file["native_turn"], (id != "main").then_some(id.as_str()), &mut events);
+            }
+        }
         cur["ended"] = true.into();
         let reason = match exit_code {
             Some(0) => "exited".to_string(),
@@ -421,7 +545,8 @@ impl Capture {
             None,
             None,
         );
-        self.outbox.append_events_with_cursor(vec![ev], &self.key, &cur)
+        events.push(ev);
+        self.outbox.append_events_with_cursor(events, &self.key, &cur)
     }
 }
 
@@ -648,6 +773,29 @@ mod tests {
     fn tool_result(parent_uuid: &str, call_id: &str, output: &str) -> Value {
         json!({"type":"context.append_loop_event","time":1,
             "event":{"type":"tool.result","parentUuid":parent_uuid,"toolCallId":call_id,"result":{"output":output}}})
+    }
+
+    #[test]
+    fn native_only_turns_survive_chunk_boundaries_and_ignore_context_injection() {
+        let e = env();
+        e.line("main", METADATA_1_5.parse().unwrap());
+        e.line("main",json!({"type":"turn.prompt","promptId":"p","origin":{"kind":"user"},"time":1000,"input":[{"type":"text","text":"question"}]}));
+        e.line("main",json!({"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"private injection"}]}}));
+        e.line("main", json!({"type":"context.append_loop_event","event":{"type":"step.begin"}}));
+        e.cap.pass().unwrap();
+        e.line("main",json!({"type":"agent.message.appended","message":{"meta":{"promptId":"p"},"message":{"role":"user","content":"question"}}}));
+        for (kind, text) in [("text", "hello"), ("thinking", "private reasoning"), ("text", " world")] {
+            e.line("main",json!({"type":"context.append_loop_event","time":2000,"event":{"type":"content.part","uuid":"part1","part":{"type":kind,"text":text}}}));
+        }
+        e.cap.pass().unwrap();
+        e.line("main", json!({"type":"prompt.completed","promptId":"p"}));
+        e.cap.pass().unwrap();
+        e.cap.pass().unwrap();
+        assert_eq!(e.kinds(), ["session_start", "user_message", "assistant_message"]);
+        let events = e.events();
+        assert_eq!(events[1]["payload"]["content"], "question");
+        assert_eq!(events[2]["payload"]["content"], "hello world");
+        assert_eq!(events[2]["at"], crate::pricing::format_ms(2000));
     }
 
     /// 真实 wire 1.5 合成样本（126 行，`tests/fixtures/kimi-wire/observed-1.5.synthetic.jsonl`，

@@ -162,8 +162,12 @@ async fn env() -> Env {
 
     let state = Arc::new(State::default());
     *state.config.write().unwrap() = ConfigSnapshot {
+        tools: vec![],
         agent_cache: false,
         revision: 1,
+        capability_contract: None,
+        policy: None,
+        policy_blocked: false,
         agents: vec![],
         routes: vec![Route {
             model: "*".into(),
@@ -420,7 +424,7 @@ async fn reconnect_after_both_links_drop(outage: Duration) {
     let count = timeout(T, async {
         loop {
             let total = e.outbox.last_seq();
-            if total >= 5 {
+            if total >= 4 {
                 break total;
             }
             sleep(Duration::from_millis(5)).await;
@@ -428,7 +432,7 @@ async fn reconnect_after_both_links_drop(outage: Duration) {
     })
     .await
     .expect("missing event or usage");
-    assert_eq!(count, 5); // one event, two successes and two failed attempts across the outage
+    assert_eq!(count, 4); // one event, two successes and one transmitted request which cannot be retried
     let mut replayed = Vec::new();
     timeout(T, async {
         while replayed.len() < count as usize {
@@ -445,8 +449,8 @@ async fn reconnect_after_both_links_drop(outage: Duration) {
     assert_eq!(replayed[0]["payload"]["content"], "before outage");
     assert_eq!(replayed[1]["cost_milli"], 15);
     assert_eq!(replayed[2]["cost_milli"], 0);
-    assert_eq!(replayed[3]["cost_milli"], 0);
-    assert_eq!(replayed[4]["cost_milli"], 15);
+    assert_eq!(replayed[2]["complete"], false);
+    assert_eq!(replayed[3]["cost_milli"], 15);
 
     peer.send(json!({"type":"events_ack","ack_seq":count})).await;
     timeout(T, async {

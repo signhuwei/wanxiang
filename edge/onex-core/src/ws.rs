@@ -36,6 +36,7 @@ pub enum Msg {
     LeaseRequest(LeaseRequest),
     DiagResult(DiagResult),
     AgentState(AgentState),
+    ConfigApplied(ConfigApplied),
 
     /// 不认识的 type。新版 Server 加消息时旧 Edge 不至于断线。
     #[serde(other)]
@@ -54,6 +55,18 @@ pub struct ErrorBody {
 pub struct Hello {
     #[serde(default)]
     pub agent_cache: bool,
+    #[serde(default)]
+    pub capability_contract_v1: bool,
+    #[serde(default)]
+    pub capability_policy_v2: bool,
+    #[serde(default)]
+    pub policy_runtime_v1: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mac_desktop_v1: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub codex_desktop_v1: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claude_desktop_v1: bool,
     pub id: String,
     pub edge_version: String,
     pub os: String,
@@ -88,12 +101,156 @@ pub struct Config {
     pub agent_cache: bool,
     pub id: String,
     pub revision: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_contract: Option<CapabilityContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<Policy>,
     #[serde(default)]
     pub routes: Vec<Route>,
     #[serde(default)]
     pub agents: Vec<AgentRelease>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolRelease>,
     #[serde(default)]
     pub rates: Vec<Rate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRelease {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub kind: String,
+    pub agents: Vec<String>,
+    pub os: Option<String>,
+    pub arch: Option<String>,
+    pub entrypoint: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityContract {
+    pub platform_revision: u64,
+    pub tenant_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyScopeRevision {
+    pub id: String,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyDisplayItem {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyNotice {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub at: String,
+    pub policy_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BalanceMode {
+    Normal,
+    Warn,
+    Restricted,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BalanceAlias {
+    pub model: String,
+    pub protocol: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BalanceRouting {
+    pub mode: BalanceMode,
+    pub aliases: Vec<BalanceAlias>,
+}
+
+/// Whitelisted, non-executable projection shared with the local status API.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicySummary {
+    pub abi: u32,
+    pub tenant_id: String,
+    pub user_id: String,
+    pub device_id: String,
+    pub policy_revision: u64,
+    pub platform_revision: u64,
+    pub tenant_revision: Option<u64>,
+    pub groups: Vec<PolicyScopeRevision>,
+    pub member: Option<PolicyScopeRevision>,
+    pub display: Vec<PolicyDisplayItem>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicySecret {
+    pub provider_id: String,
+    pub key_id: String,
+    pub nonce: String,
+    pub ciphertext: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeRules {
+    #[serde(rename = "model.max_output_tokens")]
+    pub max_output: Option<u64>,
+    #[serde(rename = "rate.member_rpm")]
+    pub requests_per_minute: Option<u64>,
+    #[serde(rename = "rate.member_tpm")]
+    pub tokens_per_minute: Option<u64>,
+    #[serde(rename = "rate.member_concurrent")]
+    pub member_concurrent: Option<u64>,
+    #[serde(rename = "rate.key_concurrent")]
+    pub key_concurrent: Option<u64>,
+    #[serde(rename = "network.public")]
+    pub public_egress: Option<bool>,
+    #[serde(rename = "route.failover")]
+    pub failover: bool,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct Policy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commerce_plan_id: Option<String>,
+    #[serde(flatten)]
+    pub summary: PolicySummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<BalanceRouting>,
+    pub notices: Vec<PolicyNotice>,
+    pub secrets: Vec<PolicySecret>,
+}
+
+impl std::fmt::Debug for Policy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Policy")
+            .field("policy_revision", &self.summary.policy_revision)
+            .field("keys", &self.secrets.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigApplied {
+    pub id: String,
+    pub config_revision: i64,
+    pub policy_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +326,10 @@ pub struct Lease {
     pub lease_id: String,
     pub expires_at: String,
     pub budget_milli: i64,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_budgets: std::collections::BTreeMap<String, i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commerce_plan_id: Option<String>,
     pub seq: u64,
 }
 
@@ -263,6 +424,8 @@ pub struct LeaseRenew {
     pub lease_id: String,
     /// 这个租约的累计已用额度（绝对值）
     pub used_milli: i64,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_used_milli: std::collections::BTreeMap<String, i64>,
 }
 
 /// 没有租约时申请新租约（v0.13）。Server 按签发规则回 `lease` 或 `cutoff`，不缓存结果，同一 `op_id` 可重发。
@@ -301,7 +464,18 @@ mod tests {
             "config_revision":12,"lease_id":"lse_1","outbox_last_seq":4810}),
         )
         .unwrap();
-        assert!(matches!(hello, Msg::Hello(Hello { outbox_last_seq: 4810, .. })));
+        assert!(matches!(
+            hello,
+            Msg::Hello(Hello { outbox_last_seq: 4810, codex_desktop_v1: false, claude_desktop_v1: false, .. })
+        ));
+        let mut wire = serde_json::to_value(hello).unwrap();
+        assert!(wire.get("codex_desktop_v1").is_none());
+        assert!(wire.get("claude_desktop_v1").is_none());
+
+        wire["claude_desktop_v1"] = json!(true);
+        let claude_hello: Msg = serde_json::from_value(wire).unwrap();
+        assert!(matches!(claude_hello, Msg::Hello(Hello { claude_desktop_v1: true, .. })));
+        assert_eq!(serde_json::to_value(claude_hello).unwrap()["claude_desktop_v1"], true);
 
         let welcome: Msg = serde_json::from_value(
             json!({"type":"welcome","re":"m1","device_id":"dev_1","user_id":"usr_1","tenant_id":"ten_1",

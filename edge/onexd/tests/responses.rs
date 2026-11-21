@@ -201,6 +201,8 @@ fn grant(state: &State, id: &str, seq: u64, budget: i64, ttl_ms: i64) {
     state
         .lease
         .grant(&Lease {
+            model_budgets: Default::default(),
+            commerce_plan_id: None,
             id: format!("m_{id}"),
             re: None,
             lease_id: id.into(),
@@ -219,8 +221,12 @@ async fn env_with(protocol: &str) -> Env {
     let upstream = Upstream::start().await;
     let state = Arc::new(State::default());
     *state.config.write().unwrap() = ConfigSnapshot {
+        tools: vec![],
         agent_cache: false,
         revision: 1,
+        capability_contract: None,
+        policy: None,
+        policy_blocked: false,
         agents: vec![],
         routes: vec![Route {
             model: "codex-model".into(),
@@ -493,6 +499,8 @@ async fn budget_exhausted_rejects_before_upstream() {
     env.state
         .lease
         .grant(&Lease {
+            model_budgets: Default::default(),
+            commerce_plan_id: None,
             id: "m_lse_2".into(),
             re: None,
             lease_id: "lse_2".into(),
@@ -527,16 +535,53 @@ async fn both_streaming_paths_stop_before_terminal_usage_and_charge_observed_out
 }
 
 #[tokio::test]
-async fn managed_codex_forces_stateless_native_requests() {
+async fn managed_codex_prefers_native_route_for_same_alias_and_disables_store() {
     let mut env = env_with("openai_responses").await;
+    {
+        let mut config = env.state.config.write().unwrap();
+        let chat = Route {
+            protocol: "openai_chat".into(),
+            model_id: "mdl_chat".into(),
+            provider_id: "prv_chat".into(),
+            ..config.routes[0].clone()
+        };
+        config.routes.insert(0, chat);
+        config.rates.push(Rate { model_id: "mdl_chat".into(), ..rate() });
+        config.capability_contract =
+            Some(onex_core::ws::CapabilityContract { platform_revision: 1, tenant_revision: 2 });
+        config.agents.push(onex_core::ws::AgentRelease {
+            id: "rel_codex".into(),
+            agent: "codex".into(),
+            version: "0.1.0".into(),
+            os: onex_core::ipc::os_name().into(),
+            arch: onex_core::ipc::arch_name().into(),
+            url: "https://example.invalid/codex".into(),
+            sha256: "0".repeat(64),
+            size: 1,
+        });
+    }
+    env.state.secrets.write().unwrap().insert("prv_chat".into(), KEY.into());
     env.state.launch_tokens.write().unwrap().insert(
         "managed-token".into(),
         onexd::state::LaunchBinding {
+            approved_model: None,
             session_id: "managed-session".into(),
             agent: "codex".into(),
+            release_id: Some("rel_codex".into()),
             first_native_session: None,
         },
     );
+    let wrong_endpoint = env
+        .http
+        .post(env.url.replace("/v1/responses", "/v1/messages"))
+        .bearer_auth("managed-token")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_endpoint.status(), StatusCode::FORBIDDEN);
+    assert_eq!(env.calls(), 0);
+
     let response = env
         .http
         .post(&env.url)
@@ -550,19 +595,52 @@ async fn managed_codex_forces_stateless_native_requests() {
     assert_eq!(response.status(), StatusCode::OK);
     response.bytes().await.unwrap();
     assert_eq!(env.upstream.seen.lock().unwrap().body.as_ref().unwrap()["store"], false);
-    assert_eq!(env.usage().await.session_id.as_deref(), Some("managed-session"));
+    let usage = env.usage().await;
+    assert_eq!(usage.provider_id, "prv_1");
+    assert_eq!(usage.session_id.as_deref(), Some("managed-session"));
+
+    let request = || {
+        env.http.post(&env.url).bearer_auth("managed-token").json(&json!({
+            "model":"codex-model","instructions":"scenario:native","input":"hi"
+        }))
+    };
+    let routes = std::mem::take(&mut env.state.config.write().unwrap().routes);
+    let no_model = request().send().await.unwrap();
+    assert_eq!(no_model.status(), StatusCode::NOT_FOUND);
+    {
+        let mut config = env.state.config.write().unwrap();
+        config.routes = routes;
+        config.agents.clear();
+    }
+    let no_release = request().send().await.unwrap();
+    assert_eq!(no_release.status(), StatusCode::FORBIDDEN);
+    assert_eq!(no_release.json::<Value>().await.unwrap()["error"]["code"], "agent_not_allowed");
+    assert_eq!(env.calls(), 1, "revocation takes effect before accessing the upstream");
 }
 
 #[tokio::test]
 async fn desktop_chat_uses_launch_binding_and_preserves_chat_tools() {
     let mut env = env_with("openai_chat").await;
+    {
+        let mut config = env.state.config.write().unwrap();
+        let responses = Route {
+            protocol: "openai_responses".into(),
+            model_id: "mdl_responses".into(),
+            provider_id: "prv_responses".into(),
+            ..config.routes[0].clone()
+        };
+        config.routes[0].model = "codex-*".into();
+        config.routes.insert(0, responses);
+    }
     let chat = env.url.replace("/v1/responses", "/v1/chat/completions");
     let launch_token = "desktop-launch-token";
     env.state.launch_tokens.write().unwrap().insert(
         launch_token.into(),
         onexd::state::LaunchBinding {
+            approved_model: None,
             session_id: "desktop-session".into(),
             agent: "deepseek-desktop".into(),
+            release_id: None,
             first_native_session: None,
         },
     );

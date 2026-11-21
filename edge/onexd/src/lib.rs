@@ -1,8 +1,14 @@
 pub mod capture;
 pub mod chat;
+mod claude_desktop;
 mod codex_capture;
+#[doc(hidden)]
+pub mod codex_desktop;
 mod codex_launch;
 pub mod credentials;
+mod desktop_bundle;
+mod desktop_launch;
+pub mod desktop_sessions;
 mod diagnostics;
 pub mod id;
 pub mod ipc;
@@ -15,10 +21,17 @@ pub mod lease;
 pub mod managed_runtime;
 mod native_capture;
 pub mod outbox;
+mod policy;
 pub mod pricing;
 mod responses;
 pub mod router;
+mod runtime_gate;
 pub mod secret;
 pub mod sse;
 pub mod state;
+mod tools;
+mod workbuddy_capture;
+#[doc(hidden)]
+pub mod workbuddy_hook;
+mod workbuddy_turns;
 pub mod ws;

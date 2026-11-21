@@ -1,0 +1,4 @@
+[
+  {"name":"claude-sonnet-5-5","labelOverride":"OneX Claude Sonnet 5.5"},
+  {"name":"sonnet5.5","labelOverride":"OneX Claude Sonnet 5.5","behavesAs":"claude-sonnet-5-5","anthropicFamilyTier":"sonnet"}
+]

@@ -188,7 +188,9 @@ Apple Silicon Edge 在 hello 中声明 `agent_cache: true` 与 `mac_desktop_v1: 
 
 原厂 DeepSeek Cordis 适配器使用 `POST /v1/onex/desktop/ready` 标记本机适配器就绪。每次模型请求由 `POST /v1/onex/desktop/session` 携带本次私有启动凭据以及 `{native_id,bind_model:true,records:[]}` 换取有效期 60 秒、单次使用的会话模型凭据。适配器先按原生历史头核对工作区、真实 SID 及来源。上传公开记录时传 `bind_model:false`，以原生序号推进游标。上游计量与原生消息使用同一 OneX 会话编号，撤销启动立即丢弃其待用凭据。
 
-WorkBuddy 的待验适配器为每次启动签发两个独立的本机凭据。受管 Hook 核对工作区、任务 SID 和厂商轮次号后，用控制端 Bearer 调用 `POST /v1/onex/workbuddy/turn` 提交 `{native_id,generation_id,event}`。`UserPromptSubmit` 登记映射，`Stop` 关闭映射。模型端携带独立凭据（Bearer 或厂商原生 `x-api-key`）和唯一的 `X-Conversation-Request-ID` 调用 Chat。一个已登记轮次可以有多笔模型请求，每笔费用归到对应原生会话。缺少映射、轮次归属冲突、头重复、轮次结束或设备退出时拒绝调用。原厂 `custom-local:` 模型名前缀在检查合约前还原。上游只接收路由指定的认证。该候选的真实桌面验收和启用状态以精确发行清单为准。
+WorkBuddy 的待验适配器为每次启动签发两个独立的本机凭据。受管 Hook 核对工作区、任务 SID 和厂商轮次号后，用控制端 Bearer 调用 `POST /v1/onex/workbuddy/turn` 提交 `{native_id,generation_id,event}`。`UserPromptSubmit` 另带 `source:{project,cwd}`，只有当前私有 profile 中已核验的原生记录来源可以登记。相同轮次归属发生冲突时封闭该轮。重复的 `Stop` 幂等，关闭后拒绝该轮的新模型请求。模型端携带独立凭据（Bearer 或厂商原生 `x-api-key`）和唯一的 `X-Conversation-Request-ID` 调用 Chat。一个已登记轮次可以有多笔模型请求，每笔费用归到对应原生会话。缺少映射、轮次归属冲突、头重复、轮次结束或设备退出时拒绝调用。原厂 `custom-local:` 模型名前缀在检查合约前还原。上游只接收路由指定的认证。该候选的真实桌面验收和启用状态以精确发行清单为准。
+
+Hook 根据原厂 `transcript_path` 取得私有 profile 内项目目录的单段名称，使用核对过的工作区绝对路径。Edge 按设备和 profile 记住 SID、项目目录和工作区，核对 `projects/<project>/<SID>.jsonl` 逐行的原生 SID 与工作区。仅回流普通用户或助手已经完成的可见正文。退出及冷重开仍使用同一来源索引，完整行的字节偏移和事件原子提交，同一行只计入一次。回流记录与该原生任务的模型费用共用同一个 OneX 会话编号。
 
 Codex Desktop 使用公开 App Server 的 thread 和 turn ID。私有启动控制端将 `{session:{thread_id,turn_id},started}` POST 到 `/v1/onex/desktop/codex-turn`。原生 Responses 请求携带模型凭据和 `x-codex-turn-metadata`，注册映射、真实线程 ID、轮次 ID 和本次分配的模型须一致。冷恢复使用同一原生 thread 派生 OneX 会话编号。归属冲突或发行从合约中移除时，请求在占用租约前被拒绝。
 

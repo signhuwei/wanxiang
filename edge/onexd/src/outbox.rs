@@ -239,6 +239,15 @@ impl Outbox {
         Ok(v)
     }
 
+    pub fn model_usage_cost_for_lease(&self, lease: &str, model: &str) -> Result<i64> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT coalesce(sum(json_extract(item,'$.cost_milli')),0) FROM outbox WHERE kind='usage'
+             AND json_extract(item,'$.lease_id')=?1 AND json_extract(item,'$.model_id')=?2",
+            [lease, model],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn last_seq(&self) -> u64 {
         *self.last_seq_tx.borrow()
     }
@@ -261,8 +270,27 @@ impl Outbox {
 
     /// 在一个事务里写入一批事件并推进游标：要么都提交，要么都不提交。
     pub fn append_events_with_cursor(&self, items: Vec<Value>, key: &str, cursor: &Value) -> Result<()> {
+        self.append_if_cursor(items, key, cursor, None).map(|_| ())
+    }
+
+    /// A JSON null expectation means no prior cursor. A stale reader leaves both events and cursor untouched.
+    pub(crate) fn append_if_cursor(
+        &self,
+        items: Vec<Value>,
+        key: &str,
+        cursor: &Value,
+        expected: Option<&Value>,
+    ) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(expected) = expected {
+            let saved: Option<String> =
+                tx.query_row("SELECT v FROM cursors WHERE k = ?1", [key], |r| r.get(0)).optional()?;
+            let saved = saved.map(|text| serde_json::from_str::<Value>(&text)).transpose()?.unwrap_or(Value::Null);
+            if saved != *expected {
+                return Ok(false);
+            }
+        }
         let mut seq = meta(&tx, "last_seq")?;
         for mut item in items {
             seq += 1;
@@ -280,7 +308,7 @@ impl Outbox {
         tx.commit()?;
         drop(conn);
         self.last_seq_tx.send_replace(seq);
-        Ok(())
+        Ok(true)
     }
 }
 

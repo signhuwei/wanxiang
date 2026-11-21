@@ -35,6 +35,28 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    let operation = args.next();
+    if operation.as_deref() == Some(std::ffi::OsStr::new("workbuddy-hook")) {
+        let policy = args.next().map(PathBuf::from).context("missing WorkBuddy hook policy")?;
+        anyhow::ensure!(args.next().is_none(), "unexpected WorkBuddy hook arguments");
+        if onexd::workbuddy_hook::notify(&policy).await.is_err() {
+            eprintln!("OneX could not verify the native WorkBuddy turn");
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
+    if operation.as_deref() == Some(std::ffi::OsStr::new("codex-desktop-app-server")) {
+        let code = match onexd::codex_desktop::app_server(args.collect()).await {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("OneX Codex Desktop bridge: {error}");
+                1
+            }
+        };
+        // Tokio's stdin reader may be waiting on the GUI after the signed child exits.
+        std::process::exit(code);
+    }
     let home = home_dir()?;
     create_private_dir(&home)?;
     let started_at = time::OffsetDateTime::now_utc();

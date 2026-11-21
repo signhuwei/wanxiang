@@ -28,3 +28,12 @@ OneX 只发布自有 profile：同目录独占临时写、同步、原子替换�
 - 待实测：两平台的官方包当前可得性与资格；新建/归档/多窗口冷恢复；控制面断开后有效租约内继续对话；流中断、过期、崩溃、睡眠后写锁与 ACK 恢复；关 GUI 后无未确认即标成功的清理。开发、工具子进程和个人 profile 不得泄露渠道凭据。本文只核对静态证据，未运行 Desktop、服务或模型。
 
 
+
+
+## OneX macOS ARM64 原厂验收
+
+既有 S3 冲刺已用同一发行和内网上游 Qwen3.8-27B 联调，重开窗口以及重启 onexd 后均恢复原任务。5 次用户输入、5 次回复和 5 笔完整用量落在同一会话，真实上游共结算 0.050 块橡皮。该次测试使用本地独立 OneX Server 和租户，记录见 `b9fcf08` 的 `HANDOFF.md`。
+
+2026-11-21 在只读挂载的官方 0.2.1-rc.3 DMG 核对整包 SHA-256、Apple 深度签名、Team ID 和 CDHash。Edge 通过厂商 Cordis `llm/stream`、`sessionPersistence` 和公开的 `LocalCredentialProvider` 接入。每次原生调用取得单次本地凭据，厂商连接身份和其他凭据仍由原生隔离 profile 保存。
+
+在 `edge` 下设置 `ONEX_DEEPSEEK_QA_BUNDLE` 为该应用的完整路径后，运行 `cargo test -p onexd --lib original_gui_restores_native_session_and_settles_each_turn -- --ignored`。该显式真机用例分两次打开签名的原厂进程，通过其公开的 SessionController 提交输入，并恢复同一原生 SID。实测两轮合计 6 个输入 token 和 4 个输出 token。OneX Router 为每轮计入 0.007 块橡皮，归到同一测试租约。持久 outbox 中仅一个会话开始事件、两次原生输入和两次原生回复。上游为本机流式 Chat 测试服务。通过的精确发行在 `server/src/desktop-qualifications.json` 中登记。

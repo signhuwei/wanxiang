@@ -193,6 +193,7 @@ async fn handshake_headers_and_hello() {
     let hello = p.handshake(0, 15000).await;
     assert_eq!(hello["outbox_last_seq"], 1);
     assert_eq!(hello["config_revision"], 0);
+    assert_eq!(hello["capability_contract_v1"], true);
     assert!(hello["os"].is_string() && hello["arch"].is_string());
 
     wait_phase(&edge.state, Phase::Connected).await;
@@ -440,16 +441,26 @@ async fn config_applied_and_acked_and_stale_ignored() {
     let rate = json!({"model_id":"mdl_1","input_milli_per_mtok":1,"output_milli_per_mtok":2,"cache_read_milli_per_mtok":0,"cache_write_milli_per_mtok":0});
     let release = json!({"id":"rel_1","agent":"claude-code","version":"2.1.311","os":"darwin","arch":"arm64",
         "url":"https://example.invalid/claude","sha256":"0".repeat(64),"size":42});
-    p.send(json!({"type":"config","id":"c1","revision":5,"routes":[route],"agents":[release],"rates":[rate]})).await;
+    let capability = json!({"platform_revision":2,"tenant_revision":3});
+    p.send(json!({"type":"config","id":"c1","revision":5,"capability_contract":capability,
+        "routes":[route],"agents":[release],"rates":[rate]}))
+        .await;
     let a = p.recv_skip_ping().await;
     assert_eq!(a, json!({"type":"ack","re":"c1","ok":true}));
     assert_eq!(edge.state.config_revision(), 5);
     assert_eq!(edge.state.config.read().unwrap().rates[0].output_milli_per_mtok, 2);
 
-    p.send(json!({"type":"config","id":"c2","revision":4,"routes":[]})).await;
+    p.send(
+        json!({"type":"config","id":"c2","revision":4,"capability_contract":{"platform_revision":9,"tenant_revision":0},
+        "routes":[]}),
+    )
+    .await;
     assert_eq!(p.recv_skip_ping().await["re"], "c2");
+    p.send(json!({"type":"config","id":"replay","revision":5,"routes":[]})).await;
+    assert_eq!(p.recv_skip_ping().await["re"], "replay");
     let cfg = edge.state.config.read().unwrap().clone();
     assert_eq!((cfg.revision, cfg.routes.len()), (5, 1));
+    assert_eq!(serde_json::to_value(cfg.capability_contract).unwrap(), capability);
     assert_eq!(cfg.agents[0].id, "rel_1");
     assert_eq!(cfg.agents[0].size, 42);
     drop(cfg);
@@ -458,6 +469,20 @@ async fn config_applied_and_acked_and_stale_ignored() {
     drop(p);
     let mut p = srv.accept().await;
     assert_eq!(p.handshake(0, 15000).await["config_revision"], 5);
+    p.send(json!({"type":"config","id":"invalid","revision":6,"capability_contract":{"platform_revision":0,"tenant_revision":0}})).await;
+    assert_eq!(p.recv_skip_ping().await["error"]["code"], "invalid");
+    assert_eq!(edge.state.config_revision(), 5);
+
+    p.send(json!({"type":"config","id":"revoke","revision":6,"capability_contract":{"platform_revision":3,"tenant_revision":0},
+        "routes":[],"agents":[],"rates":[]})).await;
+    assert_eq!(p.recv_skip_ping().await, json!({"type":"ack","re":"revoke","ok":true}));
+    let cfg = edge.state.config.read().unwrap().clone();
+    assert_eq!(cfg.capability_contract.unwrap().tenant_revision, 0);
+    assert!(cfg.routes.is_empty() && cfg.agents.is_empty() && cfg.rates.is_empty());
+
+    p.send(json!({"type":"config","id":"legacy","revision":7,"routes":[]})).await;
+    assert_eq!(p.recv_skip_ping().await["re"], "legacy");
+    assert!(edge.state.config.read().unwrap().capability_contract.is_none());
 }
 
 #[tokio::test]
@@ -780,4 +805,109 @@ async fn cancel_closes_connection() {
             other => panic!("expected close, got {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn v2_policy_is_applied_atomically_and_proved_only_for_current_identity() {
+    let server = FakeServer::start().await;
+    let edge = start_edge(&server.url, Some("t"));
+    let Some(mut key) = server_encrypt(&edge.state.device_key.public_b64(), "prv_1", "edge-fixture") else {
+        eprintln!("bun not available; skipped");
+        return;
+    };
+    key["provider_id"] = json!("prv_1");
+    let mut peer = server.accept().await;
+    let hello = peer.handshake(0, 15000).await;
+    assert_eq!(hello["capability_policy_v2"], true);
+    let config = json!({
+        "type": "config", "id": "initial", "revision": 4, "agent_cache": true,
+        "routes": [{"model":"allowed","model_id":"mdl_1","provider_id":"prv_1","protocol":"anthropic","base_url":"https://upstream.example"}],
+        "rates": [{"model_id":"mdl_1","input_milli_per_mtok":20,"output_milli_per_mtok":25,
+            "cache_read_milli_per_mtok":0,"cache_write_milli_per_mtok":0}],
+        "agents": [],
+        "policy": {
+            "abi":1,"tenant_id":"ten_1","user_id":"usr_1","device_id":"dev_1","policy_revision":7,"platform_revision":3,
+            "tenant_revision":null,"groups":[],"member":null,
+            "balance":{"mode":"restricted","aliases":[{"model":"original-*","protocol":"anthropic"}]},
+            "display":[{"id":"lease.budget","title":"单设备租约额度","kind":"money_milli","value":2125}],
+            "notices":[{"id":"pch_one","kind":"policy_changed","title":"能力配置已变更","at":"2026-11-21T05:44:00Z","policy_revision":7}],
+            "secrets":[key]
+        }
+    });
+    let mut wrongly_bound = config.clone();
+    wrongly_bound["policy"]["user_id"] = json!("usr_foreign");
+    peer.send(wrongly_bound).await;
+    assert_eq!(peer.recv_skip_ping().await["ok"], false);
+    assert_eq!(edge.state.config_revision(), 0);
+
+    peer.send(config.clone()).await;
+    assert_eq!(peer.recv_skip_ping().await["ok"], true);
+    let proof = peer.recv_skip_ping().await;
+    assert_eq!(proof["type"], "config_applied");
+    assert_eq!(proof["config_revision"], 4);
+    assert_eq!(proof["policy_revision"], 7);
+    {
+        let current = edge.state.config.read().unwrap();
+        let policy = current.policy.as_ref().unwrap();
+        assert_eq!(policy.notices.len(), 1);
+        assert_eq!(current.routes[0].model_id, "mdl_1");
+        assert!(edge.state.secrets.read().unwrap().is_empty());
+        assert!(!format!("{current:?}").contains("edge-fixture"));
+    }
+
+    // Stale duplicates cannot acknowledge a newly applied revision or insert notices.
+    let mut stale = config.clone();
+    stale["policy"]["notices"][0]["id"] = json!("pch_stale");
+    peer.send(stale).await;
+    assert_eq!(peer.recv_skip_ping().await["type"], "ack");
+    peer.expect_no_data(Duration::from_millis(100)).await;
+
+    let mut missing_key = config.clone();
+    missing_key["id"] = json!("missing");
+    missing_key["revision"] = json!(5);
+    missing_key["policy"]["secrets"] = json!([]);
+    peer.send(missing_key).await;
+    assert_eq!(peer.recv_skip_ping().await["ok"], false);
+    {
+        let live = edge.state.config.read().unwrap();
+        assert_eq!(live.revision, 4);
+        assert!(live.policy_blocked);
+        assert_eq!(live.policy.as_ref().unwrap().notices.len(), 1);
+    }
+    peer.send(json!({"type":"config","revision":6,"id":"downgrade","routes":[]})).await;
+    assert_eq!(peer.recv_skip_ping().await["ok"], false);
+    peer.expect_no_data(Duration::from_millis(100)).await;
+
+    let mut revoke = config.clone();
+    revoke["id"] = json!("revoked");
+    revoke["revision"] = json!(7);
+    revoke["routes"] = json!([]);
+    revoke["rates"] = json!([]);
+    revoke["policy"]["secrets"] = json!([]);
+    revoke["policy"]["balance"] = json!({"mode":"stopped","aliases":[]});
+    peer.send(revoke).await;
+    assert_eq!(peer.recv_skip_ping().await["ok"], true);
+    assert_eq!(peer.recv_skip_ping().await["config_revision"], 7);
+    {
+        let current = edge.state.config.read().unwrap();
+        assert!(current.routes.is_empty());
+        assert!(!current.policy_blocked);
+        assert_eq!(current.policy.as_ref().unwrap().notices.len(), 1);
+    }
+
+    peer.send(json!({"type":"cutoff","id":"wallet-empty","reason":"balance"})).await;
+    assert_eq!(peer.recv_skip_ping().await["re"], "wallet-empty");
+    assert_eq!(peer.recv_skip_ping().await["type"], "lease_request");
+
+    // Restoring routes requests a lease before the usual retry interval, with the signed revision intact.
+    let mut restored = config;
+    restored["id"] = json!("restored");
+    restored["revision"] = json!(8);
+    restored["policy"]["balance"] = json!({"mode":"normal","aliases":[]});
+    peer.send(restored).await;
+    assert_eq!(peer.recv_skip_ping().await["ok"], true);
+    let proof = peer.recv_skip_ping().await;
+    assert_eq!(proof["config_revision"], 8);
+    assert_eq!(proof["policy_revision"], 7);
+    assert_eq!(peer.recv_skip_ping().await["type"], "lease_request");
 }

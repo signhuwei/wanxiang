@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! onex login <邮箱或手机号> [--invite <邀请码>] [--tenant <租户名或 id>] [--server <https://...>] [--name <设备名>]
-//! onex run <claude-code|codex|kimi-code> [--model <模型>] [--managed]   在当前目录启动指定 Agent
+//! onex run <claude-code|codex|kimi-code|deepseek-desktop|workbuddy|codex-desktop|claude-desktop> [--model <模型>] [--managed]   在当前目录启动指定 Agent
 //!   不带 --managed：用 PATH 里已安装的可执行文件（claude-code → claude，codex → codex，kimi-code → kimi）
 //!   带 --managed：由 onexd 按 Server 下发的发行目录自己选型、下载、校验、缓存后启动
 //! onex status
@@ -23,11 +23,19 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// `onex run` 支持的 agent，以及对应的可执行文件名。
-const AGENTS: &[(&str, &str)] = &[("claude-code", "claude"), ("codex", "codex"), ("kimi-code", "kimi")];
+const AGENTS: &[(&str, &str)] = &[
+    ("claude-code", "claude"),
+    ("codex", "codex"),
+    ("kimi-code", "kimi"),
+    ("deepseek-desktop", "DeepSeek Harness"),
+    ("workbuddy", "WorkBuddy"),
+    ("codex-desktop", "Codex Desktop"),
+    ("claude-desktop", "Claude Desktop"),
+];
 
 const USAGE: &str = "usage:
   onex login <邮箱或手机号> [--invite <邀请码>] [--tenant <租户>] [--server <地址>] [--name <设备名>]
-  onex run <claude-code|codex|kimi-code> [--model <模型>] [--managed]
+  onex run <claude-code|codex|kimi-code|deepseek-desktop|workbuddy|codex-desktop|claude-desktop> [--model <模型>] [--managed]
   onex status
   onex token <device_token>
   onex logout
@@ -115,13 +123,20 @@ fn parse_run_flags(args: &[String]) -> Result<(Option<String>, bool)> {
     Ok((model, managed))
 }
 
-/// Server 缓存模式直接走受管发行。旧 Server 的 Claude Code 可从 PATH 启动，`--managed` 从发行目录
+/// Server 缓存模式和能力合约直接走受管发行。旧 Server 的 Claude Code 可从 PATH 启动，`--managed` 从发行目录
 /// 自己选型、下载、校验、缓存后启动。环境完全按 onexd 给的来。
 async fn cmd_run(agent: &str, args: &[String]) -> Result<()> {
     let binary = agent_binary(agent)?;
     let (model, managed) = parse_run_flags(args)?;
-    let managed =
-        managed || agent != "claude-code" || call(&Request::Status).await?["agent_cache"].as_bool().unwrap_or(false);
+    let managed = if managed || agent != "claude-code" {
+        true
+    } else {
+        let status = call(&Request::Status).await?;
+        status["agent_cache"].as_bool().unwrap_or(false)
+            || status["capability_contract"].is_object()
+            || status["policy"].is_object()
+            || status["policy_blocked"] == true
+    };
     let env: BTreeMap<String, String> = std::env::vars().collect();
     #[cfg(windows)]
     let env = with_git_for_windows(env);
@@ -154,6 +169,9 @@ async fn cmd_run(agent: &str, args: &[String]) -> Result<()> {
     };
     let l = call(&req).await?;
     if l["ok"] != Value::Bool(true) {
+        return print_reply(l);
+    }
+    if l["desktop"] == true {
         return print_reply(l);
     }
     let launch_id = l["launch_id"].as_str().context("no launch_id")?.to_string();

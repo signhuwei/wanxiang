@@ -8,7 +8,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use onex_core::ws::{
-    Ack, Config, DiagResult, ErrorBody, Hello, LeaseRenew, LeaseRequest, Msg, PROTOCOL_VERSION, Welcome,
+    Ack, BalanceMode, Config, ConfigApplied, DiagResult, ErrorBody, Hello, LeaseRenew, LeaseRequest, Msg,
+    PROTOCOL_VERSION, Welcome,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -109,6 +110,7 @@ pub async fn run(opts: WsOptions, state: Arc<State>, outbox: Arc<Outbox>, cancel
             End::Unauthenticated => {
                 warn!("server rejected device token; waiting for a new login");
                 *state.config.write().unwrap() = ConfigSnapshot::default();
+                state.lease.set_commercial_plan(None);
                 state.secrets.write().unwrap().clear();
                 if let Err(e) = state.lease.cutoff("unauthenticated", None) {
                     warn!(error = %e, "could not persist authentication cutoff");
@@ -225,6 +227,12 @@ async fn handshake(opts: &WsOptions, state: &State, outbox: &Outbox, tx: &mut Tx
         tx,
         &Msg::Hello(Hello {
             agent_cache: true,
+            capability_contract_v1: true,
+            capability_policy_v2: true,
+            policy_runtime_v1: true,
+            mac_desktop_v1: cfg!(all(target_os = "macos", target_arch = "aarch64")),
+            codex_desktop_v1: cfg!(all(target_os = "macos", target_arch = "aarch64")),
+            claude_desktop_v1: cfg!(all(target_os = "macos", target_arch = "aarch64")),
             id: hello_id.clone(),
             edge_version: opts.edge_version.clone(),
             os: onex_core::ipc::os_name().into(),
@@ -270,6 +278,14 @@ async fn connected(
     let (tx, rx) = socket;
     if state.expected_device_id.read().unwrap().as_ref().is_some_and(|id| id != &welcome.device_id) {
         return Err(Special::Unauthenticated.into());
+    }
+    {
+        let mut config = state.config.write().unwrap();
+        if config.policy.as_ref().is_some_and(|policy| !crate::policy::matches_identity(&policy.summary, welcome)) {
+            *config = ConfigSnapshot::default();
+            state.secrets.write().unwrap().clear();
+            state.upstream.lock().unwrap().local_usage = Default::default();
+        }
     }
     {
         let mut c = state.conn.lock().unwrap();
@@ -346,8 +362,21 @@ async fn connected(
                     }
                     Msg::Config(c) => {
                         let id = c.id.clone();
-                        apply_config(state, c);
-                        send(tx, &ack_ok(id)).await?;
+                        if state.token.borrow().as_deref() != Some(token) {
+                            return Ok(());
+                        }
+                        match apply_config(state, welcome, c) {
+                            Ok(applied) => {
+                                send(tx, &ack_ok(id)).await?;
+                                if let Some(proof) = applied
+                                    && !cancel.is_cancelled()
+                                    && state.token.borrow().as_deref() == Some(token)
+                                {
+                                    send(tx, &Msg::ConfigApplied(proof)).await?;
+                                }
+                            }
+                            Err(error) => send(tx, &ack_err(id, "invalid", error)).await?,
+                        }
                     }
                     Msg::Lease(l) => {
                         let reply = match state.lease.grant(&l) {
@@ -367,7 +396,13 @@ async fn connected(
                         send(tx, &ack_ok(c.id)).await?;
                     }
                     Msg::Secret(s) => {
-                        let reply = match state.device_key.open(&s.provider_id, &s.key_id, &s.nonce, &s.ciphertext) {
+                        let standalone_secret_allowed = {
+                            let config = state.config.read().unwrap();
+                            config.policy.is_none() && !config.policy_blocked
+                        };
+                        let reply = if !standalone_secret_allowed {
+                            ack_err(s.id, "invalid", "设备策略要求密钥与快照一起下发")
+                        } else { match state.device_key.open(&s.provider_id, &s.key_id, &s.nonce, &s.ciphertext) {
                             Ok(key) => {
                                 // 明文只进内存表，不写日志
                                 state.secrets.write().unwrap().insert(s.provider_id.clone(), key.to_string());
@@ -378,7 +413,7 @@ async fn connected(
                                 warn!(provider_id = %s.provider_id, error = ?e, "secret rejected");
                                 ack_err(s.id, "invalid", "无法解密上游密钥，请重新登录 OneX 以重新注册设备")
                             }
-                        };
+                        }};
                         send(tx, &reply).await?;
                     }
                     Msg::Diag(job) if diagnostic_tasks.is_empty() => {
@@ -404,7 +439,13 @@ async fn connected(
 async fn send_renew(state: &State, tx: &mut Tx) -> Result<()> {
     if let Some(r) = state.lease.take_renew() {
         info!(lease_id = %r.lease_id, used_milli = r.used_milli, op_id = %r.op_id, "lease_renew");
-        let m = LeaseRenew { id: id::new("msg"), op_id: r.op_id, lease_id: r.lease_id, used_milli: r.used_milli };
+        let m = LeaseRenew {
+            id: id::new("msg"),
+            op_id: r.op_id,
+            lease_id: r.lease_id,
+            used_milli: r.used_milli,
+            model_used_milli: r.model_used_milli,
+        };
         send(tx, &Msg::LeaseRenew(m)).await?;
     }
     Ok(())
@@ -436,19 +477,68 @@ async fn report_ack_regression(outbox: &Outbox, tx: &mut Tx, server_ack: u64, lo
         .await
 }
 
-/// 原子替换；revision 不大于当前值时忽略。
-fn apply_config(state: &State, c: Config) {
+/// V2 activation replaces routing, rates, releases and keys in one generation.
+fn apply_config(state: &State, welcome: &Welcome, mut c: Config) -> Result<Option<ConfigApplied>, &'static str> {
     let mut cur = state.config.write().unwrap();
-    if c.revision > cur.revision {
-        info!(revision = c.revision, routes = c.routes.len(), rates = c.rates.len(), "config applied");
-        *cur = ConfigSnapshot {
-            revision: c.revision,
-            routes: c.routes,
-            rates: c.rates,
-            agents: c.agents,
-            agent_cache: c.agent_cache,
-        };
+    if c.revision <= cur.revision {
+        return Ok(None);
     }
+    let policy = if let Some(policy) = c.policy.take() {
+        if !crate::policy::matches_identity(&policy.summary, welcome) {
+            return Err("设备策略与当前登录身份不符");
+        }
+        match crate::policy::stage(state, &c, policy, cur.policy.as_ref()) {
+            Ok(applied) => Some(applied),
+            Err(error) => {
+                cur.policy_blocked = true;
+                return Err(error);
+            }
+        }
+    } else {
+        if cur.policy.is_some() || cur.policy_blocked {
+            return Err("不能以旧版配置覆盖当前设备策略");
+        }
+        if c.capability_contract.is_some_and(|contract| contract.platform_revision == 0) {
+            return Err("平台合约修订号必须大于零");
+        }
+        None
+    };
+    let proof = policy.as_ref().map(|applied| ConfigApplied {
+        id: id::new("msg"),
+        config_revision: c.revision,
+        policy_revision: applied.summary.policy_revision,
+    });
+    if proof.is_some() {
+        state.secrets.write().unwrap().clear();
+    }
+    let restored = !c.routes.is_empty()
+        && cur.policy.as_ref().and_then(|value| value.balance.as_ref()).is_some_and(|value| {
+            matches!(value.mode, BalanceMode::Restricted | BalanceMode::Stopped)
+                && (cur.routes.is_empty()
+                    || !policy
+                        .as_ref()
+                        .and_then(|value| value.balance.as_ref())
+                        .is_some_and(|next| matches!(next.mode, BalanceMode::Restricted | BalanceMode::Stopped)))
+        });
+    info!(revision = c.revision, routes = c.routes.len(), rates = c.rates.len(), "config applied");
+    let tools = if policy.is_some() { c.tools } else { Vec::new() };
+    state.lease.set_commercial_plan(policy.as_ref().and_then(|p| p.commerce_plan_id.as_deref()));
+    *cur = ConfigSnapshot {
+        revision: c.revision,
+        capability_contract: c.capability_contract,
+        policy,
+        policy_blocked: false,
+        routes: c.routes,
+        rates: c.rates,
+        agents: c.agents,
+        tools,
+        agent_cache: c.agent_cache,
+    };
+    drop(cur);
+    if restored {
+        state.lease.request_lease_now();
+    }
+    Ok(proof)
 }
 
 fn note_ack(outbox: &Outbox, ack_seq: u64) -> Result<()> {

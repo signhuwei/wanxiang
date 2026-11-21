@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::ws::{CapabilityContract, PolicyNotice, PolicySummary};
+
 pub use crate::ws::ErrorBody;
 
 pub const SOCKET_NAME: &str = "onexd.sock";
@@ -86,6 +88,10 @@ pub enum Request {
         #[serde(default)]
         exit_code: Option<i32>,
     },
+    /// Download and verify the release that this device is currently allowed to run.
+    Download {
+        agent: String,
+    },
     Shutdown,
 }
 
@@ -144,6 +150,16 @@ pub struct Status {
     pub ws: String,
     pub device_id: Option<String>,
     pub config_revision: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_contract: Option<CapabilityContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicySummary>,
+    #[serde(default)]
+    pub policy_blocked: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<PolicyNotice>,
+    #[serde(default)]
+    pub local_usage: LocalUsage,
     pub outbox_last_seq: u64,
     pub outbox_ack_seq: u64,
     pub router_addr: Option<String>,
@@ -170,4 +186,23 @@ pub struct ManagedAgent {
     pub version: String,
     /// `available`（已选型，未必已下载）、`cached`（本机已校验缓存）
     pub status: String,
+    #[serde(default)]
+    pub instance_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<ArtifactProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactProgress {
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub verifying: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LocalUsage {
+    pub cost_milli: u64,
+    pub model_duration_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }

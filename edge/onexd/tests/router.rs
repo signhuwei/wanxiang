@@ -322,8 +322,12 @@ async fn env_with(auth: UpstreamAuth, upstream_model: Option<&str>) -> Env {
     let upstream = Upstream::start().await;
     let state = Arc::new(State::default());
     *state.config.write().unwrap() = ConfigSnapshot {
+        tools: vec![],
         agent_cache: false,
         revision: 1,
+        capability_contract: None,
+        policy: None,
+        policy_blocked: false,
         agents: vec![],
         routes: vec![Route {
             model: "claude-*".into(),
@@ -366,6 +370,8 @@ fn grant(state: &State, id: &str, seq: u64, budget: i64, ttl_ms: i64) {
     state
         .lease
         .grant(&Lease {
+            model_budgets: Default::default(),
+            commerce_plan_id: None,
             id: format!("m_{id}"),
             re: None,
             lease_id: id.into(),
@@ -740,6 +746,33 @@ async fn upstream_error_status_is_passed_through() {
 }
 
 #[tokio::test]
+async fn messages_select_compatible_prefix_over_incompatible_exact_model() {
+    let mut e = env_with(UpstreamAuth::XApiKey, Some("claude-up")).await;
+    {
+        let mut config = e.state.config.write().unwrap();
+        let incompatible = Route {
+            model: "claude-sonnet-5-5".into(),
+            protocol: "openai_responses".into(),
+            model_id: "mdl_responses".into(),
+            provider_id: "prv_responses".into(),
+            ..config.routes[0].clone()
+        };
+        config.routes.insert(0, incompatible);
+    }
+    let response = e.req("normal", false).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap()["id"], "msg_up_2");
+    assert_eq!(e.usage().await.provider_id, "prv_1");
+
+    let count = e.count_req("count").send().await.unwrap();
+    assert_eq!(count.status(), StatusCode::OK);
+    assert_eq!(count.json::<Value>().await.unwrap(), json!({"input_tokens":128}));
+    let seen = e.upstream.seen.lock().unwrap();
+    assert_eq!(seen.calls, 2);
+    assert_eq!(seen.body.as_ref().unwrap()["model"], "claude-up");
+}
+
+#[tokio::test]
 async fn count_tokens_preserves_request_and_sends_no_usage() {
     let mut e = env_with(UpstreamAuth::Bearer, Some("claude-up")).await;
     // No price is needed for an upstream input-token estimate.
@@ -787,7 +820,14 @@ async fn count_tokens_enforces_access_and_requires_anthropic_upstream() {
         .json(&json!({"model":"claude-sonnet-5-5"}));
     assert_eq!(request.send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
 
-    e.state.config.write().unwrap().routes[0].protocol = "openai_chat".into();
+    {
+        let mut config = e.state.config.write().unwrap();
+        let wildcard = Route { model: "*".into(), ..config.routes[0].clone() };
+        config.routes[0].protocol = "openai_chat".into();
+        config.routes[0].model = "claude-sonnet-5-5".into();
+        config.routes.push(wildcard);
+    }
+    // Count tokens on the same route as Messages. A different Anthropic fallback could count a different model.
     assert_eq!(e.count_req("count").send().await.unwrap().status(), StatusCode::NOT_IMPLEMENTED);
 
     e.state.config.write().unwrap().routes[0].protocol = "anthropic".into();
@@ -860,7 +900,7 @@ async fn upstream_unreachable() {
 }
 
 #[tokio::test]
-async fn retries_once_when_no_response_headers_and_records_each_attempt() {
+async fn never_replays_a_transmitted_request_when_response_headers_are_lost() {
     let mut e = env().await;
     // 一个接受连接、读完请求后直接关闭、不回任何响应头的上游
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -880,16 +920,12 @@ async fn retries_once_when_no_response_headers_and_records_each_attempt() {
     e.state.config.write().unwrap().routes[0].base_url = format!("http://{addr}");
     let r = e.req("", true).send().await.unwrap();
     assert_eq!(r.status(), 502);
-    assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 2);
-    // 两次尝试各一条 usage，请求可能已到上游，标待结算
-    let a = e.usage().await;
-    let b = e.usage().await;
-    assert_ne!(a.request_id, b.request_id);
-    for u in [&a, &b] {
-        assert_eq!(u.outcome, Outcome::UpstreamError);
-        assert!(!u.usage_final);
-        assert_eq!(u.lease_id.as_deref(), Some("lse_1"));
-    }
+    assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let usage = e.usage().await;
+    assert_eq!(usage.outcome, Outcome::UpstreamError);
+    assert!(!usage.usage_final);
+    assert_eq!(usage.lease_id.as_deref(), Some("lse_1"));
+    assert!(timeout(Duration::from_millis(100), e.usage.recv()).await.is_err());
     assert_eq!(e.state.upstream.lock().unwrap().inflight, 0);
 }
 

@@ -68,15 +68,24 @@ pub struct Capture {
     s: Session,
     outbox: Arc<Outbox>,
     key: String,
+    desktop_source: Option<(PathBuf, String)>,
 }
 
 impl Capture {
     pub fn new(s: Session, outbox: Arc<Outbox>) -> Self {
         let key = format!("claude-code:{}", s.session_id);
-        Self { s, outbox, key }
+        Self { s, outbox, key, desktop_source: None }
+    }
+
+    pub(crate) fn desktop(s: Session, path: PathBuf, native: String, outbox: Arc<Outbox>) -> Self {
+        let key = format!("claude-desktop:{}", s.session_id);
+        Self { s, outbox, key, desktop_source: Some((path, native)) }
     }
 
     fn file(&self) -> Option<PathBuf> {
+        if let Some((path, _)) = &self.desktop_source {
+            return path.canonicalize().ok().filter(|resolved| resolved == path);
+        }
         // 不自己推算项目目录的转义规则，在 projects/*/ 下找
         let name = format!("{}.jsonl", self.s.session_id);
         std::fs::read_dir(self.s.config_dir.join("projects"))
@@ -95,7 +104,7 @@ impl Capture {
     pub fn pass(&self) -> Result<Pass> {
         let mut cur = self.outbox.cursor(&self.key)?.unwrap_or(json!({"started": false, "ino": null, "offset": 0}));
         let mut events = Vec::new();
-        if cur["started"] != true {
+        if cur["started"] != true && self.desktop_source.is_none() {
             let cwd_hash = hex(&Sha256::digest(self.s.cwd.to_string_lossy().as_bytes()));
             events.push(self.base(
                 "session_start",
@@ -187,7 +196,8 @@ impl Capture {
             out.push(self.gap(&format!("unknown_type:{}", truncate(ty, 40)), offset));
             return;
         }
-        if v["sessionId"].as_str() != Some(self.s.session_id.as_str()) {
+        let native = self.desktop_source.as_ref().map_or(self.s.session_id.as_str(), |(_, native)| native.as_str());
+        if v["sessionId"].as_str() != Some(native) {
             out.push(self.gap("session_mismatch", offset));
             return;
         }

@@ -25,5 +25,36 @@ try{
     await bridge.getByRole('button',{name:'启动',exact:true}).click()
     await bridge.getByRole('status').getByText(safe,{exact:true}).waitFor()
   }
-  console.log('Desktop mock：登录、启动、设置、登出及桥错误安全文案通过')
+  const workbench=await b.newPage({viewport:{width:360,height:620}})
+  await workbench.addInitScript(()=>{
+    window.__TAURI__={core:{invoke:async (_, {request})=>{
+      if(request.op==='download') window.downloadRequested=request.agent_id
+      const downloading=!!window.downloadRequested
+      return {ok:true,state:{
+        version:'test',phase:'ready',tenant:{id:'ten_demo',name:'示例租户'},connection:'connected',
+        settings:{server_origin:'https://example.invalid',hide_on_close:true},
+        local_usage:{cost_milli:2125,model_duration_ms:2000,input_tokens:12,output_tokens:34},
+        policy:{policy_revision:7,display:[{id:'lease.budget',title:'租约额度',kind:'money_milli',value:2125}]},
+        notices:[{id:'pch_test',title:'能力配置已变更',at:'2026-11-21T05:44:00Z',policy_revision:7}],
+        agents:[
+          {id:'claude-code',vendor:'Anthropic',name:'Claude Code',status:downloading?'downloading':'not_downloaded',
+            actions:downloading?[]:['download'],progress:downloading?{downloaded_bytes:15,total_bytes:30}:null},
+          {id:'codex',vendor:'OpenAI',name:'Codex',status:'running',runtime_kind:'cli',instance_count:2,actions:['launch']},
+        ],
+      }}
+    }}}
+  })
+  await workbench.goto(server.url.href)
+  await workbench.getByText('运行实例 2').waitFor()
+  await workbench.getByText('2.125',{exact:true}).waitFor()
+  await workbench.getByText('能力配置 · v7').click()
+  await workbench.getByText('2.125 块',{exact:true}).waitFor()
+  await workbench.getByRole('button',{name:'下载',exact:true}).click()
+  const progress=workbench.getByRole('progressbar',{name:'Claude Code 下载进度'})
+  assert.equal(await progress.getAttribute('value'),'15')
+  assert.equal(await progress.getAttribute('max'),'30')
+  await workbench.getByRole('button',{name:'消息列表（1）'}).click()
+  await workbench.getByText('能力配置已变更',{exact:true}).first().waitFor()
+  await workbench.getByRole('button',{name:'消息列表',exact:true}).waitFor()
+  console.log('Desktop：登录、设置、桥错误、配置消息、实例计数及下载进度通过')
 }finally{await b.close();server.stop(true)}

@@ -5,7 +5,7 @@
 //! 请求/响应形状和错误体不同：
 //! - 上游 `openai_responses`：同协议转发，只旁路解析用量，不改写请求或响应正文。
 //! - 上游 `openai_chat`：Edge 把 Responses 请求转成 Chat，再把 Chat 的响应/流译回 Responses。
-//! - 上游 `anthropic`：S2 首批不做 Responses→Messages，直接拒绝（`model_not_allowed`）。
+//! - 上游 `anthropic`：Responses 入口不做 Responses→Messages，选路时跳过。
 //!
 //! 用量口径：`input_tokens` 含缓存，计费输入 = `input_tokens − input_tokens_details.cached_tokens`；
 //! `output_tokens_details.reasoning_tokens` 只是输出的子集，不单独计费。
@@ -29,10 +29,10 @@ use crate::chat;
 use crate::id;
 use crate::lease::Block;
 use crate::outbox::now_ms;
-use crate::pricing::{cost_milli, pick_rate};
+use crate::pricing::cost_milli;
 use crate::router::{
-    MAX_UPSTREAM_BODY, Meter, Outcome, Router, Tokens, UsageRecord, block_error, header_value, read_limited,
-    response_headers, tokio_stream_from,
+    AgentProtocol, MAX_UPSTREAM_BODY, Meter, Outcome, RouteSelectionError, Router, SelectedRoute, Tokens, UsageRecord,
+    block_error, header_value, read_limited, response_headers, tokio_stream_from,
 };
 use crate::sse::{Event, Splitter};
 
@@ -52,7 +52,22 @@ pub async fn chat_completions(AxState(rt): AxState<Arc<Router>>, headers: Header
 
 async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: Wire) -> Response {
     let started = Instant::now();
-    let Ok(binding) = rt.session_for(&headers) else {
+    let binding = if wire == Wire::Responses {
+        match rt.state.desktop_sessions.codex_response(&headers).await {
+            Ok(Some(binding)) => Ok(Some(binding)),
+            Ok(None) => rt.session_for(&headers),
+            Err(()) => {
+                return err_before_headers(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "未能核对本次 Codex Desktop 原生会话和轮次。",
+                );
+            }
+        }
+    } else {
+        rt.session_for(&headers)
+    };
+    let Ok(binding) = binding else {
         return err_before_headers(
             StatusCode::UNAUTHORIZED,
             "unauthenticated",
@@ -60,8 +75,20 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
         );
     };
 
-    let desktop = binding.as_ref().is_some_and(|binding| crate::state::is_desktop_agent(&binding.agent));
-    if desktop != (wire == Wire::Chat) || (desktop && headers.contains_key("x-api-key")) {
+    let agent_protocol = binding.as_ref().and_then(|binding| AgentProtocol::for_agent(&binding.agent));
+    let workbuddy = binding.as_ref().is_some_and(|binding| binding.agent == "workbuddy");
+    // The signed WorkBuddy custom provider may use its native x-api-key spelling.
+    let rejected_key = headers.get("x-api-key").is_some_and(|key| {
+        !workbuddy
+            || headers
+                .get("authorization")
+                .is_some_and(|bearer| bearer.as_bytes().strip_prefix(b"Bearer ") != Some(key.as_bytes()))
+    });
+    let allowed = match wire {
+        Wire::Responses => agent_protocol.is_none_or(|protocol| protocol == AgentProtocol::Responses),
+        Wire::Chat => agent_protocol == Some(AgentProtocol::Chat) && !rejected_key,
+    };
+    if !allowed {
         return err_before_headers(StatusCode::FORBIDDEN, "forbidden", "这个本机令牌无权使用该模型接口。");
     }
 
@@ -71,45 +98,54 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
             return err_before_headers(StatusCode::UNPROCESSABLE_ENTITY, "invalid", "请求体不是有效的 JSON 对象。");
         }
     };
-    let managed_codex = binding.as_ref().is_some_and(|binding| binding.agent == "codex");
+    let managed_codex = agent_protocol == Some(AgentProtocol::Responses);
     let session_id = binding.as_ref().map(|binding| binding.session_id.clone());
-    let first_native_session = binding.and_then(|binding| binding.first_native_session);
-    let Some(model) = req.get("model").and_then(Value::as_str).map(str::to_owned) else {
+    let Some(model) = req.get("model").and_then(Value::as_str) else {
         return err_before_headers(StatusCode::UNPROCESSABLE_ENTITY, "invalid", "请求缺少 model 字段。");
     };
+    let model = if workbuddy { model.strip_prefix("custom-local:").unwrap_or(model) } else { model }.to_owned();
+    if binding.as_ref().and_then(|claim| claim.approved_model.as_ref()).is_some_and(|approved| approved != &model) {
+        return err_before_headers(StatusCode::FORBIDDEN, "model_not_allowed", "该会话本次请求未获准使用此模型。");
+    }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
-    let (route, rate) = {
-        let cfg = rt.state.config.read().unwrap();
-        let route = crate::router::select_route(&cfg.routes, &model).cloned();
-        let rate = route.as_ref().and_then(|r| pick_rate(&cfg.rates, &r.model_id, now_ms()).cloned());
-        (route, rate)
+    let protocol = match wire {
+        Wire::Responses => AgentProtocol::Responses,
+        Wire::Chat => AgentProtocol::Chat,
     };
-    let Some(route) = route else {
-        return err_before_headers(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            &format!("OneX 没有为模型 {model} 配置路由，请联系管理员开通，或换用已开通的模型。"),
-        );
-    };
-    let to_chat = match (wire, route.protocol.as_str()) {
-        (Wire::Chat, "openai_chat") | (Wire::Responses, "openai_responses") => false,
-        (Wire::Responses, "openai_chat") => true,
-        (Wire::Responses, "anthropic") => {
-            return err_before_headers(
-                StatusCode::FORBIDDEN,
-                "model_not_allowed",
-                "该模型的上游协议暂不支持 Codex，请联系管理员调整路由。",
-            );
-        }
-        (_, other) => {
-            return err_before_headers(
-                StatusCode::FORBIDDEN,
-                "model_not_allowed",
-                &format!("此模型接口不支持 {other} 协议的上游。"),
-            );
-        }
-    };
+    let SelectedRoute { mut route, rate, key, mut execution } =
+        match rt.route_and_rate(&model, protocol, binding.as_ref()) {
+            Ok(selection) => selection,
+            Err(RouteSelectionError::ModelNotAllowed) => {
+                return err_before_headers(StatusCode::FORBIDDEN, "model_not_allowed", "此模型已不在生效合约中。");
+            }
+            Err(RouteSelectionError::ReleaseNotAllowed) => {
+                return err_before_headers(
+                    StatusCode::FORBIDDEN,
+                    "agent_not_allowed",
+                    "此 Agent 发行已不在生效合约中。",
+                );
+            }
+            Err(RouteSelectionError::BalanceExhausted) => {
+                return err_before_headers_block(Block::Cutoff(crate::lease::CutoffReason::Balance));
+            }
+            Err(RouteSelectionError::NotFound) => {
+                return err_before_headers(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    &format!("OneX 没有为模型 {model} 配置路由，请联系管理员开通，或换用已开通的模型。"),
+                );
+            }
+            Err(RouteSelectionError::Incompatible(upstream)) => {
+                let message = match (wire, upstream.as_str()) {
+                    (Wire::Responses, "anthropic") => "该模型的上游协议暂不支持 Codex，请联系管理员调整路由。".into(),
+                    _ => format!("此模型接口不支持 {upstream} 协议的上游。"),
+                };
+                return err_before_headers(StatusCode::FORBIDDEN, "model_not_allowed", &message);
+            }
+        };
+    let first_native_session = binding.and_then(|binding| binding.first_native_session);
+    let to_chat = wire == Wire::Responses && route.protocol == "openai_chat";
     let Some(rate) = rate else {
         warn!(model = %model, model_id = %route.model_id, "no rate for model");
         return err_before_headers(
@@ -118,7 +154,7 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
             &format!("OneX 还没有收到模型 {model} 的计价配置，请稍后重试；如果持续出现，请联系管理员检查倍率表。"),
         );
     };
-    let Some(key) = rt.state.secrets.read().unwrap().get(&route.provider_id).cloned() else {
+    let Some(mut key) = key else {
         return err_before_headers(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
@@ -126,9 +162,34 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
         );
     };
 
+    let (url, client) = match execution.prepare(&rt, &mut route, &mut key, "").await {
+        Ok(v) => v,
+        Err((status, msg)) => {
+            return err_before_headers(
+                status,
+                if status == StatusCode::FORBIDDEN { "forbidden" } else { "upstream_error" },
+                msg,
+            );
+        }
+    };
+    let (input, output_fields): (&[&str], &[&str]) = match wire {
+        Wire::Responses => (&["instructions", "input", "tools"], &["max_output_tokens"]),
+        Wire::Chat => (&["messages", "tools", "functions"], &["max_completion_tokens", "max_tokens"]),
+    };
+    let est_input = crate::router::estimate_request_fields(&req, input);
+    let permit = match execution.admit(&rt, &key, est_input, &mut req, output_fields) {
+        Ok(permit) => permit,
+        Err((code, msg)) => {
+            return err_before_headers(
+                StatusCode::from_u16(code).unwrap(),
+                if code == 429 { "rate_limit" } else { "invalid" },
+                msg,
+            );
+        }
+    };
     let upstream_model = route.upstream_model.clone().unwrap_or_else(|| model.clone());
     let kinds = if to_chat { chat_tool_kinds(&req) } else { HashMap::new() };
-    let (url, out_body) = if wire == Wire::Chat {
+    let out_body = if wire == Wire::Chat {
         if !req["messages"].as_array().is_some_and(|messages| !messages.is_empty())
             || req.get("n").is_some_and(|n| !n.is_null() && n.as_u64() != Some(1))
         {
@@ -146,7 +207,7 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
         }
         req["model"] = Value::String(upstream_model.clone());
         req["store"] = false.into();
-        (chat::chat_url(&route.base_url), Bytes::from(serde_json::to_vec(&req).unwrap()))
+        Bytes::from(serde_json::to_vec(&req).unwrap())
     } else if to_chat {
         if req.get("previous_response_id").is_some_and(|value| !value.is_null()) {
             return err_before_headers(
@@ -159,11 +220,9 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
             Ok(v) => v,
             Err(msg) => return err_before_headers(StatusCode::UNPROCESSABLE_ENTITY, "invalid", &msg),
         };
-        (chat::chat_url(&route.base_url), Bytes::from(serde_json::to_vec(&chat_req).unwrap()))
+        Bytes::from(serde_json::to_vec(&chat_req).unwrap())
     } else {
-        let base = route.base_url.trim_end_matches('/');
-        let url = format!("{}/v1/responses", base.strip_suffix("/v1").unwrap_or(base));
-        let body = if upstream_model != model || managed_codex {
+        if upstream_model != model || managed_codex || execution.clamps_output() {
             req["model"] = Value::String(upstream_model.clone());
             if managed_codex {
                 req["store"] = false.into();
@@ -171,17 +230,8 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
             Bytes::from(serde_json::to_vec(&req).unwrap())
         } else {
             body
-        };
-        (url, body)
-    };
-    let client = match rt.client_for(&url, route.proxy.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(provider_id = %route.provider_id, error = %e, "bad route proxy");
-            return err_before_headers(StatusCode::BAD_GATEWAY, "internal", "OneX 路由的代理设置无效，请联系管理员。");
         }
     };
-
     let mut out_headers = HeaderMap::new();
     if !to_chat && wire == Wire::Responses {
         for name in ["content-type", "accept", "openai-beta", "user-agent"] {
@@ -191,14 +241,9 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
         }
     }
     out_headers.entry(header::CONTENT_TYPE).or_insert("application/json".parse().unwrap());
-    out_headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {key}")));
+    out_headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {}", key.as_str())));
     out_headers.insert(header::ACCEPT_ENCODING, "identity".parse().unwrap());
 
-    let (input, output_fields): (&[&str], &[&str]) = match wire {
-        Wire::Responses => (&["instructions", "input", "tools"], &["max_output_tokens"]),
-        Wire::Chat => (&["messages", "tools", "functions"], &["max_completion_tokens", "max_tokens"]),
-    };
-    let est_input = crate::router::estimate_request_fields(&req, input);
     let mut max_output = None;
     for field in output_fields {
         if let Some(value) = req.get(field).filter(|value| !value.is_null()) {
@@ -212,7 +257,7 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
             max_output = Some(tokens);
         }
     }
-    let ticket = match rt.state.lease.admit_with(|remaining| {
+    let ticket = match rt.state.lease.admit_model_with(&route.model_id, |remaining| {
         let output = max_output.unwrap_or_else(|| output_reservation(&rate, est_input, remaining));
         Meter::new(rate.clone(), output, est_input).reservation
     }) {
@@ -243,35 +288,48 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
         rec,
         meter: Meter::new(rate, 0, est_input),
         ticket: Some(ticket),
+        permit,
         started,
         output_bytes: 0,
         first_native_session,
     };
 
-    let send = client.post(&url).headers(out_headers).body(out_body).send();
-    let resp = tokio::select! {
-        r = send => r,
-        b = req_ctx.ticket().stopped() => {
-            req_ctx.rec.outcome = Outcome::Stopped(b);
-            req_ctx.finish();
-            return err_before_headers_block(b);
-        }
-    };
-    let resp = match resp {
-        Ok(r) => r,
-        Err(e) => {
-            let reached = !e.is_connect();
-            warn!(request_id = %req_ctx.rec.request_id, error = %e.without_url(), "responses upstream request failed");
-            if reached {
-                req_ctx.meter.tokens.input = est_input;
+    let mut outbound = crate::router::Outbound { client, url, headers: out_headers, body: out_body };
+    let resp = loop {
+        let resp = tokio::select! {
+            biased;
+            b = req_ctx.ticket().stopped() => {
+                req_ctx.rec.outcome = Outcome::Stopped(b);
+                req_ctx.finish();
+                return err_before_headers_block(b);
             }
-            req_ctx.rec.usage_final = !reached;
-            req_ctx.finish();
-            return err_before_headers(
-                StatusCode::BAD_GATEWAY,
-                "upstream_error",
-                "OneX 连接上游模型服务失败，请稍后重试。",
-            );
+            r = outbound.send() => r,
+        };
+        match resp {
+            Ok(r) => break r,
+            Err(e) => {
+                let reached = !e.is_connect();
+                if !reached {
+                    if let Some((provider, model)) =
+                        execution.next(&rt, &mut outbound, &mut req_ctx.permit, "", &req_ctx.rec.model).await
+                    {
+                        req_ctx.rec.provider_id = provider;
+                        req_ctx.rec.upstream_model = model;
+                        continue;
+                    }
+                }
+                warn!(request_id = %req_ctx.rec.request_id, error = %e.without_url(), "responses upstream request failed");
+                if reached {
+                    req_ctx.meter.tokens.input = est_input;
+                }
+                req_ctx.rec.usage_final = !reached;
+                req_ctx.finish();
+                return err_before_headers(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    "OneX 连接上游模型服务失败，请稍后重试。",
+                );
+            }
         }
     };
 
@@ -300,6 +358,7 @@ struct ReqCtx {
     meter: Meter,
     output_bytes: usize,
     ticket: Option<crate::lease::Ticket>,
+    permit: Option<crate::runtime_gate::Permit>,
     started: Instant,
     first_native_session: Option<tokio::sync::watch::Receiver<Option<String>>>,
 }
@@ -334,6 +393,7 @@ impl ReqCtx {
             u.inflight = u.inflight.saturating_sub(1);
             u.completed += 1;
         }
+        self.rt.note_local_usage(rec);
         self.rt.record_usage(rec.clone(), self.first_native_session.take());
     }
 
@@ -425,7 +485,7 @@ fn err_before_headers_block(b: Block) -> Response {
 
 fn error_kind(code: &str) -> &'static str {
     match code {
-        "unauthenticated" | "model_not_allowed" | "forbidden" => "permission_error",
+        "unauthenticated" | "model_not_allowed" | "agent_not_allowed" | "forbidden" => "permission_error",
         "invalid" | "not_found" => "invalid_request_error",
         _ => "api_error",
     }

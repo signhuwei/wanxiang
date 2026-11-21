@@ -27,8 +27,12 @@ async fn anthropic_client_through_chat_fake_upstream() {
     };
     let state = Arc::new(State::default());
     *state.config.write().unwrap() = ConfigSnapshot {
+        tools: vec![],
         agent_cache: false,
         revision: 1,
+        capability_contract: None,
+        policy: None,
+        policy_blocked: false,
         agents: vec![],
         routes: vec![Route {
             model: "*".into(),
@@ -51,6 +55,8 @@ async fn anthropic_client_through_chat_fake_upstream() {
     state
         .lease
         .grant(&Lease {
+            model_budgets: Default::default(),
+            commerce_plan_id: None,
             id: "m".into(),
             re: None,
             lease_id: "l".into(),

@@ -24,7 +24,7 @@
 //! 落盘用 lastgood。从 `.bak` 恢复时，已用额度取文件与 outbox 里同租约 usage 之和的较大者，不让已花的钱变回没花。
 //! 租约绑定签发时的租户；换了租户（重新登录到别的账号）时丢弃旧租约。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -136,6 +136,10 @@ pub struct Grant {
     /// 本机挂钟下的到期时间，只用于重启后恢复
     pub expires_local_ms: i64,
     pub budget_milli: i64,
+    #[serde(default)]
+    pub model_budgets: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub commerce_plan_id: Option<String>,
     pub seq: u64,
     #[serde(default)]
     pub tenant_id: Option<String>,
@@ -152,6 +156,8 @@ struct Saved {
     /// 已发出、还没收到回应的续租。Server 可能已经提交，回应之前只原样重放这一份。
     #[serde(default)]
     renew: Option<PendingRenew>,
+    #[serde(default)]
+    model_used_milli: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +165,8 @@ struct PendingRenew {
     op_id: String,
     lease_id: String,
     used_milli: i64,
+    #[serde(default)]
+    model_used_milli: BTreeMap<String, i64>,
 }
 
 const VERSION: u32 = 1;
@@ -182,6 +190,7 @@ pub struct RenewRequest {
     pub lease_id: String,
     pub used_milli: i64,
     pub op_id: String,
+    pub model_used_milli: BTreeMap<String, i64>,
 }
 
 struct StopSlot {
@@ -200,6 +209,7 @@ impl StopSlot {
 }
 
 struct Flight {
+    model_id: Option<String>,
     /// 请求开始时的预留，只占放行额度
     reserve: i64,
     /// 实时花费（含输出字节估算），只用来判断是否越过额度
@@ -237,6 +247,7 @@ struct LeaseReq {
 }
 
 struct Inner {
+    commercial_plan: Option<String>,
     saved: Saved,
     inflight: HashMap<u64, Flight>,
     next_ticket: u64,
@@ -273,6 +284,9 @@ impl Inner {
             return Some(Block::Cutoff(CutoffReason::parse(c)));
         }
         let Some(g) = &self.saved.lease else { return Some(Block::NoLease) };
+        if g.commerce_plan_id != self.commercial_plan {
+            return Some(Block::Cutoff(CutoffReason::Contract));
+        }
         if self.remaining(now).is_zero() {
             return Some(Block::Expired);
         }
@@ -330,6 +344,7 @@ impl Ledger {
             inner: Mutex::new(Inner {
                 deadline_from_wall: deadline.is_some(),
                 deadline,
+                commercial_plan: saved.lease.as_ref().and_then(|g| g.commerce_plan_id.clone()),
                 saved,
                 inflight: HashMap::new(),
                 next_ticket: 0,
@@ -362,6 +377,11 @@ impl Ledger {
         if let Some(g) = &saved.lease {
             // 落盘之后、崩溃之前结束的请求只在 outbox 里；备份恢复也可能比真实花费少。
             let recorded = outbox.usage_cost_for_lease(&g.lease_id)?;
+            for model in g.model_budgets.keys() {
+                let observed = outbox.model_usage_cost_for_lease(&g.lease_id, model)?;
+                let used = saved.model_used_milli.entry(model.clone()).or_default();
+                *used = (*used).max(observed);
+            }
             if recorded > saved.used_milli {
                 warn!(lease_id = %g.lease_id, file = saved.used_milli, outbox = recorded, "lease used_milli raised from outbox");
                 saved.used_milli = recorded;
@@ -411,6 +431,8 @@ impl Ledger {
             "cutoff_reason": i.saved.cutoff,
             "lease_id": g.map(|g| &g.lease_id),
             "budget_milli": g.map(|g| g.budget_milli),
+            "model_budgets": g.map(|g| &g.model_budgets),
+            "model_used_milli": i.saved.model_used_milli,
             "used_milli": i.saved.used_milli,
             "inflight_milli": i.committed() - i.saved.used_milli,
             "expires_at": g.map(|g| &g.expires_at),
@@ -426,17 +448,34 @@ impl Ledger {
 
     /// 放行一个新请求。剩余额度必须覆盖本次预留 `reserve`。
     pub fn admit(self: &Arc<Self>, reserve: i64) -> Result<Ticket, Block> {
-        self.admit_with(|_| reserve)
+        self.admit_model_with("", |_| reserve)
     }
 
-    pub(crate) fn admit_with(self: &Arc<Self>, reservation: impl FnOnce(i64) -> i64) -> Result<Ticket, Block> {
+    pub fn admit_model(self: &Arc<Self>, model: &str, reserve: i64) -> Result<Ticket, Block> {
+        self.admit_model_with(model, |_| reserve)
+    }
+
+    pub(crate) fn admit_model_with(
+        self: &Arc<Self>,
+        model: &str,
+        reservation: impl FnOnce(i64) -> i64,
+    ) -> Result<Ticket, Block> {
         let now = Instant::now();
         let mut i = self.inner.lock().unwrap();
         let budget = i.saved.lease.as_ref().map_or(0, |g| g.budget_milli);
         let remaining = budget.saturating_sub(i.committed()).max(0);
+        let grant = i.saved.lease.as_ref();
+        let limited = grant.and_then(|g| g.model_budgets.get(model)).copied();
+        let model_used = i.saved.model_used_milli.get(model).copied().unwrap_or(0);
+        let held: i64 = i.inflight.values().filter(|f| f.model_id.as_deref() == Some(model)).map(Flight::hold).sum();
+        let remaining =
+            limited.map_or(remaining, |n| remaining.min(n.saturating_sub(model_used).saturating_sub(held).max(0)));
         let reserve = reservation(remaining);
+        let draining = grant.is_some_and(|g| !g.model_budgets.is_empty()) && i.saved.renew.is_some();
         let blocked = i.block(now).or_else(|| {
-            if reserve > budget {
+            if draining || limited.is_some() && remaining == 0 {
+                Some(Block::Exhausted)
+            } else if reserve > budget {
                 Some(Block::TooLarge { reserve, budget })
             } else if reserve > remaining {
                 Some(Block::Exhausted)
@@ -455,14 +494,30 @@ impl Ledger {
         let id = i.next_ticket;
         i.next_ticket += 1;
         let stop = Arc::new(StopSlot { token: CancellationToken::new(), reason: Mutex::new(None) });
-        i.inflight.insert(id, Flight { reserve, gate: 0, stop: stop.clone() });
+        i.inflight
+            .insert(id, Flight { model_id: limited.map(|_| model.to_owned()), reserve, gate: 0, stop: stop.clone() });
         let lease_id = i.saved.lease.as_ref().map(|g| g.lease_id.clone());
         Ok(Ticket { id, ledger: self.clone(), stop, lease_id, seen: 0, done: false })
+    }
+
+    /// Signed commercial plan changes take effect before admitting another paid request.
+    pub fn set_commercial_plan(&self, plan: Option<&str>) {
+        let mut i = self.inner.lock().unwrap();
+        i.commercial_plan = plan.map(str::to_owned);
+        if i.saved.lease.as_ref().is_some_and(|g| g.commerce_plan_id != i.commercial_plan) {
+            i.stop_all(Block::Cutoff(CutoffReason::Contract));
+            i.renew.wanted = true;
+            self.check_renew(&i, Instant::now());
+        }
     }
 
     /// 处理 Server 的 `lease`。返回 false 表示是过时的租约，已忽略。
     /// 已结算的部分（续租快照）从 used 里扣掉，其余的花费记到新租约，包括 cutoff 之后才结束的请求。
     pub fn grant(&self, l: &Lease) -> Result<bool> {
+        anyhow::ensure!(
+            l.model_budgets.len() <= 128 && l.model_budgets.values().all(|n| *n >= 0 && *n <= l.budget_milli),
+            "invalid model allowance"
+        );
         let expires = parse_ms(&l.expires_at).with_context(|| format!("bad expires_at {:?}", l.expires_at))?;
         let mut i = self.inner.lock().unwrap();
         if l.seq <= i.saved.lease_seq {
@@ -496,11 +551,14 @@ impl Ledger {
             expires_at: l.expires_at.clone(),
             expires_local_ms: now_ms() + remaining_ms,
             budget_milli: l.budget_milli,
+            model_budgets: l.model_budgets.clone(),
+            commerce_plan_id: l.commerce_plan_id.clone(),
             seq: l.seq,
             tenant_id: i.tenant_id.clone(),
         });
         next.lease_seq = next.lease_seq.max(l.seq);
         next.used_milli = carried;
+        next.model_used_milli = l.model_budgets.keys().map(|k| (k.clone(), 0)).collect();
         next.cutoff = None;
         // 落盘失败时不改内存状态，等待中的续租快照保留，下次重放
         self.persist(&next)?;
@@ -544,6 +602,7 @@ impl Ledger {
             let settled = i.saved.renew.as_ref().map_or(0, |p| p.used_milli);
             next.lease = None;
             next.used_milli -= settled;
+            next.model_used_milli.clear();
             next.renew = None;
             i.renew.sent_at = None;
             i.renew.wanted = false;
@@ -589,6 +648,7 @@ impl Ledger {
             let mut next = i.saved.clone();
             next.lease = None;
             next.used_milli = 0;
+            next.model_used_milli.clear();
             next.renew = None;
             if let Err(e) = self.persist(&next) {
                 error!(error = %format!("{e:#}"), "persist lease state");
@@ -645,7 +705,12 @@ impl Ledger {
             None => {
                 let lease_id = i.saved.lease.as_ref()?.lease_id.clone();
                 let used = i.saved.used_milli;
-                let p = PendingRenew { op_id: format!("{lease_id}:{used}"), lease_id, used_milli: used };
+                let p = PendingRenew {
+                    op_id: format!("{lease_id}:{used}"),
+                    lease_id,
+                    used_milli: used,
+                    model_used_milli: i.saved.model_used_milli.clone(),
+                };
                 let mut next = i.saved.clone();
                 next.renew = Some(p.clone());
                 if let Err(e) = self.persist(&next) {
@@ -661,7 +726,12 @@ impl Ledger {
         drop(i);
         // 让定时任务按重发时间重新排程
         self.changed.notify_one();
-        Some(RenewRequest { lease_id: p.lease_id, used_milli: p.used_milli, op_id: p.op_id })
+        Some(RenewRequest {
+            lease_id: p.lease_id,
+            used_milli: p.used_milli,
+            op_id: p.op_id,
+            model_used_milli: p.model_used_milli,
+        })
     }
 
     pub fn subscribe_renew(&self) -> watch::Receiver<u64> {
@@ -769,7 +839,7 @@ impl Ledger {
 
     fn renew_due(&self, i: &Inner, now: Instant) -> bool {
         let Some(g) = &i.saved.lease else { return false };
-        if i.renew.parked {
+        if i.renew.parked || !g.model_budgets.is_empty() && !i.inflight.is_empty() {
             return false;
         }
         if i.saved.renew.is_some() {
@@ -805,7 +875,17 @@ impl Ledger {
         if let Some(f) = i.inflight.get_mut(&id) {
             f.gate = gate;
         }
-        let over = i.saved.lease.as_ref().is_some_and(|g| i.gate_total() > g.budget_milli);
+        let model = i.inflight.get(&id).and_then(|f| f.model_id.as_deref());
+        let over = i.saved.lease.as_ref().is_some_and(|g| {
+            i.gate_total() > g.budget_milli
+                || model.is_some_and(|key| {
+                    let live: i64 =
+                        i.inflight.values().filter(|f| f.model_id.as_deref() == Some(key)).map(|f| f.gate).sum();
+                    g.model_budgets
+                        .get(key)
+                        .is_some_and(|cap| live.saturating_add(*i.saved.model_used_milli.get(key).unwrap_or(&0)) > *cap)
+                })
+        });
         if over {
             i.renew.wanted = true;
             if let Some(f) = i.inflight.get(&id) {
@@ -818,10 +898,13 @@ impl Ledger {
 
     fn release(&self, id: u64, cost: i64) {
         let mut i = self.inner.lock().unwrap();
-        if i.inflight.remove(&id).is_none() {
+        let Some(flight) = i.inflight.remove(&id) else {
             return;
-        }
+        };
         let mut next = i.saved.clone();
+        if let Some(id) = flight.model_id {
+            *next.model_used_milli.entry(id).or_default() += cost;
+        }
         next.used_milli += cost;
         if let Err(e) = self.persist(&next) {
             // 内存里照样记账，下次成功落盘或重启时从 outbox 补回。
@@ -894,6 +977,8 @@ mod tests {
             lease_id: id.into(),
             expires_at: format_ms(now_ms() + ttl_ms),
             budget_milli: budget,
+            model_budgets: Default::default(),
+            commerce_plan_id: None,
             seq,
         }
     }
@@ -904,6 +989,38 @@ mod tests {
 
     fn renew(l: &Ledger) -> Option<(String, i64)> {
         l.take_renew().map(|r| (r.lease_id, r.used_milli))
+    }
+
+    #[test]
+    fn capped_models_hold_budget_offline_and_freeze_counters_during_renewal() {
+        let ledger = ledger();
+        let mut first = lease("l1", 1, 100, 600_000);
+        first.commerce_plan_id = Some("cmp_one".into());
+        first.model_budgets = [("limited".into(), 25), ("blocked".into(), 0)].into_iter().collect();
+        ledger.set_commercial_plan(Some("cmp_one"));
+        ledger.grant(&first).unwrap();
+        ledger.on_disconnected();
+        let ticket = ledger.admit_model("limited", 20).unwrap();
+        assert_eq!(ledger.admit_model("limited", 6).err(), Some(Block::Exhausted));
+        assert_eq!(ledger.admit_model("blocked", 0).err(), Some(Block::Exhausted));
+        ledger.admit_model("free", 50).unwrap().finish(45);
+        ledger.set_commercial_plan(Some("cmp_two"));
+        assert!(ledger.take_renew().is_none());
+        ticket.finish(16);
+        let report = ledger.take_renew().unwrap();
+        assert_eq!(report.used_milli, 61);
+        assert_eq!(report.model_used_milli["limited"], 16);
+        assert_eq!(report.model_used_milli["blocked"], 0);
+        assert!(ledger.admit_model("free", 1).is_err());
+        ledger.on_connected();
+        assert_eq!(ledger.take_renew().unwrap().model_used_milli, report.model_used_milli);
+        let mut next = lease("l2", 2, 50, 600_000);
+        next.commerce_plan_id = Some("cmp_two".into());
+        next.model_budgets.insert("limited".into(), 9);
+        ledger.grant(&next).unwrap();
+        assert_eq!(ledger.admit_model("limited", 10).err(), Some(Block::Exhausted));
+        ledger.admit_model("limited", 9).unwrap().finish(9);
+        assert!(ledger.admit_model("limited", 0).is_err());
     }
 
     #[test]

@@ -340,8 +340,12 @@ async fn env_with_base(base: impl FnOnce(SocketAddr) -> String) -> Env {
     let up = Upstream::start().await;
     let state = Arc::new(State::default());
     *state.config.write().unwrap() = ConfigSnapshot {
+        tools: vec![],
         agent_cache: false,
         revision: 1,
+        capability_contract: None,
+        policy: None,
+        policy_blocked: false,
         agents: vec![],
         routes: vec![Route {
             model: "local-m".into(),
@@ -366,6 +370,8 @@ async fn env_with_base(base: impl FnOnce(SocketAddr) -> String) -> Env {
     state
         .lease
         .grant(&Lease {
+            model_budgets: Default::default(),
+            commerce_plan_id: None,
             id: "m".into(),
             re: None,
             lease_id: "lse_1".into(),

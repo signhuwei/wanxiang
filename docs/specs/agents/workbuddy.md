@@ -27,3 +27,24 @@ SIMA 没有可安全原地改写的个人 `models.json`：原生 GUI 会重建�
 - 待实测：目标版本厂商登录、个人 profile 指纹不变、首次 GUI 冷开、审批拒绝后续聊、并行 SID 不串话、异常退出后补传、更新后重新验桥。用两平台官方包分别验证 GUI 和真上游；本文未运行服务、GUI 或模型。
 
 
+
+
+## OneX 既有验收与本次合约换代
+
+OneX 的 `feat/s3-macos-native-desktop` 已在 Apple Silicon 的 5.3.8 原厂窗口验证限定模型菜单、收起个人模型编辑、原任务冷恢复和真实内网 Qwen3.8-27B 上游。原任务两轮回答 247、240，四次模型调用合计 0.096 块。该冲刺的实现与记录见 `5b6628b`、`2f58518` 和该分支的 `HANDOFF.md`。
+
+v2 沿用同一 OneX Router 语义。通过本机模型入口，WorkBuddy 仅能使用合约明确列出的模型名，通配路由只开放其固定上游名。余额降档可将已获准的名称路由到合约指定的低成本模型。每次转发重新查设备的生效合约及本轮获准的模型名，未授权请求在扣费前返回 403。
+
+腾讯企业控制台可按部门或成员限定可用模型，并控制成员添加个人模型的权限。原厂界面验收须覆盖成员身份的模型菜单和个人模型编辑。当前适配器从生效合约生成私有 profile 的模型列表，登录进程单独直连。S3 的原厂菜单验收使用另一套私有接口。公开 Hook 路径仍须在签名的 5.3.8 中证实双任务归属和成员菜单策略，发行表保留待验状态。[腾讯企业模型管理](https://cloud.tencent.com/document/product/1831/134418)
+
+## OneX 对公开接口的核验
+
+腾讯的桌面文档列出了第三方模型的服务地址、API Key 和模型名，也列出了 Hook 插件。原厂 5.3.5 的发行说明已记录插件 Hook 支持。[桌面模型配置](https://www.workbuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/Model) · [桌面插件系统](https://www.workbuddy.cn/docs/workbuddy/Plugins) · [发行说明](https://www.workbuddy.cn/docs/workbuddy/Changelog)
+
+腾讯 CodeBuddy 的 ACP 文档公开了轮次关联机制。普通提示进入历史后，原生记录中的 `providerData.conversationRequestId` 与模型 HTTP 头 `X-Conversation-Request-ID` 可用于精确比对。Hook 文档将 `generation_id` 定义为可选字段，并说明它在有轮次 ID 时可与之对应。验收需在目标桌面发行中用两个原生任务分别核对 Hook 的 SID、轮次 ID、实际 HTTP 头以及转发费用。缺字段、重复绑定或无法归属的调用须拒绝；同一轮可合法产生多次模型请求，计费依然按每次请求记录。[ACP 客户端轮次 ID](https://www.codebuddy.cn/docs/cli/acp) · [Hook 参考指南](https://www.workbuddy.cn/docs/cli/hooks)
+
+企业开放平台的托管 Agent 会话 ID、ACP 元数据及本地助理消息接口各有自己的协议边界。关联桌面自定义模型请求所需的证据，应来自受测桌面发行实际发出的 HTTP 请求。[开放平台 API](https://open.workbuddy.cn/docs/openapi) · [ACP 扩展字段说明](https://cloud.tencent.com/document/product/1831/137025)
+
+OneX 已在 Apple Silicon 复核 5.3.8 官方 DMG 的完整字节数、SHA-256、应用标识、Team ID 和 CDHash。可在 `edge` 设置 `ONEX_WORKBUDDY_QA_DMG` 为原包路径、`ONEX_WORKBUDDY_QA_BUNDLE` 为从该包只读挂载的应用路径，运行 `cargo test -p onexd --lib original_workbuddy_container_and_apple_signature_match_manifest -- --ignored`。该测试单独报告原包身份，桌面请求归属和上线资格另按上述实测结果登记。
+
+v2 已迁入 S3 的 JSONL 可见消息筛选规则，读取来源改由公开 Hook 按真实任务登记。设备侧测试使用临时隔离目录中的原厂格式记录，覆盖两任务内容和用量归属一致、部分行续读、重复采集、冷恢复和拒绝符号链接。运行 `cargo test -p onexd --lib workbuddy` 可独立复验。这些测试使用本机合成输入，原厂发行资格仍待前述实证。

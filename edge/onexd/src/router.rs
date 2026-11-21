@@ -14,11 +14,13 @@ use axum::extract::{DefaultBodyLimit, State as AxState};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use onex_core::ws::{Rate, Route, UpstreamAuth};
+use onex_core::ws::{BalanceMode, BalanceRouting, Rate, Route, UpstreamAuth};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 pub use crate::pricing::Tokens;
 
@@ -26,7 +28,7 @@ use crate::lease::{Block, CutoffReason, Ticket};
 use crate::outbox::now_ms;
 use crate::pricing::{cost_milli, estimate_tokens, format_ms, pick_rate};
 use crate::sse::{Event, Splitter};
-use crate::state::State;
+use crate::state::{ConfigSnapshot, State};
 use crate::{chat, id};
 
 /// Claude Code 带图片和长上下文时请求体可达数十 MB。
@@ -34,6 +36,239 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_UPSTREAM_BODY: usize = 64 * 1024 * 1024;
 const MVP_LOCAL_QWEN_PROVIDER_ID: &str = "prv_mvp_local_qwen";
 const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentProtocol {
+    Messages,
+    Responses,
+    Chat,
+}
+
+impl AgentProtocol {
+    pub(crate) fn for_agent(agent: &str) -> Option<Self> {
+        match agent {
+            "claude-code" | "kimi-code" | "claude-desktop" => Some(Self::Messages),
+            "codex" | "codex-desktop" => Some(Self::Responses),
+            "workbuddy" | "deepseek-desktop" => Some(Self::Chat),
+            _ => None,
+        }
+    }
+
+    fn upstream_priority(self, protocol: &str) -> Option<u8> {
+        match (self, protocol) {
+            (Self::Messages, "anthropic") | (Self::Responses, "openai_responses") | (Self::Chat, "openai_chat") => {
+                Some(1)
+            }
+            (Self::Messages | Self::Responses, "openai_chat") => Some(0),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn accepts_upstream(self, protocol: &str) -> bool {
+        self.upstream_priority(protocol).is_some()
+    }
+
+    pub(crate) fn select_route<'a>(self, routes: &'a [Route], model: &str) -> Option<&'a Route> {
+        select_ranked_route(routes, model, |route| self.upstream_priority(&route.protocol))
+    }
+
+    pub(crate) fn select_config_route<'a>(self, config: &'a ConfigSnapshot, model: &str) -> Option<&'a Route> {
+        self.select_route(&config.routes, model)
+            .or_else(|| self.fallback_route(&config.routes, model, config.policy.as_ref()?.balance.as_ref()?))
+    }
+
+    pub(crate) fn select_agent_route<'a>(
+        self,
+        config: &'a ConfigSnapshot,
+        model: &str,
+        agent: Option<&str>,
+    ) -> Option<&'a Route> {
+        let Some(desktop @ ("workbuddy" | "codex-desktop" | "claude-desktop")) = agent else {
+            return self.select_config_route(config, model);
+        };
+        if Self::for_agent(desktop) != Some(self) || model.contains('*') {
+            return None;
+        }
+        let selected = match desktop {
+            "workbuddy" => select_workbuddy_route(&config.routes, model),
+            "codex-desktop" => select_codex_desktop_route(&config.routes, model),
+            _ => select_claude_desktop_route(&config.routes, model),
+        };
+        selected.or_else(|| {
+            let routing = config.policy.as_ref()?.balance.as_ref()?;
+            let allowed = |protocol: &str| match desktop {
+                "claude-desktop" => protocol == "anthropic",
+                _ => self.accepts_upstream(protocol),
+            };
+            if !routing.aliases.iter().any(|alias| allowed(&alias.protocol) && alias.model == model) {
+                return None;
+            }
+            self.fallback_route(&config.routes, model, routing).filter(|route| allowed(&route.protocol))
+        })
+    }
+
+    fn fallback_route<'a>(self, routes: &'a [Route], model: &str, routing: &BalanceRouting) -> Option<&'a Route> {
+        if routing.mode != BalanceMode::Restricted
+            || !routing.aliases.iter().any(|alias| {
+                self.accepts_upstream(&alias.protocol)
+                    && (alias.model == model
+                        || alias.model.strip_suffix('*').is_some_and(|prefix| model.starts_with(prefix)))
+            })
+        {
+            return None;
+        }
+        routes
+            .iter()
+            .rev()
+            .filter(|route| route.upstream_model.as_ref().is_some_and(|name| !name.is_empty()))
+            .filter_map(|route| Some((self.upstream_priority(&route.protocol)?, route)))
+            .max_by_key(|(priority, _)| *priority)
+            .map(|(_, route)| route)
+    }
+}
+
+pub(crate) enum RouteSelectionError {
+    NotFound,
+    Incompatible(String),
+    ReleaseNotAllowed,
+    ModelNotAllowed,
+    BalanceExhausted,
+}
+
+pub(crate) struct SelectedRoute {
+    pub execution: Execution,
+    pub route: Route,
+    pub rate: Option<Rate>,
+    pub key: Option<Zeroizing<String>>,
+}
+
+pub(crate) struct Execution {
+    rules: onex_core::ws::RuntimeRules,
+    owner: (String, String),
+    revision: i64,
+    backups: Vec<(Route, Zeroizing<String>)>,
+}
+
+fn endpoint(route: &Route, path: &str) -> String {
+    let base = route.base_url.trim_end_matches('/');
+    match route.protocol.as_str() {
+        "openai_chat" => chat::chat_url(base),
+        "openai_responses" => format!("{}/v1/responses", base.strip_suffix("/v1").unwrap_or(base)),
+        _ => format!("{}{}", base.strip_suffix("/v1").unwrap_or(base), path),
+    }
+}
+
+impl Execution {
+    pub(crate) fn admit(
+        &self,
+        rt: &Router,
+        key: &str,
+        input: u64,
+        req: &mut Value,
+        fields: &[&str],
+    ) -> Result<Option<crate::runtime_gate::Permit>, (u16, &'static str)> {
+        rt.gate.admit(self.owner.clone(), &self.rules, key, input, req, fields)
+    }
+
+    pub(crate) async fn prepare(
+        &mut self,
+        rt: &Router,
+        route: &mut Route,
+        key: &mut Zeroizing<String>,
+        path: &str,
+    ) -> Result<(String, reqwest::Client), (StatusCode, &'static str)> {
+        loop {
+            if rt.state.config.read().unwrap().revision != self.revision {
+                return Err((StatusCode::CONFLICT, "OneX 策略已更新，请重新请求。"));
+            }
+            let url = endpoint(route, path);
+            if let Ok(client) = self.client(rt, &url, route.proxy.as_deref()).await {
+                if rt.state.config.read().unwrap().revision == self.revision {
+                    return Ok((url, client));
+                }
+                continue;
+            }
+            if let Some((next, secret)) = self.backups.pop() {
+                *route = next;
+                *key = secret;
+                continue;
+            }
+            return if self.rules.public_egress == Some(false) {
+                Err((StatusCode::FORBIDDEN, "合约要求私网出口，当前上游无法通过私网地址校验。"))
+            } else {
+                Err((StatusCode::BAD_GATEWAY, "OneX 路由的代理设置无效，请联系管理员。"))
+            };
+        }
+    }
+
+    pub(crate) fn clamps_output(&self) -> bool {
+        self.rules.max_output.is_some() || self.rules.tokens_per_minute.is_some()
+    }
+
+    pub(crate) async fn client(&self, rt: &Router, url: &str, proxy: Option<&str>) -> Result<reqwest::Client, String> {
+        if self.rules.public_egress == Some(false) {
+            crate::runtime_gate::restricted_client(url).await
+        } else {
+            rt.client_for(url, proxy)
+        }
+    }
+}
+
+pub(crate) struct Outbound {
+    pub client: reqwest::Client,
+    pub url: String,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+}
+
+impl Outbound {
+    pub(crate) fn send(&self) -> impl Future<Output = Result<reqwest::Response, reqwest::Error>> {
+        self.client.post(&self.url).headers(self.headers.clone()).body(self.body.clone()).send()
+    }
+}
+
+impl Execution {
+    /// Rebuild the native request with the next candidate's model and credential.
+    /// The caller invokes this only for a connect error before request transmission.
+    pub(crate) async fn next(
+        &mut self,
+        rt: &Router,
+        out: &mut Outbound,
+        permit: &mut Option<crate::runtime_gate::Permit>,
+        path: &str,
+        model: &str,
+    ) -> Option<(String, String)> {
+        while let Some((route, key)) = self.backups.pop() {
+            if rt.state.config.read().unwrap().revision != self.revision {
+                return None;
+            }
+            let url = endpoint(&route, path);
+            let Ok(client) = self.client(rt, &url, route.proxy.as_deref()).await else { continue };
+            if rt.state.config.read().unwrap().revision != self.revision {
+                return None;
+            }
+            if permit.as_mut().is_some_and(|permit| !permit.move_to(&key)) {
+                continue;
+            }
+            let upstream = route.upstream_model.unwrap_or_else(|| model.to_owned());
+            let mut body: Value = serde_json::from_slice(&out.body).ok()?;
+            body["model"] = Value::from(upstream.clone());
+            out.body = Bytes::from(serde_json::to_vec(&body).ok()?);
+            out.headers.remove(header::AUTHORIZATION);
+            out.headers.remove("x-api-key");
+            match route.auth {
+                UpstreamAuth::XApiKey => out.headers.insert("x-api-key", header_value(&key)),
+                UpstreamAuth::Bearer => {
+                    out.headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {}", key.as_str())))
+                }
+            };
+            out.url = url;
+            out.client = client;
+            return Some((route.provider_id, upstream));
+        }
+        None
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -161,6 +396,7 @@ fn is_business_error_body(v: &Value) -> bool {
 pub struct Router {
     pub(crate) state: Arc<State>,
     local_token: String,
+    gate: crate::runtime_gate::Gate,
     /// 遵从环境变量代理的默认客户端
     http: reqwest::Client,
     direct: reqwest::Client,
@@ -177,7 +413,15 @@ impl Router {
         usage_tx: mpsc::UnboundedSender<UsageRecord>,
     ) -> Arc<Self> {
         let direct = client_builder().no_proxy().build().expect("http client");
-        Arc::new(Self { state, local_token, http, direct, proxied: Mutex::default(), usage_tx })
+        Arc::new(Self {
+            state,
+            local_token,
+            http,
+            direct,
+            proxied: Mutex::default(),
+            gate: Default::default(),
+            usage_tx,
+        })
     }
 
     pub fn app(self: Arc<Self>) -> AxumRouter {
@@ -186,6 +430,16 @@ impl Router {
             .route(COUNT_TOKENS_PATH, post(messages))
             .route("/v1/responses", post(crate::responses::responses))
             .route("/v1/chat/completions", post(crate::responses::chat_completions))
+            .route(
+                "/v1/onex/desktop/codex-turn",
+                post(crate::desktop_sessions::codex_turn).layer(DefaultBodyLimit::max(4096)),
+            )
+            .route("/v1/onex/desktop/ready", post(crate::desktop_sessions::ready))
+            .route("/v1/onex/workbuddy/turn", post(crate::workbuddy_turns::observe).layer(DefaultBodyLimit::max(4096)))
+            .route(
+                "/v1/onex/desktop/session",
+                post(crate::desktop_sessions::ingest).layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
+            )
             .layer(DefaultBodyLimit::max(MAX_BODY))
             .with_state(self)
     }
@@ -198,10 +452,96 @@ impl Router {
         let token = presented.ok_or(())?;
         if token.as_bytes().ct_eq(self.local_token.as_bytes()).into() {
             return Ok(self.state.active_session.read().unwrap().clone().map(|session_id| {
-                crate::state::LaunchBinding { session_id, agent: String::new(), first_native_session: None }
+                crate::state::LaunchBinding {
+                    approved_model: None,
+                    session_id,
+                    agent: String::new(),
+                    release_id: None,
+                    first_native_session: None,
+                }
             }));
         }
-        self.state.launch_tokens.read().unwrap().get(token).cloned().map(Some).ok_or(())
+        self.state
+            .launch_tokens
+            .read()
+            .unwrap()
+            .get(token)
+            .cloned()
+            .or_else(|| self.state.desktop_sessions.model(token))
+            .or_else(|| {
+                if h.get_all("x-api-key").iter().count() > 1 || h.get_all(header::AUTHORIZATION).iter().count() > 1 {
+                    return None;
+                }
+                let mut ids = h.get_all("x-conversation-request-id").iter();
+                let generation = ids.next()?.to_str().ok()?;
+                if ids.next().is_some() {
+                    return None;
+                }
+                self.state.workbuddy_turns.resolve(token, generation)
+            })
+            .map(Some)
+            .ok_or(())
+    }
+
+    pub(crate) fn route_and_rate(
+        &self,
+        model: &str,
+        protocol: AgentProtocol,
+        binding: Option<&crate::state::LaunchBinding>,
+    ) -> Result<SelectedRoute, RouteSelectionError> {
+        let cfg = self.state.config.read().unwrap();
+        if cfg.policy_blocked
+            || ((cfg.capability_contract.is_some()
+                || cfg.policy.is_some()
+                || binding.is_some_and(|b| b.release_id.is_some() && crate::state::is_desktop_agent(&b.agent)))
+                && !binding.is_some_and(|binding| {
+                    cfg.agents.iter().any(|release| {
+                        release.agent == binding.agent && binding.release_id.as_deref() == Some(release.id.as_str())
+                    })
+                }))
+        {
+            return Err(RouteSelectionError::ReleaseNotAllowed);
+        }
+        if cfg.balance_stopped() {
+            return Err(RouteSelectionError::BalanceExhausted);
+        }
+        let agent = binding.map(|binding| binding.agent.as_str());
+        let route = protocol.select_agent_route(&cfg, model, agent).ok_or_else(|| {
+            if matches!(agent, Some("workbuddy" | "codex-desktop" | "claude-desktop")) {
+                return RouteSelectionError::ModelNotAllowed;
+            }
+            match select_route(&cfg.routes, model) {
+                Some(route) => RouteSelectionError::Incompatible(route.protocol.clone()),
+                None => RouteSelectionError::NotFound,
+            }
+        })?;
+        let rate = pick_rate(&cfg.rates, &route.model_id, now_ms()).cloned();
+        let key = match &cfg.policy {
+            Some(policy) => policy.keys.get(&route.provider_id).cloned(),
+            None => self.state.secrets.read().unwrap().get(&route.provider_id).cloned().map(Zeroizing::new),
+        };
+        let rules = cfg.policy.as_ref().map(|p| p.runtime.clone()).unwrap_or_default();
+        let owner =
+            cfg.policy.as_ref().map(|p| (p.summary.tenant_id.clone(), p.summary.user_id.clone())).unwrap_or_default();
+        let backups = cfg
+            .policy
+            .as_ref()
+            .filter(|_| rules.failover)
+            .map(|p| {
+                cfg.routes
+                    .iter()
+                    .rev()
+                    .filter(|r| {
+                        r.model_id == route.model_id
+                            && r.protocol == route.protocol
+                            && r.provider_id != route.provider_id
+                    })
+                    .filter_map(|r| Some((r.clone(), p.keys.get(&r.provider_id)?.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let execution = Execution { revision: cfg.revision, rules, owner, backups };
+        Ok(SelectedRoute { route: route.clone(), rate, key, execution })
     }
 
     /// 回环地址一律直连；`proxy` 为 `"none"` 直连，为 URL 用指定代理；不填用环境变量代理。
@@ -231,37 +571,111 @@ impl Router {
 /// 不跟随重定向：router 只能看到已选中路由的那次请求结果，3xx 要原样交给客户端处理，
 /// 不能让 reqwest 在背后换地址重发，那样既绕过了租约的同路重试限制，也无法计量中间那次尝试。
 pub fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).redirect(reqwest::redirect::Policy::none())
+    reqwest::Client::builder()
+        .retry(reqwest::retry::never())
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 /// 精确匹配优先，然后是最长前缀（`claude-*`），最后是 `*`。
 pub fn select_route<'a>(routes: &'a [Route], model: &str) -> Option<&'a Route> {
-    if let Some(r) = routes.iter().find(|r| r.model == model) {
-        return Some(r);
+    select_ranked_route(routes, model, |_| Some(0))
+}
+
+/// Match the exact name advertised by the contract for a managed WorkBuddy model.
+pub(crate) fn select_workbuddy_route<'a>(routes: &'a [Route], model: &str) -> Option<&'a Route> {
+    select_route(routes, model).filter(|route| {
+        route.protocol == "openai_chat"
+            && if route.model.contains('*') {
+                route.upstream_model.as_deref() == Some(model)
+            } else {
+                route.model == model
+            }
+    })
+}
+
+/// 忽略入口不支持的上游。相同匹配精度时优先同协议，其他并列沿用原路由顺序。
+fn select_ranked_route<'a>(
+    routes: &'a [Route],
+    model: &str,
+    priority: impl Fn(&Route) -> Option<u8>,
+) -> Option<&'a Route> {
+    let exact = routes
+        .iter()
+        .rev()
+        .filter(|route| route.model == model)
+        .filter_map(|route| Some((priority(route)?, route)))
+        .max_by_key(|(rank, _)| *rank);
+    if let Some((_, route)) = exact {
+        return Some(route);
     }
     routes
         .iter()
-        .filter_map(|r| r.model.strip_suffix('*').filter(|p| model.starts_with(p)).map(|p| (p.len(), r)))
-        .max_by_key(|(n, _)| *n)
-        .map(|(_, r)| r)
+        .rev()
+        .filter_map(|route| {
+            let prefix = route.model.strip_suffix('*').filter(|prefix| model.starts_with(prefix))?;
+            Some(((prefix.len(), priority(route)?), route))
+        })
+        .max_by_key(|(rank, _)| *rank)
+        .map(|(_, route)| route)
+}
+
+pub(crate) fn select_codex_desktop_route<'a>(routes: &'a [Route], model: &str) -> Option<&'a Route> {
+    scoped_desktop_route(routes, model, |protocol| matches!(protocol, "openai_chat" | "openai_responses"))
+}
+
+pub(crate) fn select_claude_desktop_route<'a>(routes: &'a [Route], model: &str) -> Option<&'a Route> {
+    scoped_desktop_route(routes, model, |protocol| protocol == "anthropic")
+}
+
+fn scoped_desktop_route<'a>(routes: &'a [Route], model: &str, protocol_allowed: fn(&str) -> bool) -> Option<&'a Route> {
+    let compatible = routes.iter().filter(|route| protocol_allowed(&route.protocol));
+    compatible.clone().find(|route| route.model == model).or_else(|| {
+        compatible
+            .filter_map(|route| {
+                let prefix = route.model.strip_suffix('*')?;
+                (model.starts_with(prefix) && route.upstream_model.as_deref() == Some(model))
+                    .then_some((prefix.len(), route))
+            })
+            .max_by_key(|(length, _)| *length)
+            .map(|(_, route)| route)
+    })
+}
+
+fn claude_session_id(request: &Value) -> Option<uuid::Uuid> {
+    #[derive(Deserialize)]
+    struct NativeIdentity {
+        session_id: uuid::Uuid,
+    }
+    let user_id = request["metadata"]["user_id"].as_str()?;
+    if user_id.len() > 4096 {
+        return None;
+    }
+    serde_json::from_str::<NativeIdentity>(user_id).ok().map(|identity| identity.session_id)
 }
 
 async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let started = Instant::now();
     let counts_tokens = uri.path() == COUNT_TOKENS_PATH;
-    let Ok(binding) = rt.session_for(&headers) else {
+    let claude_window = rt.state.desktop_sessions.is_claude_window(&headers);
+    let Ok(mut binding) = (if claude_window { Ok(None) } else { rt.session_for(&headers) }) else {
         return anthropic_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             "OneX 本机令牌无效。请从 OneX Desktop 重新启动这个 Agent。",
         );
     };
-    if binding.as_ref().is_some_and(|claim| crate::state::is_desktop_agent(&claim.agent)) {
-        return anthropic_error(StatusCode::FORBIDDEN, "permission_error", "这个 Agent 使用 Chat Completions 协议。");
+    if binding
+        .as_ref()
+        .and_then(|claim| AgentProtocol::for_agent(&claim.agent))
+        .is_some_and(|protocol| protocol != AgentProtocol::Messages)
+    {
+        return anthropic_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "这个本机令牌无权使用 Anthropic Messages 接口。",
+        );
     }
-    let session_id = binding.as_ref().map(|claim| claim.session_id.clone());
-    let first_native_session = binding.and_then(|claim| claim.first_native_session);
-
     let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v @ Value::Object(_)) => v,
         _ => return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", "请求体不是有效的 JSON 对象。"),
@@ -269,34 +683,65 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
     let Some(model) = req.get("model").and_then(Value::as_str).map(str::to_owned) else {
         return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", "请求缺少 model 字段。");
     };
-    let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let max_tokens = req.get("max_tokens").and_then(Value::as_u64).unwrap_or(0);
-
-    let (route, rate) = {
-        let cfg = rt.state.config.read().unwrap();
-        let route = select_route(&cfg.routes, &model).cloned();
-        let rate = route.as_ref().and_then(|r| pick_rate(&cfg.rates, &r.model_id, now_ms()).cloned());
-        (route, rate)
-    };
-    // TODO(gateway.md): 未配置路由时用哪个错误类型和状态码，等规格确定。
-    let Some(route) = route else {
-        return anthropic_error(
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            &format!("OneX 没有为模型 {model} 配置路由，请联系管理员开通，或换用已开通的模型。"),
-        );
-    };
-    let to_chat = match route.protocol.as_str() {
-        "anthropic" => false,
-        "openai_chat" => true,
-        other => {
+    if claude_window {
+        let Some(native) = claude_session_id(&req).filter(|_| !headers.contains_key("x-api-key")) else {
             return anthropic_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "api_error",
-                &format!("OneX Edge 暂不支持 {other} 协议的上游。"),
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "未能核对本次 Claude Desktop 原生会话。",
             );
+        };
+        binding = rt.state.desktop_sessions.bind_claude_window(&headers, native, &model).await;
+        if binding.is_none() {
+            return anthropic_error(StatusCode::FORBIDDEN, "permission_error", "该原生会话或模型未获得 OneX 授权。");
         }
-    };
+    }
+    let claude_desktop = binding.as_ref().filter(|claim| claim.agent == "claude-desktop");
+    if let Some(claim) = claude_desktop {
+        if !claude_window {
+            let native = rt.state.desktop_sessions.claude_native_id(&headers);
+            if headers.contains_key("x-api-key") || native.is_none() || native != claude_session_id(&req) {
+                return anthropic_error(
+                    StatusCode::FORBIDDEN,
+                    "permission_error",
+                    "未能核对本次 Claude Desktop 原生会话。",
+                );
+            }
+        }
+        if claim.approved_model.as_deref() != Some(model.as_str()) {
+            return anthropic_error(StatusCode::FORBIDDEN, "permission_error", "该模型未获当前 OneX 能力合约授权。");
+        }
+    }
+    let session_id = binding.as_ref().map(|claim| claim.session_id.clone());
+    let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+
+    let SelectedRoute { mut route, rate, key, mut execution } =
+        match rt.route_and_rate(&model, AgentProtocol::Messages, binding.as_ref()) {
+            Ok(selection) => selection,
+            Err(RouteSelectionError::ReleaseNotAllowed) => {
+                return anthropic_error(StatusCode::FORBIDDEN, "permission_error", "此 Agent 发行已不在生效合约中。");
+            }
+            Err(RouteSelectionError::ModelNotAllowed) => {
+                return anthropic_error(StatusCode::FORBIDDEN, "permission_error", "此模型已不在生效合约中。");
+            }
+            Err(RouteSelectionError::BalanceExhausted) => return block_response(Block::Cutoff(CutoffReason::Balance)),
+            Err(RouteSelectionError::NotFound) => {
+                return anthropic_error(
+                    StatusCode::NOT_FOUND,
+                    "not_found_error",
+                    &format!("OneX 没有为模型 {model} 配置路由，请联系管理员开通，或换用已开通的模型。"),
+                );
+            }
+            Err(RouteSelectionError::Incompatible(protocol)) => {
+                return anthropic_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "api_error",
+                    &format!("OneX Edge 暂不支持 {protocol} 协议的上游。"),
+                );
+            }
+        };
+    let first_native_session = binding.and_then(|claim| claim.first_native_session);
+    let to_chat = route.protocol == "openai_chat";
     if counts_tokens && to_chat {
         return anthropic_error(
             StatusCode::NOT_IMPLEMENTED,
@@ -313,7 +758,7 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
             &format!("OneX 还没有收到模型 {model} 的计价配置，请稍后重试；如果持续出现，请联系管理员检查倍率表。"),
         );
     }
-    let Some(key) = rt.state.secrets.read().unwrap().get(&route.provider_id).cloned() else {
+    let Some(mut key) = key else {
         return anthropic_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
@@ -321,8 +766,32 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         );
     };
 
+    let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path());
+    let (url, client) = match execution.prepare(&rt, &mut route, &mut key, path).await {
+        Ok(v) => v,
+        Err((status, msg)) => {
+            return anthropic_error(
+                status,
+                if status == StatusCode::FORBIDDEN { "permission_error" } else { "api_error" },
+                msg,
+            );
+        }
+    };
+    let input = estimate_input(&req);
+    let mut permit =
+        match execution.admit(&rt, &key, input, &mut req, if counts_tokens { &[] } else { &["max_tokens"] }) {
+            Ok(permit) => permit,
+            Err((code, msg)) => {
+                return anthropic_error(
+                    StatusCode::from_u16(code).unwrap(),
+                    if code == 429 { "rate_limit_error" } else { "invalid_request_error" },
+                    msg,
+                );
+            }
+        };
+    let max_tokens = req.get("max_tokens").and_then(Value::as_u64).unwrap_or(0);
     let upstream_model = route.upstream_model.clone().unwrap_or_else(|| model.clone());
-    let (url, body) = if to_chat {
+    let body = if to_chat {
         // `?beta=true` 之类的查询参数属于 Anthropic，不带给 Chat 上游。
         // MVP 本机 Qwen 的 chat template 只接受一条置于开头的 system 消息。
         let system_messages = if route.provider_id == MVP_LOCAL_QWEN_PROVIDER_ID {
@@ -334,29 +803,15 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
             Ok(v) => v,
             Err(msg) => return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg),
         };
-        (chat::chat_url(&route.base_url), Bytes::from(serde_json::to_vec(&chat_req).unwrap()))
+        Bytes::from(serde_json::to_vec(&chat_req).unwrap())
     } else {
-        let mut url = format!("{}{}", route.base_url.trim_end_matches('/'), uri.path());
-        if let Some(q) = uri.query() {
-            url.push('?');
-            url.push_str(q);
-        }
-        let body = if upstream_model != model {
+        if upstream_model != model || execution.clamps_output() {
             req["model"] = Value::String(upstream_model.clone());
             Bytes::from(serde_json::to_vec(&req).unwrap())
         } else {
             body
-        };
-        (url, body)
-    };
-    let client = match rt.client_for(&url, route.proxy.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(provider_id = %route.provider_id, error = %e, "bad route proxy");
-            return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", "OneX 路由的代理设置无效，请联系管理员。");
         }
     };
-
     // Anthropic 的请求头（anthropic-version、anthropic-beta）对 Chat 上游没有意义，不转发。
     let mut out_headers = if to_chat {
         let mut h = HeaderMap::new();
@@ -367,17 +822,20 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
     };
     match route.auth {
         UpstreamAuth::XApiKey => out_headers.insert("x-api-key", header_value(&key)),
-        UpstreamAuth::Bearer => out_headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {key}"))),
+        UpstreamAuth::Bearer => {
+            out_headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {}", key.as_str())))
+        }
     };
     // 不要压缩，才能边转发边解析 SSE。
     out_headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
 
+    let mut out = Outbound { client, url, headers: out_headers, body };
     if counts_tokens {
-        return forward_count_tokens(&rt.state.lease, client, &url, out_headers, body).await;
+        return forward_count_tokens(&rt, &mut execution, &mut permit, &mut out, path, &model).await;
     }
 
-    let meter = Meter::new(rate.expect("a message requires a rate"), max_tokens, estimate_input(&req));
-    let ticket = match rt.state.lease.admit(meter.reservation) {
+    let meter = Meter::new(rate.expect("a message requires a rate"), max_tokens, input);
+    let ticket = match rt.state.lease.admit_model(&route.model_id, meter.reservation) {
         Ok(t) => t,
         Err(b) => {
             info!(model = %model, reason = ?b, reservation_milli = meter.reservation, "request blocked by lease");
@@ -403,20 +861,21 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         duration_ms: 0,
         session_id,
     };
-    let mut req = Req { rt: rt.clone(), rec, meter, ticket, started, first_native_session };
+    let mut req = Req { rt: rt.clone(), rec, meter, ticket, started, first_native_session, permit };
 
-    // 只在没收到任何响应头时重试一次，不换路。每次尝试各记一条 usage。
+    // A connect error proves the request did not reach the upstream.
     let mut attempt = 0;
     let resp = loop {
         attempt += 1;
-        let send = client.post(&url).headers(out_headers.clone()).body(body.clone()).send();
+        let send = out.send();
         let r = tokio::select! {
-            r = send => r,
+            biased;
             b = req.ticket.stopped() => {
                 req.rec.outcome = Outcome::Stopped(b);
                 req.finish();
                 return block_response(b);
             }
+            r = send => r,
         };
         let e = match r {
             Ok(resp) => break resp,
@@ -425,12 +884,18 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         // 连不上时请求肯定没到上游，按零计；其余情况上游可能已经处理并收费，标待结算。
         let reached = !e.is_connect();
         warn!(request_id = %req.rec.request_id, provider_id = %req.rec.provider_id, attempt, reached, error = %e.without_url(), "upstream request failed");
-        if attempt >= 2 {
+        let fallback =
+            if !reached { execution.next(&rt, &mut out, &mut req.permit, path, &req.rec.model).await } else { None };
+        if reached || (fallback.is_none() && attempt >= 2) {
             req.rec.usage_final = !reached;
             req.finish();
             return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", "OneX 连接上游模型服务失败，请稍后重试。");
         }
-        req.record_failed_attempt(!reached);
+        req.record_failed_attempt(true);
+        if let Some((provider, model)) = fallback {
+            req.rec.provider_id = provider;
+            req.rec.upstream_model = model;
+        }
     };
 
     let status = resp.status();
@@ -490,20 +955,22 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
 }
 
 async fn forward_count_tokens(
-    lease: &crate::lease::Ledger,
-    client: reqwest::Client,
-    url: &str,
-    headers: HeaderMap,
-    body: Bytes,
+    rt: &Router,
+    execution: &mut Execution,
+    permit: &mut Option<crate::runtime_gate::Permit>,
+    out: &mut Outbound,
+    path: &str,
+    model: &str,
 ) -> Response {
-    let request = || client.post(url).headers(headers.clone()).body(body.clone());
     let unavailable =
         || anthropic_error(StatusCode::BAD_GATEWAY, "api_error", "OneX 连接上游模型服务失败，请稍后重试。");
-    for attempt in 1..=2 {
-        if let Err(blocked) = lease.check_access() {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        if let Err(blocked) = rt.state.lease.check_access() {
             return block_response(blocked);
         }
-        match request().send().await {
+        match out.send().await {
             Ok(response) => {
                 let status = response.status();
                 let headers = response_headers(response.headers());
@@ -513,7 +980,11 @@ async fn forward_count_tokens(
                 };
             }
             Err(error) => {
+                let connected = !error.is_connect();
                 warn!(attempt, error = %error.without_url(), "upstream token count failed");
+                if connected || (execution.next(rt, out, permit, path, model).await.is_none() && attempt >= 2) {
+                    break;
+                }
             }
         }
     }
@@ -549,6 +1020,7 @@ struct Req {
     rec: UsageRecord,
     meter: Meter,
     ticket: Ticket,
+    permit: Option<crate::runtime_gate::Permit>,
     started: Instant,
     first_native_session: Option<tokio::sync::watch::Receiver<Option<String>>>,
 }
@@ -600,7 +1072,7 @@ impl Req {
     }
 
     fn finish(self) {
-        let Req { rt, mut rec, meter, ticket, started, first_native_session } = self;
+        let Req { rt, mut rec, meter, ticket, started, first_native_session, permit: _permit } = self;
         // 用量不完整时只按已见部分计价，标 complete=false，预留绝不当作已发生的花费。
         rec.tokens = meter.final_tokens(rec.usage_final);
         rec.cost_milli = cost_milli(&meter.rate, &rec.tokens);
@@ -621,6 +1093,7 @@ impl Req {
             "request done"
         );
         rt.note_upstream(&rec);
+        rt.note_local_usage(&rec);
         {
             let mut u = rt.state.upstream.lock().unwrap();
             u.inflight = u.inflight.saturating_sub(1);
@@ -631,6 +1104,15 @@ impl Req {
 }
 
 impl Router {
+    pub(crate) fn note_local_usage(&self, usage: &UsageRecord) {
+        let mut state = self.state.upstream.lock().unwrap();
+        let total = &mut state.local_usage;
+        total.cost_milli = total.cost_milli.saturating_add(usage.cost_milli.max(0) as u64);
+        total.model_duration_ms = total.model_duration_ms.saturating_add(usage.duration_ms);
+        total.input_tokens = total.input_tokens.saturating_add(usage.tokens.input);
+        total.output_tokens = total.output_tokens.saturating_add(usage.tokens.output);
+    }
+
     pub(crate) fn record_usage(
         &self,
         mut rec: UsageRecord,
@@ -1176,6 +1658,162 @@ mod tests {
         assert_eq!(select_route(&rs, "claude-sonnet-5-5").unwrap().provider_id, "c");
         assert_eq!(select_route(&rs, "kimi-k3").unwrap().provider_id, "any");
         assert!(select_route(&rs[1..], "kimi-k3").is_none());
+    }
+
+    #[test]
+    fn restricted_routing_falls_back_only_for_previously_authorized_aliases() {
+        use onex_core::ws::BalanceAlias;
+
+        let mut fallback = route("floor", "cheap");
+        fallback.protocol = "openai_chat".into();
+        fallback.upstream_model = Some("floor-model".into());
+        let mut config = ConfigSnapshot {
+            routes: vec![fallback],
+            policy: Some(crate::state::AppliedPolicy {
+                summary: serde_json::from_value(json!({
+                    "abi": 1, "tenant_id": "ten_test", "user_id": "usr_test", "device_id": "dev_test",
+                    "policy_revision": 1, "platform_revision": 1, "groups": [], "display": []
+                }))
+                .unwrap(),
+                notices: Vec::new(),
+                keys: HashMap::new(),
+                runtime: Default::default(),
+                commerce_plan_id: None,
+                balance: Some(BalanceRouting {
+                    mode: BalanceMode::Restricted,
+                    aliases: vec![BalanceAlias { model: "claude-*".into(), protocol: "anthropic".into() }],
+                }),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            AgentProtocol::Messages
+                .select_config_route(&config, "claude-large")
+                .map(|route| route.provider_id.as_str()),
+            Some("cheap"),
+        );
+        assert!(AgentProtocol::Messages.select_config_route(&config, "unknown-model").is_none());
+        assert!(AgentProtocol::Responses.select_config_route(&config, "claude-large").is_none());
+        config.policy.as_mut().unwrap().balance.as_mut().unwrap().aliases.extend([
+            BalanceAlias { model: "large-*".into(), protocol: "openai_chat".into() },
+            BalanceAlias { model: "large-approved".into(), protocol: "openai_chat".into() },
+        ]);
+        let desktop = |name: &str| AgentProtocol::Chat.select_agent_route(&config, name, Some("workbuddy"));
+        assert_eq!(desktop("large-approved").unwrap().provider_id, "cheap");
+        assert!(desktop("large-invented").is_none());
+        config.policy.as_mut().unwrap().balance.as_mut().unwrap().mode = BalanceMode::Normal;
+        assert!(AgentProtocol::Messages.select_config_route(&config, "claude-large").is_none());
+    }
+
+    #[test]
+    fn workbuddy_routes_only_exact_names_and_fixed_wildcard_targets() {
+        let mut wildcard = route("vendor-*", "provider");
+        wildcard.protocol = "openai_chat".into();
+        wildcard.upstream_model = Some("vendor-approved".into());
+        let mut alias = wildcard.clone();
+        alias.model = "member-model".into();
+        let config = ConfigSnapshot { routes: vec![wildcard, alias], ..Default::default() };
+        let desktop = |name: &str| AgentProtocol::Chat.select_agent_route(&config, name, Some("workbuddy"));
+        assert!(desktop("member-model").is_some());
+        assert!(desktop("vendor-approved").is_some());
+        assert!(desktop("vendor-invented").is_none());
+        assert!(desktop("vendor-*").is_none());
+        assert!(AgentProtocol::Chat.select_config_route(&config, "vendor-invented").is_some());
+    }
+
+    #[tokio::test]
+    async fn managed_messages_switches_to_the_signed_backup_before_transmission_and_caps_output() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let capture = Arc::new(Mutex::new(None));
+        let seen = capture.clone();
+        let server = AxumRouter::new().route(
+            "/v1/messages",
+            post(move |h: HeaderMap, axum::Json(body): axum::Json<Value>| async move {
+                *seen.lock().unwrap() = Some((h, body));
+                axum::Json(json!({"id":"upstream","usage":{"input_tokens":1,"output_tokens":1}}))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let mut primary = route("model", "one");
+        primary.base_url = format!("http://{dead}");
+        let mut backup = route("model", "two");
+        backup.base_url = format!("http://{endpoint}");
+        backup.upstream_model = Some("backup-native".into());
+        let state = Arc::new(State::default());
+        let summary = serde_json::from_value(json!({"abi":2,"tenant_id":"t","user_id":"u","device_id":"d",
+            "policy_revision":1,"platform_revision":1,"groups":[],"display":[]}))
+        .unwrap();
+        *state.config.write().unwrap() = ConfigSnapshot {
+            revision: 17,
+            routes: vec![primary, backup],
+            rates: vec![rate()],
+            agents: vec![
+                serde_json::from_value(json!({"id":"rel","agent":"claude-code","version":"1","os":"darwin",
+                "arch":"arm64","url":"unused","sha256":"unused","size":1}))
+                .unwrap(),
+            ],
+            policy: Some(crate::state::AppliedPolicy {
+                summary,
+                notices: vec![],
+                balance: None,
+                commerce_plan_id: None,
+                keys: [
+                    ("one".into(), Zeroizing::new("primary-key".into())),
+                    ("two".into(), Zeroizing::new("backup-key".into())),
+                ]
+                .into(),
+                runtime: onex_core::ws::RuntimeRules {
+                    max_output: Some(11),
+                    failover: true,
+                    public_egress: Some(false),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+        state.launch_tokens.write().unwrap().insert(
+            "launch".into(),
+            crate::state::LaunchBinding {
+                agent: "claude-code".into(),
+                release_id: Some("rel".into()),
+                approved_model: None,
+                first_native_session: None,
+                session_id: "session".into(),
+            },
+        );
+        state
+            .lease
+            .grant(
+                &serde_json::from_value(json!({"id":"g","lease_id":"lease","expires_at":format_ms(now_ms()+60000),
+            "budget_milli":100000,"seq":1}))
+                .unwrap(),
+            )
+            .unwrap();
+        let (tx, mut usage) = mpsc::unbounded_channel();
+        let router = Router::new(state, "local".into(), client_builder().no_proxy().build().unwrap(), tx);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "launch".parse().unwrap());
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = messages(
+            AxState(router),
+            "/v1/messages".parse().unwrap(),
+            headers,
+            Bytes::from_static(br#"{"model":"model","messages":[],"max_tokens":99}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (headers, body) = capture.lock().unwrap().take().unwrap();
+        assert_eq!(headers["x-api-key"], "backup-key");
+        assert_eq!(body["model"], "backup-native");
+        assert_eq!(body["max_tokens"], 11);
+        let attempt = usage.recv().await.unwrap();
+        assert_eq!(attempt.provider_id, "one");
+        assert_eq!(attempt.cost_milli, 0);
+        let success = usage.recv().await.unwrap();
+        assert_eq!(success.provider_id, "two");
+        assert_eq!(success.model_id, "mdl");
     }
 
     #[test]

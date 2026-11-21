@@ -126,8 +126,12 @@ async fn local_installed_agent_receipt() {
     let state = Arc::new(State::default());
     let model = if is_codex { "gpt-5.4" } else { "kimi-smoke" };
     *state.config.write().unwrap() = ConfigSnapshot {
+        tools: vec![],
         agent_cache: false,
         revision: 1,
+        capability_contract: None,
+        policy: None,
+        policy_blocked: false,
         agents: vec![AgentRelease {
             id: "rel_smoke".into(),
             agent: agent.clone(),
@@ -186,6 +190,8 @@ async fn local_installed_agent_receipt() {
     state
         .lease
         .grant(&Lease {
+            model_budgets: Default::default(),
+            commerce_plan_id: None,
             id: "m".into(),
             re: None,
             lease_id: "lse_smoke".into(),
@@ -273,6 +279,9 @@ async fn local_installed_agent_receipt() {
                 .any(|item| item["content"].as_str().is_some_and(|t| t.contains("token-filtered")))
         );
     } else {
+        assert_eq!(kinds.iter().filter(|kind| **kind == "user_message").count(), 2);
+        assert_eq!(kinds.iter().filter(|kind| **kind == "assistant_message").count(), 2);
+        assert!(gaps.is_empty());
         let home = Path::new(launch["env"]["KIMI_CODE_HOME"].as_str().unwrap());
         assert!(home.join("sessions").is_dir());
         assert!(!home.join("config.toml").exists());

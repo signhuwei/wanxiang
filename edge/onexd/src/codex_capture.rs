@@ -22,12 +22,18 @@ pub struct Capture {
     outbox: Arc<Outbox>,
     key: String,
     path: PathBuf,
+    agent: &'static str,
 }
 
 impl Capture {
     pub fn new(s: Session, path: PathBuf, outbox: Arc<Outbox>) -> Self {
         let key = format!("codex:{}", s.session_id);
-        Self { s, path, outbox, key }
+        Self { s, path, outbox, key, agent: "codex" }
+    }
+
+    pub(crate) fn desktop(mut self) -> Self {
+        self.agent = "codex-desktop";
+        self
     }
 
     fn base(&self, kind: &str, payload: Value, offset: Option<u64>) -> Value {
@@ -50,7 +56,7 @@ impl Capture {
             let cwd_hash = crate::capture::hex(&Sha256::digest(self.s.cwd.to_string_lossy().as_bytes()));
             events.push(self.base(
                 "session_start",
-                json!({"agent": "codex", "agent_version": self.s.agent_version, "cwd_hash": cwd_hash,
+                json!({"agent": self.agent, "agent_version": self.s.agent_version, "cwd_hash": cwd_hash,
                     "model": self.s.model, "uuid": null, "parentUuid": null, "sidechain": false, "agent_id": null}),
                 None,
             ));

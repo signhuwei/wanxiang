@@ -229,7 +229,8 @@ pub fn finish(home: &Path, launch_id: &str) -> Result<()> {
     if !is_generated_launch_id(launch_id) {
         bail!("bad launch id");
     }
-    let config = remove_kimi_config(home, launch_id);
+    let config = clean_launch_profile(home, "kimi-code", launch_id);
+    let skills = clean_launch_profile(home, "codex", launch_id);
     let dir = home.join("run").join(launch_id);
     let runtime = match std::fs::remove_dir_all(&dir) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -237,12 +238,12 @@ pub fn finish(home: &Path, launch_id: &str) -> Result<()> {
         }
         _ => Ok(()),
     };
-    config.and(runtime)
+    config.and(skills).and(runtime)
 }
 
-fn kimi_profiles(home: &Path) -> Option<PathBuf> {
+fn profiles(home: &Path, agent: &str) -> Option<PathBuf> {
     let mut path = home.to_path_buf();
-    for name in ["agents", "kimi-code", "profiles"] {
+    for name in ["agents", agent, "profiles"] {
         path.push(name);
         if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
             return None;
@@ -251,35 +252,47 @@ fn kimi_profiles(home: &Path) -> Option<PathBuf> {
     Some(path)
 }
 
-fn remove_kimi_config(home: &Path, launch_id: &str) -> Result<()> {
-    let Some(mut path) = kimi_profiles(home) else { return Ok(()) };
-    for name in [launch_id, "kimi"] {
+fn clean_launch_profile(home: &Path, agent: &str, launch_id: &str) -> Result<()> {
+    let Some(mut path) = profiles(home, agent) else { return Ok(()) };
+    let (parents, entries): (&[&str], &[&str]) = match agent {
+        "kimi-code" => (&["kimi"], &["config.toml", "mcp.json"]),
+        "codex" if cfg!(windows) => (&["codex"], &["skills"]),
+        "codex" => (&["home", ".agents"], &["skills"]),
+        _ => return Ok(()),
+    };
+    for name in std::iter::once(launch_id).chain(parents.iter().copied()) {
         path.push(name);
         if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
             return Ok(());
         }
     }
-    let path = path.join("config.toml");
-    match std::fs::remove_file(&path) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            Err(error).with_context(|| format!("remove {}", path.display()))
+    for entry in entries {
+        let target = path.join(entry);
+        let removed = if agent == "codex" { std::fs::remove_dir_all(&target) } else { std::fs::remove_file(&target) };
+        match removed {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).with_context(|| format!("remove {}", target.display()));
+            }
+            _ => {}
         }
-        _ => Ok(()),
     }
+    Ok(())
 }
 
 /// daemon 启动时清理上次残留的本次目录：旧的本机令牌已失效，留着也没用。
 pub fn clean_stale(home: &Path) {
     let _ = std::fs::remove_dir_all(home.join("run"));
-    if let Some(profiles) = kimi_profiles(home)
-        && let Ok(entries) = std::fs::read_dir(profiles)
-    {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if let Some(id) = name.to_str().filter(|id| is_generated_launch_id(id))
-                && let Err(error) = remove_kimi_config(home, id)
-            {
-                tracing::warn!(%error, "could not remove stale Kimi configuration");
+    for agent in ["kimi-code", "codex"] {
+        if let Some(profiles) = profiles(home, agent)
+            && let Ok(entries) = std::fs::read_dir(profiles)
+        {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if let Some(id) = name.to_str().filter(|id| is_generated_launch_id(id))
+                    && let Err(error) = clean_launch_profile(home, agent, id)
+                {
+                    tracing::warn!(agent, %error, "could not remove stale launch tool or configuration");
+                }
             }
         }
     }
