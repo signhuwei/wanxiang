@@ -1,3 +1,4 @@
+import { commercePage,commerceAccountPage } from './commerce.js'
 // 外壳：顶栏（工作域切换、租户与账号、登出）+ hash 路由。
 // 路由最多两层：#/login、#/tenant/members、#/platform、#/platform/releases。钻取状态留在内存里，不进 URL。
 
@@ -5,13 +6,17 @@ import { createApi } from './api.js'
 import { createSessionStore } from './session.js'
 import { showToast } from './toast.js'
 import { devicesPage } from './devices.js'
-import { observePage } from './observation.js'
+import { observePage,sharedSessions } from './observation.js'
 import { statisticsPage } from './statistics.js'
 import { billingPage } from './billing.js'
 import { auditPage } from './audit.js'
 import { agentReleasesPage } from './agent-releases.js'
 import { catalog } from './catalog.js'
-import { contractPage } from './contract.js'
+import { platformPolicyContracts, platformPolicyDefinitions, platformPolicyTemplates } from './policy-platform.js'
+import { tenantPolicyPage, organizationPolicyPage, quotaPolicyPage } from './policy-configuration.js'
+import { mountTabs, tenantPolicy } from './policy-controls.js'
+import { rechargePage } from './policy-recharge.js'
+import { platformToolsPage } from './policy-tools.js'
 import { groupsPage } from './groups.js'
 import { bindTokenLoginTrigger, renderLogin } from './login.js'
 import { renderMembersPage } from './members.js'
@@ -66,7 +71,7 @@ function canReadAudit() {
 function appendQuotaItem(items, quota) {
   const remainingText = quota.remaining_milli === null || quota.remaining_milli === undefined
     ? '不限'
-    : formatMilli(quota.remaining_milli) + ' 橡皮'
+    : formatMilli(quota.remaining_milli) + ' 块橡皮'
   const line = el('div', 'quota-item muted')
   const label = el('span', null, '本月剩余：')
   const value = el('span', 'quota-item-value', remainingText)
@@ -86,6 +91,21 @@ function appendQuotaItem(items, quota) {
     line.appendChild(el('small', 'quota-item-note', '受个人配额限制'))
   }
   items.appendChild(line)
+}
+
+const platformNavigation = [
+  ['能力合约', [['contracts', '平台合约'], ['templates', '合约模板'], ['definitions', '条目库'], ['commerce','商业计费']]],
+  ['能力管理', [['catalog', 'Provider'], ['agents', 'Agent'], ['tools', 'Tools']]],
+  ['运维管理', [['maintenance', '维护与发布'], ['releases', 'Edge 安装包']]]
+]
+const platformPath = hash => hash.split('/')[2] || 'contracts'
+const platformGroup = path => platformNavigation.find(([, pages]) => pages.some(([id]) => path === id)) ?? platformNavigation[0]
+
+function platformNavLink(path, label, selected) {
+  const link = el('a', selected ? 'selected' : '', label)
+  link.href = '#/platform/' + path
+  if (selected) link.setAttribute('aria-current', 'page')
+  return link
 }
 
 function renderTop(hash) {
@@ -117,12 +137,8 @@ function renderTop(hash) {
       platformLink.classList.toggle('selected', hash.startsWith('#/platform'))
       domains.appendChild(platformLink)
       if (hash.startsWith('#/platform')) {
-        for (const [path, label] of [['catalog', 'Provider'], ['maintenance', '维护与发布'], ['agents', 'Agent 制品'], ['releases', 'Edge 安装包']]) {
-          const sel = hash === '#/platform/' + path || (path === 'catalog' && hash === '#/platform')
-          const link = el('a', sel ? 'selected' : '', label)
-          link.href = '#/platform/' + path
-          domains.append(link)
-        }
+        const active = platformGroup(platformPath(hash))
+        for (const group of platformNavigation) domains.append(platformNavLink(group[1][0][0], group[0], group === active))
       }
     }
     top.appendChild(domains)
@@ -191,7 +207,11 @@ function renderPlatformPlaceholder(ws) {
 
 function defaultHash() {
   if (!session) return '#/login'
-  if (session.tenant) return '#/tenant/members'
+  if (session.tenant) {
+    if (session.role === 'group_admin') return '#/tenant/groups'
+    if (session.role === 'member') return '#/tenant/contract'
+    return '#/tenant/members'
+  }
   return session.is_platform_admin ? '#/platform' : '#/account/tokens'
 }
 
@@ -244,10 +264,25 @@ function route() {
       location.replace(defaultHash())
       return
     }
-    if (hash === '#/platform/maintenance') serverReleasesPage(ws, platformApi, lifecycle.signal)
-    else if (hash === '#/platform/agents') agentReleasesPage(ws, platformApi, lifecycle.signal)
-    else if (hash === '#/platform/releases') releasesPage(ws, platformApi, session.globalActions || [])
-    else catalog(ws, platformApi, session.globalActions || [])
+    const signal = lifecycle.signal
+    const path = platformPath(hash)
+    const container = el('div', 'policy-tabs-root')
+    const nav = el('nav', 'policy-tabs platform-policy-tabs')
+    nav.setAttribute('aria-label', platformGroup(path)[0])
+    for (const [id, label] of platformGroup(path)[1]) nav.append(platformNavLink(id, label, id === path))
+    const view = el('div', 'policy-tab-content')
+    container.append(nav, view)
+    ws.append(container)
+    if (path === 'maintenance') serverReleasesPage(view, platformApi, signal)
+    else if (path === 'contracts') platformPolicyContracts(view, platformApi, signal)
+    else if (path === 'templates') platformPolicyTemplates(view, platformApi, signal)
+    else if (path === 'definitions') platformPolicyDefinitions(view, platformApi, signal)
+    else if (path === 'commerce') commercePage(view,platformApi,signal)
+    else if (path === 'agents') agentReleasesPage(view, platformApi, signal)
+    else if (path === 'tools') platformToolsPage(view, platformApi, signal)
+    else if (path === 'releases') releasesPage(view, platformApi, session.globalActions || [])
+    else if (path === 'catalog') catalog(view, platformApi, session.globalActions || [])
+    else location.replace('#/platform/contracts')
     return
   }
 
@@ -256,18 +291,52 @@ function route() {
       location.replace(defaultHash())
       return
     }
-    if (hash === '#/tenant/groups') groupsPage(ws, api, session.actions || [])
+    const signal = lifecycle.signal
+    if (hash === '#/tenant/groups') {
+      const view = el('div', 'policy-tabs-root')
+      ws.append(view)
+      const tabs = [['configuration', '组配置', (area, local) => organizationPolicyPage(area, api, 'group', local)]]
+      if (session.role === 'owner' || session.role === 'admin') tabs.unshift(
+        ['directory', '分组台账', area => groupsPage(area, api, session.actions || [], { policyManaged: true })])
+      mountTabs(view, tabs, signal)
+    }
     else if (hash === '#/tenant/devices') devicesPage(ws, api, lifecycle.signal, mockOn)
-    else if (hash === '#/tenant/observe') observePage(ws, api, session, lifecycle.signal)
+    else if (hash === '#/tenant/observe') {
+      const view=el('div','policy-tabs-root');ws.append(view)
+      mountTabs(view,[['sessions','会话监察',(area,local)=>observePage(area,api,session,local)],
+        ['shared','分享给我',(area,local)=>sharedSessions(area,api,local)]],signal)
+    }
     else if (hash === '#/tenant/statistics') statisticsPage(ws, api, lifecycle.signal)
-    else if (hash === '#/tenant/billing') billingPage(ws, api, platformApi, session)
-    else if (hash === '#/tenant/contract') contractPage(ws, api)
+    else if (hash === '#/tenant/billing') {
+      if (session.role === 'group_admin' || session.role === 'member') {
+        quotaPolicyPage(ws, api, session, signal)
+        return
+      }
+      const view = el('div', 'policy-tabs-root')
+      ws.append(view)
+      mountTabs(view, [
+        ['ledger', '橡皮流水', (area, local) => billingPage(area, api, local)],
+        ['recharges', '充值记录', (area, local) => rechargePage(area, {
+          api, endpoint: tenantPolicy + '/recharges', tenantName: session.tenant.name,
+          getBalance: () => api.get('/balance', { signal: local }), signal: local
+        })],
+        ...(session.role==='owner'?[['account','商业计费',(area,local)=>commerceAccountPage(area,api,local)]]:[])
+      ], signal)
+    }
+    else if (hash === '#/tenant/contract') tenantPolicyPage(ws, api, session, signal)
     else if (hash === '#/tenant/audit') {
       if (checkingAuditPermission) ws.appendChild(el('p', 'empty', '正在确认审计权限…'))
       else if (canReadAudit()) auditPage(ws, api, lifecycle.signal)
       else ws.appendChild(el('p', 'empty', '当前账号没有审计查询权限'))
     }
-    else renderMembersPage(ws, { api, actions: session.actions || [] })
+    else {
+      const view = el('div', 'policy-tabs-root')
+      ws.append(view)
+      const tabs = [['configuration', '个人配置', (area, local) => organizationPolicyPage(area, api, 'member', local)]]
+      if (session.role === 'owner' || session.role === 'admin') tabs.unshift(
+        ['directory', '成员台账', area => renderMembersPage(area, { api, actions: session.actions || [], policyManaged: true })])
+      mountTabs(view, tabs, signal)
+    }
     return
   }
 

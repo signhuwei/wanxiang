@@ -57,6 +57,7 @@ export function renderForm(body, { sections, values = {}, mode = 'view' }) {
       input.value = v === null || v === undefined ? '' : String(v)
     }
     if (field.placeholder) input.placeholder = field.placeholder
+    input.setAttribute('aria-label', field.label)
     input.dataset.field = field.key
     input.name = field.key
     wrap.appendChild(input)

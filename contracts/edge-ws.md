@@ -1,5 +1,7 @@
 # Edge ↔ Server WebSocket 协议 v0
 
+模式化合约的 `hello` 协商、完整策略快照和 `config_applied` 见[能力合约 v2](capability-policy-v2.md#3-edge-设备协议)。
+
 ## 连接
 
 - 地址：`wss://<server>/v1/edge/ws`。请求头 `Authorization: Bearer <device_token>`，`OneX-Edge-Version: <semver>`，`OneX-Protocol: 0`。
@@ -31,6 +33,8 @@ Server 回 `welcome`：
 
 ## Server → Edge
 
+v0.15 的 `config` 可携带平台合约和租户配置修订，字段和兼容规则见[能力合约接口](capability-contract.md#edge-下发)。
+
 | type | 字段 | 作用 |
 | --- | --- | --- |
 | `config` | `revision`、`routes[]`、`agents[]`、`rates[]` | 全量配置。Edge 原子替换，回 ack；revision 不大于当前值时忽略。route 字段：`model`（精确名、`前缀*` 或 `*`，按精确、最长前缀、`*` 的顺序匹配）、`model_id`（对应 rates）、`provider_id`、`protocol`、`base_url`、`upstream_model?`、`auth`（`x_api_key` 或 `bearer`）、`proxy?`（见下方“网络代理”） |
@@ -47,7 +51,7 @@ Server 回 `welcome`：
 | `events` | `batch[]`：`{seq, session_id, kind, at, payload}` | 会话事件回流。`seq` 每台设备单调递增、无空洞。Server 持久化后回 `events_ack{ack_seq}` |
 | `usage` | `batch[]`：`{seq, request_id, session_id, lease_id, provider_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_milli, at, status, complete}` | 用量计量。与 events 共用 seq 空间。`status`：`ok`、`upstream_<HTTP 状态码>`、`upstream_error`、`client_cancelled`，以及 Edge 主动断流的 `lease_exhausted`、`lease_expired`、`cutoff`。条目带 `model_id`。`complete=false` 表示流中断、用量不全，cost 按已收到的部分计算，Server 记为待结算，不当作零 |
 | `lease_renew` | `lease_id`、`used_milli`、`op_id` | 续租。`used_milli` 是该租约从签发起累计的绝对值（不是增量），Server 据此在租约上限内幂等扣款。签发新租约或回 `cutoff` |
-| `diag_result` | `diag_id`、`ok`、`detail` | 诊断结果 |
+| `diag_result` | `diag_id`、`ok`、`detail` | detail 可省略、为 null 或为序列化后最多 4096 个 UTF-8 字节的 JSON 对象。格式无效时回 invalid 并保留待处理状态；持久化时仅保留诊断字段白名单 |
 | `lease_request` | `op_id` | 没有租约时申请新租约（v0.13）。Server 按签发规则回 `lease` 或 `cutoff`，不缓存结果，同一 `op_id` 可重发 |
 | `agent_state` | `agent`、`session_id`、`state`（`started`、`exited`、`crashed`）、`exit_code` | Agent 生命周期 |
 
@@ -103,7 +107,7 @@ Edge 连 Server 和上游时，默认使用环境变量中的代理设置（`HTT
 
 - 断线期间 Edge 继续使用当前租约，直到 `expires_at` 或 `budget_milli` 用完，先到先停。
 - 事件和用量写本地 outbox，重连后按 seq 补传。outbox 超过 500 MB 时停止接受新请求并提示。
-- Server 侧租约默认 10 分钟、额度为“余额的 5% 与 2 橡皮中较小者”（向下取整，最低 1 毫橡皮）。具体数字由合约配置，始终不超过可用余额。
+- Server 侧租约默认 10 分钟，额度取余额的 5% 与 2 块橡皮中的较小值，按毫橡皮向下取整，最低为 0.001 块橡皮（1 毫橡皮）。具体数字由合约配置，始终不超过可用余额。
 
 ## 租约生命周期（v0.5）
 
@@ -119,9 +123,10 @@ Edge 连 Server 和上游时，默认使用环境变量中的代理设置（`HTT
 ## 多 Agent 接入（v0.12，S2）
 
 - `agent` 取值：`claude-code`、`codex`、`kimi-code`。合约 `allowed_agents` 与 `agent_releases.agent` 用同一组名字。
-- 本机 router 入口按 Agent 协议区分，共用同一个本机令牌、租约、计价和 usage 上报：
-  - `POST /v1/messages`（及 `/v1/messages/count_tokens`）：Anthropic Messages，Claude Code 与 Kimi Code 使用。
-  - `POST /v1/responses`：OpenAI Responses，Codex 使用。上游 route 为 `openai_responses` 时同协议转发；为 `openai_chat` 时由 Edge 转换为 Chat；为 `anthropic` 时 S2 首批返回 `model_not_allowed`，不做 Responses→Messages。
+- 本机 router 按入口协议选路，共用租约、计价和 usage 上报。受管启动签发的本机令牌只能用于其 Agent 的协议入口。
+  - `POST /v1/messages`：Claude Code 和 Kimi Code 使用。可选上游为 `anthropic` 和 `openai_chat`。`POST /v1/messages/count_tokens` 沿用 Messages 的选路结果，仅在该路由为 `anthropic` 时透传。
+  - `POST /v1/responses`：Codex 使用。平台可下发 `openai_responses` 原生路由和 `openai_chat` 转换路由。只有不兼容的匹配路由时返回 `model_not_allowed`。
+- 启动时只接受 Agent 协议支持的模型，默认从兼容路由的精确别名和可匹配的通配候选中依序选择。请求先筛兼容上游，再按精确名、最长前缀、`*` 的优先级匹配。匹配精度相同时优先同协议上游。
 - Responses 用量口径：`input_tokens` 含缓存，计费输入 = `input_tokens − input_tokens_details.cached_tokens`；`output_tokens_details.reasoning_tokens` 是输出的子集，只作明细。
 - 拒绝时按入口协议返回错误：Messages 用 Anthropic 错误体；Responses 未发响应头时用 `{"error":{"type","code","message"}}`，已发头时写 `response.failed` 事件。`code` 取 `errors.md`。
 - 会话事件的 `kind` 和 payload 不变，`session_start.agent` 写实际 Agent 名。采集来源：
@@ -161,7 +166,7 @@ S1 起存在的缺陷：续租回 `cutoff` 后，Edge 保留旧租约并重放�
 - **转 Chat 的工具与条目**（v0.13）：`function` 工具照转；`custom` 工具（如 `apply_patch`）转成一个只有字符串参数 `input` 的 function，回传时还原成 `custom_tool_call`；`local_shell` 转成参数为 `{command: string[], workdir?, timeout_ms?}` 的 function，回传还原成 `local_shell_call`；`web_search` 等托管工具从请求中去掉（onexd 生成的 Codex 配置已禁用它们）。input 里的 `custom_tool_call`、`local_shell_call` 及其 output 按同样映射转成 tool_calls 和 tool 消息；`reasoning` 丢弃；`instructions` 和 `input` 内 `developer`、`system` 的文本按原顺序合并为首条 `system` 消息，其他对话和工具项沿用原顺序。同一轮的多个调用合并进一条 assistant 消息的 `tool_calls`。Codex 的 `namespace` 定义展开为唯一的 Chat 工具名，回传时恢复原始 `namespace` 和工具名。
 - **转 Chat 的输出条目**：`response.output_item.done` 和 `response.completed.output` 必须带完整条目：message 条目有 `id`、`role:"assistant"`、`content:[{type:"output_text",text}]`；function 条目有 `id`、`call_id`、`name`、`arguments`。同一条目在 added 和 done 里的 `id` 一致。缺 call_id 时生成稳定 ID，不留空串。
 - **同协议转发**：URL 拼接规则同 Chat（`base_url` 以 `/v1` 结尾时直接接 `/responses`）。只转发白名单请求头（`content-type`、`accept`、`openai-beta`、`user-agent`），认证头换成上游密钥。
-- **anthropic 上游**：返回 `model_not_allowed`，`message` 写明“该模型的上游协议暂不支持 Codex，请联系管理员调整路由”。
+- **仅匹配到 anthropic 上游**：返回 `model_not_allowed`，`message` 写明“该模型的上游协议暂不支持 Codex，请联系管理员调整路由”。
 
 ### 桌面 Agent 的 Chat Completions 入口
 
@@ -175,3 +180,16 @@ S1 起存在的缺陷：续租回 `cutoff` 后，Edge 保留旧租约并重放�
 - 缓存协议的 `agents[].url` 是 `/v1/edge/agent-artifacts/<release_id>`。Edge 使用当前连接的 OneX Server 作为下载服务器，沿用同一协议、主机和端口，携带设备 Bearer，拒绝重定向。落入本机缓存前核对原始字节数及 SHA-256。缓存协议启用时，IPC 拒绝调用方指定的非受管可执行文件。
 - 合约固定发行时只下发该发行的原始身份。停用、缺失缓存或换摘要的固定条目失效，不能自动改用同 Agent 的其他版本。
 - 无固定发行的设备平台上，不带能力位的旧 Edge 继续收到登记的厂商地址。固定发行的平台要求新版 Edge，旧 Edge 收到空配置和 `cutoff{contract}`。旧 Server 可忽略新 `hello` 字段。
+
+
+### 原生桌面发行协商
+
+Apple Silicon Edge 在 hello 中声明 `agent_cache: true` 与 `mac_desktop_v1: true`。支持 Claude Desktop 或 Codex Desktop 的 Edge 另行声明相应的 `claude_desktop_v1: true` 或 `codex_desktop_v1: true`。缺少对应能力位时该发行从配置中省略。Server 同时核对设备注册平台、受管缓存、成员有效合约及精确发行资格。Edge 在私有目录验证完整 DMG、Apple 签名、bundle 标识与代码摘要后启动原厂窗口。桌面通过既有下载与启动 IPC 展示准备、下载、验证、启动和运行状态。
+
+原厂 DeepSeek Cordis 适配器使用 `POST /v1/onex/desktop/ready` 标记本机适配器就绪。每次模型请求由 `POST /v1/onex/desktop/session` 携带本次私有启动凭据以及 `{native_id,bind_model:true,records:[]}` 换取有效期 60 秒、单次使用的会话模型凭据。适配器先按原生历史头核对工作区、真实 SID 及来源。上传公开记录时传 `bind_model:false`，以原生序号推进游标。上游计量与原生消息使用同一 OneX 会话编号，撤销启动立即丢弃其待用凭据。
+
+WorkBuddy 的待验适配器为每次启动签发两个独立的本机凭据。受管 Hook 核对工作区、任务 SID 和厂商轮次号后，用控制端 Bearer 调用 `POST /v1/onex/workbuddy/turn` 提交 `{native_id,generation_id,event}`。`UserPromptSubmit` 登记映射，`Stop` 关闭映射。模型端携带独立凭据（Bearer 或厂商原生 `x-api-key`）和唯一的 `X-Conversation-Request-ID` 调用 Chat。一个已登记轮次可以有多笔模型请求，每笔费用归到对应原生会话。缺少映射、轮次归属冲突、头重复、轮次结束或设备退出时拒绝调用。原厂 `custom-local:` 模型名前缀在检查合约前还原。上游只接收路由指定的认证。该候选的真实桌面验收和启用状态以精确发行清单为准。
+
+Codex Desktop 使用公开 App Server 的 thread 和 turn ID。私有启动控制端将 `{session:{thread_id,turn_id},started}` POST 到 `/v1/onex/desktop/codex-turn`。原生 Responses 请求携带模型凭据和 `x-codex-turn-metadata`，注册映射、真实线程 ID、轮次 ID 和本次分配的模型须一致。冷恢复使用同一原生 thread 派生 OneX 会话编号。归属冲突或发行从合约中移除时，请求在占用租约前被拒绝。
+
+Claude Desktop Code 使用 3P gateway 的凭据助手与 Messages 接口。Edge 交叉核对请求中原生 `session_id`、受管工作区内原生 transcript 的首条完整用户记录和分配模型，之后将可见对话和用量归到同一 OneX 会话。退出时撤销窗口和任务凭据。重开后只能由新窗口以匹配的原生证据接续。模型、原生会话或发行不满足生效合约时，拒绝转发。

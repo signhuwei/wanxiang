@@ -11,6 +11,8 @@ import { authenticate, isTenantId } from './auth';
 import { bearer, hash, iso } from './credentials';
 import { enumField, pagination, tenantActor, type ManagementOptions } from './management';
 import type { ObjectStorage } from './object-storage';
+import {targetPolicy,visibleTarget} from './policy-impact';
+import { readEffective,readHead } from './policy-data';
 import type { Store, Transaction } from './store';
 
 const kinds = ['logs', 'status'] as const;
@@ -117,7 +119,15 @@ export function deviceRoutes(app: Hono, store: Store, opts: ManagementOptions, d
     const actor = tenantActor(store, c, opts.now());
     const row = actor.db.get<DeviceRow>(`SELECT ${deviceColumns} FROM devices WHERE id = ?`, [c.req.param('id')]);
     if (!row) throw new ApiError('not_found');
-    return c.json({ ...deviceView(row, canRequestDiag(actor.role)), online: diag.isOnline(row.id) });
+    const manage = canRequestDiag(actor.role);
+    const head = manage && readHead(actor.db);
+    const applied = head && actor.db.get<{ config_revision: number; policy_revision: number; applied_at: string }>(
+      'SELECT config_revision, policy_revision, applied_at FROM policy_device_applications WHERE device_id = ?', [row.id]);
+    const effective=head&&readEffective(actor.db,'member',row.user_id);
+    const target=effective&&targetPolicy(store,actor.db,effective,opts.dataDir,opts.now(),{...row,
+      has_key:actor.db.get<{n:number}>("SELECT length(public_key)>0 AS n FROM devices WHERE id=?",[row.id])!.n});
+    return c.json({ ...deviceView(row, manage), online: diag.isOnline(row.id),
+      ...(head && { policy: { ...head, applied,target:target&&visibleTarget(target,actor.role==='owner') } }) });
   });
 }
 

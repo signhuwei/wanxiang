@@ -21,7 +21,7 @@ const ROLE_OPTIONS = [
   { value: 'member', label: '成员' }
 ]
 
-export function renderMembersPage(host, { api, actions = [] }) {
+export function renderMembersPage(host, { api, actions = [], policyManaged = false }) {
   const grantable = ROLE_OPTIONS.filter(({value}) => actions.includes('assign_role:' + value))
   let ledger
   const invite = detailPanel(host, () => ledger)
@@ -39,8 +39,9 @@ export function renderMembersPage(host, { api, actions = [] }) {
   }
 
   function quotaUsageCell(item) {
-    const level = quotaUsageLevel(item.month_used_milli, item.quota_milli)
-    return el('span', 'status ' + level, formatQuotaUsage(item.month_used_milli, item.quota_milli))
+    const quota = item.quota_configurable === false ? null : item.quota_milli
+    const level = quotaUsageLevel(item.month_used_milli, quota)
+    return el('span', 'status ' + level, formatQuotaUsage(item.month_used_milli, quota))
   }
 
   function nameCell(item) {
@@ -122,16 +123,17 @@ export function renderMembersPage(host, { api, actions = [] }) {
       )
       if (usage) {
         kv.append(
-          el('span', null, '本月已结算'),
+          el('span', null, '本月已结算（块）'),
           document.createTextNode(formatMilli(usage.used_milli)),
-          el('span', null, '预留'),
+          el('span', null, '预留（块）'),
           document.createTextNode(formatMilli(usage.reserved_milli)),
-          el('span', null, '剩余'),
+          el('span', null, '剩余（块）'),
           document.createTextNode(usage.remaining_milli === null ? '不限' : formatMilli(usage.remaining_milli))
         )
       }
 
       const canEditRole = mode !== 'view' && grantable.some(option => option.value === member.role)
+      const quotaConfigurable = !policyManaged && member.quota_configurable !== false
       const fields = [
         { key: 'name', label: '姓名', readonly: true },
         { key: 'target', label: '账号', readonly: true },
@@ -140,8 +142,8 @@ export function renderMembersPage(host, { api, actions = [] }) {
           : { key: 'role', label: '角色', readonly: true, format: roleLabel },
         { key: 'group_id', label: '分组', type: 'select', options: [] },
         mode === 'view'
-          ? { key: 'quota_eraser', label: '橡皮配额', readonly: true, nullText: '不限' }
-          : { key: 'quota_eraser', label: '橡皮配额', type: 'number', step: 0.001, placeholder: '不限', hint: QUOTA_HINT },
+          ? { key: 'quota_eraser', label: '橡皮配额（块）', readonly: true, nullText: '不限' }
+          : { key: 'quota_eraser', label: '橡皮配额（块）', placeholder: '不限', hint: QUOTA_HINT },
         { key: 'status', label: '状态', readonly: true, format: memberStatusLabel }
       ]
 
@@ -164,17 +166,19 @@ export function renderMembersPage(host, { api, actions = [] }) {
       }
 
       const form = renderForm(body, {
-        sections: [{ key: 'base', title: '', fields }],
+        sections: [{ key: 'base', title: '', fields: quotaConfigurable ? fields : fields.filter(field => field.key !== 'quota_eraser') }],
         values: {
           ...member,
           target: member.email || member.phone || member.target,
           group_name: member.group_name || member.group_id,
-          quota_eraser: member.quota_milli === null ? null : member.quota_milli / 1000
+          quota_eraser: member.quota_milli === null ? null : formatMilli(member.quota_milli)
         },
         mode
       })
 
       body.prepend(kv)
+      if (policyManaged) body.prepend(el('p', 'muted', '配额在「个人配置」中查看和调整。'))
+      else if (!quotaConfigurable) body.prepend(el('p', 'notice', '平台合约已关闭组及成员配额。'))
       const actions = member.actions || []
       if (mode === 'view') {
         if (actions.includes('update')) {
@@ -218,7 +222,7 @@ export function renderMembersPage(host, { api, actions = [] }) {
             member = await api.post('/members/' + encodeURIComponent(member.user_id), {
               ...(canEditRole && v.role !== member.role ? { role: v.role } : {}),
               group_id: v.group_id,
-              quota_milli: quotaMilli,
+              ...(quotaConfigurable && { quota_milli: quotaMilli }),
               revision: member.revision
             }, { idempotencyKey: 'member-' + member.user_id + '-' + Date.now() })
             markDirty()

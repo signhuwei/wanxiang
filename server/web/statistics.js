@@ -3,7 +3,7 @@ import { agentLabel, AGENT_OPTIONS, formatMilli } from './format.js'
 
 const columns = [['active_people', '活跃人数'], ['sessions', '新会话'], ['events', '会话事件'], ['turns', '对话轮数'], ['requests', '模型请求'],
   ['input_tokens', '输入 token'], ['output_tokens', '输出 token'], ['cached_tokens', '缓存 token'],
-  ['cost_milli', '橡皮'], ['pending_usage', '待结算笔数']]
+  ['cost_milli', '橡皮（块）'], ['pending_usage', '待结算笔数']]
 const snapshotTime = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', dateStyle: 'short', timeStyle: 'short', hourCycle: 'h23' })
 const number = new Intl.NumberFormat('zh-CN')
 const metric = (key, value) => key === 'cost_milli' ? formatMilli(value ?? 0) : number.format(value ?? 0)

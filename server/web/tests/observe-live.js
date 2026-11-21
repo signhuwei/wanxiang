@@ -54,7 +54,7 @@ export async function checkLiveObservation({app, seed, page, target, capture, su
     console.log(`管理员 / Edge WS seq=3 → 页面正文可见（含两次 rAF）：${elapsed.toFixed(1)} ms；Chrome ${page.context().browser().version()}`)
     const usageStart=performance.now()
     send({type:'usage',id:'meter',batch:[{seq:4,request_id:'integration',session_id:session,provider_id:'test',model:'integration-model',input_tokens:23,output_tokens:7,cache_read_tokens:11,cache_write_tokens:13,cost_milli:42,status:'ok',complete:false,at:iso(Date.now())}]})
-    await page.locator('.conversation').getByText(/缓存读取 11.*缓存写入 13.*0\.042 橡皮.*待结算/).waitFor()
+    await page.locator('.conversation').getByText(/缓存读取 11.*缓存写入 13.*0\.042 块橡皮.*待结算/).waitFor()
     await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))))
     const usageMs=performance.now()-usageStart
     console.log(`usage seq=4 → 在读会话费用与待结算笔数可见：${usageMs.toFixed(1)} ms`)

@@ -165,11 +165,13 @@ try {
 
   const staffUsage = await (await page.request.get(`/v1/quota/usage?scope=member&id=${staffId}`, { headers: { Authorization: 'Bearer ' + staffToken } })).json()
   // settle 300（已结算）+ 新租约预留 200（仍 active）= 本月已用口径 500，恰好等于个人配额，UI 应显示 error 态。
-  assert.deepEqual(staffUsage, { scope: 'member', id: staffId, quota_milli: 500, used_milli: 300, reserved_milli: 200, remaining_milli: 0, actions: ['read'] })
+  assert.deepEqual(staffUsage, { scope: 'member', id: staffId, quota_distribution: true, quota_milli: 500,
+    used_milli: 300, reserved_milli: 200, remaining_milli: 0, actions: ['read'] })
   console.log('quota-staff /quota/usage 核对通过：已结算 300 + 预留 200 = 配额 500，剩余 0')
 
   const groupUsage = await (await page.request.get(`/v1/quota/usage?scope=group&id=${parentId}`, ownerAuth)).json()
-  assert.deepEqual(groupUsage, { scope: 'group', id: parentId, quota_milli: 2000, used_milli: 300, reserved_milli: 200, remaining_milli: 1500, actions: ['read'] })
+  assert.deepEqual(groupUsage, { scope: 'group', id: parentId, quota_distribution: true, quota_milli: 2000,
+    used_milli: 300, reserved_milli: 200, remaining_milli: 1500, actions: ['read'] })
   console.log('部门组 /quota/usage 核对通过：已结算 300 + 预留 200，剩余 1500')
 
   // ---- 管理端台账：成员台账「本月已用/配额」列应与 /quota/usage 一致 ----
@@ -189,9 +191,9 @@ try {
   const memberKv = page.locator('.kv').first()
   await memberKv.getByText('本月已结算').waitFor()
   const memberKvLines = (await memberKv.innerText()).split('\n')
-  assert.equal(kvValue(memberKvLines, '本月已结算'), '0.3')
-  assert.equal(kvValue(memberKvLines, '预留'), '0.2')
-  assert.equal(kvValue(memberKvLines, '剩余'), '0')
+  assert.equal(kvValue(memberKvLines, '本月已结算（块）'), '0.3')
+  assert.equal(kvValue(memberKvLines, '预留（块）'), '0.2')
+  assert.equal(kvValue(memberKvLines, '剩余（块）'), '0')
   console.log('成员钻取详情：已结算 0.3、预留 0.2、剩余 0，与 /quota/usage 一致')
   await button('← 返回').click()
 
@@ -205,9 +207,9 @@ try {
   const groupKv = page.locator('.kv').first()
   await groupKv.getByText('本月已结算').waitFor()
   const groupKvLines = (await groupKv.innerText()).split('\n')
-  assert.equal(kvValue(groupKvLines, '本月已结算'), '0.3')
-  assert.equal(kvValue(groupKvLines, '预留'), '0.2')
-  assert.equal(kvValue(groupKvLines, '剩余'), '1.5')
+  assert.equal(kvValue(groupKvLines, '本月已结算（块）'), '0.3')
+  assert.equal(kvValue(groupKvLines, '预留（块）'), '0.2')
+  assert.equal(kvValue(groupKvLines, '剩余（块）'), '1.5')
   console.log('部门组钻取详情：已结算 0.3、预留 0.2、剩余 1.5，与 /quota/usage 一致')
   await button('← 返回').click()
 
@@ -228,11 +230,11 @@ try {
   await staffPage.locator('.account-menu summary').waitFor()
   await staffPage.locator('.account-menu summary').click()
   const quotaItem = staffPage.locator('.quota-item')
-  await quotaItem.getByText('0 橡皮', { exact: true }).waitFor()
+  await quotaItem.getByText('0 块橡皮', { exact: true }).waitFor()
   await quotaItem.getByText(/受分组|受个人配额限制/).waitFor()
   const quotaNote = await quotaItem.locator('.quota-item-note').innerText()
   assert(quotaNote.includes('个人配额'), 'remaining=0 时 limited_by 应为 member（个人配额），实际提示：' + quotaNote)
-  console.log('个人菜单 /me.quota：本月剩余 0 橡皮，提示「' + quotaNote + '」')
+  console.log('个人菜单 /me.quota：本月剩余 0 块橡皮，提示「' + quotaNote + '」')
   await staffPage.close()
 
   assert.deepEqual(errors, [])

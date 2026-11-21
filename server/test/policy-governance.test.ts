@@ -1,0 +1,103 @@
+import { test, expect } from 'bun:test';
+import { randomBytes } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Hono } from 'hono';
+import { ApiError } from '../src/api';
+import { hash, iso, randomToken } from '../src/credentials';
+import { eventItems, ingestEvents } from '../src/ingest';
+import { observationRoutes } from '../src/observe';
+import { policyRoutes } from '../src/policy-routes';
+import { ensureUser, seedTenant } from '../src/seed';
+import { Store } from '../src/store';
+import { tenantUpstreamTargets, upstreamRoutes } from '../src/tenant-upstreams';
+
+test('signed execution controls preview, restore, private providers, sharing and retention through the API', async () => {
+  let at = Date.parse('2026-11-01T00:00:00Z');
+  const dir = mkdtempSync(join(tmpdir(), 'onex-policy-execution-')), store = new Store(dir, 4);
+  try {
+    const { userId, tenantId } = await seedTenant(store, { target: 'owner@execution.example', platformAdmin: true, now: at });
+    const db = store.tenant(tenantId);
+    const owner = randomToken(), platform = randomToken(), member = randomToken(), device = 'device-execution';
+    const expiry = iso(at + 31 * 86400000), masterKey = randomBytes(32);
+    const memberId = await store.system.write(sql => {
+      const recipient = ensureUser(sql, { kind: 'email', value: 'recipient@example.test' }, at).id;
+      for (const [token, user, tenant] of [[owner, userId, tenantId], [member, recipient, tenantId], [platform, userId, null]] as const) {
+        sql.run("INSERT INTO sessions (token_hash,user_id,tenant_id,kind,expires_at) VALUES (?,?,?,'web',?)", [hash(token), user, tenant, expiry]);
+      }
+      sql.run("INSERT INTO providers(id,name,protocol,base_url,secret_ciphertext,status) VALUES('prv','Provider','openai_chat','https://example.test',?,'active')", [randomBytes(48)]);
+      sql.run("INSERT INTO models(id,provider_id,upstream_name,display_name,context_window,status) VALUES('model','prv','native','Model',2048,'active')");
+      return recipient;
+    });
+    await db.write(sql => {
+      sql.run("INSERT INTO members(user_id,role,status) VALUES(?,'member','active')", [memberId]);
+      sql.run("INSERT INTO devices(id,user_id,name,os,arch,public_key,token_hash,token_expires_at,status) VALUES(?,?,'Device','darwin','arm64','test',?,?,'active')",
+        [device, userId, hash(randomToken()), expiry]);
+    });
+    const app = new Hono(), opts = { now: () => at, codeSecret: 'fixture', dataDir: dir, masterKey };
+    app.onError((error, c) => { if (error instanceof ApiError) return c.json({ error: error.body() }, error.status); throw error });
+    policyRoutes(app, store, opts); upstreamRoutes(app, store, opts); observationRoutes(app, store, opts.now);
+    const call = (token: string, path: string, method = 'GET', body?: unknown, key = randomToken()) => app.request(path, {
+      method,
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', 'Idempotency-Key': key }, ...(body !== undefined && { body: JSON.stringify(body) })
+    });
+    async function read(response: Response) { return await response.json() as { id: string; total: number; items: unknown[]; policy_revision: number }; }
+    const ref = (id: string) => ({ id, version: 1 });
+    const contract = '/v1/platform/policy/contracts/' + tenantId;
+    const signed = (values: Record<string, unknown>, platformRevision = 0, policyRevision = 0) => ({
+      expected_platform_revision: platformRevision, expected_policy_revision: policyRevision, base_revision: platformRevision || null, reason: 'test',
+      entries: Object.entries(values).map(([id, adjustment]) => ({ clause_ref: ref(id), template_ref: null, adjustment }))
+    });
+    const terms = { 'session.export': true, 'session.share': true, 'session.retention_days': 1, 'upstream.custom': true, 'access.models': ['model'], 'lease.budget': 1000 };
+    const preview = await (await call(platform, contract + '/preview', 'POST', signed(terms))).json();
+    expect(preview).toMatchObject({ impact: { member_count: 2, device_count: 1, devices: { items: [{ device_id: device, unavailable: expect.arrayContaining([{ resource_id: 'model', reason: 'rate_missing' }]) }] } } });
+    expect((await call(platform, contract + '/signatures', 'POST', signed(terms))).status).toBe(201);
+    const profile = '/v1/policy/configurations/tenant/' + tenantId;
+    const configure = (revision: number, value: boolean) => ({ expected_platform_revision: 1, expected_policy_revision: revision, template_ref: null, selections: [{ clause_ref: ref('session.export'), value }] });
+    expect((await call(owner, profile, 'PUT', configure(1, false))).status).toBe(200);
+    expect((await call(owner, profile, 'PUT', configure(2, true))).status).toBe(200);
+    const restore = { restore_revision: 1, expected_platform_revision: 1, expected_policy_revision: 3 };
+    expect((await call(owner, profile + '/preview', 'POST', restore)).status).toBe(200);
+    expect((await read(await call(owner, profile + '/history'))).total).toBe(2);
+    expect((await call(owner, profile, 'PUT', restore)).status).toBe(200);
+    expect((await read(await call(owner, profile + '/history'))).items[0]).toMatchObject({ revision: 3, restored_from_revision: 1 });
+    const up = '/v1/policy/upstreams', body = { expected_revision: 0, model_id: 'model', name: 'Tenant provider', base_url: 'https://tenant.example/v1', upstream_name: 'managed', priority: 3, secret: 'tenant-key' };
+    expect((await call(member, up, 'POST', body)).status).toBe(403);
+    const saved = await read(await call(owner, up, 'POST', body, 'same-key'));
+    expect(saved).toMatchObject({ revision: 1, has_key: true });
+    expect((await read(await call(owner, up, 'POST', body, 'same-key'))).id).toBe(saved.id);
+    expect(JSON.stringify(await read(await call(owner, up)))).not.toContain('tenant-key');
+    expect(tenantUpstreamTargets(db, tenantId, masterKey, 'model')[0]?.secret.toString()).toBe('tenant-key');
+    expect(tenantUpstreamTargets(db, 'different-tenant', masterKey, 'model')).toHaveLength(0);
+    expect((await call(owner, up + '/' + saved.id, 'PUT', { expected_revision: 0, status: 'disabled' })).status).toBe(409);
+    await store.system.write(sql=>sql.run(`INSERT INTO rates(model_id,effective_from,input_milli_per_mtok,output_milli_per_mtok,
+      cache_read_milli_per_mtok,cache_write_milli_per_mtok) VALUES('model',?,50,100,0,0)`,[iso(at)]));
+    const targetPath='/v1/policy/targets/'+memberId+'?os=darwin&arch=arm64';
+    expect(await (await call(owner,targetPath)).json()).toMatchObject({
+      models:[{model_id:'model',rate:{output_milli_per_mtok:100}}],
+      routes:[{model_id:'model',candidates:[{provider_id:saved.id,priority:3},{provider_id:'prv',priority:100}]}]});
+    expect(JSON.stringify(await (await call(member,targetPath)).json())).not.toContain('output_milli_per_mtok');
+    expect((await call(member,'/v1/policy/targets/'+userId+'?os=darwin&arch=arm64')).status).toBe(404);
+    const session = 'session-execution';
+    const ingest = (seq: number, kind: string) => ingestEvents(store, tenantId, device, userId, at, () => true,
+      eventItems([{ seq, session_id: session, kind, at: iso(at), payload: { text: 'captured content' } }]), () => { });
+    await ingest(1, 'session_start'); await ingest(2, 'user_message'); await ingest(3, 'session_end');
+    const path = '/v1/observe/sessions/' + session;
+    expect((await call(owner, path + '/export')).status).toBe(403);
+    expect((await call(member, path + '/events')).status).toBe(404);
+    expect((await call(owner, path + '/shares', 'POST', { recipient: memberId })).status).toBe(200);
+    expect((await read(await call(member, '/v1/observe/shared'))).total).toBe(1);
+    expect((await read(await call(member, path + '/events'))).total).toBe(3);
+    expect((await call(owner, path + '/shares/' + memberId, 'DELETE')).status).toBe(200);
+    expect((await call(member, path + '/events')).status).toBe(404);
+    const head = await read(await call(owner, profile));
+    expect((await call(owner, profile, 'PUT', configure(head.policy_revision, true))).status).toBe(200);
+    expect((await read(await call(owner, path + '/export?limit=2'))).items).toHaveLength(2);
+    at += 86400000;
+    expect((await call(owner, path + '/events')).status).toBe(404);
+    expect(await ingest(4, 'user_message')).toBe(4);
+    expect(db.get<{ n: number }>('SELECT count(*) AS n FROM session_events')!.n).toBe(0);
+    expect(db.get('SELECT id FROM agent_sessions WHERE content_purged_at IS NOT NULL')).toBeTruthy();
+  } finally { await store.drain(); store.close(); rmSync(dir, { recursive: true, force: true }); }
+});

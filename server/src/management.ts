@@ -3,7 +3,8 @@ import { ApiError, field, invalid } from './api';
 import { authenticate } from './auth';
 import type { Store } from './store';
 
-export type ManagementOptions = { codeSecret: string; now: () => number; masterKey?: Uint8Array; onConfigChange?: (tenantId?: string) => void; dataDir: string };
+export type ManagementOptions = { codeSecret: string; now: () => number; masterKey?: Uint8Array; dataDir: string;
+  onConfigChange?: (tenantId?: string) => void; onBalanceChange?: (tenantId: string) => void };
 
 export function tenantActor(store: Store, c: Context, at: number) {
   const session = authenticate(store, c, at);

@@ -39,14 +39,22 @@ onex-server-release-v1
 | --- | --- |
 | `GET/POST /v1/platform/agent-releases` | 服务端分页与发行登记。管理页以 `status: disabled` 新建 |
 | `GET/PATCH /v1/platform/agent-releases/{id}` | 制品状态 `artifact_cached`、当前修订与可执行操作。修改来源或启用状态 |
-| `PUT /v1/platform/agent-releases/{id}/artifact` | 上传原始可执行文件或桌面安装包。单请求上限 256 MiB。使用 `application/gzip` 可上传单文件压缩制品，解压上限 512 MiB。桌面原始包可分段上传 |
+| `PUT /v1/platform/agent-releases/{id}/artifact` | 上传原始可执行文件或桌面安装包。单请求上限 256 MiB。使用 `application/gzip` 可上传单文件压缩制品，解压后 CLI 上限 512 MiB、桌面上限 768 MiB。桌面原始包可分段上传 |
 | `POST /v1/platform/agent-releases/{id}/pull` | 从登记且匹配厂商白名单的 HTTPS 地址拉取完整原始制品，拒绝重定向。缓存已就绪时重试返回原摘要 |
 | `GET /v1/agent-artifacts/{sha256}` | 平台管理员核取仍启用的受管制品或暂存的桌面安装包 |
 | `GET /v1/edge/agent-artifacts/{id}` | 凭设备令牌取能力合约当前允许的制品 |
+| `PUT /v1/platform/agent-releases/{id}/runtime?revision=…` | 管理员上传与指定发行配套的原厂 Code 引擎。修订过期返回 409，摘要或大小不符返回 422 |
+| `GET /v1/platform/agent-releases/{id}/runtime` | 管理员下载已缓存的配套引擎 |
+| `GET /v1/edge/agent-artifacts/{id}/runtime` | 凭设备令牌下载成员当前合约允许的发行所需的引擎 |
 
 上传和拉取均在私有暂存文件中校验原始字节数及 SHA-256，验证通过后原子发布，并记录审计。
 厂商地址受限时，平台管理员可上传手头的已批准制品。同一发行允许在启用前上传或拉取。
 支持缓存协议的 Edge 使用它当前连接的 OneX Server 作为下载服务器，跟随同一协议、主机和端口。厂商源地址供 Server 入库。旧 Edge 的兼容规则见 [Edge ↔ Server 协议](edge-ws.md)。
 
 
-WorkBuddy 和 DeepSeek Harness Desktop 的原厂安装包可登记、校验并缓存。发行保留 `status: disabled`，响应包含 `qualification_required: true` 和包格式。平台管理员可下载进行原生测试。运行资格待对应系统及版本通过原生窗口、模型路径、租约和同会话回流验证。 桌面包分段上传沿用 PUT，传 `?part=<从 0 起的段号>&revision=<当前修订>`，段大小取发行返回的 `part_bytes`（32 MiB），最后一段取余数，整包最多 512 MiB。待分段齐全返回 202；合并后完成整包大小、SHA-256 和容器标记校验返回 200。同段可重传。校验完成前，文件不能下载。
+WorkBuddy、DeepSeek Harness Desktop、Claude Desktop 和 Codex Desktop 的原厂安装包可登记、校验并缓存。平台与 Edge 共读 `server/src/desktop-qualifications.json`，按 Agent、版本、系统、架构、字节数和 SHA-256 匹配原生验收结果。匹配合格且已有完整缓存的发行可由管理员激活。其余发行返回 `qualification_required: true` 并允许管理员下载测试。macOS ARM64 的 DeepSeek Harness Desktop 0.2.1-rc.3 已通过原厂进程、会话冷恢复和本机回环上游计费测试。
+
+桌面包分段上传沿用 PUT，传 `?part=<从 0 起的段号>&revision=<当前修订>`，段大小取发行返回的 `part_bytes`（32 MiB），最后一段取余数，桌面整包最多 768 MiB。待分段齐全返回 202；合并后完成整包大小、SHA-256 和容器标记校验返回 200。同段可重传。校验完成前，文件不能下载。
+
+
+Claude Desktop 6.28899.6 发行还依赖固定的 Code 引擎 2.1.330。发行详情的 `runtime` 提供引擎原包的 `size`、`sha256` 和 `artifact_cached`。WebUI 根据 `upload_runtime` 展示上传表单。Server 校验原始 `.tar.zst` 字节数、SHA-256、权限及发行修订后提交缓存，写入平台审计。DMG 与引擎均就绪后可启用。设备端的每次下载均按当前成员有效合约、操作系统和架构重新核对发行权限，签发变更后立即生效。

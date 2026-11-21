@@ -14,6 +14,7 @@ const personalToken = { type: 'string', pattern: personalLoginTokenPattern.sourc
 const tenantId = { type: 'string', pattern: '^ten_[0-9A-HJKMNP-TV-Z]{26}$' };
 const ref = (name: string) => ({ $ref: `#/components/schemas/${name}` });
 const object = (properties: Record<string, unknown>, required = Object.keys(properties)) => ({ type: 'object', properties, required });
+const boolean = { type: 'boolean' };
 const loginResponse = object({ token, user: ref('User'), tenants: { type: 'array', items: ref('Tenant') } });
 const response = (description: string, schema?: object) => ({ description, ...(schema && { content: { 'application/json': { schema } } }) });
 const error = (description: string) => response(description, ref('Error'));
@@ -71,24 +72,219 @@ const desktopRelease = managed({ id: text, version: text, os: desktopOs, arch: d
   sha256: nullableText, published_at: nullableText });
 const publicDesktopRelease = object({ id: text, version: text, os: desktopOs, arch: desktopArch,
   size: { type: 'integer', minimum: 0 }, sha256: text, published_at: text, download_url: text });
+const toolId = { ...text, pattern: '^tool_[0-9A-HJKMNP-TV-Z]{26}$' };
+const toolFields = { name: text, version: text, kind: { ...text, enum: ['skill', 'mcp','hook'] },
+  agents: { type: 'array', minItems: 1, uniqueItems: true, items: { ...text, enum: ['claude-code', 'codex', 'kimi-code'] } },
+  os: { enum: ['macos', 'windows', null] }, arch: { enum: ['arm64', 'x64', null] },
+  entrypoint: nullableText, args: { type: 'array', items: text } };
+const toolRelease = managed({ id: toolId, ...toolFields, status: { ...text, enum: ['draft', 'published', 'disabled'] },
+  created_at: timestamp, artifact_cached: boolean, sha256: nullableText, size: { type: ['integer', 'null'], minimum: 1 } });
+const toolBundle = object({ files: { type: 'array', minItems: 1, maxItems: 256, items: object({
+  path: { ...text, maxLength: 240 }, data: { ...text, contentEncoding: 'base64' },
+}) } });
 const tenantFields = { id: tenantId, name: text, owner_user_id: text, status: { type: 'string', enum: ['active', 'suspended'] } };
 const rates = { model_id: text, effective_from: { ...text, format: 'date-time' }, input_milli_per_mtok: sequence,
   output_milli_per_mtok: sequence, cache_read_milli_per_mtok: sequence, cache_write_milli_per_mtok: sequence };
 const memberInput = { user_id: text, role, group_id: nullableText, status: text, quota_milli: { type: ['integer', 'null'], minimum: 0 } };
-const member = managed({ id: text, name: text, email: nullableText, phone: nullableText, month_used_milli: sequence, ...memberInput });
+const member = managed({ id: text, name: text, email: nullableText, phone: nullableText, month_used_milli: sequence,
+  quota_configurable: boolean, ...memberInput });
 const groupInput = { name: text, parent_id: nullableText, quota_milli: memberInput.quota_milli };
-const group = managed({ id: text, month_used_milli: sequence, ...groupInput });
+const group = managed({ id: text, month_used_milli: sequence, quota_configurable: boolean, ...groupInput });
 const quotaUsage = object({ scope: { type: 'string', enum: ['member', 'group'] }, id: text, quota_milli: { type: ['integer', 'null'], minimum: 0 },
-  used_milli: sequence, reserved_milli: sequence, remaining_milli: { type: ['integer', 'null'] }, actions });
+  used_milli: sequence, reserved_milli: sequence, quota_distribution: boolean, remaining_milli: { type: ['integer', 'null'] }, actions });
 const meQuota = object({ quota_milli: { type: ['integer', 'null'], minimum: 0 }, month_used_milli: sequence,
   remaining_milli: { type: ['integer', 'null'] }, limited_by: { type: ['string', 'null'] } });
-const releaseSupply = { artifact_cached: { type: 'boolean' }, qualification_required: { type: 'boolean' }, part_bytes: { type: ['integer', 'null'], minimum: 1 },
+const agentBinary = { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } };
+const runtimeArtifact = object({ size: sequence, sha256: releaseDigest, artifact_cached: { type: 'boolean' } });
+const releaseSupply = { runtime: { anyOf: [runtimeArtifact, { type: 'null' }] }, artifact_cached: { type: 'boolean' }, qualification_required: { type: 'boolean' }, part_bytes: { type: ['integer', 'null'], minimum: 1 },
   format: { type: ['string', 'null'], enum: ['executable', 'dmg', 'nsis', null] } };
 const contractInput = { seat_limit: sequence, allowed_agents: { type: 'array', items: text }, allowed_models: { type: 'array', items: text },
   lease_minutes: sequence, lease_budget_milli: sequence, visibility: { type: 'object' } };
 const agentPin = { id: text, agent: text, version: text, os: text, arch: text, sha256: releaseDigest, size: sequence };
 const contract = managed({ ...contractInput, agent_releases: { type: 'array', items: object({ ...agentPin, available: { type: 'boolean' } }) },
-  updated_by: text, updated_at: text });
+  platform_revision: sequence, tenant_revision: sequence, quota_distribution: boolean, updated_by: text, updated_at: text });
+const visible = object({ summary: boolean, content: boolean });
+const entitlements = { ...contractInput, lease_minutes: { ...revision, maximum: 1440 },
+  visibility: object({ admin: visible, group_admin: visible }), quota_distribution: boolean };
+const configurationItems = { allowed_agents: entitlements.allowed_agents, allowed_models: entitlements.allowed_models,
+  lease_minutes: entitlements.lease_minutes, lease_budget_milli: entitlements.lease_budget_milli,
+  visibility: entitlements.visibility, agent_release_ids: { type: 'array', items: text } };
+const nullable = (schema: object) => ({ anyOf: [schema, { type: 'null' }] });
+const visibilitySelection = object({
+  admin: nullable(object({ summary: nullable(boolean), content: nullable(boolean) }, [])),
+  group_admin: nullable(object({ summary: nullable(boolean), content: nullable(boolean) }, [])),
+}, []);
+const tenantConfiguration = object({
+  ...Object.fromEntries(Object.entries(configurationItems).map(([key, schema]) => [key, nullable(schema)])),
+  visibility: nullable(visibilitySelection),
+}, []);
+const templateInput = object({ id: text, name: text, revision: sequence, entitlements: object(entitlements) });
+const template = object({ id: text, name: text, version: revision, entitlements: object(entitlements),
+  published_by: text, published_at: timestamp, actions });
+const platformContractFields = { revision, template_id: text, template_version: revision, entitlements: object(entitlements),
+  reason: text, issued_by: text, effective_at: timestamp };
+const platformContract = object(platformContractFields);
+const contractSeats = object({ limit: sequence, active: sequence, available: sequence, over_limit: sequence });
+const effectiveContract = object({ ...entitlements, agent_release_ids: configurationItems.agent_release_ids });
+const platformContractView = object({ tenant_id: tenantId, revision: sequence, platform_contract: nullable(platformContract),
+  tenant_revision: sequence, effective: effectiveContract, seats: contractSeats, actions });
+const configurationView = object({ platform_revision: sequence, revision: sequence, entitlements: nullable(object(entitlements)),
+  configuration: tenantConfiguration, effective: effectiveContract, seats: contractSeats, actions });
+const platformContractInput = object({ revision: sequence, tenant_revision: sequence, template_id: text, template_version: revision,
+  entitlements: object(entitlements, []), reason: text }, ['revision', 'tenant_revision', 'template_id', 'template_version', 'reason']);
+const configurationInput = object({ platform_revision: revision, revision: sequence, configuration: tenantConfiguration });
+const contractPreview = (input: object, parameters: object[] = []) => ({
+  security: bearer, parameters, requestBody: requestBody(input),
+  responses: { 200: response('预览', object({ previous_effective: effectiveContract, effective: effectiveContract,
+    configuration: tenantConfiguration, seats: contractSeats })),
+    404: error('对象不存在'), ...status },
+});
+const contractTenantPath = { name: 'tenant_id', in: 'path', required: true, schema: tenantId };
+const contractIdempotency = headers.map(header => ({ ...header, required: true }));
+const listItems = (items: object) => ({ type: 'array', items });
+const policyRef = object({ id: text, version: revision });
+const policyValue = { oneOf: [boolean, sequence, text, listItems(text)] };
+const policyScope = { type: 'string', enum: ['tenant', 'group', 'member'] };
+const policyBinding = object({ adapter: text, abi: { type: 'integer', const: 1 } });
+const definitionFields = {
+  id: text, title: text, description: text, category: text, scopes: listItems(policyScope),
+  schema: object({
+    kind: { type: 'string', enum: ['boolean', 'integer', 'money_milli', 'ratio_ppm', 'enum', 'resource_set', 'text'] },
+    min: sequence, max: sequence, catalog: text, options: listItems(object({ id: text, label: text })),
+  }, ['kind']),
+  merge: { type: 'string', enum: ['fixed', 'min', 'max', 'intersection', 'and'] },
+  default_value: policyValue, binding: nullable(policyBinding),
+};
+const policyDefinitionRecord = object({ ...definitionFields, version: revision });
+const policyDefinition = object({ ...definitionFields, version: revision, actions });
+const policyChoice = { clause_ref: policyRef, value: policyValue };
+const policyTemplateFields = { id: text, name: text, description: text, scope: { type: 'string', enum: ['platform', 'group', 'member'] } };
+const policyTemplate = object({ ...policyTemplateFields, version: revision, actions,
+  entries: listItems(object({ ...policyChoice, definition: policyDefinitionRecord })) });
+const policyDraftEntry = { clause_ref: policyRef, template_ref: nullable(policyRef), adjustment: policyValue };
+const policySignedEntry = object({ ...policyDraftEntry, base_value: policyValue, signed_value: policyValue, definition: policyDefinitionRecord },
+  ['clause_ref', 'template_ref', 'base_value', 'signed_value', 'definition']);
+const policyEffectiveEntry = object({ clause_ref: policyRef, definition: policyDefinitionRecord, parent_value: policyValue,
+  effective_value: policyValue, source: object({ scope: text, subject_id: text, revision }) });
+const policyHead = { platform_revision: sequence, policy_revision: sequence };
+const policyExpected = { expected_platform_revision: sequence, expected_policy_revision: sequence };
+const policyContractRow = { tenant_id: tenantId, name: text, ...policyHead, actions };
+const policySign = object({ ...policyExpected, base_revision: nullable(revision), reason: text,
+  entries: listItems(object(policyDraftEntry, ['clause_ref', 'template_ref'])) });
+const policySignature = { tenant_id: tenantId, revision, current: boolean, ...policyHead, reason: text, issued_by: text, issued_at: timestamp, actions };
+const policyConfigInput = {oneOf:[object({ ...policyExpected, template_ref: nullable(policyRef), selections: listItems(object(policyChoice)) }),
+  object({...policyExpected,restore_revision:revision})]};
+const policyConfig = { scope: policyScope, subject_id: text, revision: sequence, ...policyHead, template_ref: nullable(policyRef),
+  selections: listItems(object(policyChoice)), entries: listItems(policyEffectiveEntry), actions };
+const policyBalance = object({ balance_milli: sequence, reserved_milli: sequence, month_used_milli: sequence });
+const policyRecharge = object({ ledger_id: text, tenant_id: tenantId, platform_revision: revision, amount_milli: revision,
+  balance_before_milli: sequence, balance_after_milli: sequence, by: text, at: timestamp, note: nullableText, actions });
+const policyDiscountAmounts = { gross_milli: sequence, net_milli: sequence, discount_milli: sequence };
+const policyDiscount = object({ tenant_id: tenantId, month: text, ...policyDiscountAmounts,
+  adjustment_ledger_id: nullableText, closed_at: timestamp, closed_by: text, actions,
+  buckets: listItems(object({ platform_revision: revision, policy_revisions: listItems(revision),
+    ratio_ppm: { ...sequence, maximum: 1_000_000 }, ...policyDiscountAmounts })),
+});
+const policyPlatform = '/v1/platform/policy';
+const policyTenant = '/v1/policy';
+const policyContractPath = policyPlatform + '/contracts/{tenant_id}';
+const policyConfigPath = policyTenant + '/configurations/{scope}/{subject_id}';
+const namedPath = (name: string, schema: object = text) => ({ name, in: 'path', required: true, schema });
+const policyDetail = (schema: object, parameters: object[]) => ({ ...detailOf(schema, false), parameters });
+const policyWrite = (input: object, output: object, mode: 'create' | 'update', parameters: object[] = []) =>
+  ({ ...write(input, output, mode), parameters: [...parameters, ...contractIdempotency] });
+const policyPreview = (input: object, output: object, parameters: object[]) => ({
+  security: bearer, parameters, requestBody: requestBody(input), responses: { 200: response('预览', output), 404: error('对象不存在'), ...status },
+});
+const versionPaths = (path: string, input: object, output: object) => ({
+  [path]: { get: listOf(output), post: policyWrite(input, output, 'create') },
+  [path + '/{id}/{version}']: { get: policyDetail(output, [idPath, namedPath('version', revision)]) },
+});
+const policyTemplateInput = object({ ...policyTemplateFields, expected_version: sequence, entries: listItems(object(policyChoice)) });
+const policyConfigParams = [namedPath('scope', policyScope), namedPath('subject_id')];
+const policyRechargeList = (parameters: object[]) => ({ ...listOf(policyRecharge, parameters), responses: {
+  ...listOf(policyRecharge, parameters).responses,
+  200: response('分页结果与可用余额', object({ items: listItems(policyRecharge), total: sequence,
+    next_cursor: nullableText, actions, balance: policyBalance })),
+} });
+const policyOptions = listOf(object({ id: text, label: text }), [namedPath('catalog', { ...text, enum: ['agents', 'models', 'tools','releases','providers','commerce_plans'] }),
+  { name: 'ids', in: 'query', schema: text }]);
+const discountMonth = namedPath('month', { ...text, pattern: '^[1-9][0-9]{3}-(0[1-9]|1[0-2])$' });
+const platformDiscount = policyDetail(policyDiscount, [contractTenantPath, discountMonth]);
+const upstreamFields={model_id:text,name:text,upstream_name:text,base_url:text,priority:sequence,status:{enum:['active','disabled']}};
+const upstreamView=object({...upstreamFields,id:text,has_key:boolean,protocol:text,revision,actions});
+const upstreamWrite={...upstreamFields,expected_revision:sequence,secret:{...text,writeOnly:true}};
+const sharesResult=object({items:listItems(object({recipient:text,created_at:timestamp}))});
+const impactRow=object({device_id:text,user_id:text,os:text,arch:text,applied_policy_revision:nullable(revision),
+  changed_clauses:listItems(text),unavailable:listItems(object({resource_id:text,reason:text}))});
+const priceFields={input_milli_per_mtok:sequence,output_milli_per_mtok:sequence,cache_read_milli_per_mtok:sequence,cache_write_milli_per_mtok:sequence};
+const commerceTerms=object({monthly_grant_milli:sequence,monthly_fee_fen:sequence,
+  tiers:listItems(object({from_milli:sequence,ratio_ppm:sequence})),commitment:nullable(object({up_to_milli:sequence,ratio_ppm:sequence})),
+  model_prices:listItems(object({model_id:text,...priceFields})),model_budgets:listItems(object({model_id:text,monthly_milli:sequence})),
+  tool_prices:listItems(object({release_id:text,per_call_milli:sequence}))});
+const commercePlan=object({id:text,plan_id:text,version:revision,name:text,terms:commerceTerms,created_by:text,created_at:timestamp});
+const tierInput={floor_model_id:text,models:listItems(object({model_id:text,tier:{enum:['floor','standard','pro','advanced','top']}}))};
+const commerceAccount=object({tenant_id:text,month:text,plan:nullable(commercePlan),balance_milli:{type:'integer'},reserved_milli:sequence,
+  month_used_milli:sequence,permanent_available_milli:{type:'integer'},package_available_milli:sequence,packages:listItems({type:'object'}),
+  model_budgets:listItems({type:'object'}),tool_calls:listItems({type:'object'}),tiers:{type:'object'}},
+  ['tenant_id','month','plan','balance_milli','reserved_milli','permanent_available_milli','package_available_milli','packages','model_budgets','tool_calls','tiers']);
+const targetParameters=[namedPath('user_id'),{name:'os',in:'query',required:true,schema:{enum:['darwin','win32','linux']}},
+  {name:'arch',in:'query',required:true,schema:{enum:['arm64','x64']}}];
+const targetView=object({...policyHead,user_id:text,os:text,arch:text,models:listItems({type:'object'}),releases:listItems({type:'object'}),
+  tools:listItems({type:'object'}),routes:listItems(object({model_id:text,candidates:listItems(object({provider_id:text,priority:sequence,source:text}))})),unavailable:listItems(object({resource_id:text,reason:text}))});
+const policyPaths = {
+  [policyTenant+'/targets/{user_id}']:{get:policyDetail(targetView,targetParameters)},
+  [policyContractPath+'/targets/{user_id}']:{get:policyDetail(targetView,[contractTenantPath,...targetParameters])},
+  [policyContractPath+'/targets']:{get:listOf(object({user_id:text,name:text,actions}),[contractTenantPath])},
+  '/v1/platform/commerce/plans':{get:listOf(commercePlan),post:policyWrite(object({name:text,expected_version:sequence,plan_id:text,terms:commerceTerms},['name','expected_version','terms']),commercePlan,'create')},
+  '/v1/platform/commerce/model-tiers':{get:detailOf(object({...tierInput,revision:sequence}),false),
+    put:policyWrite(object({...tierInput,expected_revision:sequence}),object({...tierInput,revision}),'update')},
+  '/v1/platform/commerce/tenants/{tenant_id}':{get:policyDetail(commerceAccount,[contractTenantPath])},
+  '/v1/commerce/account':{get:detailOf(commerceAccount,false)},
+  [policyConfigPath+'/history']:{get:listOf(object({revision,platform_revision:revision,updated_at:timestamp,updated_by:text,
+    restored_from_revision:nullable(revision)}),policyConfigParams)},
+  [policyTenant+'/upstreams']:{get:listOf(upstreamView),post:policyWrite(object(upstreamWrite,['model_id','name','upstream_name','base_url','expected_revision','secret']),upstreamView,'create')},
+  [policyTenant+'/upstreams/{id}']:{put:policyWrite(object(upstreamWrite,['expected_revision']),upstreamView,'update',[idPath])},
+  '/v1/observe/shared':{get:listOf(object({id:text,user_id:text,agent:text,model:nullableText,created_at:timestamp}))},
+  '/v1/observe/sessions/{id}/export':{get:listOf(object({seq:sequence,kind:text,at:timestamp,payload:{type:'object'}}),[idPath])},
+  '/v1/observe/sessions/{id}/shares':{get:policyDetail(sharesResult,[idPath]),post:write(object({recipient:text}),sharesResult,'update',true)},
+  '/v1/observe/sessions/{id}/shares/{recipient}':{delete:policyDetail(sharesResult,[idPath,namedPath('recipient')])},
+  [policyPlatform + '/adapters']: { get: listOf(object({
+    id: text, abi: revision, kind: text, merge: text, scopes: listItems(policyScope), catalog: text, min: sequence, max: sequence,
+  }, ['id', 'abi', 'kind', 'merge', 'scopes'])) },
+  ...versionPaths(policyPlatform + '/definitions', object({ ...definitionFields, expected_version: sequence }), policyDefinition),
+  ...versionPaths(policyPlatform + '/templates', policyTemplateInput, policyTemplate),
+  ...versionPaths(policyTenant + '/configuration-templates', policyTemplateInput, policyTemplate),
+  [policyPlatform + '/catalog/{catalog}']: { get: policyOptions },
+  [policyTenant + '/catalog/{catalog}']: { get: policyOptions },
+  [policyPlatform + '/contracts']: { get: listOf(object(policyContractRow)) },
+  [policyContractPath]: { get: policyDetail(object({ ...policyContractRow, balance: policyBalance }), [contractTenantPath]) },
+  [policyContractPath + '/signatures']: { get: listOf(object(policySignature), [contractTenantPath]),
+    post: policyWrite(policySign, object({ ...policySignature, entries: listItems(policySignedEntry) }), 'create', [contractTenantPath]) },
+  [policyContractPath + '/signatures/{revision}']: { get: policyDetail(object({ ...policySignature, entries: listItems(policySignedEntry) }),
+    [contractTenantPath, namedPath('revision', revision)]) },
+  [policyContractPath + '/preview']: { post: policyPreview(policySign, object({ tenant_id: tenantId, ...policyHead,
+    entries: listItems(policySignedEntry), previous_entries: listItems(policySignedEntry), actions,
+    seats:object({limit:sequence,active:sequence,over_limit:sequence}),impact:object({member_count:sequence,device_count:sequence,
+      devices:object({items:listItems(impactRow),total:sequence,next_cursor:nullableText,actions})}) }), [contractTenantPath,...listParams]) },
+  [policyTenant + '/signatures']: { get: listOf(object(policySignature)) },
+  [policyTenant + '/configurations/{scope}']: { get: listOf(object({
+    id: text, name: text, role, group_id: nullableText, parent_id: nullableText, actions,
+  }, ['id', 'name', 'actions']), [namedPath('scope', { type: 'string', enum: ['group', 'member'] })]) },
+  [policyConfigPath]: { get: policyDetail(object(policyConfig), policyConfigParams),
+    put: policyWrite(policyConfigInput, object(policyConfig), 'update', policyConfigParams) },
+  [policyConfigPath + '/preview']: { post: policyPreview(policyConfigInput, object({ ...policyConfig,
+    previous_entries: listItems(policyEffectiveEntry) }), policyConfigParams) },
+  [policyContractPath + '/recharges']: { get: policyRechargeList([contractTenantPath]),
+    post: policyWrite(object({ amount_milli: revision, note: text }, ['amount_milli']), policyRecharge, 'create', [contractTenantPath]) },
+  [policyContractPath + '/recharges/{ledger_id}']: { get: policyDetail(policyRecharge, [contractTenantPath, namedPath('ledger_id')]) },
+  [policyTenant + '/recharges']: { get: policyRechargeList([]) },
+  [policyTenant + '/recharges/{ledger_id}']: { get: policyDetail(policyRecharge, [namedPath('ledger_id')]) },
+  [policyContractPath + '/discounts/{month}']: { get: platformDiscount,
+    post: { ...platformDiscount, parameters: [...platformDiscount.parameters, ...contractIdempotency],
+      responses: { ...platformDiscount.responses, ...status } } },
+  [policyTenant + '/discounts/{month}']: { get: policyDetail(policyDiscount, [discountMonth]) },
+};
 const audit = managed({ id: text, actor: text, action: text, target: text, at: { ...text, format: 'date-time' } });
 const inviteInput = { role, group_id: nullableText, max_uses: sequence, expires_in_ms: sequence };
 const invite = object({ id: text, role, group_id: nullableText, max_uses: sequence, used: sequence, expires_at: text,
@@ -106,8 +302,9 @@ function platformPaths(path: string, fields: Record<string, unknown>, required: 
   };
 }
 
-const ledger = managed({ id: text, kind: text, amount_milli: { type: 'integer' }, user_id: nullableText, lease_id: nullableText,
-  request_ref: nullableText, by: nullableText, at: text, note: nullableText });
+const ledgerFields = { id: text, kind: text, amount_milli: { type: 'integer' }, user_id: nullableText, lease_id: nullableText,
+  request_ref: nullableText, by: nullableText, at: text, note: nullableText, actions };
+const ledger = object({ ...ledgerFields, discount_month: text }, Object.keys(ledgerFields));
 const staleLease = managed({ id: text, device_id: text, user_id: text, budget_milli: sequence, used_milli: sequence,
   expires_at: text, status: text, seq: sequence, last_seen_at: nullableText });
 const device = managed({ id: text, user_id: text, name: text, os: text, arch: text, edge_version: nullableText,
@@ -120,6 +317,7 @@ export const openapi = {
   openapi: '3.1.0',
   info: { title: 'OneX Server', version: pkg.version },
   paths: {
+    ...policyPaths,
     '/v1/healthz': { get: { summary: '健康检查', responses: { 200: response('正常', object({ status: { const: 'ok' }, version: text, commit: text })) } } },
     '/v1/openapi.json': { get: { summary: '接口文档', responses: { 200: response('OpenAPI 文档', { type: 'object' }) } } },
     '/v1/auth/code': { post: { summary: '请求验证码', parameters: headers, requestBody: requestBody(object({ target: text })),
@@ -178,14 +376,20 @@ export const openapi = {
       [method, write(object({ ...groupInput, revision }, ['revision']), group, 'update', true)])) },
     '/v1/invites': { post: { ...write(object(inviteInput, ['role', 'max_uses', 'expires_in_ms']), invite, 'create'),
       description: '首次成功返回邀请码；幂等重放返回 code_returned:false 且不再披露邀请码。' } },
-    '/v1/contract': { get: detailOf(contract, false), put: write(object({
+    '/v1/contract': { get: detailOf(contract, false), put: { ...write(object({
       ...contractInput, revision: sequence, agent_release_ids: { type: 'array', items: text },
-    }, [...Object.keys(contractInput), 'revision']), contract, 'update') },
+    }, [...Object.keys(contractInput), 'revision']), contract, 'update'), deprecated: true } },
+    '/v1/contract/configuration': {
+      get: detailOf(configurationView, false),
+      put: { ...write(configurationInput, configurationView, 'update'), parameters: contractIdempotency },
+    },
+    '/v1/contract/configuration/preview': { post: contractPreview(configurationInput) },
     '/v1/contract/effective': { get: { summary: '查看指定设备实际可用的 Agent 和当前生效的模型倍率',
       security: bearer, parameters: [
         { name: 'os', in: 'query', required: true, schema: { ...text, enum: ['darwin', 'linux', 'win32'] } },
         { name: 'arch', in: 'query', required: true, schema: { ...text, enum: ['arm64', 'x64'] } },
-      ], responses: { ...status, 200: response('生效配置', object({ revision, os: text, arch: text, actions,
+      ], responses: { ...status, 200: response('生效配置', object({ revision, platform_revision: sequence, tenant_revision: sequence,
+        os: text, arch: text, actions,
         agents: { type: 'array', items: object({ agent: text,
           status: { ...text, enum: ['available', 'unavailable', 'qualification_required'] },
           releases: { type: 'array', items: object(agentPin) } }) },
@@ -226,7 +430,18 @@ export const openapi = {
       200: { description: '会话、事件和用量摘要流', content: { 'text/event-stream': { schema: text } } }, 401: status[401], 403: status[403],
     } } },
     '/v1/observe/stale-leases': { get: { ...listOf(staleLease), description: '超过 24 小时未回连，仍保留预留额度的过期租约。' } },
-    ...platformPaths('/v1/platform/tenants', tenantFields, ['name', 'owner_user_id'], { seat_limit: sequence }, { created_at: text }),
+    '/v1/platform/contract-templates': {
+      get: listOf(template),
+      post: { ...write(templateInput, template, 'create'), parameters: contractIdempotency },
+    },
+    '/v1/platform/capability-contracts': { get: listOf(object({ tenant_id: tenantId, name: text, actions })) },
+    '/v1/platform/capability-contracts/{tenant_id}': {
+      get: { ...detailOf(platformContractView, false), parameters: [contractTenantPath] },
+      put: { ...write(platformContractInput, platformContractView, 'update'), parameters: [contractTenantPath, ...contractIdempotency] },
+    },
+    '/v1/platform/capability-contracts/{tenant_id}/history': { get: listOf(object({ ...platformContractFields, actions }), [contractTenantPath]) },
+    '/v1/platform/capability-contracts/{tenant_id}/preview': { post: contractPreview(platformContractInput, [contractTenantPath]) },
+    ...platformPaths('/v1/platform/tenants', tenantFields, ['name', 'owner_user_id'], {}, { created_at: text }),
     ...platformPaths('/v1/platform/providers', providers, ['name', 'protocol', 'base_url', 'secret'], { secret: { ...text, writeOnly: true } }),
     ...platformPaths('/v1/platform/models', models, ['provider_id', 'upstream_name', 'display_name', 'context_window']),
     ...platformPaths('/v1/platform/agent-releases', releases, ['agent', 'version', 'os', 'arch', 'url', 'sha256', 'size'], {},
@@ -245,6 +460,19 @@ export const openapi = {
         artifact_cached: { const: true }, download_url: text })),
         202: response('已暂存分段', object({ artifact_cached: { const: false }, part: sequence, count: sequence })),
         404: error('发行不存在'), 413: error('文件超限') } } },
+    '/v1/platform/agent-releases/{id}/runtime': {
+      put: { summary: '上传并校验 Claude Desktop 固定 Code 引擎', security: bearer,
+        parameters: [idPath, { name: 'revision', in: 'query', required: true, schema: revision }],
+        requestBody: { required: true, content: agentBinary }, responses: { ...status, 200: response('引擎已缓存', runtimeArtifact),
+          404: error('发行没有配套的引擎'), 413: error('文件超限') } },
+      get: { summary: '平台管理员下载 Claude Desktop 配套引擎', security: bearer, parameters: [idPath],
+        responses: { 200: { description: '配套引擎原始字节', content: agentBinary }, 401: status[401], 403: status[403],
+          404: error('引擎未缓存') } },
+    },
+    '/v1/edge/agent-artifacts/{id}/runtime': { get: { summary: '按设备和能力合约下载 Claude Desktop 配套引擎',
+      security: [{ DeviceToken: [] }], parameters: [idPath],
+      responses: { 200: { description: '配套引擎原始字节', content: agentBinary }, 401: status[401],
+        404: error('引擎不可用或合约未授权') } } },
     '/v1/platform/agent-releases/{id}/pull': { post: { summary: '从登记的官方源拉取受管 Agent 制品',
       security: bearer, parameters: [idPath], responses: { ...status,
         200: response('制品校验通过', object({ sha256: releaseDigest, size: sequence, artifact_cached: { const: true }, download_url: text })),
@@ -257,6 +485,21 @@ export const openapi = {
       parameters: [idPath],
       responses: { 200: { description: '制品原始字节', content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
         401: status[401], 404: error('制品不存在或当前合约不允许') } } },
+    '/v1/platform/tool-releases': { get: listOf(toolRelease),
+      post: { ...write(object({ ...toolFields, os: { ...text, enum: ['macos', 'windows'] }, arch: desktopArch,
+        entrypoint: text }, ['name', 'version', 'kind', 'agents']), toolRelease, 'create'),
+        description: '新建固定版本。Skill 仅需通用字段。MCP 还需要系统、架构和启动文件。' } },
+    '/v1/platform/tool-releases/{id}': { get: detailOf(toolRelease) },
+    '/v1/platform/tool-releases/{id}/artifact': { put: { summary: '上传并校验工具包', security: bearer,
+      parameters: [idPath, { name: 'revision', in: 'query', required: true, schema: revision }],
+      requestBody: requestBody(toolBundle), responses: { ...status, 200: response('工具包已校验', toolRelease),
+        404: error('发行不存在'), 413: error('文件超限') } } },
+    '/v1/platform/tool-releases/{id}/publish': { post: write(object({ revision }), toolRelease, 'update', true) },
+    '/v1/platform/tool-releases/{id}/disable': { post: write(object({ revision }), toolRelease, 'update', true) },
+    '/v1/edge/tool-artifacts/{id}': { get: { summary: '按设备当前生效的能力策略下载工具包',
+      security: [{ DeviceToken: [] }], parameters: [idPath],
+      responses: { 200: response('经 SHA-256 固定的原始工具包', toolBundle),
+        401: status[401], 404: error('制品不存在或当前配置未授权') } } },
     '/v1/platform/maintenance': { get: { ...detailOf(object({ active_commit: text, runner_ready: { type: 'boolean' },
       active_rollout: optionalRollout, actions }), false), summary: '平台维护状态' } },
     '/v1/platform/server-releases': { get: listOf(serverRelease), post: { summary: '登记签名的 Server 发布包',

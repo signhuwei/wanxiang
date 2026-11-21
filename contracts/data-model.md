@@ -1,5 +1,7 @@
 # 数据模型 v0
 
+v0.15 的合约模板、平台合约、租户配置和有效投影见[能力合约数据](capability-contract.md#数据和权限)。
+
 ## system.sqlite
 
 | 表 | 主要字段 |
@@ -82,13 +84,13 @@ S0 和 S1 只运行一个 Server 写进程（SQLite 本身也要求单节点写�
 
 依据访谈“租户可以把额度分到组和个人，也可以选择不限制”。
 
-- `members.quota_milli`、`groups.quota_milli` 都是**每个自然月**的橡皮上限（毫橡皮），`null` 表示不限。月份按租户时区，S2 仍固定 Asia/Shanghai，与 `month_cost_milli` 同口径。
+- `members.quota_milli`、`groups.quota_milli` 都是**每个自然月**的橡皮上限。配额按块设置，入库时换算为整数毫橡皮，例如 12.5 块橡皮存为 `12500`。`null` 表示不限。月份按租户时区，S2 仍固定 Asia/Shanghai，与 `month_cost_milli` 同口径。
 - 一个成员的有效上限同时受本人配额、所在组配额、所有祖先组配额约束，先到先停。组配额计的是该组及其全部子组成员的合计。
 - 本月已用 = 本月 `settle` 金额加上**仍在 active 的租约**的 `budget_milli`（按租约的 `user_id` 归属）。也就是预留计入配额，与租户余额同理。`overage_pending` 不计入。
 - 月份按 `ledger.at` 落在 Asia/Shanghai 的哪个自然月计；active 租约的预留不论何时签发都计入当月（v0.13）。
 - 组的用量按**当前**成员归属汇总：成员换组后，其本月已结算和预留整体从旧组移到新组；停用或离开的成员仍按其当前 `group_id` 计（v0.13）。
 - 配额调低后，可超出的量是相关成员所有设备 active 租约之和，不是单个租约（v0.13）。
-- 签发租约时，额度取 `min(租户可用余额, 合约 lease_budget_milli, 余额的 5%（最低 1）, 本人剩余, 每一级组的剩余)`。任意一级剩余 ≤ 0 时返回 `cutoff{reason:"quota"}`；租户余额 ≤ 0 返回 `balance`。完整优先级见 `edge-ws.md`「断流原因优先级」。
+- 签发租约时，额度以毫橡皮取 `min(租户可用余额, 合约 lease_budget_milli, 余额的 5%（最低 1 毫橡皮）, 本人剩余, 每一级组的剩余)`。任意一级剩余 ≤ 0 时返回 `cutoff{reason:"quota"}`；租户余额 ≤ 0 返回 `balance`。完整优先级见 `edge-ws.md`「断流原因优先级」。
 - 续租走同样的规则。配额被调低后，已签发的租约照常用完，下一次续租按新值裁决。配额调高、充值或进入新月份后，Edge 经 `lease_request` 恢复（`edge-ws.md`「断流后的恢复」）。Server 不主动推送新租约。
 - 配额只限制员工的模型用量，不改变租户扣款、`overage_pending` 或租约结清逻辑。
 

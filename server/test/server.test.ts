@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DESKTOP_AGENT_PART_BYTES } from '../src/agent-catalog';
@@ -59,8 +59,74 @@ async function fixture(heartbeatMs = 15_000, testTime?: number) {
   }
   const publicKey = Buffer.alloc(32, 5).toString('base64');
   const device = { name: 'Mac', os: 'darwin', arch: 'arm64', public_key: publicKey };
-  return { ...service, ...seeded, owner, device, presence, request, code, login, select, advance: (ms: number) => { time += ms; }, now: () => time };
+  return { ...service, ...seeded, dataDir, owner, device, presence, request, code, login, select, advance: (ms: number) => { time += ms; }, now: () => time };
 }
+
+const templatePath = '/platform/contract-templates';
+const configurationPath = '/contract/configuration';
+const standardEntitlements = {
+  seat_limit: 2, allowed_agents: ['claude-code'], allowed_models: [] as string[], lease_minutes: 10, lease_budget_milli: 2000,
+  visibility: { admin: { summary: true, content: false }, group_admin: { summary: true, content: false } },
+  quota_distribution: true,
+};
+
+async function issueFixtureContract(f: Awaited<ReturnType<typeof fixture>>, global: string, scoped: string, entitlements = standardEntitlements) {
+  await f.store.system.write(sql => sql.run('INSERT OR IGNORE INTO platform_admins VALUES (?)', [f.userId]));
+  const template = { id: 'fixture', name: 'Fixture', revision: 0, entitlements };
+  expect((await f.request(templatePath, template, global, 'template-fixture')).status).toBe(201);
+  const path = `/platform/capability-contracts/${f.tenantId}`;
+  const body = { revision: 0, tenant_revision: 0, template_id: template.id, template_version: 1, reason: 'First contract' };
+  expect((await f.request(path, body, global, 'issue-fixture', 'PUT')).status).toBe(200);
+  const assigned = await (await f.request(configurationPath, undefined, scoped)).json() as { platform_revision: number; revision: number };
+  return { platform_revision: assigned.platform_revision, revision: assigned.revision };
+}
+
+test('platform contract revisions enforce tenant boundaries through republishing and restoration', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const owner = await f.select(global);
+  const path = `/platform/capability-contracts/${f.tenantId}`;
+  expect((await f.request(path, undefined, owner)).status).toBe(403);
+  expect((await f.request(configurationPath, undefined, global)).status).toBe(403);
+  expect(await (await f.request(configurationPath, undefined, owner)).json()).toMatchObject({ platform_revision: 0, entitlements: null });
+  const entitlements = { ...standardEntitlements, allowed_agents: ['claude-code', 'codex'] };
+  const first = await issueFixtureContract(f, global, owner, entitlements);
+  expect(first).toEqual({ platform_revision: 1, revision: 1 });
+  const oldContract = await (await f.request('/contract', undefined, owner)).json() as Record<string, unknown>;
+  const oldWrite = await f.request('/contract', { ...oldContract, seat_limit: 3 }, owner, undefined, 'PUT');
+  expect(oldWrite.status).toBe(409);
+  expect(await oldWrite.json()).toMatchObject({ error: { detail: { reason: 'use_tenant_configuration' } } });
+  expect((await f.request(configurationPath, { ...first, configuration: { seat_limit: 3 } }, owner, 'extra-seat', 'PUT')).status).toBe(422);
+  expect((await f.request(configurationPath, { ...first, configuration: { allowed_agents: ['kimi-code'] } }, owner, 'extra-agent', 'PUT')).status).toBe(422);
+  const explicit = { ...first, configuration: { allowed_agents: ['claude-code', 'codex'], lease_budget_milli: 1500 } };
+  const preview = await f.request(configurationPath + '/preview', explicit, owner);
+  expect(preview.status).toBe(200);
+  expect(await preview.json()).toMatchObject({ effective: { seat_limit: 2, lease_budget_milli: 1500 } });
+  expect(await (await f.request(configurationPath, undefined, owner)).json()).toMatchObject(first);
+  expect((await f.request(configurationPath, explicit, owner, undefined, 'PUT')).status).toBe(422);
+  const publish = await f.request(configurationPath, explicit, owner, 'explicit', 'PUT');
+  expect(publish.status).toBe(200);
+  const published = await publish.json();
+  expect(await (await f.request(configurationPath, explicit, owner, 'explicit', 'PUT')).json()).toEqual(published);
+
+  expect((await f.request(templatePath, { id: 'fixture', name: 'Fixture v2', revision: 1,
+    entitlements: { ...entitlements, seat_limit: 1 } }, global, 'new-template')).status).toBe(201);
+  expect(await (await f.request(path, undefined, global)).json()).toMatchObject({ platform_contract: { template_version: 1 }, seats: { limit: 2 } });
+  const cut = { revision: 1, tenant_revision: 2, template_id: 'fixture', template_version: 2,
+    entitlements: { allowed_agents: ['claude-code'] }, reason: 'Scope reduction' };
+  expect((await f.request(path + '/preview', cut, global)).status).toBe(200);
+  expect((await f.request(path, cut, global, 'reduce', 'PUT')).status).toBe(200);
+  expect((await f.request(configurationPath, { ...explicit, revision: 2 }, owner, 'stale', 'PUT')).status).toBe(409);
+  const reduced = await (await f.request(configurationPath, undefined, owner)).json();
+  expect(reduced).toMatchObject({ platform_revision: 2, revision: 3, effective: { allowed_agents: ['claude-code'], seat_limit: 1 } });
+  expect(reduced).toMatchObject({ seats: { limit: 1, active: 1, available: 0, over_limit: 0 } });
+  const restore = { ...cut, revision: 2, tenant_revision: 3, template_version: 1, entitlements: {}, reason: 'Restore purchased rights' };
+  expect((await f.request(path, restore, global, 'restore', 'PUT')).status).toBe(200);
+  expect(await (await f.request(configurationPath, undefined, owner)).json()).toMatchObject({
+    platform_revision: 3, revision: 3, entitlements: { allowed_agents: entitlements.allowed_agents },
+    effective: { allowed_agents: ['claude-code'], seat_limit: 2, lease_budget_milli: 1500 },
+  });
+});
 
 test('server shutdown drains accepted writes and can be awaited concurrently', async () => {
   const f = await fixture();
@@ -114,6 +180,7 @@ test('health, OpenAPI, one-use codes, tenant selection and logout', async () => 
   expect(Object.keys(spec.paths)).toContain('/v1/platform/providers');
   expect(Object.keys(spec.paths)).toEqual(expect.arrayContaining([
     '/v1/auth/token-login', '/v1/auth/personal-tokens', '/v1/auth/personal-tokens/{id}/revoke',
+    '/v1/platform/contract-templates', '/v1/platform/capability-contracts/{tenant_id}', '/v1/contract/configuration/preview',
   ]));
   expect(spec.paths).toMatchObject({ '/v1/audit': { get: { security: [{ SessionToken: [] }],
     parameters: expect.arrayContaining([expect.objectContaining({ name: 'action', in: 'query' })]),
@@ -463,8 +530,9 @@ test('tenant management enforces scope, revisions, pagination, and one-time invi
   const update = { revision: 1, quota_milli: 100 };
   expect(await (await f.request(`/members/${user.id}`, update, scoped, undefined, 'PATCH')).json()).toMatchObject({ revision: 2, group_id: group.id, quota_milli: 100 });
   expect((await f.request(`/members/${user.id}`, update, scoped)).status).toBe(409);
-  const set = { revision: 1, seat_limit: 3, allowed_agents: ['claude-code'], allowed_models: [], lease_minutes: 10, lease_budget_milli: 2000, visibility: {} };
+  const set = { revision: 1, seat_limit: 2, allowed_agents: ['claude-code'], allowed_models: [], lease_minutes: 10, lease_budget_milli: 2000, visibility: {} };
   expect((await f.request('/contract', set, employee, undefined, 'PUT')).status).toBe(403);
+  expect((await f.request('/contract', { ...set, seat_limit: 3 }, scoped, undefined, 'PUT')).status).toBe(422);
   expect(await (await f.request('/contract', set, scoped, undefined, 'PUT')).json()).toMatchObject({ ...set, revision: 2, visibility: {
     admin: { summary: true, content: false }, group_admin: { summary: true, content: false },
   } });
@@ -523,11 +591,14 @@ test('platform privileges are independent and provider secrets are never returne
     .toMatchObject({ total: 1, next_cursor: null, items: [{ model_id }] });
   expect((await f.request('/platform/agent-releases', { agent: 'claude-code', version: '1', os: 'darwin', arch: 'arm64', url: 'http://127.0.0.1/fake', sha256: 'a'.repeat(64), size: 1 }, global)).status).toBe(201);
   const tenant = { name: 'Second', owner_user_id: f.userId };
+  expect((await f.request('/platform/tenants', { ...tenant, seat_limit: 10 }, global, 'unsigned-seats')).status).toBe(422);
   const created = await f.request('/platform/tenants', tenant, global, 'tenant');
   expect(created.status).toBe(201);
   const second = await created.json() as { id: string };
   expect(await (await f.request('/platform/tenants', tenant, global, 'tenant')).json()).toEqual(second);
-  expect(f.store.tenant(second.id).get('SELECT revision FROM contract')).toEqual({ revision: 1 });
+  expect(f.store.tenant(second.id).get('SELECT revision FROM contract')).toBeNull();
+  expect(await (await f.request('/platform/policy/contracts/' + second.id, undefined, global)).json())
+    .toMatchObject({ platform_revision: 0, policy_revision: 0, actions: ['read', 'sign'] });
 });
 
 async function until(predicate: () => boolean | Promise<boolean>) {
@@ -555,7 +626,11 @@ function connect(f: Awaited<ReturnType<typeof fixture>>, token: string, version 
     return queue.shift();
   }
   function send(message: unknown) { ws.send(JSON.stringify(message)); }
-  function hello(leaseId?: string, outboxLastSeq = 0, configRevision = 0) { send({ type: 'hello', id: 'edge-hello', edge_version: version, os: 'darwin', arch: 'arm64', config_revision: configRevision, outbox_last_seq: outboxLastSeq, lease_id: leaseId }); }
+  function hello(leaseId?: string, outboxLastSeq = 0, configRevision = 0, capabilityContract = false, capabilityPolicy = false) {
+    send({ type: 'hello', id: 'edge-hello', edge_version: version, os: 'darwin', arch: 'arm64', config_revision: configRevision,
+      outbox_last_seq: outboxLastSeq, lease_id: leaseId, ...(capabilityContract && { agent_cache: true, capability_contract_v1: true }),
+      ...(capabilityPolicy && { agent_cache: true, capability_policy_v2: true }) });
+  }
   async function nextOf(type: string) {
     for (;;) {
       const message = await next();
@@ -684,13 +759,14 @@ test('capability pins select an exact verified artifact and recheck it on each d
   expect(await getConfig()).toMatchObject({ agent_releases: [{ id: first.id, available: false }] });
 });
 
-test('configuration scopes model routes and encrypts provider secrets to the registered device', async () => {
+test.each(['anthropic', 'openai_chat', 'openai_responses'])('configuration scopes %s model routes and encrypts provider secrets to the registered device', async (protocol) => {
   const f = await fixture();
   const global = await f.login();
   const scoped = await f.select(global);
   await f.store.system.write((sql) => sql.run('INSERT INTO platform_admins VALUES (?)', [f.userId]));
-  const providerResponse = await f.request('/platform/providers', { name: 'Fake', protocol: 'anthropic',
-    base_url: 'http://127.0.0.1:3333', secret: 'test-only-provider-key', auth: 'bearer', proxy: 'none' }, global);
+  const providerResponse = await f.request('/platform/providers', { name: 'Fake', protocol,
+    base_url: 'http://127.0.0.1:3333', secret: 'test-only-provider-key', proxy: 'none',
+    ...(protocol === 'anthropic' && { auth: 'bearer' }) }, global);
   expect(providerResponse.status).toBe(201);
   const provider = await providerResponse.json() as { id: string };
   const modelResponse = await f.request('/platform/models', { provider_id: provider.id, upstream_name: 'fake-upstream',
@@ -699,29 +775,45 @@ test('configuration scopes model routes and encrypts provider secrets to the reg
   const model = await modelResponse.json() as { id: string };
   expect((await f.request('/platform/rates', { model_id: model.id, effective_from: new Date(f.now()).toISOString(),
     input_milli_per_mtok: 1, output_milli_per_mtok: 2, cache_read_milli_per_mtok: 0, cache_write_milli_per_mtok: 0 }, global)).status).toBe(201);
-  const update = { revision: 1, seat_limit: 2, allowed_agents: ['claude-code'], allowed_models: [model.id], lease_minutes: 10, lease_budget_milli: 2000, visibility: {} };
-  expect((await f.request('/contract', update, scoped, undefined, 'PUT')).status).toBe(200);
+  const state = await issueFixtureContract(f, global, scoped, {
+    ...standardEntitlements, allowed_agents: ['claude-code', 'codex'], allowed_models: [model.id],
+  });
+  const enabled = await f.request(configurationPath, { ...state, configuration: {} }, scoped, 'enable-model', 'PUT');
+  expect(enabled.status).toBe(200);
+  const enabledConfig = await enabled.json() as { revision: number; platform_revision: number };
   const effective = '/contract/effective?os=darwin&arch=arm64';
   expect((await f.request(effective, undefined, global)).status).toBe(403);
   const effectiveReply = await f.request(effective, undefined, scoped);
   expect(effectiveReply.status).toBe(200);
   const view = await effectiveReply.json();
-  expect(view).toMatchObject({ revision: 2, models: [{ model_id: model.id, provider_id: provider.id, model: 'managed-*',
-    protocol: 'anthropic', rate: { input_milli_per_mtok: 1 } }] });
+  expect(view).toMatchObject({ models: [{ model_id: model.id, provider_id: provider.id, model: 'managed-*',
+    protocol, rate: { input_milli_per_mtok: 1 } }] });
   expect(JSON.stringify(view)).not.toContain('test-only-provider-key');
   expect(JSON.stringify(view)).not.toContain('127.0.0.1');
   const keys = generateKeyPairSync('x25519');
   const raw = keys.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
   const device = await (await f.request('/devices', { ...f.device, public_key: raw.toString('base64') }, scoped)).json() as DeviceReply;
+  const legacy = connect(f, device.device_token);
+  expect(await legacy.opened).toBe(true);
+  legacy.hello();
+  expect(await legacy.next()).toMatchObject({ type: 'welcome' });
+  expect(await legacy.next()).toMatchObject({ type: 'cutoff', reason: 'contract' });
+  expect(await legacy.next()).toMatchObject({ type: 'config', routes: [], rates: [], agents: [] });
+  expect(await legacy.next()).toMatchObject({ type: 'cutoff', reason: 'contract' });
+  legacy.send({ type: 'lease_request', id: 'legacy-try-again' });
+  expect(await legacy.next()).toMatchObject({ type: 'cutoff', reason: 'contract', re: 'legacy-try-again' });
+  legacy.ws.close();
+  await legacy.closed;
   const edge = connect(f, device.device_token);
   expect(await edge.opened).toBe(true);
-  edge.hello();
+  edge.hello(undefined, 0, 0, true);
   expect(await edge.next()).toMatchObject({ type: 'welcome' });
   expect(await edge.next()).toMatchObject({ type: 'cutoff' });
   const config = await edge.next();
   expect(config).toMatchObject({ type: 'config', routes: [{ model: 'managed-*', model_id: model.id,
-    provider_id: provider.id, protocol: 'anthropic', upstream_model: 'fake-upstream', auth: 'bearer', proxy: 'none' }],
-    rates: [{ model_id: model.id, input_milli_per_mtok: 1 }] });
+    provider_id: provider.id, protocol, upstream_model: 'fake-upstream', auth: 'bearer', proxy: 'none' }],
+    rates: [{ model_id: model.id, input_milli_per_mtok: 1 }],
+    capability_contract: { platform_revision: enabledConfig.platform_revision, tenant_revision: enabledConfig.revision } });
   const secret = await edge.next();
   expect(secret).toMatchObject({ type: 'secret', provider_id: provider.id });
   const der = Buffer.concat([Buffer.from('302a300506032b656e032100', 'hex'), Buffer.from(secret.key_id, 'base64')]);
@@ -739,15 +831,18 @@ test('configuration scopes model routes and encrypts provider secrets to the reg
   const noKey = await (await f.request('/devices', { name: 'No key', os: 'darwin', arch: 'arm64' }, scoped)).json() as DeviceReply;
   const secondary = connect(f, noKey.device_token);
   expect(await secondary.opened).toBe(true);
-  secondary.hello();
+  secondary.hello(undefined, 0, 0, true);
   expect(await secondary.next()).toMatchObject({ type: 'welcome' });
   expect(await secondary.next()).toMatchObject({ type: 'cutoff' });
   expect(await secondary.next()).toMatchObject({ type: 'config', routes: [{ model: 'renamed' }] });
   secondary.send({ type: 'ping', id: 'no-secret' });
   expect(await secondary.next()).toEqual({ type: 'pong', re: 'no-secret' });
-  expect((await f.request('/contract', { ...update, revision: 2, allowed_models: [] }, scoped, undefined, 'PUT')).status).toBe(200);
+  const disabled = await f.request(configurationPath, { platform_revision: enabledConfig.platform_revision, revision: enabledConfig.revision,
+    configuration: { allowed_models: [] } }, scoped, 'disable-model', 'PUT');
+  expect(disabled.status).toBe(200);
   const removed = await edge.next();
-  expect(removed).toMatchObject({ type: 'config', routes: [], rates: [] });
+  expect(removed).toMatchObject({ type: 'config', routes: [], rates: [],
+    capability_contract: { platform_revision: enabledConfig.platform_revision, tenant_revision: enabledConfig.revision + 1 } });
   expect(removed.revision).toBeGreaterThan(changed.revision);
   edge.send({ type: 'ping', id: 'barrier' });
   expect(await edge.next()).toEqual({ type: 'pong', re: 'barrier' });
@@ -755,7 +850,8 @@ test('configuration scopes model routes and encrypts provider secrets to the reg
 
 test('event and usage acknowledgments share a durable cursor, and observation is scoped and audited', async () => {
   const f = await fixture(15_000, Date.parse('2027-01-31T15:55:00.000Z'));
-  const scoped = await f.select(await f.login());
+  const global = await f.login();
+  const scoped = await f.select(global);
   const a = await linkedEdge(f, scoped);
   await a.nextOf('cutoff');
   const session_id = randomUUID();
@@ -823,9 +919,9 @@ test('event and usage acknowledgments share a durable cursor, and observation is
   expect(await (await f.request('/observe/people', undefined, admin)).json()).toMatchObject({ total: 2 });
   expect(await (await f.request('/observe/sessions', undefined, admin)).json()).toMatchObject({ items: [{ id: session_id, actions: ['read'] }] });
   expect((await f.request(`/observe/sessions/${session_id}/events`, undefined, admin)).status).toBe(404);
-  const contract = await (await f.request('/contract', undefined, scoped)).json() as Record<string, unknown>;
   const grants = { admin: { summary: true, content: true }, group_admin: { summary: true, content: false } };
-  expect((await f.request('/contract', { ...contract, visibility: grants }, scoped, undefined, 'PUT')).status).toBe(200);
+  const state = await issueFixtureContract(f, global, scoped, { ...standardEntitlements, visibility: grants });
+  expect((await f.request(configurationPath, { ...state, configuration: { visibility: grants } }, scoped, 'visibility', 'PUT')).status).toBe(200);
   expect(await (await f.request('/observe/sessions', undefined, admin)).json()).toMatchObject({ items: [{ id: session_id, actions: ['read', 'read_content'] }] });
   expect((await f.request(`/observe/sessions/${session_id}/events`, undefined, admin)).status).toBe(200);
   expect(f.store.tenant(f.tenantId).get("SELECT actor FROM audit WHERE action = 'contract.visibility.update'")).toEqual({ actor: f.userId });
@@ -868,6 +964,39 @@ async function linkedEdge(f: Awaited<ReturnType<typeof fixture>>, scoped: string
   expect(await edge.next()).toMatchObject({ type: 'welcome' });
   return { ...edge, ...token };
 }
+
+test('first signature settles legacy Edge leases and enforces the quota distribution switch', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const owner = await f.select(global);
+  await fund(f, global, 20_000);
+  const created = await f.request('/groups', { name: 'Research', quota_milli: 250 }, owner);
+  expect(created.status).toBe(201);
+  const group = await created.json() as { id: string };
+  const db = f.store.tenant(f.tenantId);
+  await db.write(sql => sql.run('UPDATE members SET group_id = ? WHERE user_id = ?', [group.id, f.userId]));
+  const oldEdge = await linkedEdge(f, owner);
+  const lease = await oldEdge.nextOf('lease');
+  expect(lease.budget_milli).toBe(250);
+  await issueFixtureContract(f, global, owner, { ...standardEntitlements, quota_distribution: false });
+  expect(await oldEdge.nextOf('cutoff')).toMatchObject({ reason: 'contract' });
+  const settle = { type: 'lease_renew', id: 'settle-legacy', op_id: 'pre-signature', lease_id: lease.lease_id, used_milli: 100 };
+  oldEdge.send(settle);
+  expect(await oldEdge.next()).toMatchObject({ type: 'cutoff', reason: 'contract', settled_lease_id: lease.lease_id, re: settle.id });
+  expect(db.get('SELECT status, used_milli FROM leases WHERE id = ?', [lease.lease_id])).toEqual({ status: 'settled', used_milli: 100 });
+  expect((await f.request(`/groups/${group.id}`, { revision: 1, quota_milli: 500 }, owner, undefined, 'PATCH')).status).toBe(403);
+  const usage = `/quota/usage?scope=group&id=${group.id}`;
+  expect(await (await f.request(usage, undefined, owner)).json()).toMatchObject({
+    quota_distribution: false, quota_milli: null, used_milli: 100, remaining_milli: null,
+  });
+  const path = `/platform/capability-contracts/${f.tenantId}`;
+  const reopen = { revision: 1, tenant_revision: 1, template_id: 'fixture', template_version: 1,
+    entitlements: { quota_distribution: true }, reason: 'Restore quota distribution' };
+  expect((await f.request(path, reopen, global, 'restore-quota', 'PUT')).status).toBe(200);
+  expect(await (await f.request(usage, undefined, owner)).json()).toMatchObject({
+    quota_distribution: true, quota_milli: 250, used_milli: 100, remaining_milli: 150,
+  });
+});
 
 test('concurrent renewals stay inside tenant funds and a replay settles only once', async () => {
   const f = await fixture();
@@ -1096,14 +1225,285 @@ test('complete desktop installers can be staged and verified without enabling an
   expect(downloaded.headers.get('content-length')).toBe(String(diskImage.length));
   expect(createHash('sha256').update(Buffer.from(await downloaded.arrayBuffer())).digest('hex')).toBe(definition.sha256);
   expect((await f.request(artifact, undefined, tenant)).status).toBe(403);
-  const current = await (await f.request('/contract', undefined, tenant)).json() as Record<string, unknown>;
-  const allow = { ...current, allowed_agents: ['claude-code', 'workbuddy'] };
-  expect((await f.request('/contract', { ...allow, agent_release_ids: [release.id] }, tenant, undefined, 'PUT')).status).toBe(422);
-  expect((await f.request('/contract', allow, tenant, undefined, 'PUT')).status).toBe(200);
+  const state = await issueFixtureContract(f, global, tenant, { ...standardEntitlements, allowed_agents: ['claude-code', 'workbuddy'] });
+  expect((await f.request(configurationPath, { ...state, configuration: { agent_release_ids: [release.id] } }, tenant, 'unqualified', 'PUT')).status).toBe(422);
+  expect((await f.request(configurationPath, { ...state, configuration: {} }, tenant, 'enable-agent', 'PUT')).status).toBe(200);
   const view = await f.request('/contract/effective?os=darwin&arch=arm64', undefined, tenant);
   expect(await view.json()).toMatchObject({ agents: [
     { agent: 'claude-code', status: 'unavailable', releases: [] },
     { agent: 'workbuddy', status: 'qualification_required', releases: [] },
   ] });
   expect((await f.request(route + '/' + release.id, { status: 'active', revision: release.revision }, global)).status).toBe(409);
+});
+
+test('policy v2 ties generic signing, exact recharge, profile revisions and device application together', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const owner = await f.select(global);
+  const platform = '/platform/policy';
+  const contract = `${platform}/contracts/${f.tenantId}`;
+  await f.store.system.write(sql => sql.run('INSERT INTO platform_admins (user_id) VALUES (?)', [f.userId]));
+  const group = 'grp_00000000000000000000000001';
+  const db = f.store.tenant(f.tenantId);
+  await db.write(sql => {
+    sql.run('INSERT INTO groups (id, name) VALUES (?, ?)', [group, 'Research']);
+    sql.run('UPDATE members SET group_id = ? WHERE user_id = ?', [group, f.userId]);
+  });
+  // The issuer chooses a definition ID that no Web UI or Edge code knows.
+  const entries = [
+    { id: 'customer.signature-note', title: '签约备注', schema: { kind: 'text' }, merge: 'fixed',
+      default_value: '基础服务', binding: null },
+    { id: 'customer.seats', title: '签约席位', schema: { kind: 'integer', min: 0 }, merge: 'fixed',
+      default_value: 20, binding: { adapter: 'seats.limit', abi: 1 } },
+    { id: 'customer.device-balance', title: '单设备租约额度', schema: { kind: 'money_milli', min: 0 }, merge: 'min',
+      default_value: 2125, binding: { adapter: 'lease.budget', abi: 1 } },
+    { id: 'customer.route-set', title: '可用模型', schema: { kind: 'resource_set', catalog: 'models' }, merge: 'intersection',
+      default_value: [], binding: { adapter: 'access.models', abi: 1 } },
+  ];
+  const modelId = 'model_fixture_a';
+  const providerId = 'provider_fixture_a';
+  const providerSecret = 'fixture-only-provider-key';
+  const { encryptProviderSecret } = await import('../src/provider-secret');
+  await f.store.system.write(sql => {
+    sql.run(`INSERT INTO providers (id,name,protocol,base_url,secret_ciphertext,status)
+      VALUES (?,?,'openai_chat','https://one.invalid/v1',?,'active')`,
+    [providerId,'Fixture Provider',encryptProviderSecret(Buffer.alloc(32, 41), providerId, providerSecret)]);
+    sql.run(`INSERT INTO models (id,provider_id,upstream_name,display_name,context_window,status)
+      VALUES (?,?,'example-a','Fixture Model',2048,'active')`, [modelId,providerId]);
+    sql.run(`INSERT INTO rates (model_id,input_milli_per_mtok,output_milli_per_mtok,cache_read_milli_per_mtok,cache_write_milli_per_mtok,effective_from)
+      VALUES (?,1,1,1,1,?)`, [modelId,iso(f.now())]);
+  });
+  function reference(id: string) { return { id, version: 1 }; }
+  for (const entry of entries) {
+    const definition = { ...entry, expected_version: 0, category: 'fixture',
+      scopes: entry.merge === 'fixed' ? ['tenant'] : ['tenant','group','member'] };
+    const response = await f.request(`${platform}/definitions`, definition, global, 'definition-' + entry.id);
+    expect(await response.json()).toMatchObject({ id: entry.id, version: 1 });
+    expect(response.status).toBe(201);
+  }
+  const template = reference('fixture-template');
+  expect((await f.request(`${platform}/templates`, {
+    id: template.id, expected_version: 0, scope: 'platform', name: 'Fixture template', description: '',
+    entries: entries.map(definition => ({ clause_ref: reference(definition.id),
+      value: definition.schema.kind === 'resource_set' ? [modelId] : definition.default_value })),
+  }, global, 'template')).status).toBe(201);
+  expect((await f.request(contract, undefined, owner)).status).toBe(403);
+  expect(await (await f.request(contract, undefined, global)).json()).toMatchObject({ platform_revision: 0, policy_revision: 0 });
+  const draft = { expected_policy_revision: 0, expected_platform_revision: 0, base_revision: null,
+    reason: 'First signed fixture', entries: entries.map(definition => ({ clause_ref: reference(definition.id), template_ref: template })) };
+  const preview = await f.request(contract + '/preview', draft, global);
+  expect(preview.status).toBe(200);
+  expect(await preview.json()).toMatchObject({ platform_revision: 0, policy_revision: 0 });
+  expect(db.all('SELECT revision FROM policy_signatures')).toEqual([]);
+  const sign = await f.request(contract + '/signatures', draft, global, 'first-signature');
+  const signed = await sign.json();
+  expect(sign.status).toBe(201);
+  expect(signed).toMatchObject({ revision: 1, current: true, platform_revision: 1, policy_revision: 1 });
+  expect(await (await f.request(contract + '/signatures', draft, global, 'first-signature')).json()).toEqual(signed);
+
+  const recharge = await f.request(contract + '/recharges', { amount_milli: 25_125, note: '内测登记' }, global, 'recharge');
+  const receipt = await recharge.json() as { ledger_id: string };
+  expect(recharge.status).toBe(201);
+  expect(receipt).toMatchObject({ amount_milli: 25_125, platform_revision: 1, balance_before_milli: 0, balance_after_milli: 25_125 });
+  expect(await (await f.request(contract + '/recharges', { amount_milli: 25_125, note: '内测登记' }, global, 'recharge')).json()).toEqual(receipt);
+  expect(await (await f.request('/policy/recharges/' + receipt.ledger_id, undefined, owner)).json()).toEqual(receipt);
+  expect((await f.request('/platform/ledger/topup', { tenant_id: f.tenantId, amount_milli: 1_000 }, global, 'obsolete-topup')).status).toBe(409);
+
+  const token = await (await f.request('/devices', f.device, owner)).json() as DeviceReply;
+  const edge = connect(f, token.device_token);
+  expect(await edge.opened).toBe(true);
+  edge.hello(undefined, 0, 0, true, true);
+  expect(await edge.next()).toMatchObject({ type: 'welcome' });
+  expect(await edge.nextOf('lease')).toMatchObject({ budget_milli: 1256 }); // 5% of available balance caps the 2125-milli policy limit.
+  const configuration = await edge.nextOf('config');
+  expect(configuration).toMatchObject({ routes: [{ model_id: modelId }], rates: [{ model_id: modelId }],
+    policy: { abi: 1, tenant_id: f.tenantId, user_id: f.userId, device_id: token.device_id, policy_revision: 1,
+      platform_revision: 1, tenant_revision: null, groups: [], member: null, secrets: [{ provider_id: providerId }],
+      display: expect.arrayContaining([expect.objectContaining({ id: 'customer.device-balance', value: 2125 })]) } });
+  expect(JSON.stringify(configuration)).not.toContain(providerSecret);
+  expect(db.all('SELECT * FROM policy_device_applications')).toEqual([]);
+  edge.send({ type: 'config_applied', id: 'unsent', config_revision: configuration.revision + 1, policy_revision: 1 });
+  expect(await edge.next()).toMatchObject({ type: 'ack', re: 'unsent', ok: false });
+  edge.send({ type: 'config_applied', id: 'actual', config_revision: configuration.revision, policy_revision: 1 });
+  expect(await edge.next()).toMatchObject({ type: 'ack', re: 'actual', ok: true });
+  expect(await (await f.request('/devices/' + token.device_id, undefined, owner)).json()).toMatchObject({
+    policy: { policy_revision: 1, applied: { config_revision: configuration.revision, policy_revision: 1 } },
+  });
+
+  const groupConfig = '/policy/configurations/group/' + group;
+  const narrow = { expected_policy_revision: 1, expected_platform_revision: 1, template_ref: null,
+    selections: [{ clause_ref: reference('customer.route-set'), value: [] }] };
+  const updated = await f.request(groupConfig, narrow, owner, 'narrow', 'PUT');
+  expect(updated.status).toBe(200);
+  expect(await updated.json()).toMatchObject({ scope: 'group', subject_id: group, policy_revision: 2 });
+  expect((await f.request(groupConfig, narrow, owner, 'stale-narrow', 'PUT')).status).toBe(409);
+  expect(await edge.nextOf('config')).toMatchObject({ routes: [], rates: [], policy: {
+    policy_revision: 2, platform_revision: 1, groups: [{ id: group, revision: 1 }], secrets: [],
+    notices: expect.arrayContaining([expect.objectContaining({ kind: 'policy_changed', policy_revision: 2 })]),
+  } });
+  expect(await (await f.request(contract + '/signatures/1', undefined, global)).json()).toMatchObject({
+    revision: 1, entries: expect.arrayContaining([expect.objectContaining({
+      clause_ref: reference('customer.route-set'), signed_value: [modelId],
+    })]),
+  });
+  const descendants = Array.from({ length: 64 }, (_, i) => 'grp_' + String(i + 2).padStart(26, '0'));
+  await db.write(sql => {
+    let parent = group;
+    for (const descendant of descendants) {
+      sql.run('INSERT INTO groups (id, name, parent_id) VALUES (?, ?, ?)', [descendant, 'Nested group', parent]);
+      sql.run(`INSERT INTO policy_configurations (scope, subject_id, revision, platform_revision, selections_json, revoked_json, retained_json, updated_by, updated_at)
+        VALUES ('group', ?, 1, 1, '[]', '[]', '{}', ?, ?)`, [descendant, f.userId, iso(f.now())]);
+      parent = descendant;
+    }
+    sql.run('UPDATE members SET group_id = ? WHERE user_id = ?', [parent, f.userId]);
+  });
+  expect((await f.request(groupConfig, { ...narrow, expected_policy_revision: 2 }, owner, 'nested-publish', 'PUT')).status).toBe(200);
+  expect(await edge.nextOf('config')).toMatchObject({ routes: [], policy: {
+    policy_revision: 3, groups: descendants.map(id => ({ id, revision: 1 })),
+  } });
+  const old = await linkedEdge(f, owner);
+  expect(await old.nextOf('cutoff')).toMatchObject({ reason: 'contract' });
+});
+
+test('platform stages Claude Desktop and Codex Desktop as separate unqualified Mac releases', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const tenant = await f.select(global);
+  await f.store.system.write(sql => sql.run('INSERT INTO platform_admins VALUES (?)', [f.userId]));
+  const path = '/platform/agent-releases';
+  const base = { version: 'fixture', os: 'darwin', arch: 'arm64', sha256: 'a'.repeat(64), size: 582_617_625 };
+  const entries = [
+    { agent: 'claude-desktop', url: 'https://downloads.claude.ai/releases/darwin/universal/6.0.1/Claude-aabbcc.dmg' },
+    { agent: 'codex-desktop', url: 'https://persistent.oaistatic.com/codex-app-prod/Codex.dmg' },
+  ];
+  for (const entry of entries) {
+    const payload = { ...base, ...entry };
+    const denied = await f.request(path, { ...payload, status: 'active' }, global);
+    expect(denied.status).toBe(409);
+    expect(await denied.json()).toMatchObject({ error: { detail: { reason: 'desktop_qualification_required' } } });
+    const stage = await f.request(path, { ...payload, status: 'disabled' }, global);
+    expect(stage.status).toBe(201);
+    const release = await stage.json() as { id: string; revision: number; actions: string[] };
+    expect(release).toMatchObject({ agent: entry.agent, format: 'dmg', status: 'disabled', qualification_required: true,
+      artifact_cached: false, part_bytes: DESKTOP_AGENT_PART_BYTES });
+    expect(release.actions).toContain('pull_artifact');
+    expect(release.actions).not.toContain('activate');
+    const pull = await f.request(path + '/' + release.id + '/pull', {}, tenant);
+    expect(pull.status).toBe(403);
+  }
+  const cli = await f.request(path, { ...base, agent: 'codex', url: 'https://releases.openai.com/fixture', status: 'disabled' }, global);
+  expect(cli.status).toBe(422);
+  const tooLarge = await f.request(path, { ...base, ...entries[0], version: 'oversize', size: 768 * 1024 * 1024 + 1, status: 'disabled' }, global);
+  expect(tooLarge.status).toBe(422);
+});
+
+test('signed release selections reach only compatible Apple Silicon Edges', async () => {
+  const f = await fixture();
+  const admin = await f.login();
+  const tenant = await f.select(admin);
+  await f.store.system.write(sql => sql.run('INSERT INTO platform_admins VALUES (?)', [f.userId]));
+  const path = '/platform/agent-releases';
+  const mac = { os: 'darwin', arch: 'arm64' };
+  const candidate = { ...mac, agent: 'codex-desktop', version: '26.1117.41037', size: 582_617_625,
+    sha256: '67d362df03de37ebd794a64608abf98a2b0b1be2783d33a950abdd83ed89b279',
+    url: 'https://persistent.oaistatic.com/codex-app-prod/Codex.dmg' };
+  const existing = { ...mac, agent: 'deepseek-desktop', version: '0.2.1-rc.3', size: 264_791_658,
+    sha256: '0c2217c2c9110d0b5104af8eb4df55f214239405d079d0a83e30080ce1cbd1e1',
+    url: 'https://download.deepseek.com/dsh-desk/fixture.dmg' };
+  const claude = { ...mac, agent: 'claude-desktop', version: '6.28899.6', size: 402_202_476,
+    sha256: 'a1226d5e7072a713f7eab74d06d1745fc47aa57eae3ba202a103032d1329530f',
+    url: 'https://downloads.claude.ai/releases/darwin/universal/6.28899.6/Claude-2f5fc59b2d1c672dd9dced86720c50f48cca0cf9.dmg' };
+  const runtime = { size: 124_237_798, sha256: '4262a1273231dc7d7ada7914750fa9b5c724548cff6b2ae4a8d49ce55ac2456f' };
+  const registerClaude = await f.request(path, { ...claude, status: 'disabled' }, admin);
+  expect(registerClaude.status).toBe(201);
+  const claudeStage = await registerClaude.json() as { id: string; revision: number };
+  expect(claudeStage).toMatchObject({ runtime: { ...runtime, artifact_cached: false }, qualification_required: false,
+    actions: expect.arrayContaining(['upload_runtime']) });
+  const claudePath = path + '/' + claudeStage.id;
+  const runtimePath = claudePath + '/runtime';
+  const edgeRuntimePath = '/edge/agent-artifacts/' + claudeStage.id + '/runtime';
+  const activateClaude = () => f.request(claudePath, { revision: claudeStage.revision, status: 'active' }, admin);
+  expect((await f.request(runtimePath, undefined, admin)).status).toBe(404);
+  expect((await f.request(runtimePath, undefined, tenant)).status).toBe(403);
+  const putRuntime = (token: string, revision: number) => fetch(new URL('/v1' + runtimePath + '?revision=' + revision, f.server.url),
+    { method: 'PUT', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/octet-stream' }, body: 'truncated' });
+  expect((await putRuntime(tenant, claudeStage.revision)).status).toBe(403);
+  expect((await putRuntime(admin, claudeStage.revision + 1)).status).toBe(409);
+  expect((await putRuntime(admin, claudeStage.revision)).status).toBe(422);
+  const wrongDigest = await f.request(path, { ...candidate, sha256: 'a'.repeat(64), status: 'active' }, admin);
+  expect(wrongDigest.status).toBe(409);
+  expect(await wrongDigest.json()).toMatchObject({ error: { detail: { reason: 'desktop_qualification_required' } } });
+  const registration = await f.request(path, { ...candidate, status: 'disabled' }, admin);
+  expect(registration.status).toBe(201);
+  const staged = await registration.json() as { id: string; revision: number };
+  expect(staged).toMatchObject({ artifact_cached: false, qualification_required: false });
+  const activate = () => f.request(path + '/' + staged.id, { revision: staged.revision, status: 'active' }, admin);
+  const uncached = await activate();
+  expect(uncached.status).toBe(409);
+  expect(await uncached.json()).toMatchObject({ error: { detail: { reason: 'artifact_unavailable' } } });
+  // Represent completed cache entries without allocating or uploading a vendor installer in the test.
+  const cache = join(f.dataDir, 'agent-artifacts');
+  mkdirSync(cache, { recursive: true });
+  for (const release of [candidate, existing, claude]) {
+    const file = join(cache, release.sha256);
+    writeFileSync(file, '');
+    truncateSync(file, release.size);
+  }
+  expect((await activate()).status).toBe(200);
+  const missingRuntime = await activateClaude();
+  expect(missingRuntime.status).toBe(409);
+  expect(await missingRuntime.json()).toMatchObject({ error: { detail: { reason: 'artifact_unavailable' } } });
+  const engine = join(cache, runtime.sha256);
+  writeFileSync(engine, '');
+  truncateSync(engine, runtime.size);
+  expect((await activateClaude()).status).toBe(200);
+  const adminRuntime = await f.request(runtimePath, undefined, admin);
+  expect(adminRuntime.status).toBe(200);
+  expect(adminRuntime.headers.get('content-length')).toBe(String(runtime.size));
+  await adminRuntime.body!.cancel();
+  const baseRelease = await f.request(path, { ...existing, status: 'active' }, admin);
+  expect(baseRelease.status).toBe(201);
+  const baseId = (await baseRelease.json() as {id:string}).id;
+  const device = await (await f.request('/devices', f.device, tenant)).json() as DeviceReply;
+  expect((await f.request(edgeRuntimePath, undefined, device.device_token)).status).toBe(404);
+  expect((await f.request(edgeRuntimePath)).status).toBe(401);
+  const signaturePath = '/platform/policy/contracts/' + f.tenantId + '/signatures';
+  function signReleases(revision: number, releases: string[]) {
+    const values = { 'seats.limit': 2, 'lease.budget': 2000,
+      'access.agents': ['deepseek-desktop', 'codex-desktop', 'claude-desktop'], 'access.releases': releases };
+    return f.request(signaturePath, {expected_policy_revision: revision, expected_platform_revision: revision,
+      base_revision: revision || null, reason: 'Signed desktop eligibility',
+      entries: Object.entries(values).map(([id, adjustment]) => ({clause_ref: {id, version: 1}, template_ref: null, adjustment}))},
+    admin, 'desktop-grant-' + revision);
+  }
+  expect((await signReleases(0, [baseId, staged.id, claudeStage.id])).status).toBe(201);
+  const authorized = await f.request(edgeRuntimePath, undefined, device.device_token);
+  expect(authorized.status).toBe(200);
+  expect(authorized.headers.get('content-length')).toBe(String(runtime.size));
+  await authorized.body!.cancel();
+  const effective = await f.request('/policy/targets/' + f.userId + '?os=darwin&arch=arm64', undefined, tenant);
+  expect(effective.status).toBe(200);
+  expect((await effective.json() as {releases: {id: string}[]}).releases.map(row => row.id).sort())
+    .toEqual([baseId, staged.id, claudeStage.id].sort());
+  for (const { features, expected } of [
+    { features: { agent_cache: true, mac_desktop_v1: true }, expected: ['deepseek-desktop'] },
+    { features: { agent_cache: true, codex_desktop_v1: true }, expected: [] },
+    { features: { agent_cache: true, mac_desktop_v1: true, codex_desktop_v1: true }, expected: ['codex-desktop', 'deepseek-desktop'] },
+    { features: { agent_cache: true, mac_desktop_v1: true, claude_desktop_v1: true }, expected: ['claude-desktop', 'deepseek-desktop'] },
+    { features: { agent_cache: true, mac_desktop_v1: true, codex_desktop_v1: true, claude_desktop_v1: true },
+      expected: ['claude-desktop', 'codex-desktop', 'deepseek-desktop'] },
+  ]) {
+    const edge = connect(f, device.device_token);
+    expect(await edge.opened).toBe(true);
+    edge.send({ type: 'hello', id: 'desktop-hello', edge_version: '0.1.0', ...mac,
+      config_revision: 0, outbox_last_seq: 0, capability_policy_v2: true, policy_runtime_v1: true, ...features });
+    await edge.nextOf('welcome');
+    await edge.nextOf('cutoff');
+    const config = await edge.nextOf('config');
+    expect(config.agents.map((row: { agent: string }) => row.agent).sort()).toEqual(expected);
+    edge.ws.close();
+    await edge.closed;
+  }
+  expect((await signReleases(1, [baseId, staged.id])).status).toBe(201);
+  expect((await f.request(edgeRuntimePath, undefined, device.device_token)).status).toBe(404);
 });

@@ -2,6 +2,16 @@
 
 从 worktree 根目录执行。页面是无构建原生 ESM；Playwright 仅用于验收。
 
+### 能力合约 v2
+
+```sh
+bun --no-env-file server/web/tests/policy-workspace-check.js
+```
+
+脚本启动临时 Server 与 SQLite，在真实 Chrome 中验证条目定义、模板、签发版本、充值凭证、月结返还钻取、Tools 发行、租户及分组配置和角色隔离。下文的 `workspace-check.js` 和旧的 `quota-check.js` 使用 v1 合约表单夹具。其中的合约场景由 v2 脚本覆盖。
+
+### 通用页面
+
 ```sh
 bun test ./server/web/tests
 bun install --cwd server/web/tests

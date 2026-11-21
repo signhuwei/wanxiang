@@ -10,6 +10,7 @@ test('formatMilli renders 毫橡皮 as 橡皮 without floating point noise', () 
   expect(formatMilli(1234567)).toBe('1234.567')
   expect(formatMilli(0)).toBe('0')
   expect(formatMilli(-250)).toBe('-0.25')
+  expect(formatMilli(Number.MAX_SAFE_INTEGER)).toBe('9007199254740.991')
 })
 
 test('formatMilli shows 不限 for null/undefined quota', () => {
@@ -74,7 +75,7 @@ test('parseQuotaEraserInput accepts non-negative 橡皮 with up to 3 decimals an
 })
 
 test('parseQuotaEraserInput rejects negative numbers and non-numeric input', () => {
-  for (const bad of [-1, '-1', -0.001, 'abc', NaN]) {
+  for (const bad of [-1, '-1', -0.001, '0.0005', '1e6', '9007199254740.992', 'abc', NaN]) {
     expect(parseQuotaEraserInput(bad)).toEqual({ error: QUOTA_INVALID_MESSAGE })
   }
 })

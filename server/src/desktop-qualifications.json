@@ -1,0 +1,68 @@
+[
+  {
+    "agent": "deepseek-desktop",
+    "version": "0.2.1-rc.3",
+    "os": "darwin",
+    "arch": "arm64",
+    "size": 264791658,
+    "sha256": "0c2217c2c9110d0b5104af8eb4df55f214239405d079d0a83e30080ce1cbd1e1",
+    "name": "DeepSeek Harness.app",
+    "executable": "Contents/MacOS/DeepSeek Harness",
+    "identifier": "com.deepseek.dsh",
+    "team": "NAN929V4UM",
+    "cdhash": "a10a6fe24b2073a4de469d57e4c45348740f083a",
+    "qualified": true
+  },
+  {
+    "agent": "workbuddy",
+    "version": "5.3.8",
+    "os": "darwin",
+    "arch": "arm64",
+    "size": 437358016,
+    "sha256": "583ee29d9f037523200eb0d6b59f199119922b9a11101e8174ae1963a4ce4974",
+    "name": "WorkBuddy.app",
+    "executable": "Contents/MacOS/Electron",
+    "identifier": "com.workbuddy.workbuddy",
+    "team": "FN2V63AD2J",
+    "cdhash": "71014f97334210d014d63b464caff4dd07f3f7f2",
+    "qualified": false
+  },
+  {
+    "agent": "claude-desktop",
+    "os": "darwin",
+    "arch": "arm64",
+    "version": "6.28899.6",
+    "name": "Claude.app",
+    "executable": "Contents/MacOS/Claude",
+    "identifier": "com.anthropic.claudefordesktop",
+    "team": "Q6L2SF6YDW",
+    "cdhash": "b0aac4378eab4e47fd1447e101efcaa676c03ccc",
+    "size": 402202476,
+    "sha256": "a1226d5e7072a713f7eab74d06d1745fc47aa57eae3ba202a103032d1329530f",
+    "qualified": true,
+    "runtime": {
+      "version": "2.1.330",
+      "name": "claude.app",
+      "executable": "Contents/MacOS/claude",
+      "identifier": "com.anthropic.claude-code",
+      "team": "Q6L2SF6YDW",
+      "cdhash": "7d87bea03bb43492572e50e344ca7aef23765d6a",
+      "size": 124237798,
+      "sha256": "4262a1273231dc7d7ada7914750fa9b5c724548cff6b2ae4a8d49ce55ac2456f"
+    }
+  },
+  {
+    "agent": "codex-desktop",
+    "os": "darwin",
+    "arch": "arm64",
+    "version": "26.1117.41037",
+    "name": "ChatGPT.app",
+    "executable": "Contents/MacOS/ChatGPT",
+    "identifier": "com.openai.codex",
+    "team": "2DC432GLL2",
+    "cdhash": "b5215002d934d1b51fa2dba60375f702e4789f28",
+    "size": 582617625,
+    "sha256": "67d362df03de37ebd794a64608abf98a2b0b1be2783d33a950abdd83ed89b279",
+    "qualified": true
+  }
+]

@@ -45,10 +45,10 @@ function canonical(value: unknown): unknown {
   return value;
 }
 
-export function operation(c: Context, secret: string, now: number, scopeValue: string, params?: unknown) {
+export function operation(c: Context, secret: string, now: number, scopeValue: string, params?: unknown, scopePath = c.req.path) {
   const key = c.req.header('Idempotency-Key');
   if (key !== undefined && !/^[\x21-\x7e]{1,128}$/.test(key)) invalid('Idempotency-Key');
-  const scope = hash(`${c.req.path}:${scopeValue}`);
+  const scope = hash(`${scopePath}:${scopeValue}`);
   const fingerprint = hmac(secret, ['request', canonical(params ?? null)]);
   const nonce = key === undefined ? null : randomToken();
   const token = nonce ? hmac(secret, ['credential', nonce]) : randomToken();

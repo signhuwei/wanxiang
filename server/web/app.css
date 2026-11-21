@@ -227,6 +227,17 @@ tr.clickable { cursor: pointer; }
 .field.wide { grid-column: 1 / -1; }
 .field output { min-height: 29px; padding: 4px 0; overflow-wrap: anywhere; }
 .field-hint { grid-column: 2; color: var(--muted); font-size: 11px; }
+.tool-draft-field[hidden] { display: none; }
+.tool-agents { margin: 16px 0; border: 1px solid var(--line); }
+.tool-agents label { display: inline-flex; align-items: center; gap: 6px; margin-right: 16px; }
+.contract-editor { display: grid; gap: 12px; max-width: 960px; }
+.contract-comparison { overflow-x: auto; max-width: 960px; margin-bottom: 16px; }
+.contract-comparison td { white-space: normal; overflow-wrap: anywhere; }
+.contract-choices { min-width: 0; margin: 0; padding: 8px 12px; border: 1px solid var(--line); }
+.contract-choice-list { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 8px 0 4px; }
+.contract-choice-list[hidden] { display: none; }
+.contract-choice { display: inline-flex; gap: 5px; align-items: center; overflow-wrap: anywhere; }
+.contract-devices .field { max-width: 480px; }
 details.section { border-top: 1px solid var(--line); margin-top: 12px; }
 details.section > summary { padding: 10px 0; cursor: pointer; font-weight: 500; }
 details.section > summary .muted { font-weight: 400; margin-left: 8px; }
@@ -267,3 +278,92 @@ details.section > summary .muted { font-weight: 400; margin-left: 8px; }
 .statistics-table table { border-collapse: collapse; width: 100%; white-space: nowrap; }
 .statistics-table th, .statistics-table td { padding: 8px; text-align: right; border-bottom: 1px solid var(--line, #dfe3ea); }
 .statistics-table th:first-child { text-align: left; }
+
+/* 能力合约的工作区、分页台账和多层右栏 */
+.policy-tabs-root, .policy-tab-content, .policy-recharges, .policy-contracts {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.policy-tabs {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+}
+.platform-policy-tabs { background: #f3f6fa; }
+.policy-tabs :is(a,button) {
+  padding: 7px 10px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  border-radius: 0;
+  color: inherit;
+}
+.policy-tabs [aria-current=page] { border-bottom-color: var(--blue); color: var(--blue); }
+.policy-contract-workspace {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+  min-width: 0;
+}
+.policy-contracts > .inline-drill > .drill-context { width: clamp(102px,14vw,144px); }
+.policy-contracts > .inline-drill:has(.policy-signatures .inline-drill, .policy-recharges .inline-drill) > .drill-context {
+  width: clamp(94px,11.75vw,120px);
+}
+.policy-contracts :is(.policy-signatures,.policy-recharges) .drill-context { width: clamp(104px,13%,128px); }
+.policy-recharges > .page { min-height: 0; }
+.policy-recharges .balance-summary { flex-wrap: wrap; gap: 8px 24px; }
+.policy-row-link { padding: 0; text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.policy-compact-value small { display: none; }
+.drill-context .policy-compact-value small { display: block; }
+.policy-facts { margin: 12px 0 20px; border-top: 1px solid var(--line); }
+.policy-facts > div {
+  display: grid;
+  grid-template-columns: minmax(86px,24%) minmax(0,1fr);
+  gap: 8px 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.policy-facts dt { font-weight: 600; }
+.policy-facts dd { margin: 0; }
+.policy-facts small { display: block; margin-top: 2px; }
+.policy-editor, .policy-entry-list { display: grid; gap: 10px; min-width: 0; }
+.policy-editor .field { max-width: 100%; }
+.policy-entry {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  border-top: 1px solid var(--line);
+  padding: 10px 0;
+}
+.policy-entry > .link { justify-self: start; }
+.policy-entry-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.policy-entry > p { margin: 0; }
+.policy-picker { overflow-wrap: anywhere; }
+.policy-picker summary { cursor: pointer; padding: 5px 0; }
+.policy-picker-ledger { max-height: 300px; }
+.policy-choice-list, .policy-picked { display: flex; flex-wrap: wrap; gap: 6px 10px; margin: 6px 0; }
+.policy-preview { overflow: auto; }
+.policy-preview table { min-width: 100%; }
+@media (max-width: 600px) {
+  .policy-tabs { padding: 0 6px; gap: 1px; }
+  .policy-tabs :is(a,button) { padding: 6px 7px; }
+  .policy-contracts > .inline-drill,
+  .policy-contracts :is(.policy-signatures,.policy-recharges) .inline-drill { flex-direction: column; }
+  .policy-contracts > .inline-drill > .drill-context,
+  .policy-contracts > .inline-drill:has(.policy-signatures .inline-drill, .policy-recharges .inline-drill) > .drill-context,
+  .policy-contracts :is(.policy-signatures,.policy-recharges) .drill-context { width: 100%; border-bottom: 1px solid var(--line); }
+  .policy-contracts .drill-context .toolbar,
+  .policy-contracts .drill-context .pager,
+  .policy-contracts .drill-context table thead,
+  .policy-contracts .drill-context table tr:not(.selected) { display: none; }
+  .policy-contracts .inline-head { gap: 4px; flex-wrap: wrap; padding: 6px 8px; }
+  .policy-facts > div { grid-template-columns: minmax(0,1fr); gap: 3px; }
+}

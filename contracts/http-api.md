@@ -8,6 +8,10 @@
 
 所有公开对象带 `revision` 和 `actions`。
 
+客户端按块录入和展示橡皮数量。充值 0.5 块橡皮时向接口提交 `amount_milli: 500`，查询得到 `cost_milli: 1` 时展示为 0.001 块橡皮。金额和费率的字段单位见[通用约定](README.md)。
+
+条目库、合约版本、租户配置和充值凭证使用[能力合约 v2](capability-policy-v2.md#2-http-协议)。
+
 创建类操作没有对象可挂，放在 `/me` 的 `actions` 里，命名为 `create_<资源单数>`：`create_member`、`create_group`、`create_invite`、`update_contract`、`topup`（平台管理员）。列表响应也带 `actions`，内容与 `/me.actions` 中该资源相关的部分一致，空列表时同样返回。
 
 ## 登录与设备
@@ -45,6 +49,8 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 
 ## 租户管理
 
+平台合约签发、租户配置和旧写入入口的兼容规则见[能力合约 HTTP 接口](capability-contract.md#http)。
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET/POST | `/members`，`/members/:id` | 成员台账与详情 |
@@ -54,7 +60,7 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 | GET | `/balance` | 余额、已预留、本月消耗 |
 | GET | `/quota/usage` | 本月配额用量（v0.12）。`?scope=member&id=` 或 `?scope=group&id=`，返回 `{scope, id, quota_milli, used_milli, reserved_milli, remaining_milli}`：`used_milli` 只含本月 `settle`，`reserved_milli` 是仍 active 的租约预留，`remaining_milli = quota_milli − used_milli − reserved_milli`（可为负，表示已被超出，上界是相关成员所有设备 active 租约之和）；`quota_milli` 为 null 时 `remaining_milli` 也为 null。台账行和 `/me.quota` 的 `month_used_milli` = `used_milli + reserved_milli`。owner、admin 可查全部；group_admin 只能查本组及子组；member 只能查自己。无权查看的对象与不存在的对象一律返回 404，不区分 |
 | GET | `/ledger` | 橡皮流水。 `overage_pending` 单列超租约待核对的差额，`amount_milli` 不计入余额、预留或本月消耗。 |
-| POST | `/platform/ledger/topup` | 平台管理员手工加分，全局令牌，`{tenant_id, amount_milli, note?}` |
+| POST | `/platform/ledger/topup` | 平台管理员为租户充值橡皮，全局令牌，`{tenant_id, amount_milli, note?}` |
 | GET | `/devices`，`/devices/:id` | 设备台账 |
 | POST | `/devices/:id/diag` | 租户 owner、admin 或平台管理员发起。`{kind}`，返回 `diag_id` |
 | GET | `/diag/:id` | 查询状态。日志包可取回时返回 OneX 同源 `download_url` |
@@ -97,7 +103,7 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 
 - `GET /v1/contract` 增加 `agent_releases`。每项含固定发行 ID、Agent、版本、系统、架构、SHA-256、大小及 `available`。
 - `GET /v1/contract/agent-releases?q=&cursor=&limit=` 向租户 owner/admin 分页返回启用且已缓存的可选发行。
-- owner 写 `PUT /v1/contract` 时可传 `agent_release_ids`，每个 Agent、系统、架构组合最多固定一项。所选 Agent 必须出现在 `allowed_agents`。空数组清除固定版本，缺省保留现有准许 Agent 的固定条目。
+- 户主在 `PUT /v1/contract/configuration` 的 `configuration.agent_release_ids` 中可按 Agent、系统、架构各固定一项，发行须属于已启用的 Agent。清除固定项后跟随平台目录。尚未签发的租户可经旧 `PUT /v1/contract` 为原有范围增加固定限制，现有固定项在对应 Agent 仍开启时须保留。
 - 保存合约时冻结原始发行身份并写审计。没有固定版本的目标跟随平台已启用的缓存发行。固定发行不可用时该目标暂停供给。固定发行的平台要求支持 Server 制品缓存的 Edge。
 - `GET /v1/contract/effective?os=&arch=` 向已选择租户的成员返回合约修订、指定平台实际可用的受管发行及当前生效的模型和倍率。Agent 状态为 `available`、`unavailable` 或 `qualification_required`。模型及倍率与 Edge 下发使用同一解析，响应省略上游 URL、代理和密钥。
 - 设备下载及平台管理接口见 [维护与发布](maintenance-releases.md)。

@@ -1,3 +1,5 @@
+import { readContract } from './capability-data';
+import { readPolicyHot, refreshPolicyForOrganization } from './policy-data';
 import { randomInt, timingSafeEqual } from 'node:crypto';
 import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
@@ -47,7 +49,7 @@ function readSession(sql: Pick<Transaction, 'get'>, tokenHash: string, at: numbe
 
 export function authenticate(store: Store, c: Context, at: number) { return readSession(store.system, tokenOf(c), at); }
 
-export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; now: () => number; deliverCode?: (target: string, code: string) => void }) {
+export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; now: () => number; deliverCode?: (target: string, code: string) => void; onConfigChange?: (tenantId:string)=>void }) {
   const { now, codeSecret } = opts;
   const pending = new Map<string, Promise<Response>>();
   const tenant = (id: string, sql: Pick<Transaction, 'get'> = store.system) =>
@@ -146,14 +148,16 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
           if (existing?.status === 'active') return existing;
           if (existing) throw new ApiError('forbidden');
           if (invitation.used >= invitation.max_uses) throw new ApiError('not_found');
-          const limit = sql.get<{ seat_limit: number }>('SELECT seat_limit FROM contract ORDER BY revision DESC LIMIT 1');
+          const limit = readContract(sql);
           const { n } = sql.get<{ n: number }>("SELECT count(*) AS n FROM members WHERE status = 'active'")!;
           if (!limit || n >= limit.seat_limit) throw new ApiError('seat_limit');
           sql.run('UPDATE invites SET used = used + 1, revision = revision + 1 WHERE code_hash = ?', [inviteHash]);
           sql.run("INSERT INTO members (user_id, role, group_id, status) VALUES (?, ?, ?, 'active')", [account.id, invitation.role, invitation.group_id]);
+          refreshPolicyForOrganization(sql,id,account.id,at);
           return { user_id: account.id, role: invitation.role, status: 'active' };
         });
         await store.system.write((sql) => indexMember(sql, id, member));
+        opts.onConfigChange?.(id);
         u = account;
       }
       if (!u) throw new ApiError('unauthenticated');
@@ -247,7 +251,8 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
     if (!s.tenant_id) return c.json({ user: publicUser(u), tenant: null, role: null, agents: [], is_platform_admin,
       actions: is_platform_admin ? platformCreateActions : [] });
     const { t, m } = await requireMember(s.tenant_id, s.user_id);
-    const contract = store.tenant(t.id).get<{ allowed_agents_json: string }>('SELECT allowed_agents_json FROM contract ORDER BY revision DESC LIMIT 1');
+    const db=store.tenant(t.id);
+    const contract=readPolicyHot(db,s.user_id)??readContract(db);
     const binding = quotaBinding(store.tenant(t.id), s.user_id, now());
     const quota = { quota_milli: binding?.quota_milli ?? null, month_used_milli: binding?.used_milli ?? selfMonthUsage(store.tenant(t.id), s.user_id, now()),
       remaining_milli: binding?.remaining_milli ?? null, limited_by: binding?.limited_by ?? null };

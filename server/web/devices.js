@@ -1,3 +1,4 @@
+import { targetSummary } from './policy-targets.js'
 import { createLedger } from './ledger.js'
 import { detailPanel, el, button } from './panel.js'
 import { formatDateTime } from './format.js'
@@ -37,6 +38,18 @@ export async function devicesPage(host,api,signal,mockOnly=false) {
     onOpen:item=>open(item.name,async pane=>{
       const d=await source.get('/devices/'+encodeURIComponent(item.id),{signal})
       pane.body.append(el('p',null,`${online(d)} · ${d.os} ${d.arch} · Edge ${d.edge_version}`),el('p','muted','最近活动：'+formatDateTime(d.last_seen_at)))
+      if (d.policy) {
+        const applied = d.policy.applied
+        const version = d.policy.platform_revision ? 'v' + d.policy.platform_revision : '未签发'
+        const recorded = applied
+          ? 'Edge 已应用策略修订 ' + applied.policy_revision + ' · 下发序号 ' + applied.config_revision + ' · ' + formatDateTime(applied.applied_at)
+          : '尚无 Edge 应用记录'
+        const status = el('div', 'notice')
+        status.append(el('p', null, '平台合约 ' + version + ' · 当前策略修订 ' + d.policy.policy_revision),
+          el('p', 'muted', recorded))
+        pane.body.append(status)
+      }
+      if(d.policy?.target) pane.body.append(targetSummary(d.policy.target))
       if(!d.actions?.some(action=>action==='diag'||action==='create_diag'))return
       const result=el('div','notice');pane.body.append(result)
       const launch=button('拉取日志',async()=>{

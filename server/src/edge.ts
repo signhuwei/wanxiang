@@ -10,7 +10,8 @@ import { ackCursor, eventItems, ingestEvents, ingestUsage, usageItems, type Publ
 import { int } from './management';
 import type { PendingWork } from './pending';
 import { bearer, hash, iso, randomToken } from './credentials';
-import type { ConfigPublisher } from './edge-config';
+import { readPolicyHot } from './policy-data';
+import { requiresPolicyRuntime, type ConfigPublisher } from './edge-config';
 import type { Presence } from './presence';
 import type { Device, Store } from './store';
 
@@ -54,7 +55,9 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
 
     const live = () => state !== 'closed' && current.get(deviceId) === socket;
     const send = (msg: Record<string, unknown>) => { if (live()) socket.send(JSON.stringify(msg)); };
-    const subscription = { tenant: tenantId, agentCache: false, live, send };
+    const subscription = { tenant: tenantId, agentCache: false, macDesktop: false, codexDesktop: false, claudeDesktop: false, supportsCapabilityContract: false, supportsCapabilityPolicy: false, supportsPolicyRuntime:false, live, send };
+    const policyCap = () => subscription.supportsCapabilityPolicy && (subscription.supportsPolicyRuntime ||
+      !requiresPolicyRuntime(store,readPolicyHot(store.tenant(tenantId),userId)));
     const stop = (code: number, reason: string) => {
       state = 'closed';
       clearTimeout(timer);
@@ -115,10 +118,22 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
           if (state === 'hello') {
             if (msg.type !== 'hello' || !isText(msg.id) || msg.edge_version !== version || !isText(msg.os, 32) || !isText(msg.arch, 32)
               || (msg.agent_cache !== undefined && typeof msg.agent_cache !== 'boolean')
+              || (msg.capability_contract_v1 !== undefined && typeof msg.capability_contract_v1 !== 'boolean')
+              || (msg.policy_runtime_v1 !== undefined && typeof msg.policy_runtime_v1 !== 'boolean')
+              || (msg.capability_policy_v2 !== undefined && typeof msg.capability_policy_v2 !== 'boolean')
+              || (msg.mac_desktop_v1 !== undefined && typeof msg.mac_desktop_v1 !== 'boolean')
+              || (msg.codex_desktop_v1 !== undefined && typeof msg.codex_desktop_v1 !== 'boolean')
+              || (msg.claude_desktop_v1 !== undefined && typeof msg.claude_desktop_v1 !== 'boolean')
               || !isSeq(msg.config_revision) || !isSeq(msg.outbox_last_seq) || (msg.lease_id != null && !isText(msg.lease_id))) {
               stop(1008, 'hello required'); return;
             }
             subscription.agentCache = msg.agent_cache === true;
+            subscription.supportsCapabilityContract = subscription.agentCache && msg.capability_contract_v1 === true;
+            subscription.supportsCapabilityPolicy = subscription.agentCache && msg.capability_policy_v2 === true;
+            subscription.supportsPolicyRuntime = msg.policy_runtime_v1 === true;
+            subscription.macDesktop = msg.mac_desktop_v1 === true;
+            subscription.codexDesktop = msg.codex_desktop_v1 === true;
+            subscription.claudeDesktop = msg.claude_desktop_v1 === true;
             state = 'starting';
             if (!await renew()) { if (live()) stop(1008, 'device unavailable'); return; }
             if (!live()) return;
@@ -129,7 +144,12 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             send({ type: 'welcome', re: msg.id, device_id: deviceId, user_id: userId, tenant_id: tenantId,
               server_time: iso(now()), ack_seq: ackCursor(store.tenant(tenantId), deviceId), heartbeat_ms: heartbeatMs });
             timer = setTimeout(tick, heartbeatMs);
-            if (msg.lease_id == null) send(await initialLease(store, tenantId, deviceId, userId, now(), live));
+            if (msg.lease_id == null) {
+              const reply = await initialLease(store, tenantId, deviceId, userId, now(), live,
+                subscription.supportsCapabilityContract, policyCap());
+              if (subscription.supportsCapabilityPolicy) await config.balanceChanged(tenantId);
+              send(reply);
+            } else if (subscription.supportsCapabilityPolicy) await config.balanceChanged(tenantId);
             if (live()) { await config.connect(deviceId, subscription); diag.connect(deviceId, tenantId, send, live); }
             return;
           }
@@ -153,16 +173,30 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             return;
           }
           if (msg.type === 'pong' || (msg.type === 'ack' && isText(msg.re) && typeof msg.ok === 'boolean')) return;
+          if (msg.type === 'config_applied' && isText(msg.id)) {
+            const revision = int(msg.config_revision, 'config_revision', 1);
+            const policyRevision = int(msg.policy_revision, 'policy_revision', 1);
+            if (!subscription.supportsCapabilityPolicy ||
+              !await config.applied(deviceId, subscription, revision, policyRevision)) throw new ApiError('conflict');
+            send({ type: 'ack', re: msg.id, ok: true });
+            return;
+          }
           if (msg.type === 'lease_renew' && isText(msg.id)) {
             if (!isText(msg.lease_id)) throw new ApiError('invalid', { fields: ['lease_id'] });
             const opId = msg.op_id ?? msg.id;
             if (!isText(opId)) throw new ApiError('invalid', { fields: ['op_id'] });
             const used = int(msg.used_milli, 'used_milli');
-            send({ ...await renewLease(store, tenantId, deviceId, userId, now(), live, msg.lease_id, used, opId), re: msg.id });
+            const reply = await renewLease(store, tenantId, deviceId, userId, now(), live, msg.lease_id, used, opId,
+              subscription.supportsCapabilityContract, policyCap(),msg.model_used_milli);
+            await config.balanceChanged(tenantId);
+            send({ ...reply, re: msg.id });
             return;
           }
           if (msg.type === 'lease_request' && isText(msg.id)) {
-            send({ ...await requestLease(store, tenantId, deviceId, userId, now(), live), re: msg.id });
+            const reply = await requestLease(store, tenantId, deviceId, userId, now(), live,
+              subscription.supportsCapabilityContract, policyCap());
+            if (subscription.supportsCapabilityPolicy) await config.balanceChanged(tenantId);
+            send({ ...reply, re: msg.id });
             return;
           }
           if (msg.type === 'usage' && isText(msg.id)) {
@@ -171,7 +205,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             return;
           }
           if (msg.type === 'events' && isText(msg.id)) {
-            const ack_seq = await ingestEvents(store, tenantId, deviceId, userId, now(), live, eventItems(msg.batch), publish);
+            const ack_seq = await ingestEvents(store, tenantId, deviceId, userId, now(), live, eventItems(msg.batch), publish, id => config.balanceChanged(id));
             send({ type: 'events_ack', re: msg.id, ack_seq });
             return;
           }

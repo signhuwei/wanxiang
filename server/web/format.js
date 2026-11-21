@@ -2,9 +2,16 @@
 
 export function formatMilli(milli) {
   if (milli === null || milli === undefined) return '不限'
-  const v = milli / 1000
-  // 去掉浮点尾差，最多三位小数
-  return String(Math.round(v * 1000) / 1000)
+  const digits = String(Math.abs(milli)).padStart(4, '0')
+  const fraction = digits.slice(-3).replace(/0+$/, '')
+  return (milli < 0 ? '-' : '') + digits.slice(0, -3) + (fraction ? '.' + fraction : '')
+}
+
+export function parseEraserMilli(value) {
+  const match = /^(\d+)(?:\.(\d{1,3})0*)?$/.exec(String(value).trim())
+  if (!match) return null
+  const milli = Number(match[1] + (match[2] ?? '').padEnd(3, '0'))
+  return Number.isSafeInteger(milli) ? milli : null
 }
 
 // 配额用量：quotaMilli 为 null 表示不限，只显示已用，不判定状态。
@@ -23,16 +30,14 @@ export function formatQuotaUsage(usedMilli, quotaMilli) {
   return used + ' / ' + quota
 }
 
-export const QUOTA_HINT = '每自然月重置，按 Asia/Shanghai；留空为不限'
-export const QUOTA_INVALID_MESSAGE = '橡皮配额必须是不小于 0 的数字，最多三位小数'
+export const QUOTA_HINT = '按北京时间自然月重置，留空为不限'
+export const QUOTA_INVALID_MESSAGE = '橡皮配额须为不小于 0 的块数，精确到 0.001 块'
 
 // 配额表单输入是橡皮，最多三位小数；换算成毫橡皮（契约字段 quota_milli，非负整数）后再校验。
 export function parseQuotaEraserInput(value) {
   if (value === null || value === undefined || value === '') return { quotaMilli: null }
-  const n = Number(value)
-  if (!Number.isFinite(n) || n < 0) return { error: QUOTA_INVALID_MESSAGE }
-  const quotaMilli = Math.round(n * 1000)
-  if (!Number.isInteger(quotaMilli) || quotaMilli < 0) return { error: QUOTA_INVALID_MESSAGE }
+  const quotaMilli = parseEraserMilli(value)
+  if (quotaMilli === null) return { error: QUOTA_INVALID_MESSAGE }
   return { quotaMilli }
 }
 
@@ -60,7 +65,7 @@ const MEMBER_STATUS = { active: '正常', disabled: '已禁用' }
 const TENANT_STATUS = { active: '正常', suspended: '已暂停' }
 export const DESKTOP_RELEASE_STATUS = { draft: '草稿', published: '已发布', unlisted: '已下架' }
 export const DESKTOP_OS_LABELS = { darwin: 'macOS', windows: 'Windows' }
-export const AGENT_LABELS = { 'claude-code': 'Claude Code', codex: 'Codex', 'kimi-code': 'Kimi Code', workbuddy: 'WorkBuddy', 'deepseek-desktop': 'DeepSeek Harness Desktop' }
+export const AGENT_LABELS = { 'claude-code': 'Claude Code', codex: 'Codex', 'kimi-code': 'Kimi Code', workbuddy: 'WorkBuddy', 'deepseek-desktop': 'DeepSeek Harness Desktop', 'claude-desktop': 'Claude Desktop', 'codex-desktop': 'Codex Desktop' }
 export const AGENT_OPTIONS = Object.entries(AGENT_LABELS).map(([value, label]) => ({ value, label }))
 
 export function roleLabel(role) {

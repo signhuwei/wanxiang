@@ -4,6 +4,8 @@ import { AGENT_LABELS, formatBytes } from './format.js'
 import { idempotencyKey } from './idempotency.js'
 
 const path = '/platform/agent-releases'
+const agentLabel = agent => AGENT_LABELS[agent] ?? agent
+const cacheText = cached => cached ? '已校验并缓存' : '待缓存'
 const options = values => values.map(value => ({ value, label: value }))
 const select = (key, label, values) => ({ key, label, type: 'select', allowEmpty: false, options: options(values) })
 const source = { key: 'url', label: '厂商源地址（供 Server 拉取）', placeholder: 'https://…' }
@@ -17,7 +19,7 @@ export function agentReleasesPage(host, api, signal) {
   let list
   const open = detailPanel(host, () => list)
   function show(row) {
-    open(row ? row.agent + ' ' + row.version : '登记 Agent 发行', pane => {
+    open(row ? agentLabel(row.agent) + ' ' + row.version : '登记 Agent 发行', pane => {
       let record = row
       const detail = () => path + '/' + encodeURIComponent(record.id)
       const notice = el('div', 'notice')
@@ -38,15 +40,23 @@ export function agentReleasesPage(host, api, signal) {
         } finally { control.disabled = false }
       }
       function render() {
+        const runtime = record.runtime
         pane.body.classList.remove('child-ledger')
         editForm(pane, { mode: 'view', values: { ...record, size: formatBytes(record.size),
           status_text: record.qualification_required ? '待原生运行验证' : record.status === 'active' ? '已启用' : '未启用',
-          cache_text: record.artifact_cached ? '已校验并缓存' : '待缓存' }, fields: [
+          cache_text: cacheText(record.artifact_cached),
+          runtime_status: cacheText(runtime?.artifact_cached),
+          runtime_size: formatBytes(runtime?.size),
+          runtime_sha256: runtime?.sha256 }, fields: [
           ...fields, { key: 'status_text', label: '发行状态' }, { key: 'cache_text', label: 'Server 制品' },
+          ...(runtime ? [
+            { key: 'runtime_status', label: 'Code 引擎缓存' }, { key: 'runtime_size', label: 'Code 引擎大小' },
+            { key: 'runtime_sha256', label: 'Code 引擎 SHA-256', wide: true },
+          ] : []),
         ] })
         pane.body.append(notice)
         if (record.actions.includes('upload_artifact')) {
-          const label = el('label', 'field wide', record.qualification_required ? '原厂完整安装包' : '原始可执行文件或它的 .gz')
+          const label = el('label', 'field wide', record.part_bytes ? '原厂完整安装包' : '原始可执行文件或它的 .gz')
           const input = el('input')
           input.type = 'file'
           const upload = button('上传并校验', () => {
@@ -68,6 +78,25 @@ export function agentReleasesPage(host, api, signal) {
               }
               throw new Error('Server 尚未完成整包校验')
             }, 'Server 缓存已就绪')
+          })
+          label.append(input)
+          pane.body.append(label)
+          pane.foot.append(upload)
+        }
+        if (runtime && record.actions.includes('upload_runtime')) {
+          const label = el('label', 'field wide', '原厂 Code 引擎（.tar.zst）')
+          const input = el('input')
+          input.type = 'file'
+          input.accept = '.zst'
+          const upload = button('上传 Code 引擎', () => {
+            const file = input.files?.[0]
+            if (!file) { notify('请选择 Code 引擎制品', true); return }
+            if (file.size !== runtime.size) { notify('Code 引擎大小与发行要求不符', true); return }
+            notify('正在上传并校验 Code 引擎…')
+            return update(upload, async () => {
+              const result = await api.putBinary(detail() + '/runtime', file, { params: { revision: record.revision } })
+              if (!result?.artifact_cached) throw new Error('Server 尚未完成 Code 引擎校验')
+            }, 'Code 引擎已校验并缓存')
           })
           label.append(input)
           pane.body.append(label)
@@ -96,16 +125,21 @@ export function agentReleasesPage(host, api, signal) {
       if (row) render()
       else editForm(pane, { mode: 'create', fields, values: { agent: 'claude-code', os:'darwin', arch:'arm64' },
         submit: (value, opts) => api.post(path, { ...value, status: 'disabled' }, opts),
-        done: saved => { record = saved; pane.setTitle(record.agent + ' ' + record.version); render() } })
+        done: saved => { record = saved; pane.setTitle(agentLabel(record.agent) + ' ' + record.version); render() } })
     })
   }
   list = createLedger(host, {
     title: 'Agent 制品', createLabel: '登记发行', createAction: 'create_agent_release',
     onCreate: () => show(null), onOpen: show, signal, searchLabel: '查询 Agent、版本或系统',
     columns: [
-      { key: 'agent', title: 'Agent' }, { key: 'version', title: '版本' },
+      { key: 'agent', title: 'Agent', render: row => agentLabel(row.agent) }, { key: 'version', title: '版本' },
       { title: '系统 / 架构', render: row => row.os + ' / ' + row.arch },
-      { title: 'Server 制品', render: row => row.artifact_cached ? '已缓存' : '待缓存' },
+      { title: 'Server 制品', render: row => {
+        if (!row.runtime) return row.artifact_cached ? '已缓存' : '待缓存'
+        const bundle = row.artifact_cached ? '安装包已缓存' : '安装包待缓存'
+        const engine = row.runtime.artifact_cached ? '引擎已缓存' : '引擎待缓存'
+        return bundle + ' · ' + engine
+      } },
       { title: '发行状态', render: row => row.qualification_required ? '待原生运行验证' : row.status === 'active' ? '已启用' : '未启用' },
     ],
     fetchPage: ({ q, limit, cursor, signal }) => api.get(path, { params: { q, limit, cursor }, signal }),

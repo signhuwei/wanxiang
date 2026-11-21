@@ -1,25 +1,23 @@
 import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
 import { tenantAuditActions } from './actions';
-import { agentTarget, allowedAgentReleases, hasArtifact, matchesPin, releaseIdentity, requiresDesktopQualification, type AgentPin, type AgentRelease } from './agent-catalog';
+import { allDesktopCapabilities, allowedAgentReleases, hasReleaseArtifacts, hasDesktopRuntime, qualifiedDesktopRelease, matchesPin, releaseIdentity, requiresDesktopQualification, type AgentPin, type AgentRelease } from './agent-catalog';
 import { ApiError, field, invalid, json, operation } from './api';
 import { groupMonthUsage, monthUsageByGroup, monthUsageByUser, selfMonthUsage } from './billing';
+import { readHead, refreshPolicyForOrganization } from './policy-data';
+import { narrowVisibility, quotaConfigurable, readContract, readPins, stringList, validatePins, type Contract } from './capability-data';
 import { day, hash, iso, randomToken } from './credentials';
 import { effectiveModelConfig } from './edge-config';
 import { enumField, expectRevision, int, pagination, tenantActor, type ManagementOptions } from './management';
 import { indexInvite, indexMember, type Member, type Store, type Transaction } from './store';
-import { defaultVisibility, visibility } from './visibility';
+import { visibility } from './visibility';
 
 type MemberRow = Member & { group_id: string | null; quota_milli: number | null; revision: number };
 type Profile = { id: string; name: string; email: string | null; phone: string | null };
 type Group = { id: string; name: string; parent_id: string | null; quota_milli: number | null; revision: number };
-type Contract = { revision: number; seat_limit: number; allowed_agents_json: string; allowed_models_json: string;
-  agent_release_pins_json: string;
-  lease_minutes: number; lease_budget_milli: number; visibility_json: string; updated_by: string; updated_at: string };
 type AuditRow = { id: string; actor: string; action: string; target: string; at: string };
 const roles = ['admin', 'group_admin', 'member'] as const;
 const statuses = ['active', 'disabled'] as const;
-const readContract = (sql: Pick<Transaction, 'get'>) => sql.get<Contract>('SELECT * FROM contract ORDER BY revision DESC LIMIT 1');
 const canManage = (role: string) => role === 'owner' || role === 'admin';
 const canEditMember = (actor: string, subject: string) => subject !== 'owner' && (actor === 'owner' || (actor === 'admin' && subject === 'member'));
 
@@ -32,47 +30,24 @@ function groupId(sql: Pick<Transaction, 'get'>, value: unknown, name: string) {
 
 function quota(value: unknown) { return value === undefined || value === null ? null : int(value, 'quota_milli'); }
 
-function stringList(value: unknown, name: string) {
-  if (!Array.isArray(value) || value.length > 200) invalid(name);
-  const items = value.map((item) => field(item, name));
-  if (new Set(items).size !== items.length) invalid(name);
-  return items;
-}
-
 export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
   const releaseById = (id: string) => store.system.get<AgentRelease>('SELECT * FROM agent_releases WHERE id = ?', [id]);
-  const readPins = (row: Contract | null): AgentPin[] => row ? JSON.parse(row.agent_release_pins_json) : [];
   const pinSummary = (pin: AgentPin) => {
     const row = releaseById(pin.id);
-    const available = !!(row && row.status === 'active' && matchesPin(row, pin) && hasArtifact(opts.dataDir, row));
+    const available = !!(row && row.status === 'active' && matchesPin(row, pin) && hasReleaseArtifacts(opts.dataDir, row));
     return { ...pin, available };
   };
-  const contractView = ({ allowed_agents_json, allowed_models_json, agent_release_pins_json, visibility_json, ...row }: Contract, role: string) => ({
+  const contractView = ({ allowed_agents_json, allowed_models_json, agent_release_pins_json, visibility_json, quota_distribution, ...row }: Contract, role: string) => ({
     ...row, allowed_agents: JSON.parse(allowed_agents_json), allowed_models: JSON.parse(allowed_models_json),
     agent_releases: (JSON.parse(agent_release_pins_json) as AgentPin[]).map(pinSummary),
-    visibility: visibility(JSON.parse(visibility_json)), actions: role === 'owner' ? ['read', 'update'] : ['read'],
+    quota_distribution: quota_distribution !== 0,
+    visibility: visibility(JSON.parse(visibility_json)), actions: role === 'owner' && row.platform_revision === 0 ? ['read', 'update'] : ['read'],
   });
-  function validatePins(value: unknown, allowed: string[], previous: AgentPin[]) {
-    if (value === undefined) return previous.filter(pin => allowed.includes(pin.agent));
-    const ids = stringList(value, 'agent_release_ids');
-    const result = ids.map(id => {
-      const saved = previous.find(pin => pin.id === id);
-      const release = releaseById(id);
-      if (saved && allowed.includes(saved.agent)) return saved;
-      if (!release || !allowed.includes(release.agent) || requiresDesktopQualification(release.agent)
-        || release.status !== 'active' || !hasArtifact(opts.dataDir, release)) {
-        throw new ApiError('invalid', { fields: ['agent_release_ids'], reason: 'artifact_unavailable', release_id: id });
-      }
-      return Object.fromEntries(releaseIdentity.map(key => [key, release[key]])) as AgentPin;
-    });
-    if (new Set(result.map(agentTarget)).size !== result.length) invalid('agent_release_ids');
-    return result.sort((a, b) => agentTarget(a).localeCompare(agentTarget(b)));
-  }
 
   const profile = (id: string) => store.system.get<Profile>('SELECT id, name, email, phone FROM platform_users WHERE id = ?', [id]);
-  const memberView = (row: MemberRow, role: string, month_used_milli: number) => {
+  const memberView = (row: MemberRow, role: string, month_used_milli: number, quota_configurable: boolean) => {
     const user = profile(row.user_id);
-    return { ...row, id: row.user_id, name: user?.name ?? row.user_id, email: user?.email ?? null, phone: user?.phone ?? null,
+    return { ...row, id: row.user_id, name: user?.name ?? row.user_id, email: user?.email ?? null, phone: user?.phone ?? null, quota_configurable,
       month_used_milli, actions: canEditMember(role, row.role) ? ['read', 'update'] : ['read'] };
   };
   function manager(c: Context, at: number) {
@@ -132,14 +107,15 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     const at = opts.now();
     // 一次聚合查询取全体成员本月已用，避免每行各发两条查询（N+1）。
     const usage = monthUsageByUser(db, at);
-    return c.json(p.page(rows.map((row) => memberView(row, role, usage.get(row.user_id) ?? 0)), n, ['create_member']));
+    const quotaAllowed = quotaConfigurable(db);
+    return c.json(p.page(rows.map((row) => memberView(row, role, usage.get(row.user_id) ?? 0, quotaAllowed)), n, ['create_member']));
   });
   app.get('/v1/members/:id', (c) => {
     const at = opts.now();
     const { db, role } = manager(c, at);
     const row = db.get<MemberRow>('SELECT * FROM members WHERE user_id = ?', [c.req.param('id')]);
     if (!row) throw new ApiError('not_found');
-    return c.json(memberView(row, role, selfMonthUsage(db, row.user_id, at)));
+    return c.json(memberView(row, role, selfMonthUsage(db, row.user_id, at), quotaConfigurable(db)));
   });
   // CONTRACT-PENDING: POST creates from a known user_id; POST/PATCH /:id updates.
   const writeMember = async (c: Context) => {
@@ -164,6 +140,11 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
       if (role === 'group_admin' && !group_id) invalid('group_id');
       const status = body.status === undefined ? previous?.status ?? 'active' : enumField(body.status, 'status', statuses);
       const quota_milli = body.quota_milli === undefined && previous ? previous.quota_milli : quota(body.quota_milli);
+      const quotaAllowed = quotaConfigurable(sql);
+      if (quota_milli !== (previous?.quota_milli ?? null)) {
+        if (readHead(sql)) throw new ApiError('conflict', { reason: 'use_capability_policy' });
+        if (!quotaAllowed) throw new ApiError('forbidden', { reason: 'quota_distribution_disabled' });
+      }
       if (status === 'active' && previous?.status !== 'active') {
         const { n } = sql.get<{ n: number }>("SELECT count(*) AS n FROM members WHERE status = 'active'")!;
         if (n >= (readContract(sql)?.seat_limit ?? 0)) throw new ApiError('seat_limit');
@@ -172,7 +153,11 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
       const member = { user_id: id, role, status, group_id, quota_milli, revision };
       if (previous) sql.run('UPDATE members SET role = ?, status = ?, group_id = ?, quota_milli = ?, revision = ? WHERE user_id = ?', [role, status, group_id, quota_milli, revision, id]);
       else sql.run('INSERT INTO members (user_id, role, status, group_id, quota_milli) VALUES (?, ?, ?, ?, ?)', [id, role, status, group_id, quota_milli]);
-      return { member, response: op.complete(sql, { status: previous ? 200 : 201, payload: memberView(member, actorRole, selfMonthUsage(sql, id, at)) }) };
+      if (!previous || previous.group_id !== group_id || previous.status !== status || previous.role !== role) {
+        refreshPolicyForOrganization(sql,actor.id,actor.userId,at);
+      }
+      return { member, response: op.complete(sql, { status: previous ? 200 : 201,
+        payload: memberView(member, actorRole, selfMonthUsage(sql, id, at), quotaAllowed) }) };
     });
     if (result.member) {
       await store.system.write((sql) => indexMember(sql, actor.id, result.member!));
@@ -183,7 +168,8 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
   app.post('/v1/members', writeMember);
   app.on(['POST', 'PATCH'], '/v1/members/:id', writeMember);
 
-  const groupView = (group: Group, month_used_milli: number) => ({ ...group, month_used_milli, actions: ['read', 'update'] });
+  const groupView = (group: Group, month_used_milli: number, quota_configurable: boolean) =>
+    ({ ...group, month_used_milli, quota_configurable, actions: ['read', 'update'] });
   app.get('/v1/groups', (c) => {
     const at = opts.now();
     const { db } = manager(c, at);
@@ -193,14 +179,15 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     const rows = db.all<Group>(`SELECT * FROM groups ${where} ORDER BY id LIMIT ? OFFSET ?`, [p.query, p.limit, p.offset]);
     // 子树汇总在内存里做一次，避免每行各发子树 + 成员查询（N+1）。
     const usage = monthUsageByGroup(db, at);
-    return c.json(p.page(rows.map((row) => groupView(row, usage.get(row.id) ?? 0)), n, ['create_group']));
+    const quotaAllowed = quotaConfigurable(db);
+    return c.json(p.page(rows.map((row) => groupView(row, usage.get(row.id) ?? 0, quotaAllowed)), n, ['create_group']));
   });
   app.get('/v1/groups/:id', (c) => {
     const at = opts.now();
     const { db } = manager(c, at);
     const row = db.get<Group>('SELECT * FROM groups WHERE id = ?', [c.req.param('id')]);
     if (!row) throw new ApiError('not_found');
-    return c.json(groupView(row, groupMonthUsage(db, row.id, at)));
+    return c.json(groupView(row, groupMonthUsage(db, row.id, at), quotaConfigurable(db)));
   });
   const writeGroup = async (c: Context) => {
     const body = await json(c);
@@ -208,10 +195,10 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     const actor = manager(c, at);
     const existingId = c.req.param('id');
     const op = operation(c, opts.codeSecret, at, actor.userId, body);
-    return actor.db.write((sql) => {
+    const result=await actor.db.write((sql) => {
       writeRole(sql, actor);
       const cached = op.read(sql);
-      if (cached) return cached;
+      if (cached) return {response:cached,changed:false};
       const previous = existingId ? sql.get<Group>('SELECT * FROM groups WHERE id = ?', [existingId]) : null;
       if (existingId && !previous) throw new ApiError('not_found');
       if (previous) expectRevision(body.revision, previous.revision);
@@ -221,11 +208,20 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
       if (parent_id && sql.get(`WITH RECURSIVE ancestors(id) AS (VALUES (?) UNION SELECT g.parent_id FROM groups g
         JOIN ancestors a ON g.id = a.id WHERE g.parent_id IS NOT NULL) SELECT 1 FROM ancestors WHERE id = ?`, [parent_id, id])) invalid('parent_id');
       const quota_milli = body.quota_milli === undefined && previous ? previous.quota_milli : quota(body.quota_milli);
+      const quotaAllowed = quotaConfigurable(sql);
+      if (quota_milli !== (previous?.quota_milli ?? null)) {
+        if (readHead(sql)) throw new ApiError('conflict', { reason: 'use_capability_policy' });
+        if (!quotaAllowed) throw new ApiError('forbidden', { reason: 'quota_distribution_disabled' });
+      }
       const revision = (previous?.revision ?? 0) + 1;
       if (previous) sql.run('UPDATE groups SET name = ?, parent_id = ?, quota_milli = ?, revision = ? WHERE id = ?', [name, parent_id, quota_milli, revision, id]);
       else sql.run('INSERT INTO groups (id, name, parent_id, quota_milli) VALUES (?, ?, ?, ?)', [id, name, parent_id, quota_milli]);
-      return op.complete(sql, { status: previous ? 200 : 201, payload: groupView({ id, name, parent_id, quota_milli, revision }, groupMonthUsage(sql, id, at)) });
+      const changed=(!previous || previous.parent_id!==parent_id) && refreshPolicyForOrganization(sql,actor.id,actor.userId,at);
+      return {response:op.complete(sql, { status: previous ? 200 : 201,
+        payload: groupView({ id, name, parent_id, quota_milli, revision }, groupMonthUsage(sql, id, at), quotaAllowed) }),changed};
     });
+    if (result.changed) opts.onConfigChange?.(actor.id);
+    return result.response;
   };
   app.post('/v1/groups', writeGroup);
   app.on(['POST', 'PATCH'], '/v1/groups/:id', writeGroup);
@@ -271,24 +267,28 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     if (!contract) throw new ApiError('not_found');
     const os = enumField(c.req.query('os'), 'os', ['darwin', 'linux', 'win32'] as const);
     const arch = enumField(c.req.query('arch'), 'arch', ['arm64', 'x64'] as const);
-    const available = allowedAgentReleases(store, opts.dataDir, contract, os, arch, true);
+    const available = allowedAgentReleases(store, opts.dataDir, contract, os, arch, true, allDesktopCapabilities);
     const { models } = effectiveModelConfig(store, contract, at);
     const agents = (JSON.parse(contract.allowed_agents_json) as string[]).map(agent => ({
       agent,
-      status: requiresDesktopQualification(agent) ? 'qualification_required'
-        : (available.some(row => row.agent === agent) ? 'available' : 'unavailable'),
+      status: available.some(row => row.agent === agent) ? 'available'
+        : requiresDesktopQualification(agent) && !hasDesktopRuntime(agent, os, arch) ? 'qualification_required' : 'unavailable',
       releases: available.filter(row => row.agent === agent).map(row =>
         Object.fromEntries(releaseIdentity.map(key => [key, row[key]]))),
     }));
-    return c.json({ revision: contract.revision, os, arch, agents, models, actions: ['read'] });
+    return c.json({ revision: contract.revision, platform_revision: contract.platform_revision, tenant_revision: contract.tenant_revision,
+      os, arch, agents, models, actions: ['read'] });
   });
   app.get('/v1/contract/agent-releases', (c) => {
     const actor = tenantActor(store, c, opts.now());
     if (!canManage(actor.role)) throw new ApiError('forbidden');
     const p = pagination(c);
+    const grant = actor.db.get<{ entitlements_json: string }>('SELECT entitlements_json FROM platform_contracts ORDER BY revision DESC LIMIT 1');
+    const allowedAgents: string[] | undefined = grant ? JSON.parse(grant.entitlements_json).allowed_agents : undefined;
     const rows = store.system.all<AgentPin>(`SELECT id, agent, version, os, arch, sha256, size FROM agent_releases
       WHERE status = 'active' AND instr(lower(agent || ' ' || version || ' ' || os || ' ' || arch), lower(?)) > 0
-      ORDER BY agent, os, arch, version, id`, [p.query]).filter(row => !requiresDesktopQualification(row.agent) && hasArtifact(opts.dataDir, row));
+      ORDER BY agent, os, arch, version, id`, [p.query]).filter(row => (!allowedAgents || allowedAgents.includes(row.agent))
+        && (!requiresDesktopQualification(row.agent) || qualifiedDesktopRelease(row)) && hasReleaseArtifacts(opts.dataDir, row));
     return c.json(p.page(rows.slice(p.offset, p.offset + p.limit), rows.length));
   });
 
@@ -300,24 +300,42 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     const op = operation(c, opts.codeSecret, at, actor.userId, body);
     const result = await actor.db.write((sql) => {
       if (writeRole(sql, actor) !== 'owner') throw new ApiError('forbidden');
+      const previous = readContract(sql);
+      if (readHead(sql)) throw new ApiError('conflict', { reason: 'use_capability_policy' });
+      if (previous?.platform_revision) throw new ApiError('conflict', { reason: 'use_tenant_configuration' });
       const cached = op.read(sql);
       if (cached) return { response: cached, changed: false };
-      const previous = readContract(sql);
-      const current = previous?.revision ?? 0;
-      expectRevision(body.revision, current, 0);
+      if (!previous) throw new ApiError('conflict', { reason: 'platform_contract_required' });
+      expectRevision(body.revision, previous.revision, 0);
       const grants = visibility(body.visibility);
+      const from = visibility(JSON.parse(previous.visibility_json));
       const allowed = stringList(body.allowed_agents, 'allowed_agents');
+      const models = stringList(body.allowed_models, 'allowed_models');
+      const oldAgents: string[] = JSON.parse(previous.allowed_agents_json);
+      const oldModels: string[] = JSON.parse(previous.allowed_models_json);
       const previousPins = readPins(previous);
-      const pins = validatePins(body.agent_release_ids, allowed, previousPins);
-      const row = { revision: current + 1, seat_limit: int(body.seat_limit, 'seat_limit'),
+      const pins = body.agent_release_ids === undefined ? previousPins.filter(pin => allowed.includes(pin.agent))
+        : validatePins(store, opts.dataDir, stringList(body.agent_release_ids, 'agent_release_ids'), allowed, previousPins);
+      const row = { revision: previous.revision + 1, seat_limit: int(body.seat_limit, 'seat_limit'),
         allowed_agents_json: JSON.stringify(allowed), agent_release_pins_json: JSON.stringify(pins),
-        allowed_models_json: JSON.stringify(stringList(body.allowed_models, 'allowed_models')),
+        allowed_models_json: JSON.stringify(models),
         lease_minutes: int(body.lease_minutes, 'lease_minutes', 1, 1440), lease_budget_milli: int(body.lease_budget_milli, 'lease_budget_milli'),
-        visibility_json: JSON.stringify(grants), updated_by: actor.userId, updated_at: iso(at) };
+        visibility_json: JSON.stringify(grants), updated_by: actor.userId, updated_at: iso(at),
+        platform_revision: 0, tenant_revision: 0, quota_distribution: previous.quota_distribution };
+      const expanded = [
+        ...(row.seat_limit > previous.seat_limit ? ['seat_limit'] : []),
+        ...(allowed.some(agent => !oldAgents.includes(agent)) ? ['allowed_agents'] : []),
+        ...(models.some(model => !oldModels.includes(model)) ? ['allowed_models'] : []),
+        ...(row.lease_minutes > previous.lease_minutes ? ['lease_minutes'] : []),
+        ...(row.lease_budget_milli > previous.lease_budget_milli ? ['lease_budget_milli'] : []),
+        ...(row.visibility_json !== JSON.stringify(narrowVisibility(grants, from)) ? ['visibility'] : []),
+        ...(previousPins.some(pin => allowed.includes(pin.agent) && !pins.some(next => next.id === pin.id)) ? ['agent_release_ids'] : []),
+      ];
+      if (expanded.length) throw new ApiError('invalid', { fields: expanded, reason: 'exceeds_legacy_contract' });
       sql.run(`INSERT INTO contract (revision, seat_limit, allowed_agents_json, allowed_models_json, lease_minutes, lease_budget_milli,
-        visibility_json, updated_by, updated_at, agent_release_pins_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [row.revision, row.seat_limit, row.allowed_agents_json, row.allowed_models_json, row.lease_minutes, row.lease_budget_milli, row.visibility_json, row.updated_by, row.updated_at, row.agent_release_pins_json]);
-      const from = previous ? visibility(JSON.parse(previous.visibility_json)) : defaultVisibility;
+        visibility_json, updated_by, updated_at, agent_release_pins_json, quota_distribution) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [row.revision, row.seat_limit, row.allowed_agents_json, row.allowed_models_json, row.lease_minutes, row.lease_budget_milli, row.visibility_json,
+          row.updated_by, row.updated_at, row.agent_release_pins_json, row.quota_distribution]);
       if (JSON.stringify(from) !== row.visibility_json) sql.run('INSERT INTO audit (id, actor, action, target, detail_json, at) VALUES (?, ?, ?, ?, ?, ?)',
         [`aud_${ulid()}`, actor.userId, 'contract.visibility.update', actor.id, JSON.stringify({ from, to: grants, revision: row.revision }), iso(at)]);
       if (JSON.stringify(previousPins) !== row.agent_release_pins_json) {

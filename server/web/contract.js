@@ -1,173 +1,265 @@
 import { el, button } from './panel.js'
-import { renderForm } from './form.js'
-import { AGENT_LABELS } from './format.js'
-import { idempotencyKey } from './idempotency.js'
+import { agentLabel, formatMilli } from './format.js'
+import { comparison, eraserMilli, hasAction, previewPublisher, readPages, seatsSummary, visibilityFields } from './contract-controls.js'
 
-const visibilityRoles = [['admin','管理员'], ['group_admin','组管（本组及子组）']]
-const visibilityFields = visibilityRoles.flatMap(([role,label]) => [
-  [role+'_summary',label+' · 台账与费用','visibility'], [role+'_content',label+' · 对话正文','visibility']
-])
-const targetOf = row => [row.agent, row.os, row.arch].join(' / ')
-const lines = value => (value || '').split('\n').map(s => s.trim()).filter(Boolean)
-const visibilityOptions = [{value:'true',label:'可见'},{value:'false',label:'不可见'}]
-const tabs = [ ['人数',[['seat_limit','人数上限','number']]], ['Agent',[['allowed_agents','准许的 Agent（每行一个）','textarea']]],
-  ['模型',[['allowed_models','准许的模型 ID（每行一个）','textarea']]], ['租约',[['lease_minutes','有效分钟','number'],['lease_budget_milli','额度（毫橡皮）','number']]], ['可见范围',visibilityFields] ]
-export async function contractPage(host, api) {
+const path = '/contract/configuration'
+const targets = [
+  ['darwin/arm64', 'macOS · Apple Silicon'], ['darwin/x64', 'macOS · Intel'],
+  ['win32/x64', 'Windows · x64'], ['linux/x64', 'Linux · x64'], ['linux/arm64', 'Linux · ARM64']
+]
+
+function field(label, control) {
+  const wrap = el('label', 'field wide')
+  wrap.append(el('span', null, label), control)
+  return wrap
+}
+
+function select(options, value) {
+  const control = el('select')
+  for (const [key, label] of options) {
+    const option = el('option', null, label)
+    option.value = key
+    control.append(option)
+  }
+  control.value = value
+  return control
+}
+
+function effectiveByDevice(api, signal) {
+  const section = el('section', 'contract-devices')
+  const systems = select(targets, targets[0][0])
+  const current = el('div')
+  section.append(el('h3', null, '设备可用能力'), field('系统和架构', systems), current)
+  let request = 0
+  async function load() {
+    const serial = ++request
+    const [os, arch] = systems.value.split('/')
+    current.textContent = '正在读取设备配置…'
+    try {
+      const result = await api.get('/contract/effective', { params: { os, arch }, signal })
+      if (serial !== request || signal?.aborted) return
+      const agents = result.agents.map(row => {
+        const status = row.status === 'available' ? row.releases.map(release => release.version).join('、')
+          : row.status === 'qualification_required' ? '待原生运行验证' : '当前设备无可用发行'
+        return el('li', null, agentLabel(row.agent) + ' · ' + status)
+      })
+      const modelRows = result.models.map(row => {
+        const rate = row.rate
+        const prices = ['input', 'output', 'cache_read', 'cache_write'].map(key => formatMilli(rate[key + '_milli_per_mtok']))
+        return el('li', null, row.name + ' · ' + row.model + ' · ' + row.protocol + ' · ' + prices.join(' / '))
+      })
+      current.replaceChildren()
+      for (const [title, rows] of [['Agent 发行', agents], ['模型费率（块/百万 token，依次为输入、输出、缓存读、缓存写）', modelRows]]) {
+        const list = el('ul')
+        list.append(...rows)
+        current.append(el('h4', null, title), rows.length ? list : el('p', 'muted', '当前设备无可用项'))
+      }
+    } catch (error) {
+      if (serial === request && !signal?.aborted) current.replaceChildren(el('p', 'error-row', error.message))
+    }
+  }
+  systems.addEventListener('change', load)
+  void load()
+  return section
+}
+
+function choiceList(label, options, saved) {
+  const group = el('fieldset', 'contract-choices')
+  group.append(el('legend', null, label))
+  const mode = select([['inherit', '继承平台'], ['select', '指定启用项']], saved == null ? 'inherit' : 'select')
+  mode.setAttribute('aria-label', label + '配置方式')
+  const items = el('div', 'contract-choice-list')
+  const removed = (saved ?? []).filter(id => !options.some(([value]) => value === id))
+  const inputs = options.concat(removed.map(id => [id, id + '（平台已收回）'])).map(([id, title]) => {
+    const wrap = el('label', 'contract-choice')
+    const input = el('input')
+    input.type = 'checkbox'
+    input.value = id
+    input.checked = saved == null || saved.includes(id)
+    wrap.append(input, el('span', null, title))
+    items.append(wrap)
+    return input
+  })
+  if (!options.length) items.append(el('p', 'muted', '平台暂未授权任何选项'))
+  mode.addEventListener('change', () => { items.hidden = mode.value === 'inherit' })
+  items.hidden = mode.value === 'inherit'
+  group.append(mode, items)
+  return {
+    node: group,
+    value() { return mode.value === 'inherit' ? undefined : inputs.filter(input => input.checked).map(input => input.value) }
+  }
+}
+
+function leaseLimit(label, saved, inherited) {
+  const input = el('input')
+  input.inputMode = 'decimal'
+  input.placeholder = '继承平台 ' + inherited
+  input.value = saved ?? ''
+  return { node: field(label, input), value: () => input.value.trim() || undefined }
+}
+
+function releasePicker(allowed, available, selected, existing) {
+  const box = el('fieldset', 'contract-choices')
+  const selects = el('div', 'form-grid')
+  const pins = new Map()
+  const groups = new Map()
+  const byId = new Map(available.map(row => [row.id, row]))
+  for (const row of existing) if (!byId.has(row.id)) byId.set(row.id, row)
+  for (const row of byId.values()) {
+    const key = [row.agent, row.os, row.arch].join('/')
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(row)
+    if (selected?.includes(row.id)) pins.set(key, row.id)
+  }
+  function refresh() {
+    selects.replaceChildren()
+    for (const [key, rows] of groups) {
+      const sample = rows[0]
+      if (!allowed().includes(sample.agent)) continue
+      const label = agentLabel(sample.agent) + ' · ' + sample.os + '/' + sample.arch
+      const control = select([['', '跟随平台版本'], ...rows.map(row => [row.id,
+        row.version + (row.available === false ? '（暂不可用）' : '')])], pins.get(key) ?? '')
+      control.addEventListener('change', () => {
+        if (control.value) pins.set(key, control.value)
+        else pins.delete(key)
+      })
+      selects.append(field(label, control))
+    }
+    if (!selects.childElementCount) selects.append(el('p', 'muted', '已启用 Agent 暂无可固定的发行'))
+  }
+  box.append(el('legend', null, '按设备固定 Agent 发行'), selects)
+  refresh()
+  return {
+    node: box, refresh,
+    value: () => [...pins.values()].filter(id => allowed().includes(byId.get(id).agent))
+  }
+}
+
+function configurationEditor(record, releases, existing, draft) {
+  const platform = record.entitlements
+  const choice = draft ?? record.configuration ?? {}
+  const agents = choiceList('Agent', platform.allowed_agents.map(id => [id, agentLabel(id)]), choice.allowed_agents)
+  const models = choiceList('模型', platform.allowed_models.map(id => [id, id]), choice.allowed_models)
+  const minutes = leaseLimit('租约时长（分钟）', choice.lease_minutes, platform.lease_minutes)
+  minutes.node.querySelector('input').inputMode = 'numeric'
+  const budget = leaseLimit('租约额度（块）', choice.lease_budget_milli == null ? null : formatMilli(choice.lease_budget_milli),
+    formatMilli(platform.lease_budget_milli))
+  const release = releasePicker(() => agents.value() ?? platform.allowed_agents, releases, choice.agent_release_ids, existing)
+  agents.node.addEventListener('change', release.refresh)
+  const lease = el('fieldset', 'contract-choices')
+  lease.append(el('legend', null, '租约'), minutes.node, budget.node)
+  const governance = el('fieldset', 'contract-choices')
+  governance.append(el('legend', null, '监察可见范围'))
+  const controls = visibilityFields.map(([role, key, label]) => {
+    const permitted = platform.visibility?.[role]?.[key]
+    const saved = choice.visibility?.[role]?.[key]
+    const options = [['', permitted ? '继承平台（允许）' : '继承平台（关闭）'], ['false', '关闭']]
+    if (permitted || saved === true) options.push(['true', permitted ? '允许' : '允许（平台已收回）'])
+    const control = select(options, saved == null ? '' : String(saved))
+    governance.append(field(label, control))
+    return { role, key, control }
+  })
+  const node = el('div', 'contract-editor')
+  node.append(agents.node, models.node, release.node, lease, governance)
+  return {
+    node,
+    collect() {
+      const leaseMinutes = minutes.value()
+      if (leaseMinutes !== undefined && (!/^\d+$/.test(leaseMinutes) || Number(leaseMinutes) < 1 || Number(leaseMinutes) > platform.lease_minutes)) {
+        throw new Error('租约时长须为 1 到 ' + platform.lease_minutes + ' 分钟的整数')
+      }
+      const leaseBudget = budget.value()
+      const budgetMilli = leaseBudget === undefined ? undefined : eraserMilli(leaseBudget, '租约额度')
+      if (budgetMilli > platform.lease_budget_milli) throw new Error('租约额度不能超过 ' + formatMilli(platform.lease_budget_milli) + ' 块')
+      const visibility = {}
+      for (const { role, key, control } of controls) {
+        if (control.value === '') continue
+        visibility[role] ??= {}
+        visibility[role][key] = control.value === 'true'
+      }
+      return {
+        platform_revision: record.platform_revision,
+        revision: record.revision,
+        configuration: {
+          allowed_agents: agents.value(), allowed_models: models.value(),
+          agent_release_ids: release.value(),
+          lease_minutes: leaseMinutes === undefined ? undefined : Number(leaseMinutes),
+          lease_budget_milli: budgetMilli,
+          ...(Object.keys(visibility).length && { visibility })
+        }
+      }
+    }
+  }
+}
+
+export async function contractPage(host, api, signal) {
   host.classList.add('page')
-  const bar = el('div','toolbar'), body = el('div','inline-body'), foot = el('div','inline-foot')
-  host.append(bar,body,foot)
-  try {
-    let contract = await api.get('/contract'), tab, draft, editing, form
-    let choices
-    let target = 'darwin/arm64'
-    const targets = [['darwin/arm64','macOS · Apple Silicon'], ['darwin/x64','macOS · Intel'], ['win32/x64','Windows · x64'], ['linux/x64','Linux · x64'], ['linux/arm64','Linux · ARM64']]
-    function effective(section, kind) {
-      const heading = el('label', 'field', '设备系统和架构')
-      const systems = el('select')
-      systems.setAttribute('aria-label', '设备系统和架构')
-      for (const [value, text] of targets) {
-        const item = el('option', null, text)
-        item.value = value
-        systems.append(item)
+  const bar = el('div', 'toolbar'), body = el('div', 'inline-body'), foot = el('div', 'inline-foot')
+  bar.append(el('h1', null, '能力合约'))
+  host.append(bar, body, foot)
+  let record
+  async function load() {
+    foot.replaceChildren()
+    body.replaceChildren(el('p', 'empty', '正在读取能力合约…'))
+    try {
+      record = await api.get(path, { signal })
+      render()
+    } catch (error) {
+      if (signal?.aborted) return
+      if ([403, 404].includes(error.status)) {
+        body.replaceChildren(effectiveByDevice(api, signal))
+      } else {
+        body.replaceChildren(el('p', 'error-row', error.message), button('重试', load))
       }
-      systems.value = target
-      heading.append(systems)
-      const list = el('div')
-      section.append(heading, list)
-      let serial = 0
-      async function load() {
-        const request = ++serial
-        target = systems.value
-        const [os, arch] = target.split('/')
-        list.textContent = '正在核对实际可用配置…'
+    }
+  }
+  function render() {
+    if (signal?.aborted) return
+    body.replaceChildren()
+    foot.replaceChildren()
+    if (!record.entitlements) body.append(el('p', 'notice warn', '等待平台确认签约权益。现有有效配置供查看。'))
+    else body.append(el('p', 'muted', '平台合约第 ' + record.platform_revision + ' 版 · 租户配置第 ' + record.revision + ' 版'))
+    const seats = seatsSummary(record.seats)
+    if (seats) body.append(seats)
+    body.append(comparison(record.entitlements ? [
+      { title: '平台授权', values: record.entitlements },
+      { title: '租户配置', values: record.configuration, configuration: true },
+      { title: '当前生效', values: record.effective }
+    ] : [{ title: '当前生效', values: record.effective }]), effectiveByDevice(api, signal))
+    if (hasAction(record, 'update')) {
+      const edit = button('编辑租户配置', async () => {
+        edit.disabled = true
         try {
-          const result = await api.get('/contract/effective', { params:{os,arch} })
-          if (!list.isConnected || serial !== request) return
-          const rows = kind === 'agents' ? result.agents.map(row => {
-            const label = AGENT_LABELS[row.agent] || row.agent
-            const value = row.status === 'available' ? row.releases.map(release => release.version).join('、')
-              : row.status === 'qualification_required' ? '待原生运行验证' : '当前设备无可用发行'
-            return label + ' · ' + value
-          }) : result.models.map(row => {
-            const {input_milli_per_mtok, output_milli_per_mtok, cache_read_milli_per_mtok, cache_write_milli_per_mtok} = row.rate
-            return row.name + ' · ' + row.model + ' · ' + row.protocol + ' · 输入 ' + input_milli_per_mtok + ' / 输出 '
-              + output_milli_per_mtok + ' / 缓存读 ' + cache_read_milli_per_mtok + ' / 缓存写 ' + cache_write_milli_per_mtok + ' 毫橡皮/百万 token'
-          })
-          list.replaceChildren(...(rows.length ? rows.map(text => el('p', null, text)) : [el('p', 'muted', '当前没有可用配置')]))
+          const [releases, current] = await Promise.all([
+            readPages(api, '/contract/agent-releases', signal),
+            api.get('/contract', { signal })
+          ])
+          if (signal?.aborted) return
+          function drawEditor(draft) {
+            body.replaceChildren()
+            if (draft) body.append(el('p', 'notice', '已读取最新合约修订，草稿已保留。请核对授权范围后重新预览。'))
+            previewPublisher({
+              body, foot, editor: configurationEditor(record, releases, current.agent_releases ?? [], draft),
+              preview: payload => api.post(path + '/preview', payload, { signal }),
+              publish: (payload, key) => api.put(path, payload, { idempotencyKey: key, signal }),
+              onCancel: render,
+              onPublished: saved => { record = saved; render() },
+              reload: async values => {
+                record = await api.get(path, { signal })
+                if (hasAction(record, 'update')) drawEditor(values.configuration)
+                else render()
+              }
+            })
+          }
+          drawEditor()
         } catch (error) {
-          if (serial === request) list.replaceChildren(el('p', 'error-row', error.message))
+          if (!signal?.aborted) body.prepend(el('p', 'notice error', error.message))
+        } finally {
+          edit.disabled = false
         }
-      }
-      systems.addEventListener('change', load)
-      void load()
+      }, 'primary')
+      foot.append(edit)
     }
-    async function availableReleases() {
-      const items = []; let cursor
-      do {
-        const page = await api.get('/contract/agent-releases', { params:{cursor,limit:200} })
-        items.push(...page.items); cursor = page.next_cursor
-      } while (cursor)
-      return items
-    }
-    function reset(edit) {
-      editing = edit; tab = 0
-      draft = {...contract, pins: new Map((contract.agent_releases || []).map(row => [targetOf(row), row])), allowed_agents:contract.allowed_agents.join('\n'), allowed_models:contract.allowed_models.join('\n')}
-      for (const [role] of visibilityRoles) {
-        const saved = contract.visibility?.[role]
-        draft[role+'_summary'] = String(saved?.summary ?? true)
-        draft[role+'_content'] = String(saved?.content ?? false)
-      }
-      paint()
-    }
-    function paintPins(section, available) {
-      section.replaceChildren(el('h3', null, '按平台固定发行'))
-      if (!editing) {
-        const rows = [...draft.pins.values()]
-        for (const row of rows) section.append(el('p', null,
-          targetOf(row) + ' · ' + row.version + (row.available ? '' : ' · 暂不可用')))
-        if (!rows.length) section.append(el('p', 'muted', '跟随平台已启用的缓存版本'))
-        return
-      }
-      section.append(el('p', 'muted', '固定发行后，对应系统和架构的设备需使用支持 Server 制品的 Edge。'))
-      const allowed = new Set(lines(body.querySelector('[name="allowed_agents"]')?.value))
-      const groups = new Map()
-      for (const row of [...available, ...[...draft.pins.values()].filter(row => !available.some(item => item.id === row.id))]) {
-        if (!allowed.has(row.agent)) continue
-        const key = targetOf(row)
-        if (!groups.has(key)) groups.set(key, [])
-        groups.get(key).push(row)
-      }
-      if (!groups.size) section.append(el('p', 'muted', '当前 Agent 暂无已缓存的发行可选'))
-      for (const [key, rows] of groups) {
-        const label = el('label', 'field', key)
-        const select = el('select')
-        select.append(el('option', null, '跟随平台缓存版本'))
-        select.firstChild.value = ''
-        for (const row of rows) {
-          const item = el('option', null, row.version + (row.available === false ? '（暂不可用）' : ''))
-          item.value = row.id
-          select.append(item)
-        }
-        select.value = draft.pins.get(key)?.id || ''
-        select.addEventListener('change', () => {
-          const row = rows.find(item => item.id === select.value)
-          if (row) draft.pins.set(key, row)
-          else draft.pins.delete(key)
-        })
-        label.append(select)
-        section.append(label)
-      }
-    }
-    function paint() {
-      bar.replaceChildren(el('h1',null,'租户合约'))
-      tabs.forEach(([label],i) => bar.append(button(label, () => {
-        if (editing) Object.assign(draft,form.collect())
-        tab=i; paint()
-      }, i===tab ? 'active' : '')))
-      const fields = tabs[tab][1].map(([key,label,type]) => type === 'visibility'
-        ? {key,label,type:'select',options:visibilityOptions,allowEmpty:false} : {key,label,type})
-      form = renderForm(body,{ sections:[{fields}], values:draft,mode:editing?'edit':'view' })
-      if (tab === 1) {
-        const section = el('div', 'form-grid')
-        body.append(section)
-        if (!editing) paintPins(section, [])
-        else {
-          section.textContent = '正在读取已缓存发行…'
-          choices ??= availableReleases().catch(error => { choices = null; throw error })
-          choices.then(items => {
-            if (!section.isConnected) return
-            paintPins(section, items)
-            body.querySelector('[name="allowed_agents"]')?.addEventListener('input', () => paintPins(section, items))
-          }).catch(error => { section.textContent = error.message })
-        }
-      }
-      if (!editing && (tab === 1 || tab === 2)) {
-        const section = el('div', 'form-grid')
-        section.append(el('h3', null, tab === 1 ? '设备实际可用版本' : '已生效的模型与倍率'))
-        body.append(section)
-        effective(section, tab === 1 ? 'agents' : 'models')
-      }
-      foot.replaceChildren()
-      if (!editing) {
-        if (contract.actions.includes('update')) foot.append(button('编辑',()=>reset(true),'primary'))
-        return
-      }
-      const save = button('保存',async () => {
-        Object.assign(draft,form.collect()); save.disabled=true
-        const {seat_limit,lease_minutes,lease_budget_milli,revision} = draft
-        const visibility = Object.fromEntries(visibilityRoles.map(([role]) => [role, {
-          summary:draft[role+'_summary'] === 'true', content:draft[role+'_content'] === 'true'
-        }]))
-        try {
-          const allowed_agents = lines(draft.allowed_agents)
-          const agent_release_ids = [...draft.pins.values()].filter(row => allowed_agents.includes(row.agent)).map(row => row.id)
-          contract = await api.put('/contract',{seat_limit,lease_minutes,lease_budget_milli,revision,visibility,
-            allowed_agents,agent_release_ids,allowed_models:lines(draft.allowed_models)},{idempotencyKey:idempotencyKey()})
-          reset(false)
-        } catch(e) { form.setNotice(e.message,'error'); save.disabled=false }
-      },'primary')
-      foot.append(button('取消',()=>reset(false)),save)
-    }
-    reset(false)
-  } catch(e) { body.replaceChildren(el('p','error-row',e.message)) }
+  }
+  await load()
 }

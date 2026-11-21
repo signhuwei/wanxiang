@@ -53,11 +53,78 @@ function eventRow(e) {
 function compactCell(title,stats) {
   const cell=el('div','observe-identity');cell.append(el('span',null,title),el('small','observe-stats',stats));return cell
 }
-const monthCost=p=>p.month_cost_milli == null ? '未提供' : formatMilli(p.month_cost_milli)+' 橡皮'
+const monthCost=p=>p.month_cost_milli == null ? '未提供' : formatMilli(p.month_cost_milli)+' 块橡皮'
 const turns=s=>s.turn_count == null ? '轮数未提供' : s.turn_count+' 轮'
 function usageText(s) {
-  return `输入 ${s.input_tokens} · 输出 ${s.output_tokens} · 缓存读取 ${s.cache_read_tokens} · 缓存写入 ${s.cache_write_tokens} token · ${formatMilli(s.cost_milli)} 橡皮` +
+  return `输入 ${s.input_tokens} · 输出 ${s.output_tokens} · 缓存读取 ${s.cache_read_tokens} · 缓存写入 ${s.cache_write_tokens} token · ${formatMilli(s.cost_milli)} 块橡皮` +
     (s.pending_usage_count ? ` · ${s.pending_usage_count} 笔待结算` : '')
+}
+function sessionActions(view,api,session,signal) {
+  const endpoint='/observe/sessions/'+encodeURIComponent(session.id)
+  const message=el('p','muted')
+  if(session.actions?.includes('export')) view.foot.append(button('导出会话', async event=>{
+    const action=event.currentTarget
+    action.disabled=true
+    try {
+      const events=[]
+      let cursor
+      do {
+        const data=await api.get(endpoint+'/export',{params:{cursor,limit:200},signal})
+        events.push(...data.items);cursor=data.next_cursor
+      } while(cursor&&!signal.aborted)
+      if(signal.aborted) return
+      const url=URL.createObjectURL(new Blob([JSON.stringify({session_id:session.id,events},null,2)],{type:'application/json'}))
+      const link=el('a');link.href=url;link.download='session-'+session.id+'.json';link.click()
+      setTimeout(()=>URL.revokeObjectURL(url),1000)
+    } catch(error){if(!signal.aborted)message.textContent=error.message}
+    finally{action.disabled=false}
+  }))
+  if(session.actions?.includes('share')) {
+    const open=detailPanel(view.body)
+    view.foot.append(button('管理分享',()=>open('会话分享',async pane=>{
+      const list=el('ul'),recipient=el('input'),notice=el('p','error-row')
+      recipient.setAttribute('aria-label','接收成员 ID')
+      const update=async operation=>{
+        try {const data=await operation;paint(data.items);notice.textContent=''}
+        catch(error){if(!signal.aborted)notice.textContent=error.message}
+      }
+      function paint(items) {
+        list.replaceChildren(...items.map(item=>{
+          const li=el('li',null,item.recipient+' ')
+          li.append(button('撤销',()=>update(api.request(endpoint+'/shares/'+encodeURIComponent(item.recipient),{method:'DELETE',signal}))))
+          return li
+        }))
+      }
+      const label=el('label',null,'接收成员 ID');label.append(recipient)
+      pane.body.append(list,label,notice)
+      pane.foot.append(button('分享',()=>update(api.post(endpoint+'/shares',{recipient:recipient.value.trim()},{signal})),'primary'))
+      await update(api.get(endpoint+'/shares',{signal}))
+    })))
+  }
+  view.body.append(message)
+}
+export function sharedSessions(host,api,signal) {
+  let list
+  const open=detailPanel(host,()=>list)
+  list=createLedger(host,{title:'分享给我的会话',rowKey:'id',signal,searchable:false,
+    columns:[{key:'agent',title:'Agent'},{key:'user_id',title:'分享人'},{title:'分享时间',render:item=>formatDateTime(item.created_at)}],
+    fetchPage:async({cursor,limit})=>{
+      const data=await api.get('/observe/shared',{params:{cursor,limit},signal})
+      return {...data,items:data.items.map(item=>({...item,actions:['read']}))}
+    },
+    onOpen:s=>open(s.agent,pane=>{
+      let seq=0
+      const more=button('读取更多',async()=>{
+        more.disabled=true
+        try {
+          const data=await api.get('/observe/sessions/'+encodeURIComponent(s.id)+'/events',{params:{after_seq:seq,limit:100},signal})
+          for(const item of data.items){pane.body.append(eventRow(item));seq=item.seq}
+          more.hidden=!data.next_cursor
+        } catch(error){if(!signal.aborted)pane.body.textContent=error.message}
+        finally{more.disabled=false}
+      })
+      pane.foot.append(more);more.click()
+    })})
 }
 export async function observePage(host,api,session,signal) {
   host.classList.add('page')
@@ -86,7 +153,7 @@ export async function observePage(host,api,session,signal) {
       const open=detailPanel(pane.body,()=>list)
       sessions={host:pane.body,list:list=createLedger(pane.body,{title:'会话',rowKey:'id',openAction:'read_content',noOpenText:'无正文查看权限，可请户主开放',
         filters:[{key:'agent',label:'Agent',options:[{value:'',label:'全部 Agent'},...AGENT_OPTIONS]}],
-        columns:[{key:'agent',title:'Agent',render:s=>agentLabel(s.agent)},{key:'started_at',title:'开始时间 ↓',render:s=>compactCell(formatDateTime(s.started_at),`${turns(s)} · ${formatMilli(s.cost_milli)} 橡皮`)},{key:'model',title:'模型'},
+        columns:[{key:'agent',title:'Agent',render:s=>agentLabel(s.agent)},{key:'started_at',title:'开始时间 ↓',render:s=>compactCell(formatDateTime(s.started_at),`${turns(s)} · ${formatMilli(s.cost_milli)} 块橡皮`)},{key:'model',title:'模型'},
         {key:'turn_count',title:'轮数',render:turns},{key:'input_tokens',title:'输入 token'},{key:'output_tokens',title:'输出 token'},{key:'cost_milli',title:'橡皮',render:s=>formatMilli(s.cost_milli)}],
         fetchPage:async ({q,filters,cursor,limit,signal:listSignal})=>{
           const data=await api.get('/observe/sessions',{params:{user_id:p.user_id,agent:filters.agent,q,cursor,limit},signal:listSignal})
@@ -100,6 +167,7 @@ export async function observePage(host,api,session,signal) {
           const node=view.body;node.classList.add('conversation')
           const summary=el('div','muted',usageText(s))
           node.append(summary)
+          sessionActions(view,api,s,signal)
           let seq=0,loading=false,pending=false
           const more=button('读取更多',()=>load());view.foot.append(more)
           async function load() {

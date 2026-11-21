@@ -1,5 +1,7 @@
 import { createLedger } from './ledger.js'
 import { detailPanel, editForm, el, button } from './panel.js'
+import { formatMilli } from './format.js'
+import { eraserMilli } from './contract-controls.js'
 
 const text = (key, label, extra = {}) => ({ key, label, ...extra })
 const number = (key, label) => text(key, label, { type: 'number' })
@@ -9,7 +11,7 @@ const types = {
   model: { path:'models', label:'模型', title:'模型目录', name:'display_name', parent:'provider_id', child:'rate', drill:'倍率记录',
     fields:[text('display_name','名称'),text('upstream_name','上游模型名'),number('context_window','上下文窗口')] },
   rate: { path:'rates', label:'倍率', title:'倍率记录', name:'effective_from', parent:'model_id', fields:[text('effective_from','生效时间（UTC）'),
-    ...[['input','输入'],['output','输出'],['cache_read','缓存读取'],['cache_write','缓存写入']].map(([k,label]) => number(k+'_milli_per_mtok',label+'（毫橡皮/Mtok）'))] }
+    ...[['input','输入'],['output','输出'],['cache_read','缓存读取'],['cache_write','缓存写入']].map(([k,label]) => text(k+'_milli_per_mtok',label+'（块/百万 token）'))] }
 }
 
 export function catalog(host, api, actions, kind = 'provider', parent = null) {
@@ -25,9 +27,15 @@ export function catalog(host, api, actions, kind = 'provider', parent = null) {
           if (f.key === 'effective_from' && row) return {...f, readonly:true}
           return f
         })
-        editForm(pane, { fields, values:{...values,secret_state:'已设置'}, mode,
+        const display = kind === 'rate'
+          ? Object.fromEntries(cfg.fields.slice(1).map(field => [field.key, formatMilli(values[field.key])]))
+          : {}
+        editForm(pane, { fields, values:{...values,...display,secret_state:'已设置'}, mode,
           submit(v, opts) {
             if (kind === 'provider' && !v.secret && row) delete v.secret
+            if (kind === 'rate') {
+              for (const field of cfg.fields.slice(1)) v[field.key] = eraserMilli(v[field.key], field.label)
+            }
             if (parent) v[cfg.parent] = parent.id
             if (row) v.revision = row.revision
             return api.post(path+(row && kind !== 'rate' ? '/'+encodeURIComponent(row.id) : ''), v, opts)
@@ -46,7 +54,9 @@ export function catalog(host, api, actions, kind = 'provider', parent = null) {
     })
   }
   const fields = cfg.fields.filter(f => f.type !== 'password')
-  list = createLedger(host, { title:cfg.title, rowKey:kind === 'rate' ? 'effective_from' : 'id', columns:fields.map(f => ({key:f.key,title:f.label})),
+  list = createLedger(host, { title:cfg.title, rowKey:kind === 'rate' ? 'effective_from' : 'id',
+    columns:fields.map(f => ({ key:f.key, title:f.label,
+      ...(f.key.endsWith('_milli_per_mtok') && { render: row => formatMilli(row[f.key]) }) })),
     createLabel:'新建'+(kind === 'provider' ? ' ' : '')+cfg.label,
     onCreate: actions.includes('create_'+kind) ? () => show(null) : null, onOpen:show,
     fetchPage:async ({q,cursor,limit,signal}) => {

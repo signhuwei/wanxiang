@@ -1,13 +1,12 @@
 import type { SQLQueryBindings } from 'bun:sqlite';
 import type { Context, Hono } from 'hono';
-import { AGENT_ARTIFACT_MAX_BYTES, DESKTOP_AGENT_PART_BYTES, artifactFormat, hasArtifact, managedAgents, officialArtifactSource, releaseIdentity, requiresDesktopQualification } from './agent-catalog';
+import { agentArtifactMaxBytes, DESKTOP_AGENT_PART_BYTES, artifactFormat, hasArtifact, hasReleaseArtifacts, runtimeArtifact, managedAgents, officialArtifactSource, qualifiedDesktopRelease, releaseIdentity, requiresDesktopQualification } from './agent-catalog';
 import { ulid } from 'ulid';
 import { ApiError, field, invalid, json, operation } from './api';
 import type { platformCreateActions } from './actions';
 import { iso } from './credentials';
 import { enumField, expectRevision, int, pagination, platformActor, urlField, type ManagementOptions } from './management';
 import { encryptProviderSecret } from './provider-secret';
-import { insertInitialContract } from './seed';
 import { indexMember, type Store, type Transaction } from './store';
 
 const statuses = ['active', 'disabled'] as const;
@@ -113,13 +112,18 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
   register({ path: 'agent-releases', table: 'agent_releases', columns: '*',
     search: "agent || ' ' || version || ' ' || os || ' ' || arch", prefix: 'rel', action: 'create_agent_release',
     project: (row) => {
-      const artifact_cached = hasArtifact(opts.dataDir, { sha256: String(row.sha256), size: Number(row.size) });
-      const qualification_required = requiresDesktopQualification(String(row.agent));
-      return { ...row, artifact_cached, qualification_required, part_bytes: qualification_required ? DESKTOP_AGENT_PART_BYTES : null,
-        format: artifactFormat({ agent: String(row.agent), os: String(row.os), arch: String(row.arch) }),
-        actions: ['read', 'update', 'upload_artifact',
+      const release = { agent: String(row.agent), version: String(row.version), os: String(row.os),
+        arch: String(row.arch), size: Number(row.size), sha256: String(row.sha256) };
+      const artifact_cached = hasArtifact(opts.dataDir, release);
+      const companion = runtimeArtifact(release);
+      const runtime = companion && { ...companion, artifact_cached: hasArtifact(opts.dataDir, { ...companion, agent: release.agent }) };
+      const desktop = requiresDesktopQualification(release.agent);
+      const qualification_required = desktop && !qualifiedDesktopRelease(release);
+      return { ...row, artifact_cached, runtime, qualification_required, part_bytes: desktop ? DESKTOP_AGENT_PART_BYTES : null,
+        format: artifactFormat(release),
+        actions: ['read', 'update', 'upload_artifact', ...(runtime ? ['upload_runtime'] : []),
           ...(officialArtifactSource({ agent: String(row.agent), url: String(row.url) }) ? ['pull_artifact'] : []),
-          ...(row.status === 'active' ? ['disable'] : artifact_cached && !qualification_required ? ['activate'] : [])] };
+          ...(row.status === 'active' ? ['disable'] : artifact_cached && (!runtime || runtime.artifact_cached) && !qualification_required ? ['activate'] : [])] };
     },
     parse: (body, row, sql) => {
       const sha256 = text(body, row, 'sha256').toLowerCase();
@@ -130,9 +134,9 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
         arch: enumField(value(body, row, 'arch'), 'arch', ['arm64', 'x64'] as const),
         url: urlField(value(body, row, 'url'), 'url'), sha256, size: number(body, row, 'size', 1), status: status(body, row),
       };
-      if (next.size > AGENT_ARTIFACT_MAX_BYTES) invalid('size');
+      if (next.size > agentArtifactMaxBytes(next.agent)) invalid('size');
       if (!artifactFormat(next)) invalid('os', 'arch');
-      if (requiresDesktopQualification(next.agent) && next.status === 'active') {
+      if (requiresDesktopQualification(next.agent) && !qualifiedDesktopRelease(next) && next.status === 'active') {
         throw new ApiError('conflict', { reason: 'desktop_qualification_required' });
       }
       if (row && releaseIdentity.some(key => key !== 'id' && row[key] !== next[key])) {
@@ -140,7 +144,7 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
       }
       if (!row && sql.get('SELECT 1 FROM agent_releases WHERE agent = ? AND version = ? AND os = ? AND arch = ?',
         [next.agent, next.version, next.os, next.arch])) throw new ApiError('conflict', { reason: 'release_exists' });
-      if (row?.status === 'disabled' && next.status === 'active' && !hasArtifact(opts.dataDir, next)) {
+      if ((row?.status === 'disabled' || requiresDesktopQualification(next.agent)) && next.status === 'active' && !hasReleaseArtifacts(opts.dataDir, next)) {
         throw new ApiError('conflict', { reason: 'artifact_unavailable' });
       }
       return next;
@@ -211,14 +215,13 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
       const name = field(body.name, 'name');
       const owner = field(body.owner_user_id, 'owner_user_id');
       if (!store.system.get('SELECT 1 FROM platform_users WHERE id = ?', [owner])) invalid('owner_user_id');
-      const seatLimit = body.seat_limit === undefined ? 10 : int(body.seat_limit, 'seat_limit', 1);
+      if (body.seat_limit !== undefined) invalid('seat_limit');
       const newStatus = enumField(body.status ?? 'active', 'status', ['active', 'suspended']);
       const id = `ten_${ulid()}`;
       const member = { user_id: owner, role: 'owner', status: 'active' };
       // Publish the directory only after the tenant facts have committed.
       await store.tenant(id, true).write((sql) => {
         sql.run('INSERT INTO members (user_id, role, status) VALUES (?, ?, ?)', [owner, member.role, member.status]);
-        insertInitialContract(sql, owner, seatLimit, at);
       });
       return store.system.write((sql) => {
         requirePlatform(sql, actor);

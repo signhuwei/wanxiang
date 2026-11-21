@@ -1,5 +1,7 @@
+import { purgeExpiredContent } from './session-governance';
 import { ApiError, field, invalid } from './api';
 import { deviceAllowed, reconcileUsage } from './billing';
+import { toolEvent } from './commerce-tools';
 import { int } from './management';
 import type { Store, Transaction } from './store';
 
@@ -62,16 +64,22 @@ export function eventItems(value: unknown) {
 }
 
 export async function ingestEvents(store: Store, tenant: string, device: string, user: string, at: number, live: () => boolean,
-  items: ReturnType<typeof eventItems>, publish: PublishSummary) {
-  const { ack, summaries } = await store.tenant(tenant).write((sql) => {
+  items: ReturnType<typeof eventItems>, publish: PublishSummary, onBalanceChange?: (id:string)=>void|Promise<void>) {
+  const { ack, summaries, charged } = await store.tenant(tenant).write((sql) => {
     if (!live() || !deviceAllowed(store, sql, tenant, device, at)) throw new ApiError('forbidden');
+    let charged=false;
     const summaries: IngestSummary[] = [];
     for (const row of items) {
       if (!markSequence(sql, device, row.seq)) continue;
-      const existing = sql.get<{ device_id: string }>('SELECT device_id FROM agent_sessions WHERE id = ?', [row.session]);
+      purgeExpiredContent(sql,at,row.session);
+      const existing = sql.get<{ device_id: string;content_purged_at:string|null }>('SELECT device_id,content_purged_at FROM agent_sessions WHERE id = ?', [row.session]);
       if (existing && existing.device_id !== device) {
         console.warn('OneX rejected cross-device session event', { tenant_id: tenant, device_id: device, session_id: row.session });
         throw new ApiError('conflict');
+      }
+      if (existing?.content_purged_at) {
+        if (toolEvent(sql,device,user,row,at)) charged=true;
+        continue;
       }
       if (!existing) {
         sql.run(`INSERT INTO agent_sessions (id, device_id, user_id, agent, agent_version, started_at, last_event_at)
@@ -92,6 +100,7 @@ export async function ingestEvents(store: Store, tenant: string, device: string,
       }
       sql.run(`INSERT INTO session_events (device_id, seq, session_id, kind, at, payload_json, source_offset)
         VALUES (?, ?, ?, ?, ?, ?, ?)`, [device, row.seq, row.session, row.kind, row.at, JSON.stringify(row.payload), row.offset]);
+      if(toolEvent(sql,device,user,row,at)) charged=true;
       sql.run(`UPDATE agent_sessions SET event_count = event_count + 1, revision = revision + 1,
         last_event_at = max(coalesce(last_event_at, ''), ?) WHERE id = ?`, [row.at, row.session]);
       summaries.push({ type: 'event', session_id: row.session, user_id: user, seq: row.seq, kind: row.kind });
@@ -99,9 +108,10 @@ export async function ingestEvents(store: Store, tenant: string, device: string,
     const previous = ackCursor(sql, device);
     const ack = advanceCursor(sql, device);
     if (ack > previous) summaries.push({ type: 'cursor', user_id: user, seq: ack });
-    return { ack, summaries };
+    return { ack, summaries, charged };
   });
   publish(tenant, summaries);
+  if(charged) await onBalanceChange?.(tenant);
   return ack;
 }
 

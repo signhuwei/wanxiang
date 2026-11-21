@@ -1,19 +1,29 @@
 import type { Hono } from 'hono';
 import { ulid } from 'ulid';
+import { grantPackage, modelBudgetWire, modelReport, packageFunds, readPlan, reserveCommercial, settleCommercial } from './commerce-data';
+import { settlePendingTools,toolSnapshot } from './commerce-tools';
 import { ApiError, field, invalid, json, operation } from './api';
 import { isTenantId } from './auth';
+import { quotaConfigurable, readContract } from './capability-data';
+import { balanceFallbackModels, balancePolicyMode } from './policy-balance';
+import { readEffective as effectivePolicy, readHead, readPolicyHot } from './policy-data';
 import { day, iso, monthBounds } from './credentials';
 import { enumField, int, pagination, platformActor, tenantActor, type ManagementOptions } from './management';
 import type { Store, Transaction } from './store';
 
 type Reader = Pick<Transaction, 'get'>;
-type LedgerKind = 'topup' | 'reserve' | 'settle' | 'release' | 'overage_pending';
+type LedgerKind = 'topup' | 'reserve' | 'settle' | 'release' | 'adjust' | 'overage_pending';
 type LeaseRow = { id: string; device_id: string; user_id: string; budget_milli: number; used_milli: number; expires_at: string; status: string; seq: number };
 export type Cutoff = { type: 'cutoff'; id: string; reason: 'balance' | 'contract' | 'disabled' | 'quota'; settled_lease_id?: string };
 type Lease = { type: 'lease'; id: string; lease_id: string; expires_at: string; budget_milli: number; seq: number };
 type LeaseReply = Cutoff | Lease;
-const leaseView = (row: LeaseRow): Lease => ({ type: 'lease', id: `msg_${ulid()}`, lease_id: row.id,
-  expires_at: row.expires_at, budget_milli: row.budget_milli, seq: row.seq });
+const leaseView = (row: LeaseRow, sql:Transaction): Lease => ({ type: 'lease', id: `msg_${ulid()}`, lease_id: row.id,
+  expires_at: row.expires_at, budget_milli: row.budget_milli, seq: row.seq, ...leaseModelLimits(sql,row.id) });
+function leaseModelLimits(sql:Transaction,id:string) {
+  const model_budgets=modelBudgetWire(sql,id);
+  const c=sql.get<{plan_id:string}>('SELECT plan_id FROM commerce_leases WHERE lease_id=? AND platform_revision>0',[id]);
+  return {...(c && {commerce_plan_id:c.plan_id}),...(Object.keys(model_budgets).length>0 && {model_budgets})};
+}
 // settledLeaseId 只在续租结清旧租约之后才带（v0.13）；disabled 在结清前判定，不带这个字段。
 export const cutoff = (reason: Cutoff['reason'], settledLeaseId?: string): Cutoff =>
   ({ type: 'cutoff', id: `msg_${ulid()}`, reason, ...(settledLeaseId !== undefined && { settled_lease_id: settledLeaseId }) });
@@ -21,11 +31,18 @@ export const cutoff = (reason: Cutoff['reason'], settledLeaseId?: string): Cutof
 export function balance(sql: Reader, now: number) {
   // 月份口径同配额和 observe.ts 的 month_cost_milli：Asia/Shanghai 自然月（v0.13）。
   const [month] = monthBounds(now);
-  const { credits, month_used_milli } = sql.get<{ credits: number; month_used_milli: number }>(`SELECT
-    coalesce(sum(CASE WHEN kind IN ('topup', 'adjust') THEN amount_milli WHEN kind = 'settle' THEN -amount_milli ELSE 0 END), 0) AS credits,
-    coalesce(sum(CASE WHEN kind = 'settle' AND at >= ? THEN amount_milli ELSE 0 END), 0) AS month_used_milli FROM ledger`, [month])!;
-  const { reserved_milli } = sql.get<{ reserved_milli: number }>("SELECT coalesce(sum(budget_milli), 0) AS reserved_milli FROM leases WHERE status = 'active'")!;
-  return { balance_milli: credits - reserved_milli, reserved_milli, month_used_milli };
+  const { credits, month_used_milli } = sql.get<{credits: number; month_used_milli: number}>(`SELECT
+    coalesce(sum(CASE WHEN l.kind IN ('topup','adjust') THEN l.amount_milli
+      WHEN l.kind='settle' THEN -(l.amount_milli-coalesce(c.package_used,t.package_used,0)) ELSE 0 END),0) AS credits,
+    coalesce(sum(CASE WHEN l.kind='settle' AND l.at>=? THEN l.amount_milli ELSE 0 END),0) AS month_used_milli
+    FROM ledger l LEFT JOIN commerce_leases c ON c.lease_id=l.lease_id LEFT JOIN commerce_tool_calls t ON t.ledger_id=l.id`,[month])!;
+  const { reserved_milli, permanent_reserved } = sql.get<{reserved_milli:number;permanent_reserved:number}>(`SELECT
+    coalesce(sum(l.budget_milli),0) reserved_milli,coalesce(sum(l.budget_milli-coalesce(c.package_reserved,0)),0) permanent_reserved
+    FROM leases l LEFT JOIN commerce_leases c ON c.lease_id=l.id WHERE l.status='active'`)!;
+  const {package_available_milli} = packageFunds(sql,now);
+  const available = credits-permanent_reserved+package_available_milli;
+  if (![available,reserved_milli,month_used_milli,credits].every(Number.isSafeInteger)) invalid('balance_milli');
+  return {balance_milli:available,reserved_milli,month_used_milli};
 }
 
 // 组和个人月配额（v0.12）：本月已用 = 本月 settle（按 user_id 归属）+ 仍在 active 的租约的 budget_milli，
@@ -49,14 +66,26 @@ export type QuotaLevel = { limited_by: string; quota_milli: number; used_milli: 
 
 /** 本人剩余与祖先组（含本组）每一级剩余，只含设了配额（非 null）的级别，按限制力度（remaining 升序）排好。 */
 export function quotaLevels(sql: Reader, userId: string, at: number): QuotaLevel[] {
+  const head=readHead(sql);
+  if (!head && !quotaConfigurable(sql)) return [];
+  const tenantPolicy=head?sql.get<{subject_id:string}>("SELECT subject_id FROM policy_effective WHERE scope='tenant'"):null;
+  const tenantQuota=tenantPolicy?effectivePolicy(sql,'tenant',tenantPolicy.subject_id)?.hot.quota_milli:null;
   const [from, to] = monthBounds(at);
   const member = sql.get<{ quota_milli: number | null; group_id: string | null }>(
     'SELECT quota_milli, group_id FROM members WHERE user_id = ?', [userId]);
   if (!member) return [];
   const levels: QuotaLevel[] = [];
-  if (member.quota_milli !== null) {
+  const distribution=quotaConfigurable(sql);
+  if (tenantQuota !== null && tenantQuota !== undefined) {
+    const used=usedByUsers(sql,'SELECT user_id FROM members',[],from,to);
+    levels.push({limited_by:'tenant',quota_milli:tenantQuota,used_milli:used,remaining_milli:tenantQuota-used});
+  }
+  if (!distribution) return levels;
+  const memberPolicy=head?effectivePolicy(sql,'member',userId):null;
+  const memberQuota=head?memberPolicy?.hot.quota_milli:member.quota_milli;
+  if (memberQuota !== null && memberQuota !== undefined) {
     const used = usedByUsers(sql, '?', [userId], from, to);
-    levels.push({ limited_by: 'member', quota_milli: member.quota_milli, used_milli: used, remaining_milli: member.quota_milli - used });
+    levels.push({ limited_by: 'member', quota_milli: memberQuota, used_milli: used, remaining_milli: memberQuota - used });
   }
   let groupId = member.group_id;
   const chain: string[] = [];
@@ -67,10 +96,11 @@ export function quotaLevels(sql: Reader, userId: string, at: number): QuotaLevel
   }
   for (const id of chain) {
     const group = sql.get<{ quota_milli: number | null }>('SELECT quota_milli FROM groups WHERE id = ?', [id]);
-    if (!group || group.quota_milli === null) continue;
+    const groupQuota=head?effectivePolicy(sql,'group',id)?.hot.quota_milli:group?.quota_milli;
+    if (groupQuota === undefined || groupQuota === null) continue;
     const members = `SELECT user_id FROM members WHERE group_id IN (${groupSubtree})`;
     const used = usedByUsers(sql, members, [id], from, to);
-    levels.push({ limited_by: `group:${id}`, quota_milli: group.quota_milli, used_milli: used, remaining_milli: group.quota_milli - used });
+    levels.push({ limited_by: `group:${id}`, quota_milli: groupQuota, used_milli: used, remaining_milli: groupQuota - used });
   }
   return levels.sort((a, b) => a.remaining_milli - b.remaining_milli);
 }
@@ -139,6 +169,8 @@ function entry(sql: Transaction, kind: LedgerKind, amount_milli: number, at: num
   return { ...row, actions: ['read'] };
 }
 
+export { entry as appendLedgerEntry };
+
 export function deviceAllowed(store: Store, sql: Reader, tenantId: string, deviceId: string, at: number) {
   return !!(store.system.get("SELECT 1 FROM tenants WHERE id = ? AND status = 'active'", [tenantId])
     && sql.get(`SELECT 1 FROM devices d JOIN members m ON m.user_id = d.user_id WHERE d.id = ?
@@ -146,41 +178,66 @@ export function deviceAllowed(store: Store, sql: Reader, tenantId: string, devic
 }
 
 // 断流优先级（v0.13 edge-ws.md「断流原因优先级」）：disabled（调用方在 issue() 之前判定）> contract > balance > quota。
-function issue(sql: Transaction, deviceId: string, userId: string, at: number, settledLeaseId?: string): LeaseReply {
-  const contract = sql.get<{ lease_budget_milli: number; lease_minutes: number }>(
-    'SELECT lease_budget_milli, lease_minutes FROM contract ORDER BY revision DESC LIMIT 1');
-  if (!contract || contract.lease_budget_milli <= 0) return cutoff('contract', settledLeaseId);
+function issue(store:Store, sql: Transaction, deviceId: string, userId: string, at: number, supportsCapabilityContract: boolean, supportsCapabilityPolicy: boolean,
+  settledLeaseId?: string): LeaseReply {
+  const policy=readPolicyHot(sql,userId);
+  if (policy && (!supportsCapabilityPolicy || policy.allowed_models_json==='[]')) return cutoff('contract',settledLeaseId);
+  const contract=policy??readContract(sql);
+  if (!contract || contract.lease_budget_milli <= 0 || (!policy && contract.platform_revision > 0 && !supportsCapabilityContract)) {
+    return cutoff('contract', settledLeaseId);
+  }
   const outstanding = sql.get<LeaseRow>("SELECT * FROM leases WHERE device_id = ? AND status = 'active'", [deviceId]);
-  if (outstanding) return leaseView(outstanding);
-  const { balance_milli: available } = balance(sql, at);
+  if (outstanding) return leaseView(outstanding,sql);
+  const plan=readPlan(store,policy);
+  grantPackage(sql,plan,at);
+  settlePendingTools(sql,at);
+  const wallet = balance(sql, at);
+  const available = wallet.balance_milli;
   // 余额和配额都耗尽时报 balance（合约优先级见 data-model.md 配额一节）。
   if (available <= 0) return cutoff('balance', settledLeaseId);
   const binding = quotaBinding(sql, userId, at);
   if (binding && binding.remaining_milli <= 0) return cutoff('quota', settledLeaseId);
   const budget = Math.min(available, contract.lease_budget_milli, Math.max(1, Math.floor(available / 20)),
     ...(binding ? [binding.remaining_milli] : []));
+  // The reservation itself can cross the threshold. Avoid reserving money for a member with no permitted fallback.
+  if (policy && balancePolicyMode(policy, { balance_milli: available - budget, reserved_milli: wallet.reserved_milli + budget }) === 'restricted') {
+    const allowed = new Set<string>(JSON.parse(policy.allowed_models_json));
+    if (!balanceFallbackModels(policy).some(id => allowed.has(id))) return cutoff('contract', settledLeaseId);
+  }
   const last = sql.get<{ seq: number }>('SELECT seq FROM leases WHERE device_id = ? ORDER BY seq DESC LIMIT 1', [deviceId]);
   const row: LeaseRow = { id: `lse_${ulid()}`, device_id: deviceId, user_id: userId, budget_milli: budget, used_milli: 0,
-    expires_at: iso(at + contract.lease_minutes * 60_000), status: 'active', seq: (last?.seq ?? 0) + 1 };
+    expires_at: iso(Math.min(at + contract.lease_minutes * 60_000,plan?Date.parse(monthBounds(at)[1]):Infinity)), status: 'active', seq: (last?.seq ?? 0) + 1 };
   sql.run('INSERT INTO leases (id, device_id, user_id, budget_milli, expires_at, status, seq) VALUES (?, ?, ?, ?, ?, ?, ?)',
     [row.id, deviceId, userId, budget, row.expires_at, row.status, row.seq]);
+  if (policy && plan) {
+    reserveCommercial(sql,row.id,budget,plan,policy,at);
+    sql.run('UPDATE commerce_leases SET tool_prices_json=? WHERE lease_id=?',
+      [JSON.stringify(toolSnapshot(store,sql,deviceId,plan,policy)),row.id]);
+  } else if (packageFunds(sql,at).package_available_milli>0) {
+    sql.run(`INSERT INTO commerce_leases(lease_id,month,plan_id,terms_json,platform_revision,policy_revision,package_reserved,issued_at)
+      SELECT ?,month,plan_id,'{}',0,0,?,? FROM commerce_packages WHERE month=strftime('%Y-%m',?,'+8 hours')`,
+      [row.id,Math.min(budget,packageFunds(sql,at).package_available_milli),iso(at),iso(at)]);
+  }
+  if (policy && policy.discount_ppm < 1_000_000) {
+    sql.run(`INSERT INTO policy_discount_leases (lease_id, platform_revision, policy_revision, ratio_ppm)
+      VALUES (?, ?, ?, ?)`, [row.id, policy.platform_revision, policy.policy_revision, policy.discount_ppm]);
+  }
   entry(sql, 'reserve', budget, at, { lease: row });
-  return leaseView(row);
+  return leaseView(row,sql);
 }
 
-export function initialLease(store: Store, tenantId: string, deviceId: string, userId: string, at: number, live: () => boolean) {
+export function initialLease(store: Store, tenantId: string, deviceId: string, userId: string, at: number, live: () => boolean,
+  supportsCapabilityContract: boolean, supportsCapabilityPolicy = false) {
   return store.tenant(tenantId).write((sql) => {
     if (!live() || !deviceAllowed(store, sql, tenantId, deviceId, at)) return cutoff('disabled');
-    return issue(sql, deviceId, userId, at);
+    return issue(store, sql, deviceId, userId, at, supportsCapabilityContract, supportsCapabilityPolicy);
   });
 }
 
 /** lease_request（v0.13）：设备不可用回 disabled；已有 active 租约直接回它；否则按签发规则裁决。不写 lease_operations。 */
-export function requestLease(store: Store, tenantId: string, deviceId: string, userId: string, at: number, live: () => boolean) {
-  return store.tenant(tenantId).write((sql) => {
-    if (!live() || !deviceAllowed(store, sql, tenantId, deviceId, at)) return cutoff('disabled');
-    return issue(sql, deviceId, userId, at);
-  });
+export function requestLease(store: Store, tenantId: string, deviceId: string, userId: string, at: number, live: () => boolean,
+  supportsCapabilityContract: boolean, supportsCapabilityPolicy = false) {
+  return initialLease(store, tenantId, deviceId, userId, at, live, supportsCapabilityContract, supportsCapabilityPolicy);
 }
 
 export function reconcileUsage(sql: Transaction, deviceId: string) {
@@ -194,14 +251,24 @@ export function reconcileUsage(sql: Transaction, deviceId: string) {
 }
 
 export function renewLease(store: Store, tenantId: string, deviceId: string, userId: string, at: number, live: () => boolean,
-  leaseId: string, used: number, opId: string) {
+  leaseId: string, used: number, opId: string, supportsCapabilityContract: boolean, supportsCapabilityPolicy = false, modelUsed?:unknown) {
   return store.tenant(tenantId).write((sql) => {
     if (!live() || !deviceAllowed(store, sql, tenantId, deviceId, at)) return cutoff('disabled');
-    const cached = sql.get<{ lease_id: string; used_milli: number; result_json: string }>(
-      'SELECT lease_id, used_milli, result_json FROM lease_operations WHERE device_id = ? AND op_id = ?', [deviceId, opId]);
+    const report=modelReport(modelUsed);
+    const reportJson=report?JSON.stringify(report):null;
+    const cached = sql.get<{ lease_id: string; used_milli: number; result_json: string;model_used_json:string|null }>(
+      'SELECT lease_id, used_milli, result_json, model_used_json FROM lease_operations WHERE device_id = ? AND op_id = ?', [deviceId, opId]);
     if (cached) {
-      if (cached.lease_id !== leaseId || cached.used_milli !== used) throw new ApiError('conflict');
-      return JSON.parse(cached.result_json) as LeaseReply;
+      if (cached.lease_id !== leaseId || cached.used_milli !== used || cached.model_used_json!==reportJson) throw new ApiError('conflict');
+      const result = JSON.parse(cached.result_json) as LeaseReply;
+      const policy=readPolicyHot(sql,userId);
+      if (result.type==='lease') {
+        const contract=policy??readContract(sql);
+        if (!contract || contract.lease_budget_milli<=0 || (policy
+          ? (!supportsCapabilityPolicy || policy.allowed_models_json==='[]')
+          : (contract.platform_revision>0&&!supportsCapabilityContract))) return cutoff('contract',leaseId);
+      }
+      return result;
     }
     const lease = sql.get<LeaseRow>('SELECT * FROM leases WHERE id = ? AND device_id = ?', [leaseId, deviceId]);
     if (!lease) throw new ApiError('not_found');
@@ -210,14 +277,15 @@ export function renewLease(store: Store, tenantId: string, deviceId: string, use
     // 多出的部分单独记一笔 overage_pending 挂账待核对，不计入余额、消费或预留，也不转嫁到下一份租约。
     const charged = Math.min(used, lease.budget_milli);
     sql.run("UPDATE leases SET used_milli = ?, status = 'settled', revision = revision + 1 WHERE id = ?", [charged, leaseId]);
+    settleCommercial(sql,leaseId,charged,used,report,at);
     if (charged) entry(sql, 'settle', charged, at, { lease, requestRef: opId });
     if (charged < lease.budget_milli) entry(sql, 'release', lease.budget_milli - charged, at, { lease, requestRef: opId });
     if (used > charged) entry(sql, 'overage_pending', used - charged, at, { lease, requestRef: opId, note: '超租约差额待核对' });
     reconcileUsage(sql, deviceId);
     // 旧租约已经在上面结清；如果这次裁决回 cutoff，带上 settled_lease_id 让 Edge 知道这份租约不用再保留或重放（v0.13）。
-    const response = issue(sql, deviceId, userId, at, lease.id);
-    sql.run('INSERT INTO lease_operations (device_id, op_id, lease_id, used_milli, result_json) VALUES (?, ?, ?, ?, ?)',
-      [deviceId, opId, leaseId, used, JSON.stringify(response)]);
+    const response = issue(store, sql, deviceId, userId, at, supportsCapabilityContract, supportsCapabilityPolicy, lease.id);
+    sql.run('INSERT INTO lease_operations (device_id, op_id, lease_id, used_milli, result_json, model_used_json) VALUES (?, ?, ?, ?, ?, ?)',
+      [deviceId, opId, leaseId, used, JSON.stringify(response), reportJson]);
     return response;
   });
 }
@@ -229,6 +297,7 @@ export function billingRoutes(app: Hono, store: Store, opts: ManagementOptions) 
     const { db, role } = actor;
     const scope = enumField(c.req.query('scope') ?? '', 'scope', ['member', 'group']);
     const id = field(c.req.query('id') ?? '', 'id');
+    const quota_distribution = quotaConfigurable(db);
     const [from, to] = monthBounds(at);
     // 无权查看和不存在一律 404，不借由 403/404 的区别探测 id 是否存在（v0.13 契约修订）。
     if (scope === 'member') {
@@ -238,23 +307,25 @@ export function billingRoutes(app: Hono, store: Store, opts: ManagementOptions) 
         `SELECT 1 FROM members WHERE user_id = ? AND group_id IN (${groupSubtree})`, [id, actor.group_id]));
       if (!member || !allowed || !groupAllowed) throw new ApiError('not_found');
       const { settled, reserved } = usageByUsers(db, '?', [id], from, to);
-      return c.json({ scope, id, quota_milli: member.quota_milli, used_milli: settled, reserved_milli: reserved,
-        remaining_milli: member.quota_milli === null ? null : member.quota_milli - settled - reserved, actions: ['read'] });
+      const quota_milli = quota_distribution ? (readHead(db)?effectivePolicy(db,'member',id)?.hot.quota_milli??null:member.quota_milli) : null;
+      return c.json({ scope, id, quota_distribution, quota_milli, used_milli: settled, reserved_milli: reserved,
+        remaining_milli: quota_milli === null ? null : quota_milli - settled - reserved, actions: ['read'] });
     }
     const group = db.get<{ quota_milli: number | null }>('SELECT quota_milli FROM groups WHERE id = ?', [id]);
     const groupAllowed = role !== 'member' && (role !== 'group_admin' || (actor.group_id && db.get(`SELECT 1 FROM (${groupSubtree}) WHERE id = ?`, [actor.group_id, id])));
     if (!group || !groupAllowed) throw new ApiError('not_found');
     const members = `SELECT user_id FROM members WHERE group_id IN (${groupSubtree})`;
     const { settled, reserved } = usageByUsers(db, members, [id], from, to);
-    return c.json({ scope, id, quota_milli: group.quota_milli, used_milli: settled, reserved_milli: reserved,
-      remaining_milli: group.quota_milli === null ? null : group.quota_milli - settled - reserved, actions: ['read'] });
+    const quota_milli = quota_distribution ? (readHead(db)?effectivePolicy(db,'group',id)?.hot.quota_milli??null:group.quota_milli) : null;
+    return c.json({ scope, id, quota_distribution, quota_milli, used_milli: settled, reserved_milli: reserved,
+      remaining_milli: quota_milli === null ? null : quota_milli - settled - reserved, actions: ['read'] });
   });
   app.get('/v1/balance', (c) => {
     const at = opts.now();
     const { db, role } = tenantActor(store, c, at);
     if (role !== 'owner' && role !== 'admin') throw new ApiError('forbidden');
     // The immutable ledger advances the balance object's revision.
-    const { revision } = db.get<{ revision: number }>('SELECT count(*) + 1 AS revision FROM ledger')!;
+    const { revision } = db.get<{ revision: number }>('SELECT count(*) + 1 AS revision FROM commerce_ledger')!;
     return c.json({ ...balance(db, at), revision, actions: ['read'] });
   });
   app.get('/v1/ledger', (c) => {
@@ -262,9 +333,12 @@ export function billingRoutes(app: Hono, store: Store, opts: ManagementOptions) 
     if (role !== 'owner' && role !== 'admin') throw new ApiError('forbidden');
     const p = pagination(c);
     const where = "WHERE instr(lower(kind || ' ' || coalesce(note, '')), lower(?)) > 0";
-    const { n } = db.get<{ n: number }>(`SELECT count(*) AS n FROM ledger ${where}`, [p.query])!;
-    const rows = db.all<Record<string, unknown>>(`SELECT * FROM ledger ${where} ORDER BY at DESC, id DESC LIMIT ? OFFSET ?`, [p.query, p.limit, p.offset]);
-    return c.json(p.page(rows.map((row) => ({ ...row, actions: ['read'] })), n));
+    const { n } = db.get<{ n: number }>(`SELECT count(*) AS n FROM commerce_ledger ${where}`, [p.query])!;
+    const month = role === 'owner' ? ', (SELECT month FROM policy_discount_periods p WHERE p.adjustment_ledger_id = ledger.id) AS discount_month' : '';
+    const rows = db.all<Record<string, unknown>>(`SELECT ledger.*${month} FROM commerce_ledger ledger ${where} ORDER BY at DESC, id DESC LIMIT ? OFFSET ?`, [p.query, p.limit, p.offset]);
+    return c.json(p.page(rows.map(({ discount_month, ...row }) => ({ ...row,
+      ...(discount_month && typeof discount_month === 'string' ? { discount_month, actions: ['read', 'read_discount'] } : { actions: ['read'] }),
+    })), n));
   });
   app.post('/v1/platform/ledger/topup', async (c) => {
     const body = await json(c);
@@ -278,6 +352,7 @@ export function billingRoutes(app: Hono, store: Store, opts: ManagementOptions) 
     const op = operation(c, opts.codeSecret, at, actor, [id, amount, note]);
     return store.tenant(id).write((sql) => {
       if (!store.system.get('SELECT 1 FROM platform_admins WHERE user_id = ?', [actor])) throw new ApiError('forbidden');
+      if (readHead(sql) || !readContract(sql)) throw new ApiError('conflict', { reason: 'use_policy_recharges' });
       const cached = op.read(sql);
       if (cached) return cached;
       // Keep aggregate ledger arithmetic exactly representable by the API's integers.
