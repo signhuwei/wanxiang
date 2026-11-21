@@ -222,6 +222,13 @@ test('kind=status resolves immediately from diag_result without any upload', asy
   const diagMsg = await edge.nextOf('diag');
   expect(diagMsg).toMatchObject({ diag_id: job.id, kind: 'status' });
   expect(diagMsg.upload_url).toBeUndefined();
+  // Rejected receipts do not finish the job or prevent the device from sending a valid receipt.
+  for (const detail of [['bad shape'], 'bad shape', { reason: '界'.repeat(1500) }]) {
+    edge.send({ type: 'diag_result', id: 'bad-detail', diag_id: job.id, ok: true, detail });
+    expect(await edge.nextOf('ack')).toMatchObject({ ok: false, error: { code: 'invalid', detail: { fields: ['detail'] } } });
+    const unchanged = await f.request(`/diag/${job.id}`, undefined, a.scoped);
+    expect(await unchanged.json()).toMatchObject({ status: 'pending' });
+  }
   edge.send({ type: 'diag_result', id: 'sr1', diag_id: job.id, ok: true, detail: { connected: true, other: 'private sample' } });
   expect(await edge.nextOf('ack')).toMatchObject({ ok: true });
   const result = await f.request(`/diag/${job.id}`, undefined, a.scoped);

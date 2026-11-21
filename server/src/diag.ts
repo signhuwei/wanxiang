@@ -250,9 +250,17 @@ function activeTenant(store: Store, tenantId: string) {
   return !!store.system.get("SELECT 1 FROM tenants WHERE id = ? AND status = 'active'", [tenantId]);
 }
 
+function invalidDetail(): never {
+  throw new ApiError('invalid', { fields: ['detail'] });
+}
+
 function safeDetail(value: unknown) {
   const safe: Record<string, string | boolean | number> = {};
-  if (!value || typeof value !== 'object') return safe;
+  if (value == null) return safe;
+  if (typeof value !== 'object' || Array.isArray(value)) invalidDetail();
+  let serialized: string;
+  try { serialized = JSON.stringify(value); } catch { return invalidDetail(); }
+  if (Buffer.byteLength(serialized, 'utf8') > 4096) invalidDetail();
   const fields = value as Record<string, unknown>;
   if (typeof fields.connected === 'boolean') safe.connected = fields.connected;
   for (const name of ['outbox_last_seq', 'config_revision', 'bytes']) {
