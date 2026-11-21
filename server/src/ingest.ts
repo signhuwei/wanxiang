@@ -50,7 +50,7 @@ export function advanceCursor(sql: Transaction, device: string) {
   return ack;
 }
 
-const eventKinds = ['session_start', 'user_message', 'assistant_message', 'system_message', 'tool_call', 'tool_result', 'session_end', 'gap', 'compact'];
+const eventKinds = ['session_start', 'session_resume', 'user_message', 'assistant_message', 'system_message', 'tool_call', 'tool_result', 'session_end', 'gap', 'compact'];
 
 export function eventItems(value: unknown) {
   return batchItems(value).map((row) => {
@@ -72,12 +72,20 @@ export async function ingestEvents(store: Store, tenant: string, device: string,
     for (const row of items) {
       if (!markSequence(sql, device, row.seq)) continue;
       purgeExpiredContent(sql,at,row.session);
-      const existing = sql.get<{ device_id: string;content_purged_at:string|null }>('SELECT device_id,content_purged_at FROM agent_sessions WHERE id = ?', [row.session]);
+      const existing = sql.get<{
+        device_id: string;
+        content_purged_at: string | null;
+        content_floor_seq: number | null;
+        content_floor_at: string | null;
+      }>('SELECT device_id, content_purged_at, content_floor_seq, content_floor_at FROM agent_sessions WHERE id = ?', [row.session]);
       if (existing && existing.device_id !== device) {
         console.warn('OneX rejected cross-device session event', { tenant_id: tenant, device_id: device, session_id: row.session });
         throw new ApiError('conflict');
       }
-      if (existing?.content_purged_at) {
+      const pastEpoch = existing?.content_floor_seq != null && row.seq < existing.content_floor_seq;
+      const oldContent = row.kind !== 'session_start' && row.kind !== 'session_resume' && row.kind !== 'session_end'
+        && existing?.content_floor_at != null && row.at <= existing.content_floor_at;
+      if (pastEpoch || oldContent || (existing?.content_purged_at && row.kind !== 'session_resume')) {
         if (toolEvent(sql,device,user,row,at)) charged=true;
         continue;
       }
@@ -86,7 +94,16 @@ export async function ingestEvents(store: Store, tenant: string, device: string,
           VALUES (?, ?, ?, 'unknown', '', ?, ?)`, [row.session, device, user, row.at, row.at]);
         summaries.push({ type: 'session', session_id: row.session, user_id: user, seq: row.seq });
       }
-      if (row.kind === 'session_start') {
+      if (row.kind === 'session_resume') {
+        const reopened = sql.run(`UPDATE agent_sessions SET resumed_seq = ?,
+          content_floor_seq = CASE WHEN content_purged_at IS NOT NULL THEN ? ELSE content_floor_seq END,
+          content_floor_at = CASE WHEN content_purged_at IS NOT NULL
+            THEN max(coalesce(content_floor_at, ''), coalesce(ended_at, '')) ELSE content_floor_at END,
+          ended_at = NULL, content_purged_at = NULL
+          WHERE id = ? AND ? > max(coalesce(started_seq, 0), coalesce(resumed_seq, 0), coalesce(ended_seq, 0))`,
+          [row.seq, row.seq, row.session, row.seq]).changes;
+        if (!reopened) continue;
+      } else if (row.kind === 'session_start') {
         const info = (key: string, fallback: string | null) => typeof row.payload[key] === 'string' && row.payload[key].length <= 200
           ? row.payload[key] : fallback;
         sql.run(`UPDATE agent_sessions SET started_seq = ?, started_at = ?, agent = ?, agent_version = ?, model = ?
@@ -95,8 +112,8 @@ export async function ingestEvents(store: Store, tenant: string, device: string,
         sql.run('UPDATE agent_sessions SET ended_at = NULL WHERE id = ? AND ended_seq < ?', [row.session, row.seq]);
       } else if (row.kind === 'session_end') {
         sql.run(`UPDATE agent_sessions SET ended_seq = ?, ended_at = ? WHERE id = ?
-          AND (ended_seq IS NULL OR ended_seq < ?) AND (started_seq IS NULL OR started_seq < ?)`,
-          [row.seq, row.at, row.session, row.seq, row.seq]);
+          AND ? > max(coalesce(ended_seq, 0), coalesce(started_seq, 0), coalesce(resumed_seq, 0))`,
+          [row.seq, row.at, row.session, row.seq]);
       }
       sql.run(`INSERT INTO session_events (device_id, seq, session_id, kind, at, payload_json, source_offset)
         VALUES (?, ?, ?, ?, ?, ?, ?)`, [device, row.seq, row.session, row.kind, row.at, JSON.stringify(row.payload), row.offset]);

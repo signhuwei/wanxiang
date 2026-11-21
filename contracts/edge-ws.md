@@ -60,6 +60,7 @@ v0.15 的 `config` 可携带平台合约和租户配置修订，字段和兼容�
 | kind | payload |
 | --- | --- |
 | `session_start` | `agent`、`agent_version`、`cwd_hash`、`model` |
+| `session_resume` | `{}`。已结束的原生会话出现新的实际活动，从原会话续接 |
 | `user_message` | `content`（本轮新增的用户输入，不含重发的历史上下文） |
 | `assistant_message` | `content`、`model`、`stop_reason` |
 | `system_message` | `content`。Agent 原生记录明确标为用户可见的系统提示，不计用户轮次 |
@@ -77,6 +78,8 @@ v0.15 的 `config` 可携带平台合约和租户配置修订，字段和兼容�
 - 事件带 `source_offset`（在会话文件中的字节偏移），读取游标、事件和 outbox 在一个本地事务里提交。
 - 读到坏行、未知类型、文件被替换或截短时，发一条 `kind: "gap"` 事件，payload 为 `{reason, offset}`，不能把缺口显示为完整。
 - 一个 `session_id` 只属于第一次上报它的那台设备。其他设备用同一个 `session_id` 上报，Server 拒绝整批（`conflict`）并记日志，不记正文。员工换电脑后 resume 会产生新的会话。
+- WorkBuddy 和 DeepSeek 的留存从最后一次确认的结束时间起算。应用退出时，Edge 先补传可见记录，再结束本次实际使用的会话。Edge 本身异常退出后，重新打开受管应用时补记此前未关闭的会话。扫描旧记录不会重开会话。
+- 续聊仍使用原 `session_id`。Edge 先排入 `session_resume`，再排入本次新的可见记录。Server 按设备序号忽略落在恢复之前的迟到结束事件。正文已到期的会话恢复后，只接收从恢复事件开始、原生时间晚于上次结束的可见记录。旧正文和分享不会回填，原用量和审计保留。
 - thinking 内容、签名和凭据不回流。会话文件中的 `api-request`、`api-request-blob` 行含完整模型请求，也不回流。
 
 ## 密钥下发（v0.7）

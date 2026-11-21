@@ -6,7 +6,8 @@ export const reasonLabels = {
   device_key_missing: '缺少设备密钥', protocol_unsupported: '不支持此协议', lease_budget_zero: '租约额度为零', scope_denied: '租户或下级配置已关闭', release_disabled: '固定发行已停用', release_unavailable: '固定发行包不可用',
   balance_restricted: '当前余额策略限制此模型', desktop_release_unqualified: '没有可用的受管桌面发行', agent_release_unavailable: '没有兼容的 Agent 发行', tool_release_unavailable: '没有兼容的工具发行',
   tool_release_disabled: '工具发行已停用', tool_agent_denied: '当前合约未允许工具适用的 Agent',
-  tool_platform_mismatch: '工具发行不适用于当前系统或架构', tool_artifact_missing: '工具制品缓存缺失'
+  tool_platform_mismatch: '工具发行不适用于当前系统或架构', tool_artifact_missing: '工具制品缓存缺失',
+  tool_price_missing: '当前商业方案未配置搜索单价'
 }
 export function targetSummary(target) {
   const section = el('section')

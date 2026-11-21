@@ -92,6 +92,14 @@ pub enum Request {
     Download {
         agent: String,
     },
+    HostedSearch {
+        launch_id: String,
+        capability: String,
+        release_id: String,
+        query: String,
+        limit: u8,
+        call_key: String,
+    },
     Shutdown,
 }
 

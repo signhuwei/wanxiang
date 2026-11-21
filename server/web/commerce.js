@@ -82,8 +82,9 @@ async function planEditor(pane, api, signal, plan) {
   const budgets = repeated(pane.body, '单模型月预算', [m, amount('monthly', '每月额度（块）')],
     (t.model_budgets ?? []).map(r => ({ model_id: r.model_id, monthly: formatMilli(r.monthly_milli) })))
   const fees = repeated(pane.body, '工具调用费', [
-    select('release_id', 'MCP 发行', tools.filter(r => r.kind === 'mcp' && r.status === 'published')
-      .map(r => ({ value: r.id, label: r.name + ' · ' + r.version + ' · ' + r.os + '/' + r.arch }))), amount('price', '每次费用（块）'),
+    select('release_id', '计费工具发行', tools.filter(r => ['mcp', 'http_search'].includes(r.kind) && r.status === 'published')
+      .map(r => ({ value: r.id, label: r.name + ' · ' + r.version + ' · ' + (r.kind === 'http_search' ? 'HTTP 搜索' : r.os + '/' + r.arch) }))),
+    amount('price', '每次费用（块）'),
   ], (t.tool_prices ?? []).map(r => ({ release_id: r.release_id, price: formatMilli(r.per_call_milli) })))
   saver(pane, '发布方案', () => {
     const f = form.collect()
@@ -143,6 +144,7 @@ export async function commerceAccountPanel(pane, api, tenantId, signal) {
   table(host, '模型月预算', ['模型', '预算', '已用', '预留'], r.model_budgets.map(v => [v.model_id, blocks(v.monthly_milli), blocks(v.used), blocks(v.reserved)]))
   table(host, '模型档位', ['模型', '档位', '输出倍率'], r.tiers.models.map(v => [v.model_id, tierNames[v.tier], v.display_multiplier == null ? '暂无费率' : v.display_multiplier + '×']))
   const statuses = { charged: '已扣费', awaiting_result: '等待结果', failed: '调用失败', pending_funds: '待补足余额' }
-  table(host, '工具调用记录', ['发行', '调用编号', '费用', '状态', '时间'], r.tool_calls.map(v => [v.release_id, v.native_id, blocks(v.fee_milli), statuses[v.status], formatDateTime(v.called_at)]))
+  table(host, '工具调用记录', ['发行', '类型', '调用编号', '费用', '状态', '时间'], r.tool_calls.map(v =>
+    [v.release_id, v.source_kind === 'http_search' ? 'HTTP 搜索' : 'MCP', v.native_id, blocks(v.fee_milli), statuses[v.status], formatDateTime(v.called_at)]))
 }
 export function commerceAccountPage(host, api, signal) { return commerceAccountPanel(host, api, null, signal) }

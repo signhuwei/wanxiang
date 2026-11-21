@@ -21,7 +21,9 @@ function bounded(text) {
 }
 
 function visibleMessage(event, offset) {
-  const source = { seq:Number.isSafeInteger(event.seq) && event.seq > 0 ? event.seq : offset + 1, at_ms:event.time }
+  const at = typeof event.time === 'string' ? Date.parse(event.time) : event.time
+  const source = { seq:Number.isSafeInteger(event.seq) && event.seq > 0 ? event.seq : offset + 1 }
+  if (Number.isSafeInteger(at) && at >= 0 && at <= 253402300799999) source.at_ms = at
   const data = event.data
   if (event.type === 'tool/call' && typeof data.callId === 'string' && typeof data.name === 'string') {
     return { ...source, kind:'tool_call', call_id:data.callId, tool:data.name, ...bounded(typeof data.arguments === 'string' ? data.arguments : '') }
@@ -50,12 +52,13 @@ export async function apply(ctx, config) {
   if (typeof ctx.credentials.withSession !== 'function') throw new Error('OneX session credentials are unavailable')
   let disposed = false
   const offsets = new Map()
+  const bound = new Set()
 
   async function register(id, records, bindModel = false) {
     const body = JSON.stringify({ native_id:id, records, bind_model:bindModel })
     if (!bindModel && records.length > 1 && Buffer.byteLength(body) > 1536 * 1024) {
       const split = Math.floor(records.length / 2)
-      await register(id, records.slice(0, split))
+      if (!await register(id, records.slice(0, split))) return null
       return register(id, records.slice(split))
     }
     const response = await fetch(binding, {
@@ -63,8 +66,9 @@ export async function apply(ctx, config) {
       headers:{ authorization:'Bearer ' + bearer, 'content-type':'application/json' },
       body,
     })
+    if (!bindModel && response.status === 403) return null
     if (!response.ok) throw new Error('OneX could not bind the original session')
-    return (await response.json()).model_token
+    return bindModel ? (await response.json()).model_token : true
   }
 
   const belongs = header => !header.origin && !header.isSeeded && path(header.cwd) === workspace
@@ -76,6 +80,8 @@ export async function apply(ctx, config) {
     const stat = await ctx.sessionPersistence.stat(id)
     if (!stat || stat.header.id !== id || !belongs(stat.header)) throw new Error('This workspace is outside the OneX launch')
     const token = await register(id, [], true)
+    bound.add(id)
+    if (offsets.get(id)?.unbound) offsets.delete(id)
     const source = ctx.credentials.withSession(token, () => next()[Symbol.asyncIterator]())
     try {
       while (!disposed) {
@@ -101,7 +107,10 @@ export async function apply(ctx, config) {
           for (let page = 0; page < 32 && !disposed; page++) {
             const {events} = await handle.read(offset, 32)
             const records = events.map((event,i) => visibleMessage(event, offset + i)).filter(Boolean)
-            if (records.length) await register(header.id, records)
+            if (records.length && !await register(header.id, records)) {
+              offsets.set(header.id, {offset, revision:bound.has(header.id) ? undefined : revision, unbound:true})
+              break
+            }
             offset += events.length
             offsets.set(header.id, {offset, revision:events.length < 32 ? revision : undefined})
             if (events.length < 32) break

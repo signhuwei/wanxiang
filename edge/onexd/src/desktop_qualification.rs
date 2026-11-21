@@ -290,6 +290,7 @@ async fn workbuddy_interleaved_requests_bill_only_the_registered_native_task() -
         "device",
         &release.version,
         "wire-model",
+        "control",
         outbox.clone(),
     )?);
     state.desktop_sessions.start(

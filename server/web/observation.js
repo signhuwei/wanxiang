@@ -20,7 +20,7 @@ export async function readStream(body, receive) {
     }
   } finally {reader.releaseLock()}
 }
-const names={user_message:'用户',assistant_message:'助手',system_message:'系统',tool_call:'工具调用',tool_result:'工具结果',session_start:'会话开始',session_end:'会话结束',gap:'采集缺口',compact:'上下文摘要'}
+const names={user_message:'用户',assistant_message:'助手',system_message:'系统',tool_call:'工具调用',tool_result:'工具结果',session_start:'会话开始',session_resume:'恢复会话',session_end:'会话结束',gap:'采集缺口',compact:'上下文摘要'}
 function contentText(value) {
   if (typeof value === 'string') return value
   if (Array.isArray(value)) return value.map(contentText).filter(Boolean).join('\n')
@@ -36,7 +36,11 @@ export function eventText(e) {
     case 'tool_call': return p.tool || '未命名工具'
     case 'tool_result': return (contentText(p.output) || '无可展示的输出') + (p.truncated ? '\n（结果已截断）' : '')
     case 'compact': return p.summary == null ? '上下文已压缩' : (contentText(p.summary) || '上下文已压缩')
-    case 'session_end': return p.reason || '会话已结束'
+    case 'session_resume': return '已继续原会话'
+    case 'session_end':
+      if (p.reason === 'desktop_process_exited') return '桌面进程已退出'
+      if (p.reason === 'daemon_restart') return 'Edge 重启后补记结束'
+      return p.reason || '会话已结束'
     case 'gap': return `采集缺口：${p.reason || '原因未知'}`
     default: return '不支持展示此事件'
   }

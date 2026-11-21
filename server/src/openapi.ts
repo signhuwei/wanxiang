@@ -73,12 +73,19 @@ const desktopRelease = managed({ id: text, version: text, os: desktopOs, arch: d
 const publicDesktopRelease = object({ id: text, version: text, os: desktopOs, arch: desktopArch,
   size: { type: 'integer', minimum: 0 }, sha256: text, published_at: text, download_url: text });
 const toolId = { ...text, pattern: '^tool_[0-9A-HJKMNP-TV-Z]{26}$' };
-const toolFields = { name: text, version: text, kind: { ...text, enum: ['skill', 'mcp','hook'] },
+const toolFields = { name: text, version: text, kind: { ...text, enum: ['skill', 'mcp', 'hook', 'http_search'] },
   agents: { type: 'array', minItems: 1, uniqueItems: true, items: { ...text, enum: ['claude-code', 'codex', 'kimi-code'] } },
   os: { enum: ['macos', 'windows', null] }, arch: { enum: ['arm64', 'x64', null] },
   entrypoint: nullableText, args: { type: 'array', items: text } };
-const toolRelease = managed({ id: toolId, ...toolFields, status: { ...text, enum: ['draft', 'published', 'disabled'] },
+const toolReleaseBase = managed({ id: toolId, ...toolFields, status: { ...text, enum: ['draft', 'published', 'disabled'] },
   created_at: timestamp, artifact_cached: boolean, sha256: nullableText, size: { type: ['integer', 'null'], minimum: 1 } });
+const toolRelease = { ...toolReleaseBase, properties: { ...toolReleaseBase.properties, endpoint: { ...text, format: 'uri' }, has_key: boolean } };
+const searchReceipt = object({
+  call_id: text, release_id: toolId, session_id: text, plan_id: text, fee_milli: sequence, package_used_milli: sequence,
+  status: { ...text, enum: ['awaiting_result', 'charged', 'failed'] },
+  called_at: timestamp, settled_at: nullableTimestamp, ledger_id: nullableText, outcome: nullableText,
+});
+const searchReply = object({ receipt: searchReceipt, results: { type: 'array', items: object({ url: text, title: text, snippet: text }) } }, ['receipt']);
 const toolBundle = object({ files: { type: 'array', minItems: 1, maxItems: 256, items: object({
   path: { ...text, maxLength: 240 }, data: { ...text, contentEncoding: 'base64' },
 }) } });
@@ -217,6 +224,7 @@ const upstreamWrite={...upstreamFields,expected_revision:sequence,secret:{...tex
 const sharesResult=object({items:listItems(object({recipient:text,created_at:timestamp}))});
 const impactRow=object({device_id:text,user_id:text,os:text,arch:text,applied_policy_revision:nullable(revision),
   changed_clauses:listItems(text),unavailable:listItems(object({resource_id:text,reason:text}))});
+const impactMember = object({user_id:text,name:text,changed_clauses:listItems(text),device_count:sequence});
 const priceFields={input_milli_per_mtok:sequence,output_milli_per_mtok:sequence,cache_read_milli_per_mtok:sequence,cache_write_milli_per_mtok:sequence};
 const commerceTerms=object({monthly_grant_milli:sequence,monthly_fee_fen:sequence,
   tiers:listItems(object({from_milli:sequence,ratio_ppm:sequence})),commitment:nullable(object({up_to_milli:sequence,ratio_ppm:sequence})),
@@ -266,7 +274,9 @@ const policyPaths = {
   [policyContractPath + '/preview']: { post: policyPreview(policySign, object({ tenant_id: tenantId, ...policyHead,
     entries: listItems(policySignedEntry), previous_entries: listItems(policySignedEntry), actions,
     seats:object({limit:sequence,active:sequence,over_limit:sequence}),impact:object({member_count:sequence,device_count:sequence,
-      devices:object({items:listItems(impactRow),total:sequence,next_cursor:nullableText,actions})}) }), [contractTenantPath,...listParams]) },
+      members:object({items:listItems(impactMember),total:sequence,next_cursor:nullableText,actions}),
+      devices:object({items:listItems(impactRow),total:sequence,next_cursor:nullableText,actions})}) }),
+    [contractTenantPath,...listParams,{name:'member_cursor',in:'query',schema:text,description:'受影响成员的分页游标。cursor 用于受影响设备。'}]) },
   [policyTenant + '/signatures']: { get: listOf(object(policySignature)) },
   [policyTenant + '/configurations/{scope}']: { get: listOf(object({
     id: text, name: text, role, group_id: nullableText, parent_id: nullableText, actions,
@@ -487,8 +497,9 @@ export const openapi = {
         401: status[401], 404: error('制品不存在或当前合约不允许') } } },
     '/v1/platform/tool-releases': { get: listOf(toolRelease),
       post: { ...write(object({ ...toolFields, os: { ...text, enum: ['macos', 'windows'] }, arch: desktopArch,
-        entrypoint: text }, ['name', 'version', 'kind', 'agents']), toolRelease, 'create'),
-        description: '新建固定版本。Skill 仅需通用字段。MCP 还需要系统、架构和启动文件。' } },
+        entrypoint: text, endpoint: { ...text, format: 'uri' }, secret: { ...text, writeOnly: true } },
+        ['name', 'version', 'kind', 'agents']), toolRelease, 'create'),
+        description: '新建固定版本。MCP 与 Hook 需要系统、架构和启动文件。HTTP 搜索需要 HTTPS endpoint 和上游凭据。' } },
     '/v1/platform/tool-releases/{id}': { get: detailOf(toolRelease) },
     '/v1/platform/tool-releases/{id}/artifact': { put: { summary: '上传并校验工具包', security: bearer,
       parameters: [idPath, { name: 'revision', in: 'query', required: true, schema: revision }],
@@ -500,6 +511,16 @@ export const openapi = {
       security: [{ DeviceToken: [] }], parameters: [idPath],
       responses: { 200: response('经 SHA-256 固定的原始工具包', toolBundle),
         401: status[401], 404: error('制品不存在或当前配置未授权') } } },
+    '/v1/edge/tool-search/{release_id}': { post: { summary: '代理按次计费的 HTTP 搜索',
+      security: [{ DeviceToken: [] }], parameters: [
+        { name: 'release_id', in: 'path', required: true, schema: toolId },
+        { name: 'Idempotency-Key', in: 'header', required: true, schema: { ...text, pattern: '^[A-Za-z0-9_:-]{1,128}$' } },
+      ],
+      requestBody: requestBody(object({ session_id: text, query: { ...text, minLength: 1, maxLength: 2000 },
+        limit: { type: 'integer', minimum: 1, maximum: 20 } })),
+      responses: { ...status, 200: response('首次结算及结果，或相同回执', searchReply),
+        202: response('相同调用仍在执行', searchReply), 404: error('发行或活动会话不匹配'),
+        413: error('请求体超限'), 502: response('搜索未完成且没有扣费', searchReply) } } },
     '/v1/platform/maintenance': { get: { ...detailOf(object({ active_commit: text, runner_ready: { type: 'boolean' },
       active_rollout: optionalRollout, actions }), false), summary: '平台维护状态' } },
     '/v1/platform/server-releases': { get: listOf(serverRelease), post: { summary: '登记签名的 Server 发布包',

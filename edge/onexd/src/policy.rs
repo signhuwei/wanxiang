@@ -49,7 +49,7 @@ pub(crate) fn stage(
     policy: Policy,
     previous: Option<&AppliedPolicy>,
 ) -> Result<AppliedPolicy, &'static str> {
-    let Policy { mut summary, mut notices, balance, secrets, runtime, commerce_plan_id } = policy;
+    let Policy { mut summary, mut notices, balance, secrets, runtime, commerce_plan_id, search_tools } = policy;
     if !matches!((summary.abi, runtime.is_some()), (1, false) | (2, true)) {
         return Err("不支持的设备策略版本");
     }
@@ -186,6 +186,9 @@ pub(crate) fn stage(
     }
     crate::tools::validate_device_releases(&config.tools, onex_core::ipc::os_name(), onex_core::ipc::arch_name())
         .map_err(|_| "设备策略包含无效或不适用的受管工具")?;
+    if !search_tools.is_empty() && commerce_plan_id.is_none() || !crate::hosted_search::valid_tools(&search_tools) {
+        return Err("设备策略包含无效或无商业方案的搜索发行");
+    }
     let mut keys = HashMap::new();
     for secret in secrets {
         if !route_providers.contains(secret.provider_id.as_str())
@@ -203,5 +206,5 @@ pub(crate) fn stage(
     if keys.len() != route_providers.len() {
         return Err("设备策略缺少路由密钥");
     }
-    Ok(AppliedPolicy { summary, notices, balance, keys, runtime, commerce_plan_id })
+    Ok(AppliedPolicy { summary, notices, balance, keys, runtime, commerce_plan_id, search_tools })
 }

@@ -323,7 +323,7 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
     const current=db.get<{n:number}>("SELECT count(*) AS n FROM members WHERE status='active'")!.n;
     const affected=calculatePolicy(db,id,prospective);
     return c.json({...head,tenant_id:id,previous_entries:readSignature(db,head.platform_revision)?.entries??[],entries,
-      impact:signatureImpact(store,db,affected,opts.dataDir,at,pagination(c)),
+      impact:signatureImpact(store,db,affected,opts.dataDir,at,{devices:pagination(c),members:pagination(c,'member_cursor')}),
       seats:{limit:affected.tenant.hot.seat_limit,active:current,over_limit:Math.max(0,current-affected.tenant.hot.seat_limit)},
       revoked:affected.revised.map(({scope,subject_id,revoked})=>({scope,subject_id,revoked})),actions:['sign']});
   });

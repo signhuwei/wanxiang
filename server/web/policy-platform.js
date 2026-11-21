@@ -58,26 +58,42 @@ function drafting(api, base, revisions, signal) {
   }
 }
 
-function signaturePreview(value, nextPage) {
-  const body=previewEntries(value,'signed_value')
-  if (!value.impact) return body
-  const { impact,seats }=value
-  body.append(el('h3',null,'签发影响'),el('p',null,`影响 ${impact.member_count} 位成员、${impact.device_count} 台设备；现有 ${seats.active} 席，拟签 ${seats.limit} 席，超出 ${seats.over_limit} 席。`))
-  const list=el('ul')
-  body.append(list)
-  const more=button('查看更多设备', async()=>{
-    more.disabled=true
-    try { append((await nextPage(cursor)).impact.devices) }
-    catch(error){body.append(el('p','error-row',error.message))}
-    finally{more.disabled=false}
+function appendImpactList(body, title, moreLabel, page, load, label) {
+  if (!page.total) return
+  const list = el('ul', null)
+  list.setAttribute('aria-label', title)
+  const error = el('p', 'error-row')
+  error.hidden = true
+  const more = button(moreLabel, async () => {
+    more.disabled = true
+    error.hidden = true
+    try { append(await load(page.next_cursor)) }
+    catch (failure) {
+      error.textContent = failure.message
+      error.hidden = false
+    } finally { more.disabled = false }
   })
-  let cursor
-  function append(page) {
-    for (const d of page.items) list.append(el('li',null,`${d.device_id} · ${d.user_id} · ${d.os}/${d.arch} · ${d.changed_clauses.join('、')}`+
-      d.unavailable.map(item=>' · '+item.resource_id+' '+(reasonLabels[item.reason]??item.reason)).join('')))
-    cursor=page.next_cursor;more.hidden=!cursor
+  function append(next) {
+    for (const row of next.items) list.append(el('li', null, label(row)))
+    page = next
+    more.hidden = !page.next_cursor
   }
-  body.append(more);append(impact.devices)
+  body.append(el('h4', null, title), list, more, error)
+  append(page)
+}
+
+function signaturePreview(value, nextPage) {
+  const body = previewEntries(value, 'signed_value')
+  if (!value.impact) return body
+  const { impact, seats } = value
+  body.append(el('h3', null, '签发影响'), el('p', null, `影响 ${impact.member_count} 位成员、${impact.device_count} 台设备；现有 ${seats.active} 席，拟签 ${seats.limit} 席，超出 ${seats.over_limit} 席。`))
+  appendImpactList(body, '受影响成员', '查看更多成员', impact.members,
+    async member_cursor => (await nextPage({ member_cursor })).impact.members,
+    row => `${row.name} · ${row.user_id} · ${row.device_count} 台设备 · ${row.changed_clauses.join('、')}`)
+  appendImpactList(body, '受影响设备', '查看更多设备', impact.devices,
+    async cursor => (await nextPage({ cursor })).impact.devices,
+    row => `${row.device_id} · ${row.user_id} · ${row.os}/${row.arch} · ${row.changed_clauses.join('、')}` +
+      row.unavailable.map(item => ' · ' + item.resource_id + ' ' + (reasonLabels[item.reason] ?? item.reason)).join(''))
   return body
 }
 
@@ -117,7 +133,10 @@ function signaturesPage(host, api, endpoint, tenant, onChange, signal) {
           body: pane.body, foot: pane.foot, editor: drafting(api, data, revisions, signal),
           preview: body => { previewBody=body; return api.post(endpoint + '/preview', body, { signal }) },
           publish: (body, key) => api.post(endpoint + '/signatures', body, { signal, idempotencyKey: key }),
-          renderPreview: value => signaturePreview(value,cursor=>api.post(endpoint+'/preview',previewBody,{signal,params:{cursor}})),
+          renderPreview: value => {
+            const draft = previewBody
+            return signaturePreview(value, params => api.post(endpoint + '/preview', draft, { signal, params }))
+          },
           reload: async () => {
             const latest = await api.get(endpoint, { signal })
             if (signal?.aborted) return

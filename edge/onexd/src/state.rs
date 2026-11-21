@@ -92,6 +92,7 @@ pub struct AppliedPolicy {
     pub(crate) balance: Option<BalanceRouting>,
     pub(crate) runtime: onex_core::ws::RuntimeRules,
     pub(crate) commerce_plan_id: Option<String>,
+    pub(crate) search_tools: Vec<onex_core::ws::SearchTool>,
     pub(crate) keys: HashMap<String, Zeroizing<String>>,
 }
 

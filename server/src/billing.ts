@@ -37,8 +37,12 @@ export function balance(sql: Reader, now: number) {
     coalesce(sum(CASE WHEN l.kind='settle' AND l.at>=? THEN l.amount_milli ELSE 0 END),0) AS month_used_milli
     FROM ledger l LEFT JOIN commerce_leases c ON c.lease_id=l.lease_id LEFT JOIN commerce_tool_calls t ON t.ledger_id=l.id`,[month])!;
   const { reserved_milli, permanent_reserved } = sql.get<{reserved_milli:number;permanent_reserved:number}>(`SELECT
-    coalesce(sum(l.budget_milli),0) reserved_milli,coalesce(sum(l.budget_milli-coalesce(c.package_reserved,0)),0) permanent_reserved
-    FROM leases l LEFT JOIN commerce_leases c ON c.lease_id=l.id WHERE l.status='active'`)!;
+    coalesce(sum(total),0) reserved_milli, coalesce(sum(permanent),0) permanent_reserved FROM (
+      SELECT l.budget_milli total, l.budget_milli-coalesce(c.package_reserved,0) permanent
+      FROM leases l LEFT JOIN commerce_leases c ON c.lease_id=l.id WHERE l.status='active'
+      UNION ALL SELECT fee_milli, fee_milli-package_reserved FROM commerce_tool_calls
+      WHERE source_kind='http_search' AND status='awaiting_result' AND reserved_until>?
+    )`, [iso(now)])!;
   const {package_available_milli} = packageFunds(sql,now);
   const available = credits-permanent_reserved+package_available_milli;
   if (![available,reserved_milli,month_used_milli,credits].every(Number.isSafeInteger)) invalid('balance_milli');
@@ -50,15 +54,18 @@ export function balance(sql: Reader, now: number) {
 const groupSubtree = `WITH RECURSIVE subtree(id) AS (VALUES (?) UNION
   SELECT g.id FROM groups g JOIN subtree s ON g.parent_id = s.id) SELECT id FROM subtree`;
 
-function usageByUsers(sql: Reader, usersSql: string, usersParams: string[], from: string, to: string) {
+function usageByUsers(sql: Reader, usersSql: string, usersParams: string[], from: string, to: string, at: number) {
   const { settled } = sql.get<{ settled: number }>(`SELECT coalesce(sum(amount_milli), 0) AS settled FROM ledger
     WHERE kind = 'settle' AND at >= ? AND at < ? AND user_id IN (${usersSql})`, [from, to, ...usersParams])!;
-  const { reserved } = sql.get<{ reserved: number }>(`SELECT coalesce(sum(budget_milli), 0) AS reserved FROM leases
-    WHERE status = 'active' AND user_id IN (${usersSql})`, usersParams)!;
+  const { reserved } = sql.get<{ reserved: number }>(`SELECT coalesce(sum(amount),0) reserved FROM (
+    SELECT budget_milli amount, user_id FROM leases WHERE status='active'
+    UNION ALL SELECT fee_milli, user_id FROM commerce_tool_calls
+    WHERE source_kind='http_search' AND status='awaiting_result' AND reserved_until>?
+  ) WHERE user_id IN (${usersSql})`, [iso(at), ...usersParams])!;
   return { settled, reserved };
 }
-function usedByUsers(sql: Reader, usersSql: string, usersParams: string[], from: string, to: string) {
-  const { settled, reserved } = usageByUsers(sql, usersSql, usersParams, from, to);
+function usedByUsers(sql: Reader, usersSql: string, usersParams: string[], from: string, to: string, at: number) {
+  const { settled, reserved } = usageByUsers(sql, usersSql, usersParams, from, to, at);
   return settled + reserved;
 }
 
@@ -77,14 +84,14 @@ export function quotaLevels(sql: Reader, userId: string, at: number): QuotaLevel
   const levels: QuotaLevel[] = [];
   const distribution=quotaConfigurable(sql);
   if (tenantQuota !== null && tenantQuota !== undefined) {
-    const used=usedByUsers(sql,'SELECT user_id FROM members',[],from,to);
+    const used=usedByUsers(sql,'SELECT user_id FROM members',[],from,to,at);
     levels.push({limited_by:'tenant',quota_milli:tenantQuota,used_milli:used,remaining_milli:tenantQuota-used});
   }
   if (!distribution) return levels;
   const memberPolicy=head?effectivePolicy(sql,'member',userId):null;
   const memberQuota=head?memberPolicy?.hot.quota_milli:member.quota_milli;
   if (memberQuota !== null && memberQuota !== undefined) {
-    const used = usedByUsers(sql, '?', [userId], from, to);
+    const used = usedByUsers(sql, '?', [userId], from, to, at);
     levels.push({ limited_by: 'member', quota_milli: memberQuota, used_milli: used, remaining_milli: memberQuota - used });
   }
   let groupId = member.group_id;
@@ -99,7 +106,7 @@ export function quotaLevels(sql: Reader, userId: string, at: number): QuotaLevel
     const groupQuota=head?effectivePolicy(sql,'group',id)?.hot.quota_milli:group?.quota_milli;
     if (groupQuota === undefined || groupQuota === null) continue;
     const members = `SELECT user_id FROM members WHERE group_id IN (${groupSubtree})`;
-    const used = usedByUsers(sql, members, [id], from, to);
+    const used = usedByUsers(sql, members, [id], from, to, at);
     levels.push({ limited_by: `group:${id}`, quota_milli: groupQuota, used_milli: used, remaining_milli: groupQuota - used });
   }
   return levels.sort((a, b) => a.remaining_milli - b.remaining_milli);
@@ -113,14 +120,14 @@ export function quotaBinding(sql: Reader, userId: string, at: number): QuotaLeve
 /** 本人本月已用（供 /me.quota 在不限时也能展示用量），不区分是否被某一级配额限制。 */
 export function selfMonthUsage(sql: Reader, userId: string, at: number) {
   const [from, to] = monthBounds(at);
-  return usedByUsers(sql, '?', [userId], from, to);
+  return usedByUsers(sql, '?', [userId], from, to, at);
 }
 
 /** 组及其全部子组成员的本月已用合计，供台账展示（口径同配额）。 */
 export function groupMonthUsage(sql: Reader, groupId: string, at: number) {
   const [from, to] = monthBounds(at);
   const members = `SELECT user_id FROM members WHERE group_id IN (${groupSubtree})`;
-  return usedByUsers(sql, members, [groupId], from, to);
+  return usedByUsers(sql, members, [groupId], from, to, at);
 }
 
 /** 一次查询取全体成员本月已用（settle + 活跃预留），供 /members 台账批量展示，避免逐行查询。 */
@@ -132,7 +139,11 @@ export function monthUsageByUser(sql: Pick<Transaction, 'all'>, at: number): Map
     usage.set(user_id, (usage.get(user_id) ?? 0) + settled);
   }
   for (const { user_id, reserved } of sql.all<{ user_id: string; reserved: number }>(
-    "SELECT user_id, sum(budget_milli) AS reserved FROM leases WHERE status = 'active' GROUP BY user_id")) {
+    `SELECT user_id, sum(amount) AS reserved FROM (
+      SELECT user_id,budget_milli amount FROM leases WHERE status='active'
+      UNION ALL SELECT user_id,fee_milli FROM commerce_tool_calls
+      WHERE source_kind='http_search' AND status='awaiting_result' AND reserved_until>?
+    ) GROUP BY user_id`, [iso(at)])) {
     usage.set(user_id, (usage.get(user_id) ?? 0) + reserved);
   }
   return usage;
@@ -306,7 +317,7 @@ export function billingRoutes(app: Hono, store: Store, opts: ManagementOptions) 
       const groupAllowed = role !== 'group_admin' || id === actor.userId || (actor.group_id && db.get(
         `SELECT 1 FROM members WHERE user_id = ? AND group_id IN (${groupSubtree})`, [id, actor.group_id]));
       if (!member || !allowed || !groupAllowed) throw new ApiError('not_found');
-      const { settled, reserved } = usageByUsers(db, '?', [id], from, to);
+      const { settled, reserved } = usageByUsers(db, '?', [id], from, to, at);
       const quota_milli = quota_distribution ? (readHead(db)?effectivePolicy(db,'member',id)?.hot.quota_milli??null:member.quota_milli) : null;
       return c.json({ scope, id, quota_distribution, quota_milli, used_milli: settled, reserved_milli: reserved,
         remaining_milli: quota_milli === null ? null : quota_milli - settled - reserved, actions: ['read'] });
@@ -315,7 +326,7 @@ export function billingRoutes(app: Hono, store: Store, opts: ManagementOptions) 
     const groupAllowed = role !== 'member' && (role !== 'group_admin' || (actor.group_id && db.get(`SELECT 1 FROM (${groupSubtree}) WHERE id = ?`, [actor.group_id, id])));
     if (!group || !groupAllowed) throw new ApiError('not_found');
     const members = `SELECT user_id FROM members WHERE group_id IN (${groupSubtree})`;
-    const { settled, reserved } = usageByUsers(db, members, [id], from, to);
+    const { settled, reserved } = usageByUsers(db, members, [id], from, to, at);
     const quota_milli = quota_distribution ? (readHead(db)?effectivePolicy(db,'group',id)?.hot.quota_milli??null:group.quota_milli) : null;
     return c.json({ scope, id, quota_distribution, quota_milli, used_milli: settled, reserved_milli: reserved,
       remaining_milli: quota_milli === null ? null : quota_milli - settled - reserved, actions: ['read'] });

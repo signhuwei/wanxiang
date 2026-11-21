@@ -48,7 +48,7 @@ export function parseTerms(sql: Get, value: unknown): Terms {
     }), r => r.model_id),
     model_budgets: rows(t.model_budgets ?? [], 'model_budgets', r => ({ model_id: modelId(sql, r.model_id), monthly_milli: int(r.monthly_milli, 'monthly_milli') }), r => r.model_id),
     tool_prices: rows(t.tool_prices ?? [], 'tool_prices', r => {
-      if (typeof r.release_id !== 'string' || !sql.get("SELECT 1 FROM tool_releases WHERE id=? AND status='published' AND kind='mcp'", [r.release_id])) invalid('release_id');
+      if (typeof r.release_id !== 'string' || !sql.get("SELECT 1 FROM tool_releases WHERE id=? AND status='published' AND kind IN ('mcp','http_search')", [r.release_id])) invalid('release_id');
       return { release_id: r.release_id, per_call_milli: int(r.per_call_milli, 'per_call_milli', 1) };
     }, r => r.release_id)
   };
@@ -106,8 +106,10 @@ export function packageFunds(sql: Get, at: number) {
   return sql.get<{ package_available_milli: number }>(`SELECT coalesce((SELECT grant_milli FROM commerce_packages WHERE month=?),0)
     - coalesce((SELECT sum(CASE WHEN l.status='active' THEN c.package_reserved ELSE c.package_used END)
       FROM commerce_leases c JOIN leases l ON l.id=c.lease_id WHERE c.month=?),0)
-    - coalesce((SELECT sum(package_used) FROM commerce_tool_calls WHERE status='charged' AND month=?),0) AS package_available_milli`,
-    [month, month, month])!;
+    - coalesce((SELECT sum(package_used) FROM commerce_tool_calls WHERE status='charged' AND month=?),0)
+    - coalesce((SELECT sum(package_reserved) FROM commerce_tool_calls WHERE source_kind='http_search'
+      AND status='awaiting_result' AND month=? AND reserved_until>?),0) AS package_available_milli`,
+    [month, month, month, month, iso(at)])!;
 }
 export function modelUsage(sql: Get, model: string, month: string, excludeLease: string | null = null) {
   // A newly signed cap also sees earlier leases this month. Before per-model counters were requested,

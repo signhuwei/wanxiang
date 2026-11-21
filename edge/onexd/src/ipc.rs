@@ -51,6 +51,7 @@ pub struct LaunchCtx {
     running: Arc<std::sync::Mutex<std::collections::HashMap<String, Running>>>,
     preparing: std::sync::Mutex<Option<Preparation>>,
     download_failed: std::sync::Mutex<HashMap<String, String>>,
+    desktop_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 struct Running {
@@ -59,6 +60,13 @@ struct Running {
     code: Arc<std::sync::Mutex<Option<i32>>>,
     session_id: String,
     token: String,
+    search: Option<SearchAccess>,
+}
+
+struct SearchAccess {
+    capability: String,
+    releases: Vec<String>,
+    sessions: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -84,6 +92,7 @@ impl LaunchCtx {
             running: Default::default(),
             preparing: Default::default(),
             download_failed: Default::default(),
+            desktop_tasks: Default::default(),
         }
     }
 
@@ -126,8 +135,9 @@ pub async fn serve(listener: Listener, path: PathBuf, ipc: Arc<Ipc>) {
             r = listener.accept() => match r {
                 Ok(conn) => {
                     let ipc = ipc.clone();
+                    let socket = path.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle(conn, &ipc).await {
+                        if let Err(e) = handle(conn, &ipc, &socket).await {
                             warn!(error = %format!("{e:#}"), "ipc connection");
                         }
                     });
@@ -136,10 +146,21 @@ pub async fn serve(listener: Listener, path: PathBuf, ipc: Arc<Ipc>) {
             }
         }
     }
+    if let Some(ctx) = &ipc.launch {
+        let tasks = std::mem::take(&mut *ctx.desktop_tasks.lock().unwrap());
+        let joining = async {
+            for task in tasks {
+                let _ = task.await;
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(5), joining).await.is_err() {
+            warn!("desktop shutdown did not finish; outstanding sessions will recover after restart");
+        }
+    }
     transport::cleanup(&path);
 }
 
-async fn handle(stream: Connection, ipc: &Arc<Ipc>) -> Result<()> {
+async fn handle(stream: Connection, ipc: &Arc<Ipc>, socket: &Path) -> Result<()> {
     let (r, mut w) = stream.into_split();
     let mut r = BufReader::new(r);
     let mut line = String::new();
@@ -163,7 +184,7 @@ async fn handle(stream: Connection, ipc: &Arc<Ipc>) -> Result<()> {
             return Ok(());
         }
         let (reply, stop) = match request {
-            Ok(req) => dispatch(req, ipc).await,
+            Ok(req) => dispatch(req, ipc, socket).await,
             Err(e) => (err("invalid", &format!("无法解析请求：{e}")), false),
         };
         // 先决定好的关停不能因为回复写失败（调用方已经断开）就不生效。
@@ -176,7 +197,7 @@ async fn handle(stream: Connection, ipc: &Arc<Ipc>) -> Result<()> {
     }
 }
 
-async fn dispatch(req: Request, ipc: &Arc<Ipc>) -> (Value, bool) {
+async fn dispatch(req: Request, ipc: &Arc<Ipc>, socket: &Path) -> (Value, bool) {
     match req {
         Request::Status => (ok(status(ipc)), false),
         Request::Login { token, server, device_id } => (login(ipc, token, server, device_id), false),
@@ -186,14 +207,25 @@ async fn dispatch(req: Request, ipc: &Arc<Ipc>) -> (Value, bool) {
             (json!({"ok": true, "public_key": ipc.state.device_key.public_b64(), "server_url": ipc.server_url}), false)
         }
         Request::Launch { agent, program, cwd, env, model, agent_version } => (
-            launch(ipc, &agent, program.as_deref(), &cwd, &env, model.as_deref(), agent_version.as_deref()).await,
+            launch(ipc, socket, &agent, program.as_deref(), &cwd, &env, model.as_deref(), agent_version.as_deref())
+                .await,
             false,
         ),
         Request::Download { agent } => (start_download(ipc, &agent), false),
+        Request::HostedSearch { launch_id, capability, release_id, query, limit, call_key } => {
+            (hosted_search(ipc, &launch_id, &capability, &release_id, &query, limit, &call_key).await, false)
+        }
         Request::LaunchDone { launch_id, exit_code } => {
             let Some(ctx) = &ipc.launch else { return (err("invalid", "这个 onexd 不支持启动 Agent"), false) };
-            let Some(launch) = ctx.running.lock().unwrap().remove(&launch_id) else {
-                return (json!({"ok": true}), false);
+            let launch = {
+                let mut running = ctx.running.lock().unwrap();
+                let Some(launch) = running.get(&launch_id) else { return (json!({"ok": true}), false) };
+                if crate::state::is_desktop_agent(&launch.agent) {
+                    // The desktop supervisor drains the original journal before closing.
+                    launch.stop.cancel();
+                    return (json!({"ok": true}), false);
+                }
+                running.remove(&launch_id).unwrap()
             };
             info!(%launch_id, ?exit_code, "agent exited");
             ipc.state.launch_tokens.write().unwrap().remove(&launch.token);
@@ -353,8 +385,118 @@ fn start_download(ipc: &Arc<Ipc>, agent: &str) -> Value {
     json!({"ok": true})
 }
 
+async fn hosted_search(
+    ipc: &Ipc,
+    launch_id: &str,
+    capability: &str,
+    release: &str,
+    query: &str,
+    limit: u8,
+    key: &str,
+) -> Value {
+    use reqwest::StatusCode;
+    use std::time::Duration;
+    use subtle::ConstantTimeEq;
+
+    if !crate::hosted_search::input_valid(query, limit)
+        || key.len() != 64
+        || !key.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return err("invalid", "查询词或结果数量无效");
+    }
+    let (Some(ctx), Some(origin)) = (&ipc.launch, &ipc.server_url) else {
+        return err("unauthenticated", "没有可用的 OneX 服务");
+    };
+    let Some(device_token) = ipc.state.token.borrow().clone() else {
+        return err("unauthenticated", "请重新登录 OneX");
+    };
+    let (agent, model_capability, stop) = {
+        let running = ctx.running.lock().unwrap();
+        let Some(launch) = running.get(launch_id).filter(|launch| {
+            launch.search.as_ref().is_some_and(|search| {
+                bool::from(search.capability.as_bytes().ct_eq(capability.as_bytes()))
+                    && search.releases.iter().any(|id| id == release)
+            })
+        }) else {
+            return err("forbidden", "当前受管启动没有该搜索工具权限");
+        };
+        (launch.agent.clone(), launch.token.clone(), launch.stop.clone())
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        {
+            let cfg = ipc.state.config.read().unwrap();
+            if cfg.policy_blocked
+                || cfg.balance_stopped()
+                || !crate::hosted_search::select(&cfg, &agent).any(|r| r.id == release)
+            {
+                return err("forbidden", "当前能力合约已停止搜索授权");
+            }
+        }
+        if stop.is_cancelled() || ipc.shutdown.is_cancelled() {
+            return err("forbidden", "受管启动已结束");
+        }
+        let session = {
+            let launches = ipc.state.launch_tokens.read().unwrap();
+            let Some(binding) = launches.get(&model_capability) else {
+                return err("forbidden", "受管启动已结束");
+            };
+            match &binding.first_native_session {
+                Some(pending) => pending.borrow().clone(),
+                None => Some(binding.session_id.clone()),
+            }
+        };
+        if let Some(session) = session {
+            let session = {
+                let mut running = ctx.running.lock().unwrap();
+                let Some(search) = running.get_mut(launch_id).and_then(|launch| launch.search.as_mut()) else {
+                    return err("forbidden", "受管启动已结束");
+                };
+                if search.sessions.len() >= 65536 && !search.sessions.contains_key(key) {
+                    return err("conflict", "受管启动的搜索调用已达上限");
+                }
+                search.sessions.entry(key.to_owned()).or_insert(session).clone()
+            };
+            let result = tokio::select! {
+                _ = stop.cancelled() => return err("forbidden", "受管启动已结束"),
+                _ = ipc.shutdown.cancelled() => return err("forbidden", "受管启动已结束"),
+                result = crate::hosted_search::forward(&ctx.http, origin, &device_token, release, key, &session, query, limit) => result,
+            };
+            match result {
+                Ok((StatusCode::OK, value)) if value["results"].is_array() => {
+                    return json!({"ok":true,"results":value["results"]});
+                }
+                Ok((StatusCode::NOT_FOUND, value))
+                    if value["error"]["detail"]["reason"] == "session_not_registered" => {}
+                Ok((StatusCode::OK, value)) if value["receipt"].is_object() => {
+                    return json!({"ok":true,"receipt":value["receipt"]});
+                }
+                Ok((StatusCode::ACCEPTED, _)) => return err("conflict", "搜索仍在结算，请勿新建调用"),
+                Ok((StatusCode::FORBIDDEN, value)) => {
+                    let message = match value["error"]["detail"]["reason"].as_str() {
+                        Some("balance") => "橡皮余额不足，未执行搜索",
+                        Some("quota") => "可用配额不足，未执行搜索",
+                        _ => "当前能力合约不允许搜索",
+                    };
+                    return err("forbidden", message);
+                }
+                Ok((StatusCode::CONFLICT, value)) if value["error"]["detail"]["reason"] == "search_lease_required" => {
+                    return err("conflict", "还没有可用于搜索的商业租约");
+                }
+                Ok((StatusCode::BAD_GATEWAY, _)) => return err("upstream_error", "搜索未完成"),
+                _ => return err("upstream_error", "未能确认搜索结果，请勿自动重试这笔调用"),
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return err("conflict", "原生会话尚未登记，暂不能使用搜索");
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+}
+
 async fn launch(
     ipc: &Ipc,
+    socket: &Path,
     agent: &str,
     program: Option<&str>,
     cwd: &str,
@@ -392,7 +534,7 @@ async fn launch(
         return err("conflict", "该桌面 Agent 已在运行");
     }
     let (os, arch) = (onex_core::ipc::os_name(), onex_core::ipc::arch_name());
-    let (approved, tool_releases) = {
+    let (approved, tool_releases, search_releases) = {
         let cfg = ipc.state.config.read().unwrap();
         if cfg.policy_blocked {
             return err("agent_not_allowed", "设备策略尚未成功同步");
@@ -412,7 +554,8 @@ async fn launch(
             None
         };
         let tools: Vec<_> = crate::tools::select(&cfg.tools, agent, os, arch).into_iter().cloned().collect();
-        (approved, tools)
+        let searches = crate::hosted_search::select(&cfg, agent).cloned().collect::<Vec<_>>();
+        (approved, tools, searches)
     };
     // program 不填：按 Server 下发的发行目录自己选型、下载、校验并原子缓存；program 填了就是旧 PATH 用法。
     let device_token = ipc.state.token.borrow().clone();
@@ -495,6 +638,7 @@ async fn launch(
     let program = program.as_str();
     let tools_current = |cfg: &crate::state::ConfigSnapshot| {
         crate::tools::select(&cfg.tools, agent, os, arch).into_iter().eq(tool_releases.iter())
+            && crate::hosted_search::select(cfg, agent).eq(search_releases.iter())
     };
     // 别名候选：精确名字的路由；通配路由用它固定的上游模型名（server 的 MVP seed 是 `*` → Qwen3.8-27B）
     let (models, routable) = {
@@ -588,10 +732,20 @@ async fn launch(
     };
     match crate::launch::prepare(&r) {
         Ok(mut l) => {
-            if let Err(error) = crate::tools::apply(agent, &mut l, &installed_tools) {
+            let search = (!search_releases.is_empty()).then(|| SearchAccess {
+                capability: crate::id::token(),
+                releases: search_releases.iter().map(|r| r.id.clone()).collect(),
+                sessions: HashMap::new(),
+            });
+            let search_config = search.as_ref().map(|access| crate::tools::SearchLaunch {
+                socket,
+                capability: &access.capability,
+                releases: &search_releases,
+            });
+            if let Err(error) = crate::tools::apply(agent, &mut l, &installed_tools, search_config) {
                 let _ = crate::launch::finish(&ctx.home, &l.launch_id);
                 warn!(agent, %error, "could not prepare managed tools");
-                return err("invalid", "无法加载受管 Skill 或 MCP");
+                return err("invalid", "无法加载受管工具");
             }
             let cfg = ipc.state.config.read().unwrap();
             let release_unchanged = if let Some(release) = &approved {
@@ -646,6 +800,7 @@ async fn launch(
                     code: code.clone(),
                     session_id: l.session_id.clone(),
                     token: local_token.clone(),
+                    search,
                 },
             );
             *ipc.state.active_session.write().unwrap() = Some(l.session_id.clone());
@@ -692,6 +847,7 @@ async fn start_desktop(
             request.owner,
             &release.version,
             request.model,
+            request.token,
             ipc.outbox.clone(),
         ) {
             Ok(capture) => Some(Arc::new(capture)),
@@ -759,6 +915,7 @@ async fn start_desktop(
             code: Default::default(),
             session_id: launch.session_id,
             token: token.clone(),
+            search: None,
         },
     );
     let state = ipc.state.clone();
@@ -773,7 +930,7 @@ async fn start_desktop(
     });
     let outbox = ipc.outbox.clone();
     let device = request.owner.to_owned();
-    tokio::spawn(async move {
+    let supervisor = tokio::spawn(async move {
         let capture_stop = CancellationToken::new();
         let capture = if let Some(workbuddy) = workbuddy_capture {
             Some(tokio::spawn(workbuddy.run(capture_stop.clone())))
@@ -784,14 +941,14 @@ async fn start_desktop(
                         session,
                         token.clone(),
                         state.clone(),
-                        outbox,
+                        outbox.clone(),
                         capture_stop.clone(),
                     ))
                 } else {
                     tokio::spawn(crate::native_capture::capture_codex_desktop(
                         session,
                         device,
-                        outbox,
+                        outbox.clone(),
                         capture_stop.clone(),
                     ))
                 }
@@ -801,17 +958,25 @@ async fn start_desktop(
             _ = child.wait() => {}
             _ = stop.cancelled() => { let _ = child.kill().await; }
         }
+        let exited_at = crate::outbox::now_ms();
         capture_stop.cancel();
         if let Some(capture) = capture {
             let _ = capture.await;
         }
         state.desktop_sessions.stop(&token);
         state.workbuddy_turns.stop(&token);
+        let owner = crate::outbox::desktop_launch_key(&token);
+        if let Err(error) = outbox.close_desktop_sessions(Some(&owner), Some(exited_at)) {
+            warn!(%error, "could not persist desktop session endings");
+        }
         drop(runtime);
         let _ = crate::launch::finish(&home, &id);
         running.lock().unwrap().remove(&id);
         info!(launch_id = %id, "desktop process exited");
     });
+    let mut tasks = ctx.desktop_tasks.lock().unwrap();
+    tasks.retain(|task| !task.is_finished());
+    tasks.push(supervisor);
     json!({"ok":true, "launch_id":launch_id, "desktop":true})
 }
 
@@ -926,4 +1091,168 @@ async fn write_line(w: &mut (impl AsyncWriteExt + Unpin), v: &Value) -> Result<(
     s.push('\n');
     w.write_all(s.as_bytes()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod hosted_search_tests {
+    use super::*;
+    use axum::{
+        Json,
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+        routing::post,
+    };
+    use onex_core::ws::SearchTool;
+
+    #[tokio::test]
+    async fn stdio_search_uses_the_bound_session_and_replays_a_receipt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = seen.clone();
+        let http = axum::Router::new().route("/v1/edge/tool-search/tool_01M7YV31G92NTSZM04NQKFV5Z7",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let calls = calls.clone();
+                async move {
+                    assert_eq!(headers["authorization"], "Bearer device-only");
+                    let key = headers["idempotency-key"].to_str().unwrap().to_owned();
+                    let mut calls = calls.lock().unwrap();
+                    calls.push((key, body));
+                    let receipt = json!({"call_id":calls[0].0,"status":"charged","ledger_id":"ledger-search"});
+                    match calls.len() {
+                        1 => (StatusCode::NOT_FOUND, Json(json!({"error":{"detail":{"reason":"session_not_registered"}}}))).into_response(),
+                        2 => Json(json!({"receipt":receipt,"results":[{"url":"https://example.test","title":"Sample","snippet":"OK"}]})).into_response(),
+                        _ => Json(json!({"receipt":receipt})).into_response(),
+                    }
+                }
+            }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, http).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("onexd.sock");
+        let state = Arc::new(State::default());
+        state.token.send_replace(Some("device-only".into()));
+        let release = "tool_01M7YV31G92NTSZM04NQKFV5Z7";
+        state.config.write().unwrap().policy = Some(crate::state::AppliedPolicy {
+            summary: serde_json::from_value(
+                json!({"abi":2,"tenant_id":"ten_test","user_id":"usr_test","device_id":"dev_test",
+                "platform_revision":1,"policy_revision":1,"groups":[],"display":[]}),
+            )
+            .unwrap(),
+            notices: vec![],
+            balance: None,
+            runtime: Default::default(),
+            commerce_plan_id: Some("plan".into()),
+            search_tools: vec![SearchTool {
+                id: release.into(),
+                name: "search".into(),
+                agents: vec!["claude-code".into()],
+            }],
+            keys: HashMap::new(),
+        });
+        state.launch_tokens.write().unwrap().insert(
+            "model-only".into(),
+            crate::state::LaunchBinding {
+                session_id: "native-one".into(),
+                agent: "claude-code".into(),
+                release_id: None,
+                approved_model: None,
+                first_native_session: None,
+            },
+        );
+        let ctx = LaunchCtx::new(
+            dir.path().into(),
+            reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap(),
+        );
+        ctx.running.lock().unwrap().insert(
+            "test-launch".into(),
+            Running {
+                agent: "claude-code".into(),
+                stop: CancellationToken::new(),
+                code: Default::default(),
+                session_id: "native-one".into(),
+                token: "model-only".into(),
+                search: Some(SearchAccess {
+                    capability: "search-only".into(),
+                    releases: vec![release.into()],
+                    sessions: HashMap::new(),
+                }),
+            },
+        );
+        let shutdown = CancellationToken::new();
+        let service = Arc::new(Ipc {
+            state: state.clone(),
+            outbox: Arc::new(Outbox::open(&dir.path().join("outbox.sqlite")).unwrap()),
+            router_addr: None,
+            server_url: Some(origin),
+            launch: Some(ctx),
+            credentials: None,
+            identity_transition: Default::default(),
+            shutdown: shutdown.clone(),
+        });
+        let wrong = hosted_search(&service, "test-launch", "model-only", release, "public", 3, &"0".repeat(64)).await;
+        assert_eq!(wrong["error"]["code"], "forbidden");
+        let ipc_listener = bind(&socket).await.unwrap();
+        let daemon = tokio::spawn(serve(ipc_listener, socket.clone(), service));
+        let (agent, stdio) = tokio::io::duplex(4096);
+        let child = tokio::spawn(async move {
+            let (reader, writer) = tokio::io::split(stdio);
+            let config = crate::hosted_search::McpConfig {
+                socket,
+                launch_id: "test-launch".into(),
+                capability: "search-only".into(),
+                release_id: release.into(),
+                name: "approved".into(),
+            };
+            crate::hosted_search::serve_stdio(&config, BufReader::new(reader), writer).await.unwrap();
+        });
+        let (reader, mut writer) = tokio::io::split(agent);
+        let mut reader = BufReader::new(reader);
+        async fn rpc(
+            reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+            writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+            id: usize,
+            method: &str,
+            params: Value,
+        ) -> Value {
+            let request = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+            writer.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+            let mut line = String::new();
+            tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+        assert_eq!(
+            rpc(&mut reader, &mut writer, 0, "initialize", json!({"protocolVersion":"2024-11-05"})).await["result"]["protocolVersion"],
+            "2024-11-05"
+        );
+        assert_eq!(
+            rpc(&mut reader, &mut writer, 1, "tools/list", json!({})).await["result"]["tools"][0]["name"],
+            "search"
+        );
+        let params = json!({"name":"search","arguments":{"query":"public","limit":3}});
+        let result = rpc(&mut reader, &mut writer, 2, "tools/call", params.clone()).await;
+        assert!(result["result"]["content"][0]["text"].as_str().unwrap().contains("https://example.test"));
+
+        // A replay keeps its original identity even after the native session binding advances.
+        state.launch_tokens.write().unwrap().get_mut("model-only").unwrap().session_id = "native-two".into();
+        let replay = rpc(&mut reader, &mut writer, 2, "tools/call", params.clone()).await;
+        let receipt: Value = serde_json::from_str(replay["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(receipt["receipt"]["ledger_id"], "ledger-search");
+        assert!(receipt.get("results").is_none());
+        state.config.write().unwrap().policy.as_mut().unwrap().search_tools.clear();
+        let revoked = rpc(&mut reader, &mut writer, 3, "tools/call", params).await;
+        assert_eq!(revoked["result"]["isError"], true);
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(calls[0].1, json!({"session_id":"native-one","query":"public","limit":3}));
+        server.abort();
+        shutdown.cancel();
+        child.abort();
+        daemon.await.unwrap();
+    }
 }

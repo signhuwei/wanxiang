@@ -9,8 +9,8 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use serde_json::Value;
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde_json::{Value, json};
 use tokio::sync::watch;
 
 pub const RETAIN_MS: i64 = 72 * 3600 * 1000;
@@ -66,6 +66,18 @@ pub struct Outbox {
     last_size_prune: Mutex<i64>,
 }
 
+pub(crate) struct DesktopActivity<'a> {
+    pub session: &'a str,
+    pub launch: &'a str,
+    pub live_from: Option<usize>,
+    pub at_ms: i64,
+}
+
+pub(crate) fn desktop_launch_key(control: &str) -> String {
+    use sha2::{Digest, Sha256};
+    crate::capture::hex(&Sha256::digest(control.as_bytes()))
+}
+
 impl Outbox {
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with(path, RETAIN_MS, RETAIN_BYTES)
@@ -85,7 +97,15 @@ impl Outbox {
                  kind TEXT NOT NULL,
                  item TEXT NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS cursors (k TEXT PRIMARY KEY, v TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS cursors (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS desktop_lifecycle (
+                 session_id TEXT PRIMARY KEY,
+                 launch_id TEXT,
+                 last_active_ms INTEGER NOT NULL,
+                 closed_ms INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS desktop_lifecycle_open
+                 ON desktop_lifecycle (launch_id) WHERE launch_id IS NOT NULL;",
         )?;
         // 第一批的表没有 acked_at，补上。
         let has_acked_at: bool =
@@ -281,6 +301,28 @@ impl Outbox {
         cursor: &Value,
         expected: Option<&Value>,
     ) -> Result<bool> {
+        self.append_cursor(items, key, cursor, expected, None)
+    }
+
+    pub(crate) fn append_desktop_events(
+        &self,
+        items: Vec<Value>,
+        key: &str,
+        cursor: &Value,
+        expected: Option<&Value>,
+        activity: DesktopActivity<'_>,
+    ) -> Result<bool> {
+        self.append_cursor(items, key, cursor, expected, Some(activity))
+    }
+
+    fn append_cursor(
+        &self,
+        mut items: Vec<Value>,
+        key: &str,
+        cursor: &Value,
+        expected: Option<&Value>,
+        activity: Option<DesktopActivity<'_>>,
+    ) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(expected) = expected {
@@ -291,16 +333,12 @@ impl Outbox {
                 return Ok(false);
             }
         }
-        let mut seq = meta(&tx, "last_seq")?;
-        for mut item in items {
-            seq += 1;
-            item.as_object_mut().context("outbox item must be a JSON object")?.insert("seq".into(), seq.into());
-            tx.execute(
-                "INSERT INTO outbox (seq, kind, item) VALUES (?1, ?2, ?3)",
-                params![seq as i64, Kind::Events.as_str(), item.to_string()],
-            )?;
+        if let Some(activity) = activity
+            && !apply_desktop_activity(&tx, &mut items, activity)?
+        {
+            return Ok(false);
         }
-        tx.execute("UPDATE meta SET v = ?1 WHERE k = 'last_seq'", [seq as i64])?;
+        let seq = append_event_rows(&tx, items)?;
         tx.execute(
             "INSERT INTO cursors (k, v) VALUES (?1, ?2) ON CONFLICT (k) DO UPDATE SET v = excluded.v",
             params![key, cursor.to_string()],
@@ -310,8 +348,115 @@ impl Outbox {
         self.last_seq_tx.send_replace(seq);
         Ok(true)
     }
+
+    /// Called after the daemon takes the device's IPC listener. A previous
+    /// process cannot close its windows after an unclean daemon exit.
+    pub fn recover_desktop_sessions(&self) -> Result<()> {
+        self.close_desktop_sessions(None, None)
+    }
+
+    pub(crate) fn close_desktop_sessions(&self, launch: Option<&str>, exited_at: Option<i64>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows = {
+            let mut query = tx.prepare(
+                "SELECT session_id, last_active_ms FROM desktop_lifecycle WHERE launch_id IS NOT NULL
+                 AND (?1 IS NULL OR launch_id = ?1) ORDER BY session_id",
+            )?;
+            query
+                .query_map([launch], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut events = Vec::with_capacity(rows.len());
+        for (session, last_active) in rows {
+            let closed = exited_at.unwrap_or(last_active).max(last_active);
+            let reason = if exited_at.is_some() { "desktop_process_exited" } else { "daemon_restart" };
+            events.push(desktop_event(&session, "session_end", closed, json!({ "reason": reason })));
+            tx.execute(
+                "UPDATE desktop_lifecycle SET launch_id = NULL, closed_ms = ?1 WHERE session_id = ?2",
+                params![closed, session],
+            )?;
+        }
+        let seq = append_event_rows(&tx, events)?;
+        tx.commit()?;
+        drop(conn);
+        self.last_seq_tx.send_replace(seq);
+        Ok(())
+    }
 }
 
+fn desktop_event(session: &str, kind: &str, at: i64, payload: Value) -> Value {
+    json!({ "session_id":session, "kind":kind, "at":crate::pricing::format_ms(at), "payload":payload })
+}
+
+fn apply_desktop_activity(tx: &Transaction<'_>, items: &mut Vec<Value>, activity: DesktopActivity<'_>) -> Result<bool> {
+    let saved: Option<(Option<String>, Option<i64>)> = tx
+        .query_row(
+            "SELECT launch_id, closed_ms FROM desktop_lifecycle WHERE session_id = ?1",
+            [activity.session],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (owner, closed) = saved.unwrap_or_default();
+    let last_event = items.iter().filter_map(|item| item["at"].as_str().and_then(crate::pricing::parse_ms)).max();
+    // A scan may race the first real turn after a window reopens. Keep its
+    // cursor unchanged so the new prompt is retried after the resume event.
+    if owner.is_none()
+        && activity.live_from.is_none()
+        && closed.is_some_and(|end| last_event.is_some_and(|at| at > end))
+    {
+        return Ok(false);
+    }
+
+    if let Some(at_index) = activity.live_from {
+        let newly_started = items.first().is_some_and(|item| item["kind"] == "session_start");
+        if owner.is_none() && !newly_started {
+            items.insert(at_index, desktop_event(activity.session, "session_resume", activity.at_ms, json!({})));
+        }
+        tx.execute(
+            "INSERT INTO desktop_lifecycle (session_id, launch_id, last_active_ms) VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET launch_id = excluded.launch_id,
+               last_active_ms = max(desktop_lifecycle.last_active_ms, excluded.last_active_ms)",
+            params![activity.session, activity.launch, activity.at_ms],
+        )?;
+    } else if let Some(last_event) = last_event
+        && owner.as_deref() == Some(activity.launch)
+    {
+        tx.execute(
+            "UPDATE desktop_lifecycle SET last_active_ms = max(last_active_ms, ?1) WHERE session_id = ?2",
+            params![last_event.min(activity.at_ms), activity.session],
+        )?;
+    }
+    // A record without a native time can seed an original session, but it
+    // cannot prove new content after an earlier retention period ended.
+    items.retain_mut(|item| {
+        if item["at"].is_null() {
+            if closed.is_some() {
+                return false;
+            }
+            item["at"] = crate::pricing::format_ms(activity.at_ms).into();
+        }
+        true
+    });
+    Ok(true)
+}
+
+fn append_event_rows(tx: &Transaction<'_>, events: Vec<Value>) -> Result<u64> {
+    let mut seq = meta(tx, "last_seq")?;
+    for mut item in events {
+        seq += 1;
+        item.as_object_mut().context("outbox item must be a JSON object")?.insert("seq".into(), seq.into());
+        tx.execute(
+            "INSERT INTO outbox (seq, kind, item) VALUES (?1, ?2, ?3)",
+            params![seq as i64, Kind::Events.as_str(), item.to_string()],
+        )?;
+    }
+    tx.execute("UPDATE meta SET v = ?1 WHERE k = 'last_seq'", [seq as i64])?;
+    Ok(seq)
+}
 fn meta(conn: &Connection, k: &str) -> Result<u64> {
     let v: Option<i64> = conn.query_row("SELECT v FROM meta WHERE k = ?1", [k], |r| r.get(0)).optional()?;
     Ok(v.context("outbox meta missing")? as u64)

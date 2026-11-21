@@ -2,6 +2,7 @@ import { createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, randomBy
 import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
 import { ulid } from 'ulid';
 import { readContract } from './capability-data';
+import { readPlan } from './commerce-data';
 import { commerceDisplay, commerceRates } from './commerce';
 import { tenantUpstreamTargets,platformUpstreamPriority,upstreamOrder } from './tenant-upstreams';
 import { balance } from './billing';
@@ -24,6 +25,25 @@ type RouteRow = { model_id: string; route_model: string | null; upstream_model: 
   input_milli_per_mtok: number; output_milli_per_mtok: number; cache_read_milli_per_mtok: number;
   cache_write_milli_per_mtok: number; effective_from: string };
 type Participant = { user_id: string; os: string; arch: string; public_key: string | null };
+
+export function allowedSearchTools(store: Store, policy: {
+  commerce_plan_id?: string | null; tool_release_ids_json: string; allowed_agents_json: string;
+}, onUnavailable?: (id: string, reason: string) => void) {
+  const prices = new Set(readPlan(store, policy)?.terms.tool_prices.map(row => row.release_id));
+  const allowed = new Set<string>(JSON.parse(policy.allowed_agents_json));
+  return store.system.all<{ id: string; name: string; version: string; agents_json: string; configured: number }>(`SELECT r.id,r.name,r.version,r.agents_json,
+    EXISTS(SELECT 1 FROM tool_search_targets t WHERE t.release_id=r.id) AS configured FROM tool_releases r
+    WHERE r.kind='http_search' AND r.status='published' AND r.id IN (SELECT value FROM json_each(?)) ORDER BY r.id`,
+    [policy.tool_release_ids_json]).flatMap(row => {
+      const agents = (JSON.parse(row.agents_json) as string[]).filter(agent => allowed.has(agent));
+      if (!agents.length) return [];
+      if (!row.configured || !prices.has(row.id)) {
+        onUnavailable?.(row.id, !row.configured ? 'tool_release_unavailable' : 'tool_price_missing');
+        return [];
+      }
+      return [{id:row.id,name:row.name,version:row.version,agents}];
+    });
+}
 
 export function encryptEdgeSecret(publicKey: string, providerId: string, plaintext: Uint8Array) {
   // The wire key_id is the sender's ephemeral X25519 public key.
@@ -160,6 +180,7 @@ export function configPublisher(store: Store, dataDir: string, now: () => number
         return candidates.filter(item=>routeSecrets.has(item.route.provider_id)).sort(upstreamOrder).map(item=>item.route);
       });
       const tools = allowedToolReleases(store, dataDir, policy, participant.os, participant.arch);
+      const searchTools = allowedSearchTools(store, policy).map(({id,name,agents}) => ({id,name,agents}));
       const mode = balancePolicyEnabled(policy) ? readBalanceMode(db) : null;
       const eligible = mode === 'restricted' ? new Set(balanceFallbackModels(policy)) : null;
       const availableRoutes = mode === 'stopped' ? [] : eligible ? routes.filter(route => eligible.has(route.model_id)) : routes;
@@ -183,7 +204,8 @@ export function configPublisher(store: Store, dataDir: string, now: () => number
         policy: { abi: runtimeRequired ? 2 : 1, ...(runtimeRequired && {runtime}), ...(policy.commerce_plan_id && {commerce_plan_id:policy.commerce_plan_id}), tenant_id: sub.tenant, user_id: participant.user_id, device_id: device,
           platform_revision: policy.platform_revision, policy_revision: policy.policy_revision,
           tenant_revision: policy.tenant_revision, groups: policy.groups.slice(-maxPolicyScopeRefs), member: policy.member,
-          display, notices, secrets, ...(mode && { balance: { mode, aliases } }) } });
+          display, notices, secrets, ...(searchTools.length && { search_tools: searchTools }),
+          ...(mode && { balance: { mode, aliases } }) } });
       targets.set(device, { subscription: sub, revision, policyRevision: policy.policy_revision });
       if (policy.lease_budget_milli <= 0) sub.send({ type: 'cutoff', id: `msg_${ulid()}`, reason: 'contract' });
       return;

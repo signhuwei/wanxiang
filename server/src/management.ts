@@ -43,18 +43,18 @@ export function urlField(value: unknown, name: string) {
   return raw;
 }
 
-export function pagination(c: Context) {
+export function pagination(c: Context, cursorParam = 'cursor') {
   const query = c.req.query('q') ?? '';
   if (query.length > 200) invalid('q');
   const rawLimit = c.req.query('limit') ?? '50';
   if (!/^\d{1,3}$/.test(rawLimit)) invalid('limit');
   const limit = int(Number(rawLimit), 'limit', 1, 200);
-  const cursor = c.req.query('cursor');
+  const cursor = c.req.query(cursorParam);
   let offset = 0;
   if (cursor !== undefined) {
     const decoded = Buffer.from(cursor, 'base64url');
-    if (cursor.length > 24 || decoded.toString('base64url') !== cursor || !/^\d+$/.test(decoded.toString())) invalid('cursor');
-    offset = int(Number(decoded), 'cursor');
+    if (cursor.length > 24 || decoded.toString('base64url') !== cursor || !/^\d+$/.test(decoded.toString())) invalid(cursorParam);
+    offset = int(Number(decoded), cursorParam);
   }
   return {
     query, limit, offset,

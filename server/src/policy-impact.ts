@@ -1,5 +1,5 @@
 import { allDesktopCapabilities, allowedAgentReleases, hasDesktopRuntime, requiresDesktopQualification } from './agent-catalog';
-import { effectiveModelConfig } from './edge-config';
+import { allowedSearchTools, effectiveModelConfig } from './edge-config';
 import { balancePolicyEnabled, readBalanceMode, balanceFallbackModels } from './policy-balance';
 import { iso } from './credentials';
 import type { pagination } from './management';
@@ -48,6 +48,7 @@ export function targetPolicy(store: Store, db: PolicyReader, document: Effective
     else missing(id, release.status !== 'active' ? 'release_disabled' : 'release_unavailable');
   }
   const toolReleases = allowedToolReleases(store, dataDir, hot, device.os, device.arch, missing);
+  const searches = allowedSearchTools(store, hot, missing);
   const mode = balancePolicyEnabled(hot) ? readBalanceMode(db) : null;
   const fallback = new Set(balanceFallbackModels(hot));
   const models = effectiveModelConfig(store, hot, at).models.filter(model => {
@@ -71,7 +72,8 @@ export function targetPolicy(store: Store, db: PolicyReader, document: Effective
   });
   return {
     os: device.os, arch: device.arch, models, routes, releases: releases.map(({ agent, version, os, arch, id }) => ({ agent, version, os, arch, id })),
-    tools: toolReleases.map(({ id, name, kind, version }) => ({ id, name, kind, version })), unavailable: problems
+    tools: [...toolReleases.map(({ id, name, kind, version }) => ({ id, name, kind, version })),
+      ...searches.map(({ id, name, version }) => ({ id, name, kind:'http_search', version }))], unavailable: problems
   };
 }
 
@@ -81,7 +83,7 @@ export function visibleTarget(target: ReturnType<typeof targetPolicy>, commercia
 }
 
 export function signatureImpact(store: Store, db: PolicyReader, projection: ReturnType<typeof calculatePolicy>,
-  dataDir: string, at: number, page: ReturnType<typeof pagination>) {
+  dataDir: string, at: number, pages: Record<'members' | 'devices', ReturnType<typeof pagination>>) {
   const changes = new Map<string, string[]>();
   for (const member of projection.members) {
     if (member.status !== 'active') continue;
@@ -96,12 +98,23 @@ export function signatureImpact(store: Store, db: PolicyReader, projection: Retu
      FROM devices d LEFT JOIN policy_device_applications a ON a.device_id=d.id
      WHERE d.status='active' AND d.token_expires_at>? ORDER BY d.id`, [iso(at)]);
   const affected = devices.filter(device => changes.has(device.user_id));
-  const items = affected.slice(page.offset, page.offset + page.limit).map(device => {
+  const deviceCounts = new Map<string, number>();
+  for (const device of affected) deviceCounts.set(device.user_id, (deviceCounts.get(device.user_id) ?? 0) + 1);
+  const { members: memberPage, devices: devicePage } = pages;
+  const memberIds = [...changes.keys()].sort().slice(memberPage.offset, memberPage.offset + memberPage.limit);
+  const names = new Map(store.system.all<{ id: string; name: string }>(
+    'SELECT id,name FROM platform_users WHERE id IN (SELECT value FROM json_each(?))', [JSON.stringify(memberIds)]
+  ).map(row => [row.id, row.name]));
+  const members = memberIds.map(id => ({
+    user_id: id, name: names.get(id) ?? id, changed_clauses: changes.get(id)!, device_count: deviceCounts.get(id) ?? 0
+  }));
+  const items = affected.slice(devicePage.offset, devicePage.offset + devicePage.limit).map(device => {
     const target = targetPolicy(store, db, projection.materialized.get('member:' + device.user_id)!, dataDir, at, device);
     return {
       device_id: device.id, user_id: device.user_id, os: device.os, arch: device.arch, applied_policy_revision: device.policy_revision,
       changed_clauses: changes.get(device.user_id), unavailable: target.unavailable
     };
   });
-  return { member_count: changes.size, device_count: affected.length, devices: page.page(items, affected.length) };
+  return { member_count: changes.size, device_count: affected.length, members: memberPage.page(members, changes.size),
+    devices: devicePage.page(items, affected.length) };
 }

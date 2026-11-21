@@ -18,18 +18,26 @@ export function toolSnapshot(store: Store, sql: Transaction, device: string, pla
   });
 }
 type Call = { device_id: string; session_id: string; agent_id: string; native_id: string; release_id: string; user_id: string; month: string; fee_milli: number; status: string };
+export function postToolCharge(sql: Transaction, call: Call, packageUsed: number, at: number, label: string) {
+  const ledgerId = 'led_' + ulid(), time = iso(at);
+  const update = sql.run(`UPDATE commerce_tool_calls SET status='charged',package_used=?,settled_at=?
+    WHERE device_id=? AND session_id=? AND agent_id=? AND native_id=? AND status=?
+      AND status IN ('awaiting_result','pending_funds') AND ledger_id IS NULL`,
+    [packageUsed, time, call.device_id, call.session_id, call.agent_id, call.native_id, call.status]);
+  if (!update.changes) return false;
+  sql.run(`INSERT INTO ledger(id,kind,amount_milli,user_id,request_ref,at,note)
+    VALUES(?,'settle',?,?,?,?,?)`, [ledgerId, call.fee_milli, call.user_id, call.native_id, time, label + ' · ' + call.release_id]);
+  sql.run("UPDATE commerce_tool_calls SET ledger_id=? WHERE device_id=? AND session_id=? AND agent_id=? AND native_id=?",
+    [ledgerId, call.device_id, call.session_id, call.agent_id, call.native_id]);
+  return true;
+}
 function charge(sql: Transaction, call: Call, at: number) {
   const nowMonth = commerceMonth(at);
   const funds = packageFunds(sql, at);
   const wallet = balance(sql, at);
   const grant = call.month === nowMonth ? Math.min(call.fee_milli, funds.package_available_milli) : 0;
   if (wallet.balance_milli - funds.package_available_milli + grant < call.fee_milli) return false;
-  const ledgerId = 'led_' + ulid(), time = iso(at);
-  sql.run(`INSERT INTO ledger(id,kind,amount_milli,user_id,request_ref,at,note)
-    VALUES(?,'settle',?,?,?,?,?)`, [ledgerId, call.fee_milli, call.user_id, call.native_id, time, 'MCP 按次 · ' + call.release_id]);
-  sql.run("UPDATE commerce_tool_calls SET status='charged',ledger_id=?,package_used=?,settled_at=? WHERE device_id=? AND session_id=? AND agent_id=? AND native_id=?",
-    [ledgerId, grant, time, call.device_id, call.session_id, call.agent_id, call.native_id]);
-  return true;
+  return postToolCharge(sql, call, grant, at, 'MCP 按次');
 }
 export function settlePendingTools(sql: Transaction, at: number) {
   for (const row of sql.all<Call>("SELECT * FROM commerce_tool_calls WHERE status='pending_funds' ORDER BY called_at LIMIT 256")) charge(sql, row, at);
@@ -51,7 +59,7 @@ function matchReceipt(sql: Transaction, key: ToolKey, user: string, runtime: str
   }
   if (row.result_error === null) return false;
   const status = row.result_error ? 'failed' : 'pending_funds';
-  const update = sql.run("UPDATE commerce_tool_calls SET status=? WHERE status='awaiting_result' AND " + identity, [status, ...key]);
+  const update = sql.run("UPDATE commerce_tool_calls SET status=? WHERE source_kind='mcp' AND status='awaiting_result' AND " + identity, [status, ...key]);
   sql.run('DELETE FROM commerce_tool_receipts WHERE ' + identity, key);
   if (!update.changes || row.result_error) return false;
   return charge(sql, sql.get<Call>('SELECT * FROM commerce_tool_calls WHERE ' + identity, key)!, at);
@@ -71,8 +79,8 @@ export function toolEvent(sql: Transaction, device: string, user: string, row: {
   const native = row.payload.tool_call_id, agent = row.payload.agent_id ?? '';
   if (typeof native !== 'string' || !native || native.length > 256 || typeof agent !== 'string' || agent.length > 256) return false;
   const key: ToolKey = [device, row.session, agent, native];
-  const call = sql.get<{ status: string }>('SELECT status FROM commerce_tool_calls WHERE ' + identity, key);
-  if (call && call.status !== 'awaiting_result') return false;
+  const call = sql.get<{ status: string; source_kind: string }>('SELECT status,source_kind FROM commerce_tool_calls WHERE ' + identity, key);
+  if (call && (call.source_kind !== 'mcp' || call.status !== 'awaiting_result')) return false;
   if (row.kind === 'tool_call') {
     const name = row.payload.tool;
     if (typeof name !== 'string' || !name.startsWith('mcp__')) return false;

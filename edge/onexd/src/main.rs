@@ -37,6 +37,11 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let operation = args.next();
+    if operation.as_deref() == Some(std::ffi::OsStr::new("tool-search-stdio")) {
+        let config = args.next().map(PathBuf::from).context("missing hosted search configuration")?;
+        anyhow::ensure!(args.next().is_none(), "unexpected hosted search arguments");
+        return onexd::hosted_search::stdio(&config).await;
+    }
     if operation.as_deref() == Some(std::ffi::OsStr::new("workbuddy-hook")) {
         let policy = args.next().map(PathBuf::from).context("missing WorkBuddy hook policy")?;
         anyhow::ensure!(args.next().is_none(), "unexpected WorkBuddy hook arguments");
@@ -104,6 +109,7 @@ async fn run(home: PathBuf, started_at: time::OffsetDateTime) -> Result<()> {
 
     let sock_path = home.join(SOCKET_NAME);
     let listener = ipc::bind(&sock_path).await?;
+    outbox.recover_desktop_sessions()?;
 
     // 本机令牌每次启动重新生成，写到 0600 文件里，供 Agent 启动器读取。
     let local_token = id::token();

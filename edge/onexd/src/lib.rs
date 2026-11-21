@@ -10,6 +10,8 @@ mod desktop_bundle;
 mod desktop_launch;
 pub mod desktop_sessions;
 mod diagnostics;
+#[doc(hidden)]
+pub mod hosted_search;
 pub mod id;
 pub mod ipc;
 mod kimi_capture;

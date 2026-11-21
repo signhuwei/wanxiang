@@ -88,7 +88,7 @@ Server 持有生效策略与发包目标，Edge 持有最后成功应用的运�
 | GET `P/contracts`、`P/contracts/:tenant_id` | 以租户为对象的台账及详情。在未签发的租户里，两个业务修订均为 0 |
 | GET `P/contracts/:tenant_id/signatures`、`P/contracts/:tenant_id/signatures/:revision` | 签发历史按修订倒序分页；以修订读取不可变表单 |
 | GET `T/signatures` | 户主、租户管理员分页只读签发摘要，返回签发修订及元数据 |
-| POST `P/contracts/:tenant_id/preview`、`P/contracts/:tenant_id/signatures` | 预览及签发使用同一份草稿。签发重新执行全部校验 |
+| POST `P/contracts/:tenant_id/preview`、`P/contracts/:tenant_id/signatures` | 预览及签发使用同一份草稿。签发预览分别分页列出受影响成员和设备，成员页使用 `member_cursor`，设备页使用 `cursor`。签发重新执行全部校验 |
 | GET/POST `P/contracts/:tenant_id/recharges` | 平台查看或登记充值，详情追加 `/:ledger_id` |
 | GET `T/recharges`、`T/recharges/:ledger_id` | 户主、租户管理员查询本租户相同的充值凭证。自助写入未开放 |
 | GET/POST `P/contracts/:tenant_id/discounts/:month` | 查询已结算月份，或由平台手动触发该月关账。月份格式 `YYYY-MM`，写入需要 `Idempotency-Key` |

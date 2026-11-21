@@ -8,6 +8,9 @@ import { receiveArtifact } from './artifact-upload';
 import { bearer, hash, iso } from './credentials';
 import { enumField, expectRevision, pagination, platformActor, type ManagementOptions } from './management';
 import { readPolicyHot } from './policy-data';
+import { encryptProviderSecret } from './provider-secret';
+import { toolSearchRoutes } from './tool-search';
+import type { RunSearch } from './tool-search-upstream';
 import type { Store, Transaction } from './store';
 
 const base = '/v1/platform/tool-releases';
@@ -20,7 +23,7 @@ const maxLaunchBytes = 96 * 1024 * 1024;
 const releaseId = /^tool_[0-9A-HJKMNP-TV-Z]{26}$/;
 const cliAgents = ['claude-code', 'codex', 'kimi-code'] as const;
 type ToolAgent = typeof cliAgents[number];
-type ToolKind = 'skill' | 'mcp' | 'hook';
+type ToolKind = 'skill' | 'mcp' | 'hook' | 'http_search';
 type ToolOS = 'macos' | 'windows';
 type ToolArch = 'arm64' | 'x64';
 type ToolStatus = 'draft' | 'published' | 'disabled';
@@ -31,7 +34,7 @@ export type ToolRelease = {
   sha256: string | null; size: number | null; status: ToolStatus; revision: number; created_at: string;
 };
 export type ToolReleaseDescriptor = {
-  id: string; name: string; version: string; kind: ToolKind; agents: ToolAgent[];
+  id: string; name: string; version: string; kind: Exclude<ToolKind, 'http_search'>; agents: ToolAgent[];
   os: ToolOS | null; arch: ToolArch | null; entrypoint: string | null; args: string[];
   sha256: string; size: number;
 };
@@ -57,7 +60,7 @@ export function validateToolSet(db: Pick<Transaction, 'all'>, ids: string[], fie
         const installed = new Set<string>();
         let bytes = 0;
         for (const [index, row] of rows.entries()) {
-          if (!agents[index]?.includes(agent) || (row.kind !== 'skill' && (row.os !== os || row.arch !== arch))) continue;
+          if (row.kind === 'http_search' || !agents[index]?.includes(agent) || (row.kind !== 'skill' && (row.os !== os || row.arch !== arch))) continue;
           const key = `${row.kind}:${row.name.toLowerCase()}`;
           bytes += row.size ?? 0;
           if (installed.has(key) || bytes > maxLaunchBytes) invalid(field);
@@ -83,16 +86,17 @@ function releaseMetadata(row: ToolRelease) {
     entrypoint: row.entrypoint, args: JSON.parse(row.args_json) as string[] };
 }
 
-export function toolReleaseView(row: ToolRelease, dataDir: string) {
+export function toolReleaseView(row: ToolRelease, dataDir: string, endpoint?: string) {
   const artifact_cached = hasToolArtifact(dataDir, row);
   const actions = ['read'];
   if (row.status === 'draft') {
-    if (row.sha256 === null) actions.push('upload');
-    if (artifact_cached) actions.push('publish');
+    if (row.kind !== 'http_search' && row.sha256 === null) actions.push('upload');
+    if (row.kind === 'http_search' ? !!endpoint : artifact_cached) actions.push('publish');
   }
   if (row.status !== 'disabled') actions.push('disable');
   return { ...releaseMetadata(row), agents: JSON.parse(row.agents_json) as ToolAgent[], sha256: row.sha256, size: row.size,
-    status: row.status, revision: row.revision, created_at: row.created_at, artifact_cached, actions };
+    status: row.status, revision: row.revision, created_at: row.created_at, artifact_cached,
+    ...(endpoint && { endpoint, has_key: true }), actions };
 }
 
 export function allowedToolReleases(store: Store, dataDir: string, policy: ToolPolicy | null, os?: string, arch?: string,
@@ -113,10 +117,11 @@ export function allowedToolReleases(store: Store, dataDir: string, policy: ToolP
     const agents = (JSON.parse(row.agents_json) as ToolAgent[]).filter(agent => allowed.has(agent));
     if (row.status !== 'published') onUnavailable?.(row.id, 'tool_release_disabled');
     else if (!agents.length) onUnavailable?.(row.id, 'tool_agent_denied');
+    else if (row.kind === 'http_search') continue;
     else if (os !== undefined && row.kind !== 'skill' && (row.os !== platform || row.arch !== arch)) {
       onUnavailable?.(row.id, 'tool_platform_mismatch');
     } else if (!hasToolArtifact(dataDir, row)) onUnavailable?.(row.id, 'tool_artifact_missing');
-    else releases.push({ ...releaseMetadata(row), agents, sha256: row.sha256, size: row.size });
+    else releases.push({ ...releaseMetadata(row), kind: row.kind, agents, sha256: row.sha256, size: row.size });
   }
   return releases;
 }
@@ -129,19 +134,28 @@ function portablePath(value: unknown, name: string) {
 }
 
 function parseRelease(body: Record<string, unknown>) {
-  if (Object.keys(body).some(key => !['name', 'version', 'kind', 'agents', 'os', 'arch', 'entrypoint', 'args'].includes(key))) invalid('body');
+  if (Object.keys(body).some(key => !['name', 'version', 'kind', 'agents', 'os', 'arch', 'entrypoint', 'args', 'endpoint', 'secret'].includes(key))) invalid('body');
   const name = field(body.name, 'name', 48);
   if (!/^[a-z0-9][a-z0-9-]*$/.test(name) || reserved.test(name)) invalid('name');
   const version = field(body.version, 'version', 64);
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(version)) invalid('version');
-  const kind = enumField(body.kind, 'kind', ['skill', 'mcp', 'hook']);
+  const kind = enumField(body.kind, 'kind', ['skill', 'mcp', 'hook', 'http_search']);
   if (!Array.isArray(body.agents) || !body.agents.length || body.agents.length > cliAgents.length) invalid('agents');
   const agents = body.agents.map(agent => enumField(agent, 'agents', cliAgents));
   if (new Set(agents).size !== agents.length) invalid('agents');
   const common = { name, version, kind, agents_json: JSON.stringify(agents), args_json: '[]' };
+  if (kind === 'http_search') {
+    for (const key of ['os', 'arch', 'entrypoint', 'args']) if (body[key] !== undefined) invalid(key);
+    const endpoint = URL.parse(field(body.endpoint, 'endpoint', 1024));
+    if (!endpoint || endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) invalid('endpoint');
+    const secret = field(body.secret, 'secret', 8192);
+    if (!/^[\x21-\x7e]+$/.test(secret)) invalid('secret');
+    return { metadata: { ...common, os: null, arch: null, entrypoint: null }, target: { endpoint: endpoint.href, secret } };
+  }
+  if (body.endpoint !== undefined || body.secret !== undefined) invalid('body');
   if (kind === 'skill') {
     for (const key of ['os', 'arch', 'entrypoint', 'args']) if (body[key] !== undefined) invalid(key);
-    return { ...common, os: null, arch: null, entrypoint: null };
+    return { metadata: { ...common, os: null, arch: null, entrypoint: null } };
   }
   const os = enumField(body.os, 'os', ['macos', 'windows']);
   const arch = enumField(body.arch, 'arch', ['arm64', 'x64']);
@@ -152,7 +166,7 @@ function parseRelease(body: Record<string, unknown>) {
     || Buffer.byteLength(arg) > 256 || /[\x00-\x1f\x7f]/.test(arg))) invalid('args');
   if (kind === 'hook' && (os !== 'macos' || agents.length !== 1 || agents[0] !== 'claude-code' || args.length)) invalid('agents', 'os', 'args');
   if (Buffer.byteLength(JSON.stringify(args)) > 4096) invalid('args');
-  return { ...common, os, arch, entrypoint, args_json: JSON.stringify(args) };
+  return { metadata: { ...common, os, arch, entrypoint, args_json: JSON.stringify(args) } };
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -242,11 +256,13 @@ function requireRelease(db: Reader, id: string) {
 function requireUploadable(row: ToolRelease, revision: string | undefined) {
   if (!revision || !/^[1-9]\d{0,15}$/.test(revision)) invalid('revision');
   expectRevision(Number(revision), row.revision);
-  if (row.status !== 'draft' || row.sha256 !== null) throw new ApiError('conflict', { revision: row.revision });
+  if (row.kind === 'http_search' || row.status !== 'draft' || row.sha256 !== null) throw new ApiError('conflict', { revision: row.revision });
 }
 
-export function toolReleaseRoutes(app: Hono, store: Store, opts: ManagementOptions) {
-  const view = (row: ToolRelease) => toolReleaseView(row, opts.dataDir);
+export function toolReleaseRoutes(app: Hono, store: Store, opts: ManagementOptions, runSearch?: RunSearch) {
+  const endpoint = (row: ToolRelease) => row.kind === 'http_search'
+    ? store.system.get<{ endpoint: string }>('SELECT endpoint FROM tool_search_targets WHERE release_id=?', [row.id])?.endpoint : undefined;
+  const view = (row: ToolRelease) => toolReleaseView(row, opts.dataDir, endpoint(row));
   const directory = join(opts.dataDir, 'tool-artifacts');
   app.get(base, (c) => {
     platformActor(store, c, opts.now());
@@ -262,8 +278,8 @@ export function toolReleaseRoutes(app: Hono, store: Store, opts: ManagementOptio
   app.post(base, async (c) => {
     const at = opts.now();
     const actor = platformActor(store, c, at);
-    const metadata = parseRelease(await json(c));
-    const op = operation(c, opts.codeSecret, at, actor, metadata);
+    const { metadata, target } = parseRelease(await json(c));
+    const op = operation(c, opts.codeSecret, at, actor, target ? { metadata, target } : metadata);
     return store.system.write((sql) => {
       requirePlatform(sql, actor);
       const cached = op.read(sql);
@@ -274,8 +290,13 @@ export function toolReleaseRoutes(app: Hono, store: Store, opts: ManagementOptio
       sql.run(`INSERT INTO tool_releases (id, name, version, kind, agents_json, os, arch, entrypoint, args_json, status, revision, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [row.id, row.name, row.version, row.kind, row.agents_json, row.os, row.arch, row.entrypoint, row.args_json, row.status, row.revision, row.created_at]);
+      if (target) {
+        if (!opts.masterKey) throw new ApiError('conflict', { reason: 'master_key_required' });
+        sql.run('INSERT INTO tool_search_targets(release_id,endpoint,secret_ciphertext) VALUES(?,?,?)',
+          [row.id, target.endpoint, encryptProviderSecret(opts.masterKey, row.id, target.secret)]);
+      }
       audit(sql, actor, 'create', row, at);
-      return op.complete(sql, { status: 201, payload: view(row) });
+      return op.complete(sql, { status: 201, payload: toolReleaseView(row, opts.dataDir, target?.endpoint) });
     });
   });
 
@@ -327,7 +348,8 @@ export function toolReleaseRoutes(app: Hono, store: Store, opts: ManagementOptio
         if (cached) return { response: cached, changed: false };
         const row = requireRelease(sql, id);
         expectRevision(body.revision, row.revision);
-        if (row.status === 'disabled' || (action === 'publish' && (row.status !== 'draft' || !hasToolArtifact(opts.dataDir, row)))) {
+        const configured = row.kind === 'http_search' ? !!endpoint(row) : hasToolArtifact(opts.dataDir, row);
+        if (row.status === 'disabled' || (action === 'publish' && (row.status !== 'draft' || !configured))) {
           throw new ApiError('conflict', { revision: row.revision });
         }
         const next = { ...row, status, revision: row.revision + 1 };
@@ -360,4 +382,5 @@ export function toolReleaseRoutes(app: Hono, store: Store, opts: ManagementOptio
       'content-disposition': 'attachment; filename="onex-tool.json"', 'x-content-type-options': 'nosniff',
     } });
   });
+  toolSearchRoutes(app, store, opts, runSearch);
 }

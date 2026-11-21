@@ -1683,6 +1683,7 @@ mod tests {
                 keys: HashMap::new(),
                 runtime: Default::default(),
                 commerce_plan_id: None,
+                search_tools: vec![],
                 balance: Some(BalanceRouting {
                     mode: BalanceMode::Restricted,
                     aliases: vec![BalanceAlias { model: "claude-*".into(), protocol: "anthropic".into() }],
@@ -1763,6 +1764,7 @@ mod tests {
                 notices: vec![],
                 balance: None,
                 commerce_plan_id: None,
+                search_tools: vec![],
                 keys: [
                     ("one".into(), Zeroizing::new("primary-key".into())),
                     ("two".into(), Zeroizing::new("backup-key".into())),

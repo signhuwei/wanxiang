@@ -255,13 +255,13 @@ pub(crate) async fn download(origin: &str, token: &str, releases: &[ToolRelease]
     Ok(tools)
 }
 
-struct Mcp<'a> {
-    name: &'a str,
+struct Mcp {
+    name: String,
     command: PathBuf,
-    args: &'a [String],
+    args: Vec<String>,
 }
 
-fn install<'a>(bundles: &'a [Bundle], executable_root: &Path, skills: &Path) -> Result<Vec<Mcp<'a>>> {
+fn install(bundles: &[Bundle], executable_root: &Path, skills: &Path) -> Result<Vec<Mcp>> {
     let mut servers = Vec::new();
     for bundle in bundles {
         let destination = match bundle.kind.as_str() {
@@ -283,7 +283,11 @@ fn install<'a>(bundles: &'a [Bundle], executable_root: &Path, skills: &Path) -> 
         }
         if bundle.kind == "mcp" {
             let relative = bundle.entrypoint.as_deref().context("missing managed MCP entrypoint")?;
-            servers.push(Mcp { name: &bundle.name, command: destination.join(relative), args: &bundle.args });
+            servers.push(Mcp {
+                name: bundle.name.clone(),
+                command: destination.join(relative),
+                args: bundle.args.clone(),
+            });
         }
     }
     Ok(servers)
@@ -304,11 +308,11 @@ fn mcp_environment(launch: &crate::launch::Launch) -> BTreeMap<String, String> {
     env
 }
 
-fn mcp_json(servers: &[Mcp<'_>], env: &BTreeMap<String, String>) -> Result<Vec<u8>> {
+fn mcp_json(servers: &[Mcp], env: &BTreeMap<String, String>) -> Result<Vec<u8>> {
     let mut configuration = serde_json::Map::new();
     for server in servers {
         configuration.insert(
-            server.name.to_owned(),
+            server.name.clone(),
             json!({
                 "command": path_text(&server.command)?, "args": server.args, "env": env,
             }),
@@ -323,9 +327,20 @@ fn replace_argument(args: &mut [String], option: &str, value: String) -> Result<
     Ok(())
 }
 
+pub(crate) struct SearchLaunch<'a> {
+    pub releases: &'a [onex_core::ws::SearchTool],
+    pub capability: &'a str,
+    pub socket: &'a Path,
+}
+
 /// Only called on a new, private launch before passing its arguments to the CLI.
-pub(crate) fn apply(agent: &str, launch: &mut crate::launch::Launch, bundles: &[Bundle]) -> Result<()> {
-    if bundles.is_empty() {
+pub(crate) fn apply(
+    agent: &str,
+    launch: &mut crate::launch::Launch,
+    bundles: &[Bundle],
+    search: Option<SearchLaunch<'_>>,
+) -> Result<()> {
+    if bundles.is_empty() && search.is_none() {
         return Ok(());
     }
     let root = launch.run_dir.join("managed-tools");
@@ -338,7 +353,28 @@ pub(crate) fn apply(agent: &str, launch: &mut crate::launch::Launch, bundles: &[
         "codex" => codex_skills_root(&launch.config_dir)?,
         _ => root.join("skills"),
     };
-    let servers = install(bundles, &root, &skills)?;
+    let mut servers = install(bundles, &root, &skills)?;
+    if let Some(search) = search {
+        let program = std::env::current_exe().context("找不到 OneX 搜索工具执行程序")?;
+        for release in search.releases {
+            // Bundle names cannot contain underscores, so native tool event billing cannot see this as a paid stdio artifact.
+            let name = format!("onex_search_{}", release.id.to_ascii_lowercase());
+            let config = root.join(format!("{name}.json"));
+            let payload = crate::hosted_search::McpConfig {
+                socket: search.socket.to_owned(),
+                launch_id: launch.launch_id.clone(),
+                release_id: release.id.clone(),
+                name: release.name.clone(),
+                capability: search.capability.to_owned(),
+            };
+            crate::launch::write_private(&config, &serde_json::to_vec(&payload)?)?;
+            servers.push(Mcp {
+                name,
+                command: program.clone(),
+                args: vec!["tool-search-stdio".into(), path_text(&config)?.into()],
+            });
+        }
+    }
 
     match agent {
         "claude-code" => {
@@ -383,7 +419,7 @@ pub(crate) fn apply(agent: &str, launch: &mut crate::launch::Launch, bundles: &[
                         write!(config, "{separator}{}", crate::codex_launch::quote(arg))?;
                     }
                     config.push_str("]\nrequired = true\n[mcp_servers.");
-                    config.push_str(server.name);
+                    config.push_str(&server.name);
                     config.push_str(".env]\n");
                     for name in env.keys() {
                         writeln!(config, "{} = \"\"", crate::codex_launch::quote(name))?;
@@ -579,7 +615,7 @@ mod tests {
             client_env: &BTreeMap::new(),
         })
         .unwrap();
-        apply("claude-code", &mut launch, &[bundle]).unwrap();
+        apply("claude-code", &mut launch, &[bundle], None).unwrap();
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(launch.run_dir.join("settings.json")).unwrap()).unwrap();
         assert_eq!(settings["model"], "managed");
@@ -608,6 +644,11 @@ mod tests {
         let client_env = BTreeMap::new();
         let program = std::env::current_exe().unwrap();
         let secret = "router-only-launch-token";
+        let hosted = [onex_core::ws::SearchTool {
+            id: "tool_01M7YV31G92NTSZM04NQKFV5Z7".into(),
+            name: "approved-search".into(),
+            agents: vec!["claude-code".into(), "codex".into(), "kimi-code".into()],
+        }];
         for agent in ["claude-code", "codex", "kimi-code"] {
             let mut launch = crate::launch::prepare(&crate::launch::Request {
                 agent,
@@ -620,7 +661,14 @@ mod tests {
                 client_env: &client_env,
             })
             .unwrap();
-            apply(agent, &mut launch, &tools).unwrap();
+            let socket = home.join("onexd.sock");
+            apply(
+                agent,
+                &mut launch,
+                &tools,
+                Some(SearchLaunch { releases: &hosted, capability: "search-only", socket: &socket }),
+            )
+            .unwrap();
             let arg = |flag: &str| launch.args.windows(2).find(|pair| pair[0] == flag).unwrap()[1].clone();
             let (skill_root, config) = match agent {
                 "claude-code" => {
@@ -647,6 +695,17 @@ mod tests {
                 assert_eq!(configuration["mcpServers"]["probe"]["env"]["ANTHROPIC_API_KEY"], "");
             }
             assert!(!config.contains(secret));
+            assert!(config.contains("onex_search_tool_01m7yv31g92ntszm04nqkfv5z7"));
+            assert!(config.contains("tool-search-stdio"));
+            assert!(!config.contains("search-only"));
+            let search_file = launch.run_dir.join("managed-tools/onex_search_tool_01m7yv31g92ntszm04nqkfv5z7.json");
+            let search_config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(search_file).unwrap()).unwrap();
+            assert_eq!(search_config["launch_id"], launch.launch_id);
+            assert_eq!(search_config["capability"], "search-only");
+            assert_eq!(search_config["release_id"], hosted[0].id);
+            assert!(search_config.get("endpoint").is_none());
+            assert!(search_config.get("secret").is_none());
             let mcp_file = launch.run_dir.join("managed-tools/mcp/probe/bin/probe.exe");
             assert_eq!(std::fs::read_to_string(&mcp_file).unwrap(), "inert MCP marker");
             assert!(!cwd.join("skills").exists());

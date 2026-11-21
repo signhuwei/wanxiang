@@ -29,14 +29,18 @@ function account(store: Store, tenant: string, sql: Transaction, at: number) {
     SELECT c.month,CASE WHEN l.status='active' THEN c.package_reserved ELSE 0 END reserved,c.package_used used
       FROM commerce_leases c JOIN leases l ON c.lease_id=l.id
     UNION ALL SELECT month,0,package_used FROM commerce_tool_calls WHERE status='charged'
+    UNION ALL SELECT month,package_reserved,0 FROM commerce_tool_calls
+      WHERE source_kind='http_search' AND status='awaiting_result' AND reserved_until>?
   ) SELECT p.*,coalesce(sum(f.reserved),0) reserved_milli,coalesce(sum(f.used),0) used_milli,
     CASE WHEN p.month<? THEN p.grant_milli-coalesce(sum(f.reserved+f.used),0) ELSE 0 END expired_milli
-    FROM commerce_packages p LEFT JOIN funded f ON f.month=p.month GROUP BY p.month ORDER BY p.month DESC LIMIT 24`, [month]);
+    FROM commerce_packages p LEFT JOIN funded f ON f.month=p.month GROUP BY p.month ORDER BY p.month DESC LIMIT 24`, [iso(at), month]);
   return {
     tenant_id: tenant, month, plan, ...wallet, monthly_sources: { package_used_milli, permanent_used_milli: wallet.month_used_milli - package_used_milli }, permanent_available_milli: wallet.balance_milli - funds.package_available_milli, package_available_milli: funds.package_available_milli,
     packages,
     model_budgets: (plan?.terms.model_budgets ?? []).map(r => ({ ...r, ...modelUsage(sql, r.model_id, month) })), tiers: tierTable(store, at, plan),
-    tool_calls: sql.all('SELECT release_id,native_id,fee_milli,status,called_at,settled_at FROM commerce_tool_calls ORDER BY called_at DESC LIMIT 100'), actions: ['read']
+    tool_calls: sql.all(`SELECT release_id,native_id,source_kind,fee_milli,called_at,settled_at,
+      CASE WHEN source_kind='http_search' AND status='awaiting_result' AND reserved_until<=? THEN 'failed' ELSE status END status
+      FROM commerce_tool_calls ORDER BY called_at DESC LIMIT 100`, [iso(at)]), actions: ['read']
   };
 }
 type PlanRow = Parameters<typeof planRow>[0];

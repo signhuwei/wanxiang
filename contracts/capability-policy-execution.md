@@ -17,7 +17,7 @@
 
 ## 管理和执行协议
 
-平台签发沿用 `POST /v1/platform/policy/contracts/:tenant_id/preview`。返回 `impact`，其中记录受影响的成员和设备总数以及分页的设备诊断。源版本或时间戳本身不构成执行差异。
+平台签发沿用 `POST /v1/platform/policy/contracts/:tenant_id/preview`。`impact` 返回 `member_count`、`device_count`，以及分别分页的 `members` 和 `devices`。成员明细按 `user_id` 排序，每项含 `user_id`、`name`、`changed_clauses`、`device_count`。未注册有效设备的受影响成员也会列出，设备数为 0。分页请求使用同一份签发草稿。成员页用 `member_cursor`，设备页用 `cursor`，两页共享 `limit`。每次仍校验平台身份和草稿的期望修订。源版本或时间戳本身不构成执行差异。
 
 配置版本列表使用 `GET /v1/policy/configurations/:scope/:subject_id/history`。预览 `POST …/preview` 与发布 `PUT …/:subject_id` 均接受 `restore_revision` 或明确的模板与条目选择；两种输入互斥。请求携带当前平台和策略修订，发布带幂等键。
 
@@ -40,7 +40,7 @@ Edge 在 hello 中声明 policy_runtime_v1。需要请求级约束、商业方�
 | 项 | 功能 | 可复核的入口 |
 | --- | --- | --- |
 | 1 | 户主编辑配置时左侧保留当前值，右侧填写、预览和发布 | 租户 → 合约 → 合约条目 → 编辑配置 |
-| 2 | 签发前统计受影响成员与设备，按成员和系统查看模型、费率、发行及不可用原因 | 平台 → 能力合约 → 平台合约 → 租户 → 签发记录 |
+| 2 | 签发前列出受影响成员与设备及不可用原因，按成员和系统查看模型、费率和发行 | 平台 → 能力合约 → 平台合约 → 租户 → 签发记录 |
 | 3 | 以历史配置预览并生成新版本，按当前签发边界校验 | 租户 → 合约 → 合约条目 → 配置版本 |
 | 4 | 固定 Agent 发行，按系统、架构和制品身份限制下载与启动 | 条目 `access.releases`、设备下发和制品下载接口 |
 | 5 | 发布、授权和运行工具 Hook | 能力管理 → Tools；macOS Claude Code 的 PostToolUse |
@@ -49,12 +49,12 @@ Edge 在 hello 中声明 policy_runtime_v1。需要请求级约束、商业方�
 | 8 | 按优先级选择主备上游 | 租户自有上游的优先级、条目 `route.failover` |
 | 9 | 限制成员 RPM、TPM、并发及单 Key 并发 | 条目 `rate.member_rpm`、`rate.member_tpm`、`rate.member_concurrent`、`rate.key_concurrent` |
 | 10 | 各设备在单模型月预算内预留和结算 | 商业计费方案 → 单模型月预算；租约分配和续约 |
-| 11 | 按会话作者的留存期限清理正文，保留费用与审计 | 条目 `session.retention_days`、会话读取及周期清理 |
+| 11 | 按会话作者的留存期限清理正文，保留费用与审计 | 条目 `session.retention_days`、桌面会话关闭及恢复事件、会话读取及周期清理 |
 | 12 | 控制导出及租户内的定向分享和撤销 | 条目 `session.export`、`session.share`；租户 → 监察 |
 | 13 | 按 Provider 和公网出口权限限制实际连接 | 条目 `network.providers`、`network.public`；Edge 路由 |
 | 14 | 户主登记独立密钥、模型映射及优先级 | 租户 → 合约 → 自有上游；条目 `upstream.custom` |
 | 15 | 以基准模型输出价计算五档倍率 | 能力合约 → 商业计费 → 模型档位 |
-| 16 | 按受管外部工具的成功调用计费，重复和迟到回执可核对 | 商业计费方案 → 工具调用费；租户商业计费明细 |
+| 16 | 受管 MCP 和独立 HTTP 搜索按成功调用计费，可核对调用回执 | 能力管理 → Tools；商业计费方案 → 工具调用费；租户商业计费明细 |
 | 17 | 月包按期发放、优先消费、到期与永久余额分别结算 | 商业计费方案 → 每月发放；租户 → 橡皮 |
 | 18 | WorkBuddy 原厂 GUI 的多任务归属、采集和计费 | [WorkBuddy 适配规格](../docs/specs/agents/workbuddy.md)及精确发行资格 |
 | 19 | DeepSeek Harness 原厂 GUI 的会话恢复、采集和计费 | [DeepSeek 适配规格](../docs/specs/agents/deepseek-desktop.md)及精确发行资格 |

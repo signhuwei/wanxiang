@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use crate::outbox::Outbox;
+use crate::outbox::{DesktopActivity, Outbox, desktop_launch_key, now_ms};
 use crate::router::Router;
 use crate::state::LaunchBinding;
 
@@ -257,8 +257,15 @@ impl DesktopSessions {
         let session = crate::native_capture::session_id(&launch.device, &launch.agent, &batch.native_id);
         let key = format!("desktop:{session}");
         let cursor = launch.outbox.cursor(&key)?;
+        let deepseek = launch.agent == "deepseek-desktop";
+        // The plugin scans the whole managed journal to recover late writes.
+        // A scan alone cannot start a previously unbound desktop session.
+        if deepseek && cursor.is_none() && !batch.bind_model {
+            return Ok(None);
+        }
         let mut seq = cursor.as_ref().and_then(|value| value["seq"].as_u64()).unwrap_or(0);
-        let at = crate::pricing::format_ms(crate::outbox::now_ms());
+        let observed = now_ms();
+        let at = crate::pricing::format_ms(observed);
         let mut events = Vec::new();
         let event = |kind, payload, offset: Option<u64>| json!({"session_id":session, "kind":kind, "payload":payload, "source_offset":offset, "at":at});
         if let Some(saved) = &cursor {
@@ -275,6 +282,7 @@ impl DesktopSessions {
                 None,
             ));
         }
+        let new_stage = events.len();
         for record in batch.records {
             if record.seq <= seq {
                 continue;
@@ -305,15 +313,29 @@ impl DesktopSessions {
             let mut item = event(kind, payload, Some(record.seq));
             if let Some(time) = record.at_ms {
                 item["at"] = crate::pricing::format_ms(time).into();
+            } else if deepseek {
+                item["at"] = serde_json::Value::Null;
             }
             events.push(item);
         }
-        if !events.is_empty() {
-            launch.outbox.append_events_with_cursor(
+        let next = json!({"seq":seq, "workspace_hash":launch.workspace_hash});
+        if deepseek && (!events.is_empty() || batch.bind_model) {
+            if !launch.outbox.append_desktop_events(
                 events,
                 &key,
-                &json!({"seq":seq, "workspace_hash":launch.workspace_hash}),
-            )?;
+                &next,
+                None,
+                DesktopActivity {
+                    session: &session,
+                    launch: &desktop_launch_key(credential),
+                    live_from: batch.bind_model.then_some(new_stage),
+                    at_ms: observed,
+                },
+            )? {
+                return Ok(None);
+            }
+        } else if !events.is_empty() {
+            launch.outbox.append_events_with_cursor(events, &key, &next)?;
         }
         if !batch.bind_model {
             return Ok(Some(None));
@@ -567,7 +589,7 @@ mod tests {
             native_id: native_id.into(),
             records: vec![Record {
                 seq,
-                at_ms: None,
+                at_ms: Some(now_ms()),
                 kind,
                 text: "visible fixture".into(),
                 call_id: None,
@@ -584,6 +606,11 @@ mod tests {
         let outbox = Arc::new(Outbox::open(&tmp.path().join("outbox.sqlite")).unwrap());
         let sessions = DesktopSessions::default();
         start(&sessions, "launch", "workspace", &outbox);
+        let binding: Batch = serde_json::from_value(json!({
+            "native_id":"original-session", "bind_model":true, "records":[]
+        }))
+        .unwrap();
+        assert!(sessions.receive("launch", binding).unwrap().flatten().is_some());
         let records: Batch = serde_json::from_value(json!({
             "native_id":"original-session", "bind_model":false,
             "records":[
@@ -615,6 +642,7 @@ mod tests {
         assert_ne!(registry.model(&different).unwrap().session_id, id);
         let unspent = registry.receive("before", batch("native", 1, Kind::User)).unwrap().unwrap().unwrap();
         registry.stop("before");
+        outbox.close_desktop_sessions(Some(&desktop_launch_key("before")), Some(now_ms())).unwrap();
         assert!(registry.model(&unspent).is_none());
         assert!(registry.model(&old).is_none());
         assert!(registry.model(&different).is_none());
@@ -629,7 +657,63 @@ mod tests {
         assert_eq!(binding.approved_model.as_deref(), Some("managed-model"));
         registry.receive("after", batch("native", 4, Kind::Assistant)).unwrap();
         let rows = outbox.pending(0, 30).unwrap();
-        assert_eq!(rows.len(), 5);
+        let kinds: Vec<_> = rows
+            .iter()
+            .filter(|row| row.item["session_id"] == id)
+            .map(|row| row.item["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["session_start", "user_message", "session_end", "session_resume", "assistant_message"]);
+        assert_eq!(rows.len(), 8);
+    }
+
+    #[test]
+    fn deepseek_scan_preserves_the_first_new_prompt_until_the_native_turn_binds() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let outbox = Arc::new(Outbox::open(&root.path().join("events.sqlite"))?);
+        let registry = DesktopSessions::default();
+        start(&registry, "before", "workspace", &outbox);
+        let make = |native_id: &str, bind_model, seq: Option<u64>, at_ms| Batch {
+            native_id: native_id.to_owned(),
+            bind_model,
+            records: seq
+                .map(|seq| Record {
+                    seq,
+                    at_ms,
+                    kind: Kind::User,
+                    text: format!("fixture {seq}"),
+                    call_id: None,
+                    tool: None,
+                    failed: false,
+                    truncated: false,
+                })
+                .into_iter()
+                .collect(),
+        };
+        assert!(registry.receive("before", make("unbound", false, Some(1u64), Some(1)))?.is_none());
+        assert!(outbox.pending(0, 10)?.is_empty());
+        registry.receive("before", make("native", true, Some(1), Some(1)))?;
+        registry.stop("before");
+        drop(outbox);
+        let outbox = Arc::new(Outbox::open(&root.path().join("events.sqlite"))?);
+        outbox.recover_desktop_sessions()?;
+        let rows = outbox.pending(0, 10)?;
+        assert_eq!(rows.last().unwrap().item["payload"]["reason"], "daemon_restart");
+        let last = rows.last().unwrap();
+        let closed = crate::pricing::parse_ms(last.item["at"].as_str().unwrap()).unwrap();
+
+        start(&registry, "after", "workspace", &outbox);
+        // A passive scan cannot advance past the prompt that just awakened this session.
+        assert!(registry.receive("after", make("native", false, Some(2), Some(closed + 1)))?.is_none());
+        assert_eq!(outbox.pending(0, 10)?, rows);
+        registry.receive("after", make("native", true, None, None))?;
+        registry.receive("after", make("native", false, Some(2), Some(closed + 1)))?;
+        registry.receive("after", make("native", false, Some(3), None))?;
+        let rows = outbox.pending(0, 10)?;
+        assert_eq!(rows[3].item["kind"], "session_resume");
+        assert_eq!(rows[4].item["payload"]["content"], "fixture 2");
+        assert_eq!(rows[4].item["at"], crate::pricing::format_ms(closed + 1));
+        assert_eq!(rows.len(), 5, "unproven historic records cannot reappear after recovery");
+        Ok(())
     }
     #[tokio::test]
     async fn codex_bills_exact_thread_and_turn_and_retires_the_launch_credential() {

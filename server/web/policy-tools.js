@@ -4,7 +4,7 @@ import { AGENT_LABELS, formatBytes } from './format.js'
 import { idempotencyKey } from './idempotency.js'
 
 const releasePath = '/platform/tool-releases'
-const kindLabels = { skill: 'Skill', mcp: 'MCP（stdio）', hook:'Hook（PostToolUse）' }
+const kindLabels = { skill: 'Skill', mcp: 'MCP（stdio）', hook: 'Hook（PostToolUse）', http_search: 'HTTP 搜索' }
 const statusLabels = { draft: '草稿', published: '已发布', disabled: '已停用' }
 const systemLabels = { macos: 'macOS', windows: 'Windows' }
 const optionList = labels => Object.entries(labels).map(([value, label]) => ({ value, label }))
@@ -22,9 +22,13 @@ const fields = [
   { key: 'entrypoint', label: '启动文件', placeholder: '例如 bin/tool.exe', wide: true },
   { key: 'args', label: '启动参数', hint: '每行一个参数，按行原样传入。', type: 'textarea', wide: true },
 ]
+const searchFields = [
+  { key: 'endpoint', label: 'HTTPS 搜索接口', wide: true },
+  { key: 'secret', label: '上游 Bearer 凭据', type: 'password', wide: true },
+]
 
 export const toolKind = row => kindLabels[row.kind] || row.kind
-export const toolTarget = row => row.os ? `${systemLabels[row.os] || row.os} / ${row.arch}` : '各平台'
+export const toolTarget = row => row.kind === 'http_search' ? 'Server' : row.os ? `${systemLabels[row.os] || row.os} / ${row.arch}` : '各平台'
 export const toolAgents = row => (row.agents || []).map(agent => AGENT_LABELS[agent] || agent).join('、')
 const toolStatus = row => statusLabels[row.status] || row.status
 
@@ -81,8 +85,9 @@ function createDraft(pane, api, signal, done) {
   agents.addEventListener('change', () => {
     selectedAgents.value = [...agents.querySelectorAll('input:checked')].map(box => box.value).join(',')
   })
+  const createFields = [...fields, ...searchFields]
   editForm(pane, {
-    mode: 'create', label: '新建草稿', fields, values: { kind: 'skill', os: 'macos', arch: 'arm64' },
+    mode: 'create', label: '新建草稿', fields: createFields, values: { kind: 'skill', os: 'macos', arch: 'arm64' },
     submit(value, options) {
       if (!value.selected_agents) throw new Error('请至少选择一个适用 Agent')
       const body = { name: value.name?.trim(), version: value.version?.trim(), kind: value.kind, agents: value.selected_agents.split(',') }
@@ -92,7 +97,14 @@ function createDraft(pane, api, signal, done) {
       if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(body.version ?? '')) {
         throw new Error('版本使用字母、数字、点、下划线或短横线，最多 64 字符，并以字母或数字开头。')
       }
-      if (body.kind !== 'skill') {
+      if (body.kind === 'http_search') {
+        const endpoint = URL.parse(value.endpoint?.trim() ?? '')
+        if (!endpoint || endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+          throw new Error('请填写固定 HTTPS 搜索接口地址')
+        }
+        if (!/^[\x21-\x7e]{1,8192}$/.test(value.secret ?? '')) throw new Error('请填写上游 Bearer 凭据')
+        Object.assign(body, { endpoint: endpoint.href, secret: value.secret })
+      } else if (body.kind !== 'skill') {
         if (body.kind==='hook' && (value.os!=='macos'||body.agents.length!==1||body.agents[0]!=='claude-code')) throw new Error('Hook 需要选择 macOS 和 Claude Code')
         const entrypoint = value.entrypoint?.trim()
         if (!entrypoint) throw new Error('请填写 工具启动文件的相对路径')
@@ -105,15 +117,18 @@ function createDraft(pane, api, signal, done) {
     },
     done,
   })
-  for (const { key, label } of fields) pane.body.querySelector(`[name="${key}"]`).setAttribute('aria-label', label)
+  for (const { key, label } of createFields) pane.body.querySelector(`[name="${key}"]`).setAttribute('aria-label', label)
   const kind = pane.body.querySelector('[name="kind"]')
-  const mcpFields = ['os', 'arch', 'entrypoint', 'args'].map(key => {
+  const toggleFields = keys => keys.map(key => {
     const field = pane.body.querySelector(`[name="${key}"]`).closest('.field')
     field.classList.add('tool-draft-field')
     return field
   })
+  const mcpFields = toggleFields(['os', 'arch', 'entrypoint', 'args'])
+  const hostedFields = toggleFields(searchFields.map(field => field.key))
   function selectKind() {
-    for (const field of mcpFields) field.hidden = kind.value === 'skill'
+    for (const field of mcpFields) field.hidden = ['skill', 'http_search'].includes(kind.value)
+    for (const field of hostedFields) field.hidden = kind.value !== 'http_search'
   }
   kind.addEventListener('change', selectKind)
   selectKind()
@@ -203,11 +218,14 @@ export function platformToolsPage(host, api, signal) {
         editForm(pane, {
           mode: 'view',
           fields: [
-            ...fields.filter(field => record.kind !== 'skill' || ['name', 'version', 'kind'].includes(field.key)),
+            ...fields.filter(field => !['skill', 'http_search'].includes(record.kind) || ['name', 'version', 'kind'].includes(field.key)),
             { key: 'agentLabels', label: '适用 Agent', wide: true }, { key: 'statusLabel', label: '状态' },
-            { key: 'sizeLabel', label: '制品大小' }, { key: 'sha256', label: 'SHA-256', wide: true },
+            ...(record.kind === 'http_search'
+              ? [searchFields[0], { key: 'keyStatus', label: '凭据' }]
+              : [{ key: 'sizeLabel', label: '制品大小' }, { key: 'sha256', label: 'SHA-256', wide: true }]),
           ],
-          values: { ...record, args: record.args?.join('、'), agentLabels: toolAgents(record), statusLabel: toolStatus(record), sizeLabel: formatBytes(record.size) },
+          values: { ...record, args: record.args?.join('、'), agentLabels: toolAgents(record), statusLabel: toolStatus(record),
+            sizeLabel: formatBytes(record.size), keyStatus: record.has_key ? '已配置' : '待配置' },
         })
         notify(message)
         pane.body.append(notice)

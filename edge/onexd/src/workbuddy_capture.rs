@@ -12,7 +12,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::{capture, native_capture, outbox::Outbox, pricing};
+use crate::{
+    capture, native_capture,
+    outbox::{DesktopActivity, Outbox, desktop_launch_key, now_ms},
+    pricing,
+};
 
 const MAX_LINE: usize = 2 * 1024 * 1024;
 const MAX_TEXT: usize = 48 * 1024;
@@ -42,7 +46,9 @@ pub(crate) struct Capture {
     model: String,
     store: Arc<Outbox>,
     index: String,
+    launch: String,
     sources: Mutex<BTreeMap<String, Source>>,
+    registered_offsets: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Capture {
@@ -52,6 +58,7 @@ impl Capture {
         device: &str,
         version: &str,
         model: &str,
+        control: &str,
         store: Arc<Outbox>,
     ) -> Result<Self> {
         ensure!(config.symlink_metadata()?.is_dir(), "invalid WorkBuddy private config directory");
@@ -72,7 +79,9 @@ impl Capture {
             model: model.into(),
             store,
             index,
+            launch: desktop_launch_key(control),
             sources: Mutex::new(sources),
+            registered_offsets: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -108,9 +117,16 @@ impl Capture {
 
     pub(crate) fn register(&self, id: &str, source: Source) -> Result<()> {
         ensure!(self.accepts(id, &source), "WorkBuddy source outside the private launch");
+        let transcript = self.config.join("projects").join(&source.project).join(format!("{id}.jsonl"));
+        let previous_size = match transcript.metadata() {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
         let mut sources = self.sources.lock().unwrap();
         if let Some(known) = sources.get(id) {
             ensure!(known == &source, "WorkBuddy changed an existing native source");
+            self.registered_offsets.lock().unwrap().entry(id.to_owned()).or_insert(previous_size);
             return Ok(());
         }
         loop {
@@ -120,6 +136,7 @@ impl Capture {
             if let Some(known) = next.get(id) {
                 ensure!(known == &source, "WorkBuddy changed an existing native source");
                 *sources = next;
+                self.registered_offsets.lock().unwrap().entry(id.to_owned()).or_insert(previous_size);
                 return Ok(());
             }
             ensure!(next.len() < 4096, "WorkBuddy source index is full");
@@ -131,6 +148,7 @@ impl Capture {
                 Some(previous.as_ref().unwrap_or(&Value::Null)),
             )? {
                 *sources = next;
+                self.registered_offsets.lock().unwrap().entry(id.to_owned()).or_insert(previous_size);
                 return Ok(());
             }
         }
@@ -161,6 +179,7 @@ impl Capture {
             );
         }
         cursor.identity = identity;
+        let from = self.registered_offsets.lock().unwrap().get(id).copied();
         let cwd_hash = capture::hex(&Sha256::digest(source.cwd.to_str().context("invalid workspace")?.as_bytes()));
         while cursor.offset < meta.len() {
             let before = cursor.offset;
@@ -168,6 +187,8 @@ impl Capture {
             let mut bytes = Vec::new();
             (&mut file).take((meta.len() - before).min(MAX_LINE as u64 + 1)).read_to_end(&mut bytes)?;
             let mut events = Vec::new();
+            let mut live_from = None;
+            let observed = now_ms();
             for line in bytes.split_inclusive(|b| *b == b'\n') {
                 if line.last() != Some(&b'\n') {
                     if cursor.skipping || line.len() > MAX_LINE {
@@ -176,15 +197,21 @@ impl Capture {
                     }
                     break;
                 }
+                let line_start = cursor.offset;
                 cursor.offset += line.len() as u64;
                 if std::mem::take(&mut cursor.skipping) || line.len() > MAX_LINE {
                     continue;
                 }
                 let Some((kind, payload, time)) = visible(line, id, &source.cwd) else { continue };
+                let fresh = from.is_some_and(|offset| line_start >= offset);
+                let time = time.or(fresh.then_some(observed)).map(pricing::format_ms);
                 if !cursor.started {
-                    events.push(json!({"session_id":session,"source_offset":null,"at":time,"kind":"session_start",
+                    events.push(json!({"session_id":session,"source_offset":null,"at":time.as_deref(),"kind":"session_start",
                         "payload":{"agent":"workbuddy","agent_version":self.version,"model":self.model,"cwd_hash":cwd_hash,"sidechain":false}}));
                     cursor.started = true;
+                }
+                if fresh && live_from.is_none() {
+                    live_from = Some(events.len());
                 }
                 let mut payload = payload;
                 payload["uuid"] = format!("{session}:{}", cursor.offset).into();
@@ -200,7 +227,13 @@ impl Capture {
             }
             cursor.anchor = anchor(&mut file, cursor.offset)?;
             let next = serde_json::to_value(&cursor)?;
-            if !self.store.append_if_cursor(events, &key, &next, Some(previous.as_ref().unwrap_or(&Value::Null)))? {
+            if !self.store.append_desktop_events(
+                events,
+                &key,
+                &next,
+                Some(previous.as_ref().unwrap_or(&Value::Null)),
+                DesktopActivity { session: &session, launch: &self.launch, live_from, at_ms: observed },
+            )? {
                 break;
             }
             previous = Some(next);
@@ -251,7 +284,7 @@ fn anchor(file: &mut fs::File, end: u64) -> Result<String> {
     Ok(capture::hex(&Sha256::digest(bytes)))
 }
 
-fn visible(line: &[u8], id: &str, cwd: &Path) -> Option<(&'static str, Value, String)> {
+fn visible(line: &[u8], id: &str, cwd: &Path) -> Option<(&'static str, Value, Option<i64>)> {
     let row = serde_json::from_slice::<Value>(line).ok()?;
     if row["type"] != "message"
         || row["sessionId"] != id
@@ -290,8 +323,8 @@ fn visible(line: &[u8], id: &str, cwd: &Path) -> Option<(&'static str, Value, St
         text.truncate(cut);
         text.push('…');
     }
-    let at = row["timestamp"].as_str().and_then(pricing::parse_ms).unwrap_or_else(crate::outbox::now_ms);
-    Some((kind, json!({"content":text,"sidechain":false,"truncated":truncated}), pricing::format_ms(at)))
+    let at = row["timestamp"].as_str().and_then(pricing::parse_ms);
+    Some((kind, json!({"content":text,"sidechain":false,"truncated":truncated}), at))
 }
 
 #[cfg(all(test, unix))]
@@ -299,6 +332,51 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn workbuddy_closes_and_resumes_only_after_new_native_writes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = root.path().join("config");
+        let project = config.join("projects/managed");
+        let cwd = root.path().join("work");
+        fs::create_dir_all(&project)?;
+        fs::create_dir(&cwd)?;
+        let cwd = cwd.canonicalize()?;
+        let db = Arc::new(Outbox::open(&root.path().join("db"))?);
+        let new = |token| Capture::new(&config, &cwd, "device", "release", "model", token, db.clone());
+        let source = Source { project: "managed".into(), cwd: cwd.clone() };
+        let transcript = project.join("task.jsonl");
+        let record = |text| {
+            json!({"type":"message","sessionId":"task","cwd":cwd,"role":"user",
+            "content":[{"type":"input_text","text":text}]})
+        };
+        let first = new("before")?;
+        first.register("task", source.clone())?;
+        let mut file = fs::File::create(transcript)?;
+        writeln!(file, "{}", record("before"))?;
+        first.read_source("task", &source, true)?;
+        let owner = desktop_launch_key("before");
+        db.close_desktop_sessions(Some(&owner), Some(now_ms()))?;
+        db.close_desktop_sessions(Some(&owner), Some(now_ms()))?;
+
+        let next = new("after")?;
+        next.read_source("task", &source, true)?;
+        next.register("task", source.clone())?;
+        next.read_source("task", &source, true)?;
+        assert_eq!(db.pending(0, 20)?.len(), 3, "opening and reading an old task do not resume it");
+        writeln!(file, "{}", record("after"))?;
+        next.read_source("task", &source, true)?;
+        db.close_desktop_sessions(Some(&desktop_launch_key("after")), Some(now_ms()))?;
+        let rows = db.pending(0, 20)?;
+        let keys: Vec<_> = rows.iter().map(|row| row.item["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            keys,
+            ["session_start", "user_message", "session_end", "session_resume", "user_message", "session_end"]
+        );
+        assert_eq!(rows[4].item["payload"]["content"], "after");
+        assert!(rows.iter().all(|row| row.item["session_id"] == rows[0].item["session_id"]));
+        Ok(())
+    }
 
     #[test]
     fn workbuddy_history_recovers_partial_lines_and_deduplicates_concurrent_readers() -> Result<()> {
@@ -310,7 +388,7 @@ mod tests {
         fs::create_dir(&cwd)?;
         let cwd = cwd.canonicalize()?;
         let db = Arc::new(Outbox::open(&root.path().join("db"))?);
-        let new = || Capture::new(&config, &cwd, "device", "release", "model", db.clone());
+        let new = || Capture::new(&config, &cwd, "device", "release", "model", "control", db.clone());
         let source = Source { project: "managed".into(), cwd: cwd.clone() };
         let capture = new()?;
         capture.register("task", source.clone())?;

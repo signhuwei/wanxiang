@@ -229,12 +229,21 @@ pub struct Policy {
     pub runtime: Option<RuntimeRules>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commerce_plan_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub search_tools: Vec<SearchTool>,
     #[serde(flatten)]
     pub summary: PolicySummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceRouting>,
     pub notices: Vec<PolicyNotice>,
     pub secrets: Vec<PolicySecret>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchTool {
+    pub id: String,
+    pub name: String,
+    pub agents: Vec<String>,
 }
 
 impl std::fmt::Debug for Policy {
