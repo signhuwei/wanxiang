@@ -10,4 +10,8 @@
 
 脚本编译 x64 原生 onex 与 onexd，执行锁定依赖的 Rust 工作区测试，并用 Tauri 打包当前用户模式的 NSIS 安装器。输出中包含 Git 提交、应用版本、安装器路径、文件字节数和 SHA-256。安装器默认写入 `edge\target\onex-windows\x86_64-pc-windows-msvc\release\bundle\nsis`。
 
+Edge 安装器写入应用前会执行 `git --version`，并检查 Git for Windows 的注册表安装路径。缺失时优先用当前用户的 WinGet 安装官方 `Git.Git`。没有 WinGet 的设备从 Git for Windows 官方发行下载固定的 x64 安装器，按微软清单核对 SHA-256 后执行。Git 仍不可用时，安装器显示错误并退出。Edge 会从注册表找到新装的 Git，安装器启动的首个 Agent 也可直接使用。 [Git for Windows 安装](https://git-scm.com/install/windows) · [WinGet 安装命令](https://learn.microsoft.com/en-us/windows/package-manager/winget/install)
+
+在 Windows x64 测试快照里验收两种情况。在已有 Git 的快照上，记录安装前后的 `git --version`，确认原版本继续可用。在没有 Git 的快照上，以普通用户运行 NSIS 安装器，确认安装器安装了 Git，再直接从完成页启动 OneX Desktop。登录内测租户后，从 OneX 启动 Agent 并执行 `git --version`。用没有 WinGet 的快照走一遍官方安装器下载路径。恢复一个已有 Edge、无 Git 的快照并暂时断网，执行原地重装，确认报告失败，原 Edge 和自启项保留。
+
 Windows 验收记录编译与测试退出状态、安装器及摘要，并在指定的测试用户下验证安装、自启、登录、受管终端、重开后的设备身份和卸载清理。测试只使用内测账号与合成对话。正式签名和外部发布按后续计划处理。 [Tauri NSIS 安装器](https://v2.tauri.app/distribute/windows-installer/)

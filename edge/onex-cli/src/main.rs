@@ -123,6 +123,8 @@ async fn cmd_run(agent: &str, args: &[String]) -> Result<()> {
     let managed =
         managed || agent != "claude-code" || call(&Request::Status).await?["agent_cache"].as_bool().unwrap_or(false);
     let env: BTreeMap<String, String> = std::env::vars().collect();
+    #[cfg(windows)]
+    let env = with_git_for_windows(env);
     let (program, version) = if managed {
         (None, None)
     } else {
@@ -212,6 +214,42 @@ fn env_get<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a Strin
 #[cfg(windows)]
 fn env_get<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a String> {
     env.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v)
+}
+
+/// The setup process may have started before Git’s installer updated the user PATH.
+/// Only augment the Agent launch environment, keeping the current PATH and its Git precedence.
+#[cfg(windows)]
+fn with_git_for_windows(mut env: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY};
+
+    let path = env_get(&env, "PATH").map(String::as_str).unwrap_or_default();
+    let looks_like_git = |dir: &std::path::Path| dir.is_absolute() && dir.join("git.exe").is_file();
+    if std::env::split_paths(path).any(|dir| looks_like_git(&dir)) {
+        return env;
+    }
+
+    let git = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].into_iter().find_map(|hive| {
+        [KEY_WOW64_64KEY, KEY_WOW64_32KEY].into_iter().find_map(|view| {
+            let key = RegKey::predef(hive).open_subkey_with_flags(r"Software\GitForWindows", KEY_READ | view).ok()?;
+            let root: String = key.get_value("InstallPath").ok()?;
+            let bin = PathBuf::from(root).join("cmd");
+            looks_like_git(&bin).then_some(bin)
+        })
+    });
+    let Some(git_dir) = git.and_then(|dir| std::env::join_paths([dir]).ok()) else {
+        return env;
+    };
+    let git_dir = git_dir.to_string_lossy();
+    if let Some((_, value)) = env.iter_mut().find(|(key, _)| key.eq_ignore_ascii_case("PATH")) {
+        if !value.is_empty() {
+            value.push(';');
+        }
+        value.push_str(&git_dir);
+    } else {
+        env.insert("PATH".into(), git_dir.into_owned());
+    }
+    env
 }
 
 fn prompt(p: &str) -> Result<String> {
