@@ -35,16 +35,30 @@ OneX 的 `feat/s3-macos-native-desktop` 已在 Apple Silicon 的 5.3.8 原厂窗
 
 v2 沿用同一 OneX Router 语义。通过本机模型入口，WorkBuddy 仅能使用合约明确列出的模型名，通配路由只开放其固定上游名。余额降档可将已获准的名称路由到合约指定的低成本模型。每次转发重新查设备的生效合约及本轮获准的模型名，未授权请求在扣费前返回 403。
 
-腾讯企业控制台可按部门或成员限定可用模型，并控制成员添加个人模型的权限。原厂界面验收须覆盖成员身份的模型菜单和个人模型编辑。当前适配器从生效合约生成私有 profile 的模型列表，登录进程单独直连。S3 的原厂菜单验收使用另一套私有接口。公开 Hook 路径仍须在签名的 5.3.8 中证实双任务归属和成员菜单策略，发行表保留待验状态。[腾讯企业模型管理](https://cloud.tencent.com/document/product/1831/134418)
+v2 恢复 S3 固定构建的受管模型菜单与任务创建逻辑。窗口只显示合约分配且经原厂允许的模型，设置页沿用厂商的管理员限制提示。登录窗口使用进程级直连。创建或恢复任务时，Edge 核对原生任务 ID 与私有工作区，签发只属于该任务的本机模型令牌。任务自己的模型客户端解析该环境变量。公开 Hook 提供可选的轮次佐证。[腾讯企业模型管理](https://cloud.tencent.com/document/product/1831/134418)
+
+### v2 原厂窗口双任务验收（2026-11-21）
+
+在 macOS ARM64 通过 `onex run workbuddy --managed --model Qwen3.8-27B` 启动 5.3.8 原厂窗口。签名、代码摘要和 DMG SHA-256 与发行清单一致。聊天模型菜单只列出 `Qwen3.8-27B`，个人自定义模型的配置入口已隐藏。在「设置 → 模型」中仍能看到原厂的「添加模型」按钮，点击仅显示「企业管理员已禁止添加个人自定义模型」，无法打开编辑表单。
+
+在同一窗口使用「新建任务」创建两个独立任务，分别确认原厂回复「青杏」和「山桃」。内网 Qwen 上游当日连接超时，验收使用分别返回已知 token 数量的本机回环上游。签发、设备注册、转发、用量上报、续租和扣款均走隔离 v2 租户的正式接口。核对原厂 JSONL、OneX 会话和租户数据库得到以下记录。
+
+| 任务 | 原生任务 ID | OneX 会话 ID | 请求数 | 输入 token | 输出 token | 结算橡皮 |
+|---|---|---|---:|---:|---:|---:|
+| A | `716da687-7c2f-4e58-80a9-c66c08d97423` | `27e58ab2-19ba-5b09-a061-112a297e5cd4` | 3 | 111 | 15 | 0.141 块 |
+| B | `3b54b1d0-f255-4a5a-9178-2b33faa87e08` | `5ffed6c2-22de-5cc4-abc0-ce75099a4e23` | 3 | 159 | 33 | 0.225 块 |
+
+六笔用量全部已结算，账本实扣 0.366 块，未归属请求为 0。运行资格只适用于表中所述的 macOS ARM64 固定构建。
+
 
 ## OneX 对公开接口的核验
 
 腾讯的桌面文档列出了第三方模型的服务地址、API Key 和模型名，也列出了 Hook 插件。原厂 5.3.5 的发行说明已记录插件 Hook 支持。[桌面模型配置](https://www.workbuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/Model) · [桌面插件系统](https://www.workbuddy.cn/docs/workbuddy/Plugins) · [发行说明](https://www.workbuddy.cn/docs/workbuddy/Changelog)
 
-腾讯 CodeBuddy 的 ACP 文档公开了轮次关联机制。普通提示进入历史后，原生记录中的 `providerData.conversationRequestId` 与模型 HTTP 头 `X-Conversation-Request-ID` 可用于精确比对。Hook 文档将 `generation_id` 定义为可选字段，并说明它在有轮次 ID 时可与之对应。验收需在目标桌面发行中用两个原生任务分别核对 Hook 的 SID、轮次 ID、实际 HTTP 头以及转发费用。缺字段、重复绑定或无法归属的调用须拒绝；同一轮可合法产生多次模型请求，计费依然按每次请求记录。[ACP 客户端轮次 ID](https://www.codebuddy.cn/docs/cli/acp) · [Hook 参考指南](https://www.workbuddy.cn/docs/cli/hooks)
+腾讯 CodeBuddy 的 ACP 文档公开了轮次关联机制。普通提示进入历史后，原生记录中的 `providerData.conversationRequestId` 与模型 HTTP 头 `X-Conversation-Request-ID` 可用于精确比对。Hook 文档将 `generation_id` 定义为可选字段，并说明它在有轮次 ID 时可与之对应。在共享模型凭据路径上，Edge 要求已登记的唯一轮次。使用本次任务专用凭据的原厂请求直接归入该 SID，若同时携带已登记的轮次，则两者须一致。同一轮可以产生多笔请求。[ACP 客户端轮次 ID](https://www.codebuddy.cn/docs/cli/acp) · [Hook 参考指南](https://www.workbuddy.cn/docs/cli/hooks)
 
 企业开放平台的托管 Agent 会话 ID、ACP 元数据及本地助理消息接口各有自己的协议边界。关联桌面自定义模型请求所需的证据，应来自受测桌面发行实际发出的 HTTP 请求。[开放平台 API](https://open.workbuddy.cn/docs/openapi) · [ACP 扩展字段说明](https://cloud.tencent.com/document/product/1831/137025)
 
 OneX 已在 Apple Silicon 复核 5.3.8 官方 DMG 的完整字节数、SHA-256、应用标识、Team ID 和 CDHash。可在 `edge` 设置 `ONEX_WORKBUDDY_QA_DMG` 为原包路径、`ONEX_WORKBUDDY_QA_BUNDLE` 为从该包只读挂载的应用路径，运行 `cargo test -p onexd --lib original_workbuddy_container_and_apple_signature_match_manifest -- --ignored`。该测试单独报告原包身份，桌面请求归属和上线资格另按上述实测结果登记。
 
-v2 已迁入 S3 的 JSONL 可见消息筛选规则，读取来源改由公开 Hook 按真实任务登记。设备侧测试使用临时隔离目录中的原厂格式记录，覆盖两任务内容和用量归属一致、部分行续读、重复采集、冷恢复和拒绝符号链接。运行 `cargo test -p onexd --lib workbuddy` 可独立复验。这些测试使用本机合成输入，原厂发行资格仍待前述实证。
+v2 沿用 S3 的 JSONL 可见消息筛选规则。设备端回归覆盖按原生任务签发凭据、两任务交错、热撤销、部分行续读、重复采集、冷恢复及符号链接拒绝。在 `edge` 目录运行 `cargo test -p onexd --lib workbuddy` 可复验这些路径。

@@ -6,7 +6,8 @@
 
 - 统计页支持日期与 Agent 筛选、租户角色范围和带审计的 Parquet 导出。DuckDB 读取 Parquet，SQLite 继续承接在线写入。运行基准使用 `bun --no-env-file tests/e2e/statistics/load.ts`，100 人、30 天、12 万笔请求下，最终本机 p95 为缓存命中 92 ms、重建快照 758 ms。
 - 租户合约可按设备平台查看生效的 Agent 发行、模型及倍率。平台可登记、拉取或分段上传两款桌面 Agent 的原厂包，并以完整 SHA-256 核对。Edge 的 Chat Completions 已通过假上游的流式工具、租约和用量归属测试。
-- WorkBuddy 和 DeepSeek Harness Desktop 仍需完成原厂 GUI 的纳管运行。本地令牌必须绑定实际原生会话，原生记录须可恢复、补传，并核对同会话的费用。WorkBuddy 还需验证厂商登录后受管模型选择持续生效。两款待验证的发行保持暂存状态；Windows 原生编译、安装和验收在 Windows 环境执行。
+- Apple Silicon 的 DeepSeek Harness Desktop 0.2.1-rc.3 已通过原厂 GUI 真机测试。原生窗口冷启动恢复同一 SID，两轮原生消息均进入持久 outbox，真实 Router 的回环测试共结算 0.014 块。精确制品资格在 `server/src/desktop-qualifications.json` 管理。
+- WorkBuddy 5.3.8 的 S3 菜单与按任务模型凭据已接入 v2。macOS ARM64 原厂窗口实测只有合约分配的模型可选，个人编辑受限。两个原生任务分别结算 0.141 与 0.225 块，6 笔用量全部归属，账本实扣 0.366 块。此次使用回环模型；S3 内网 Qwen 验收另有记录。固定发行 qualified=true，详情见 `docs/specs/agents/workbuddy.md`。
 - 211 保持 S2 内测版本。
 
 移交时间：2026-11-19 16:40。移交时 `main` 已包含全部开发分支，测试全部通过（Server 27 通过 1 跳过、管理端 26、Desktop 前端 1、Edge 161）。开发规则和测试命令见 [AGENTS.md](AGENTS.md)。

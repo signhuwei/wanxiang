@@ -93,9 +93,14 @@ pub(crate) fn prepare(
                     !model_bearer.is_empty() && model_bearer != request.token,
                     "invalid WorkBuddy model credential"
                 );
+                let entry = request.entry.canonicalize()?;
+                let app = entry.ancestors().nth(3).context("missing WorkBuddy application bundle")?;
+                anyhow::ensure!(app.join("Contents/MacOS/Electron") == entry, "invalid WorkBuddy desktop executable");
+                let adapter = run.join("workbuddy.cjs");
+                launch::write_private(&adapter, include_bytes!("desktop_adapters/workbuddy.cjs"))?;
                 let models = json!({
                     "models":[{ "id":request.model, "name":request.model, "vendor":"Custom",
-                        "url":format!("{origin}/v1/chat/completions"), "apiKey":model_bearer, "supportsToolCall":true }],
+                        "url":format!("{origin}/v1/chat/completions"), "apiKey":"${ONEX_WORKBUDDY_SESSION_MODEL_TOKEN}", "supportsToolCall":true }],
                     "availableModels":[request.model]
                 });
                 // Project model overrides win over the user-level allowlist in CodeBuddy.
@@ -111,8 +116,8 @@ pub(crate) fn prepare(
                 launch::write_private(
                     &policy,
                     &serde_json::to_vec(&json!({
-                        "origin":origin, "workspace":workspace, "config":path_text(&config)?,
-                        "privateHome":path_text(&home)?, "credential":path_text(&credential)?
+                        "origin":origin, "workspace":workspace, "config":path_text(&config)?, "bundle":path_text(app)?, "model":request.model,
+                        "privateHome":path_text(&home.canonicalize()?)?, "credential":path_text(&credential)?
                     }))?,
                 )?;
                 let quote =
@@ -132,6 +137,10 @@ pub(crate) fn prepare(
                 env.insert("WORKBUDDY_CONFIG_DIR".into(), path_text(&config)?);
                 env.insert("CODEBUDDY_CONFIG_DIR".into(), path_text(&config)?);
                 env.insert("WORKBUDDY_USER_DATA_DIR".into(), path_text(&data)?);
+                env.insert("WORKBUDDY_CLI_PREWARM_POOL_SIZE".into(), "0".into());
+                env.insert("ONEX_WORKBUDDY_POLICY".into(), path_text(&policy)?);
+                let adapter = path_text(&adapter)?.replace('\\', "\\\\").replace('"', "\\\"");
+                env.insert("NODE_OPTIONS".into(), format!("--require=\"{adapter}\""));
                 args.push("--no-proxy-server".into());
                 config
             }
@@ -264,11 +273,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("work's space");
         launch::private_dir(&workspace).unwrap();
+        let vendor = root.path().join("WorkBuddy.app/Contents/MacOS/Electron");
+        launch::private_dir(vendor.parent().unwrap()).unwrap();
+        std::fs::write(&vendor, []).unwrap();
         let request = Request {
             owner: "owner",
             home: root.path(),
             agent: "workbuddy",
-            entry: Path::new("/dev/null"),
+            entry: &vendor,
             cwd: &workspace,
             token: "test-control",
             model_bearer: Some("test-model-only"),
@@ -278,7 +290,11 @@ mod tests {
         let prepared = prepare(&request, None).unwrap();
         let launch = &prepared.launch;
         assert_eq!(launch.args.last().map(String::as_str), Some("--no-proxy-server"));
-        assert!(launch.env.get("NODE_OPTIONS").is_none());
+        assert_eq!(
+            launch.env["NODE_OPTIONS"],
+            format!("--require=\"{}\"", launch.run_dir.join("workbuddy.cjs").display())
+        );
+        assert_eq!(launch.env["WORKBUDDY_CLI_PREWARM_POOL_SIZE"], "0");
         assert_eq!(launch.env["CFFIXED_USER_HOME"], launch.env["HOME"]);
         assert!(Path::new(&launch.env["HOME"]).starts_with(root.path()));
         assert!(Path::new(&launch.env["WORKBUDDY_USER_DATA_DIR"]).starts_with(root.path()));
@@ -287,7 +303,7 @@ mod tests {
         let config = Path::new(&launch.env["WORKBUDDY_CONFIG_DIR"]);
         let models = read_json(&config.join("models.json"));
         assert_eq!(models["availableModels"], json!([request.model]));
-        assert_eq!(models["models"][0]["apiKey"], "test-model-only");
+        assert_eq!(models["models"][0]["apiKey"], "${ONEX_WORKBUDDY_SESSION_MODEL_TOKEN}");
         assert_eq!(models["models"][0]["url"], "http://127.0.0.1:19876/v1/chat/completions");
         assert_eq!(models["models"].as_array().unwrap().len(), 1);
         assert!(!models.to_string().contains(request.token));

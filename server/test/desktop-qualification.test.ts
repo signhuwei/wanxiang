@@ -14,6 +14,17 @@ test('native runtime qualification follows the exact approved build', () => {
   }
 });
 
+test('only the accepted Apple Silicon WorkBuddy 5.3.8 image is eligible', () => {
+  const build = {
+    agent: 'workbuddy', version: '5.3.8', os: 'darwin', arch: 'arm64', size: 437358016,
+    sha256: '583ee29d9f037523200eb0d6b59f199119922b9a11101e8174ae1963a4ce4974',
+  };
+  expect(qualifiedDesktopRelease(build)).toBeTrue();
+  expect(qualifiedDesktopRelease({ ...build, arch: 'x64' })).toBeFalse();
+  expect(qualifiedDesktopRelease({ ...build, version: '5.3.9' })).toBeFalse();
+  expect(qualifiedDesktopRelease({ ...build, sha256: 'f'.repeat(64) })).toBeFalse();
+});
+
 test('staged native builds retain their exact vendor identity without granting runtime access', () => {
   for (const candidate of builds.filter(row => !row.qualified)) {
     expect(candidate.sha256).toMatch(/^[a-f0-9]{64}$/);

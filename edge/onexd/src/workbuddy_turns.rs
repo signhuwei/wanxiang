@@ -21,19 +21,40 @@ pub(crate) struct Change {
     pub source: Option<crate::workbuddy_capture::Source>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeTask {
+    native_id: String,
+    source: crate::workbuddy_capture::Source,
+}
+
+fn control(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(axum::http::header::AUTHORIZATION).iter();
+    let token = values.next()?.to_str().ok()?.strip_prefix("Bearer ")?;
+    (!token.is_empty() && values.next().is_none()).then_some(token)
+}
+
+pub(crate) async fn session(
+    axum::extract::State(router): axum::extract::State<std::sync::Arc<crate::router::Router>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(task): axum::Json<NativeTask>,
+) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
+    use axum::http::StatusCode;
+    let control = control(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    if !router.state.desktop_sessions.register_workbuddy_source(control, &task.native_id, task.source).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let token = router.state.workbuddy_turns.bind_task(control, &task.native_id).ok_or(StatusCode::FORBIDDEN)?;
+    Ok(axum::Json(serde_json::json!({"model_token":token})))
+}
+
 pub(crate) async fn observe(
     axum::extract::State(router): axum::extract::State<std::sync::Arc<crate::router::Router>>,
     headers: axum::http::HeaderMap,
     axum::Json(change): axum::Json<Change>,
 ) -> axum::http::StatusCode {
-    use axum::http::{StatusCode, header::AUTHORIZATION};
-    let mut credentials = headers.get_all(AUTHORIZATION).iter();
-    let Some(control) = credentials.next().and_then(|h| h.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")) else {
-        return StatusCode::UNAUTHORIZED;
-    };
-    if credentials.next().is_some() || control.is_empty() {
-        return StatusCode::UNAUTHORIZED;
-    }
+    use axum::http::StatusCode;
+    let Some(control) = control(&headers) else { return StatusCode::UNAUTHORIZED };
     let turns = &router.state.workbuddy_turns;
     let accepted = match change.event {
         HookEvent::UserPromptSubmit => {
@@ -61,6 +82,7 @@ struct Launch {
     model: String,
     // An ended or conflicting generation stays closed for the lifetime of the credential.
     turns: HashMap<String, Turn>,
+    tasks: HashMap<String, String>,
 }
 
 enum Turn {
@@ -103,6 +125,7 @@ impl Turns {
                 release: release.into(),
                 model: model.into(),
                 turns: HashMap::new(),
+                tasks: HashMap::new(),
             },
         );
         true
@@ -153,13 +176,42 @@ impl Turns {
         }
     }
 
-    pub(crate) fn resolve(&self, bearer: &str, generation: &str) -> Option<LaunchBinding> {
-        if !generation_id(generation) {
+    // OneX assigns this token only to the native sidecar that owns this task.
+    // Reopening it within this launch must return the same credential.
+    fn bind_task(&self, control: &str, native: &str) -> Option<String> {
+        let mut launches = self.0.lock().unwrap();
+        let launch = launches.get_mut(control)?;
+        if let Some((key, _)) = launch.tasks.iter().find(|(_, sid)| *sid == native) {
+            return Some(key.clone());
+        }
+        if launch.tasks.len() >= 4096 {
             return None;
         }
+        let key = crate::id::token();
+        launch.tasks.insert(key.clone(), native.to_owned());
+        Some(key)
+    }
+
+    pub(crate) fn resolve(&self, bearer: &str, generation: Option<&str>) -> Option<LaunchBinding> {
         let launches = self.0.lock().unwrap();
-        let launch = launches.values().find(|launch| launch.model_bearer == bearer)?;
-        let Turn::Active(sid) = launch.turns.get(generation)? else { return None };
+        let (launch, sid) = launches.values().find_map(|launch| {
+            if let Some(sid) = launch.tasks.get(bearer) {
+                if let Some(turn) = generation.and_then(|id| launch.turns.get(id))
+                    && !matches!(turn, Turn::Active(owner) if owner == sid)
+                {
+                    return None;
+                }
+                return Some((launch, sid));
+            }
+            let generation = generation.filter(|id| generation_id(id))?;
+            if launch.model_bearer != bearer {
+                return None;
+            }
+            match launch.turns.get(generation)? {
+                Turn::Active(sid) => Some((launch, sid)),
+                _ => None,
+            }
+        })?;
         Some(LaunchBinding {
             session_id: crate::native_capture::session_id(&launch.device, "workbuddy", sid),
             agent: "workbuddy".into(),
@@ -191,22 +243,22 @@ mod tests {
         assert!(!state.admit("model-key", "task-A", A));
         assert!(state.admit("hook", "task-A", A));
         assert!(state.admit("hook", "task-B", B));
-        let first = state.resolve("model-key", A).unwrap();
-        let second = state.resolve("model-key", B).unwrap();
+        let first = state.resolve("model-key", Some(A)).unwrap();
+        let second = state.resolve("model-key", Some(B)).unwrap();
         assert_ne!(first.session_id, second.session_id);
-        assert_eq!(state.resolve("model-key", A).unwrap().session_id, first.session_id);
-        assert!(state.resolve("hook", A).is_none());
-        assert!(state.resolve("model-key", "").is_none());
+        assert_eq!(state.resolve("model-key", Some(A)).unwrap().session_id, first.session_id);
+        assert!(state.resolve("hook", Some(A)).is_none());
+        assert!(state.resolve("model-key", Some("")).is_none());
         assert!(state.admit("hook", "task-A", A)); // repeated delivery of the same authenticated Hook
         assert!(state.finish("hook", "task-A", A));
         assert!(state.finish("hook", "task-A", A));
         assert!(!state.finish("hook", "task-B", A));
-        assert!(state.resolve("model-key", A).is_none());
+        assert!(state.resolve("model-key", Some(A)).is_none());
         assert!(!state.admit("hook", "task-A", A));
         assert_eq!(second.approved_model.as_deref(), Some("allowed"));
         assert_eq!(second.release_id.as_deref(), Some("release"));
         state.stop("hook");
-        assert!(state.resolve("model-key", B).is_none());
+        assert!(state.resolve("model-key", Some(B)).is_none());
     }
 
     #[test]
@@ -218,11 +270,11 @@ mod tests {
         assert!(state.admit("a-control", "task-A", A));
         assert!(state.admit("b-control", "task-A", A));
         assert!(!state.admit("a-control", "task-B", A));
-        assert!(state.resolve("a-key", A).is_none());
-        assert!(state.resolve("b-key", A).is_some());
+        assert!(state.resolve("a-key", Some(A)).is_none());
+        assert!(state.resolve("b-key", Some(A)).is_some());
         assert!(!state.admit("b-control", "../bad", B));
         assert!(!state.admit("b-control", "task-A", &A.to_uppercase()));
         state.clear();
-        assert!(state.resolve("b-key", A).is_none());
+        assert!(state.resolve("b-key", Some(A)).is_none());
     }
 }

@@ -1231,6 +1231,11 @@ test('complete desktop installers can be staged and verified without enabling an
   const view = await f.request('/contract/effective?os=darwin&arch=arm64', undefined, tenant);
   expect(await view.json()).toMatchObject({ agents: [
     { agent: 'claude-code', status: 'unavailable', releases: [] },
+    { agent: 'workbuddy', status: 'unavailable', releases: [] },
+  ] });
+  const windows = await f.request('/contract/effective?os=win32&arch=x64', undefined, tenant);
+  expect(await windows.json()).toMatchObject({ agents: [
+    { agent: 'claude-code', status: 'unavailable', releases: [] },
     { agent: 'workbuddy', status: 'qualification_required', releases: [] },
   ] });
   expect((await f.request(route + '/' + release.id, { status: 'active', revision: release.revision }, global)).status).toBe(409);

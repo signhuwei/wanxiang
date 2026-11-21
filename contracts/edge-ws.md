@@ -188,7 +188,9 @@ Apple Silicon Edge 在 hello 中声明 `agent_cache: true` 与 `mac_desktop_v1: 
 
 原厂 DeepSeek Cordis 适配器使用 `POST /v1/onex/desktop/ready` 标记本机适配器就绪。每次模型请求由 `POST /v1/onex/desktop/session` 携带本次私有启动凭据以及 `{native_id,bind_model:true,records:[]}` 换取有效期 60 秒、单次使用的会话模型凭据。适配器先按原生历史头核对工作区、真实 SID 及来源。上传公开记录时传 `bind_model:false`，以原生序号推进游标。上游计量与原生消息使用同一 OneX 会话编号，撤销启动立即丢弃其待用凭据。
 
-WorkBuddy 的待验适配器为每次启动签发两个独立的本机凭据。受管 Hook 核对工作区、任务 SID 和厂商轮次号后，用控制端 Bearer 调用 `POST /v1/onex/workbuddy/turn` 提交 `{native_id,generation_id,event}`。`UserPromptSubmit` 另带 `source:{project,cwd}`，只有当前私有 profile 中已核验的原生记录来源可以登记。相同轮次归属发生冲突时封闭该轮。重复的 `Stop` 幂等，关闭后拒绝该轮的新模型请求。模型端携带独立凭据（Bearer 或厂商原生 `x-api-key`）和唯一的 `X-Conversation-Request-ID` 调用 Chat。一个已登记轮次可以有多笔模型请求，每笔费用归到对应原生会话。缺少映射、轮次归属冲突、头重复、轮次结束或设备退出时拒绝调用。原厂 `custom-local:` 模型名前缀在检查合约前还原。上游只接收路由指定的认证。该候选的真实桌面验收和启用状态以精确发行清单为准。
+WorkBuddy 受管窗口创建或恢复任务时，用本次启动的控制凭据向本机 `POST /v1/onex/workbuddy/session` 提交 `{native_id,source:{project,cwd}}`。Edge 校验签名发行对应的私有 profile 和记录来源后返回 `{model_token}`。令牌只属于本次启动的该原生任务，供任务自己的模型客户端使用。原厂窗口的模型列表来自合约授予且原厂允许的模型，自定义模型的新增、编辑及删除由受管策略禁用。
+
+模型请求可使用 Bearer 或原厂的 `x-api-key`。Edge 依据任务令牌确定 OneX 会话，并在每笔请求前复核当前合约模型、发行和租约。带 `X-Conversation-Request-ID` 时校验已知轮次归属。公开 Hook 使用独立的控制端凭据向 `POST /v1/onex/workbuddy/turn` 登记或结束轮次；使用启动级模型凭据的请求须携带已登记的轮次。任务专用凭据支持原厂未附轮次头的任务内辅助请求。设备退出或该窗口结束时撤销其凭据，上游只接收路由指定的认证。
 
 Hook 根据原厂 `transcript_path` 取得私有 profile 内项目目录的单段名称，使用核对过的工作区绝对路径。Edge 按设备和 profile 记住 SID、项目目录和工作区，核对 `projects/<project>/<SID>.jsonl` 逐行的原生 SID 与工作区。仅回流普通用户或助手已经完成的可见正文。退出及冷重开仍使用同一来源索引，完整行的字节偏移和事件原子提交，同一行只计入一次。回流记录与该原生任务的模型费用共用同一个 OneX 会话编号。
 

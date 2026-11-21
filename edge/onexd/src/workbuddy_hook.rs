@@ -22,13 +22,16 @@ struct Policy {
 #[derive(Deserialize)]
 struct Event {
     session_id: String,
-    generation_id: String,
+    generation_id: Option<String>,
     hook_event_name: HookEvent,
     transcript_path: PathBuf,
     cwd: Option<PathBuf>,
 }
 
-fn change(policy: &Policy, event: Event) -> Result<Change> {
+fn change(policy: &Policy, event: Event) -> Result<Option<Change>> {
+    // The signed 5.3.8 client can omit its optional turn evidence. The sidecar
+    // still proves its task with the dedicated model credential on each request.
+    let Some(generation_id) = event.generation_id else { return Ok(None) };
     let sid = &event.session_id;
     ensure!(
         !sid.is_empty()
@@ -72,7 +75,7 @@ fn change(policy: &Policy, event: Event) -> Result<Change> {
         ensure!(matches!(event.hook_event_name, HookEvent::Stop), "missing workspace");
         None
     };
-    Ok(Change { native_id: event.session_id, generation_id: event.generation_id, event: event.hook_event_name, source })
+    Ok(Some(Change { native_id: event.session_id, generation_id, event: event.hook_event_name, source }))
 }
 
 pub async fn notify(policy_file: &Path) -> Result<()> {
@@ -99,7 +102,7 @@ pub async fn notify(policy_file: &Path) -> Result<()> {
     const LIMIT: u64 = 2 * 1024 * 1024;
     std::io::stdin().lock().take(LIMIT + 1).read_to_end(&mut input)?;
     ensure!((input.len() as u64) <= LIMIT, "hook payload exceeded limit");
-    let change = change(&policy, serde_json::from_slice(&input)?)?;
+    let Some(change) = change(&policy, serde_json::from_slice(&input)?)? else { return Ok(()) };
     let credential = std::fs::read_to_string(&policy.credential)?;
     let client = reqwest::Client::builder()
         .no_proxy()

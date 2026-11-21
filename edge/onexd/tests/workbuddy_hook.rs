@@ -64,6 +64,10 @@ async fn hook_command_only_sends_managed_turn_identity_to_its_local_daemon() {
         }
         assert_eq!(rx.recv().await.unwrap(), expected);
     }
+    let mut no_generation = event.clone();
+    no_generation.as_object_mut().unwrap().remove("generation_id");
+    assert!(hook(&policy, &no_generation).await.status.success());
+    assert!(rx.try_recv().is_err());
     event["transcript_path"] = json!(config.join("projects/workspace/other-sid.jsonl"));
     assert!(!hook(&policy, &event).await.status.success());
     assert!(rx.try_recv().is_err());

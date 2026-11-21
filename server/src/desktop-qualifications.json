@@ -25,7 +25,7 @@
     "identifier": "com.workbuddy.workbuddy",
     "team": "FN2V63AD2J",
     "cdhash": "71014f97334210d014d63b464caff4dd07f3f7f2",
-    "qualified": false
+    "qualified": true
   },
   {
     "agent": "claude-desktop",

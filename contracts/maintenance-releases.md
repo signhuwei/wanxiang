@@ -52,7 +52,7 @@ onex-server-release-v1
 支持缓存协议的 Edge 使用它当前连接的 OneX Server 作为下载服务器，跟随同一协议、主机和端口。厂商源地址供 Server 入库。旧 Edge 的兼容规则见 [Edge ↔ Server 协议](edge-ws.md)。
 
 
-WorkBuddy、DeepSeek Harness Desktop、Claude Desktop 和 Codex Desktop 的原厂安装包可登记、校验并缓存。平台与 Edge 共读 `server/src/desktop-qualifications.json`，按 Agent、版本、系统、架构、字节数和 SHA-256 匹配原生验收结果。匹配合格且已有完整缓存的发行可由管理员激活。其余发行返回 `qualification_required: true` 并允许管理员下载测试。macOS ARM64 的 DeepSeek Harness Desktop 0.2.1-rc.3 已通过原厂进程、会话冷恢复和本机回环上游计费测试。
+WorkBuddy、DeepSeek Harness Desktop、Claude Desktop 和 Codex Desktop 的原厂安装包可登记、校验并缓存。平台与 Edge 共读 `server/src/desktop-qualifications.json`，按 Agent、版本、系统、架构、字节数和 SHA-256 匹配原生验收结果。匹配合格且已有完整缓存的发行可由管理员激活。其余发行返回 `qualification_required: true` 并允许管理员下载测试。macOS ARM64 的 WorkBuddy 5.3.8 已通过原厂模型菜单和双任务独立入账验收。macOS ARM64 的 DeepSeek Harness Desktop 0.2.1-rc.3 已通过原厂进程、会话冷恢复和本机回环上游计费测试。
 
 桌面包分段上传沿用 PUT，传 `?part=<从 0 起的段号>&revision=<当前修订>`，段大小取发行返回的 `part_bytes`（32 MiB），最后一段取余数，桌面整包最多 768 MiB。待分段齐全返回 202；合并后完成整包大小、SHA-256 和容器标记校验返回 200。同段可重传。校验完成前，文件不能下载。
 

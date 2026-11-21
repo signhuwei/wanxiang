@@ -435,6 +435,10 @@ impl Router {
                 post(crate::desktop_sessions::codex_turn).layer(DefaultBodyLimit::max(4096)),
             )
             .route("/v1/onex/desktop/ready", post(crate::desktop_sessions::ready))
+            .route(
+                "/v1/onex/workbuddy/session",
+                post(crate::workbuddy_turns::session).layer(DefaultBodyLimit::max(4096)),
+            )
             .route("/v1/onex/workbuddy/turn", post(crate::workbuddy_turns::observe).layer(DefaultBodyLimit::max(4096)))
             .route(
                 "/v1/onex/desktop/session",
@@ -473,7 +477,7 @@ impl Router {
                     return None;
                 }
                 let mut ids = h.get_all("x-conversation-request-id").iter();
-                let generation = ids.next()?.to_str().ok()?;
+                let generation = ids.next().map(|v| v.to_str()).transpose().ok()?;
                 if ids.next().is_some() {
                     return None;
                 }

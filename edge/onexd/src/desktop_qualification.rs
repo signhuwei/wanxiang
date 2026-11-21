@@ -271,7 +271,7 @@ async fn original_gui_restores_native_session_and_settles_each_turn() -> anyhow:
 }
 
 #[tokio::test]
-async fn staged_workbuddy_interleaved_requests_bill_only_the_registered_native_turn() -> anyhow::Result<()> {
+async fn workbuddy_interleaved_requests_bill_only_the_registered_native_task() -> anyhow::Result<()> {
     let release = fixture_release("workbuddy");
     let (state, addr, mut usage) = router_fixture(&release).await?;
     state.config.write().unwrap().routes[0].model = "wire-model".into();
@@ -396,6 +396,36 @@ async fn staged_workbuddy_interleaved_requests_bill_only_the_registered_native_t
     assert!(allowed.text().await?.contains("verified reply"));
     assert_eq!(usage.recv().await.unwrap().cost_milli, 7);
     assert_eq!(state.lease.snapshot().used_milli, 28);
+    let bind = |token: &str, sid: &str| {
+        client
+            .post(format!("http://{addr}/v1/onex/workbuddy/session"))
+            .bearer_auth(token)
+            .json(&json!({"native_id":sid,"source":{"project":"fixture","cwd":workspace}}))
+    };
+    assert_eq!(bind("model", "task-a").send().await?.status(), 403);
+    let mut keys = Vec::new();
+    for sid in ["task-a", "task-b", "task-a"] {
+        let reply: Value = bind("control", sid).send().await?.error_for_status()?.json().await?;
+        keys.push(reply["model_token"].as_str().unwrap().to_owned());
+    }
+    assert_ne!(keys[0], keys[1]);
+    assert_eq!(keys[0], keys[2]);
+    let task_call = |index: usize| {
+        client.post(format!("http://{addr}/v1/chat/completions")).header("x-api-key", keys[index].as_str()).json(
+            &json!({"model":"custom-local:wire-model","stream":true,"messages":[{"role":"user","content":"fixture"}]}),
+        )
+    };
+    assert_eq!(task_call(1).header("X-Conversation-Request-ID", a).send().await?.status(), 401);
+    for (index, sid) in [(0, "task-a"), (1, "task-b"), (0, "task-a")] {
+        let response = task_call(index).send().await?.error_for_status()?;
+        assert!(response.text().await?.contains("verified reply"));
+        let record = tokio::time::timeout(Duration::from_secs(5), usage.recv()).await?.unwrap();
+        assert_eq!(record.session_id, Some(crate::native_capture::session_id("device", "workbuddy", sid)));
+        assert_eq!(record.cost_milli, 7);
+    }
+    state.workbuddy_turns.stop("control");
+    assert_eq!(task_call(0).send().await?.status(), 401);
+    assert_eq!(state.lease.snapshot().used_milli, 49);
     Ok(())
 }
 
