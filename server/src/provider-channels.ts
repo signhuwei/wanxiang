@@ -84,23 +84,30 @@ export function syncProviderChannel(db: Transaction, providerId: string, at: num
 
 function jobView(row: Job) {
   return { id: row.id, kind: row.kind, status: row.status, location: `${jobPath}/${row.id}`, observed_at: row.observed_at,
-    scope: { provider_id: row.provider_id, account_id: row.account_id, endpoint_id: row.endpoint_id, endpoint_revision: row.endpoint_revision },
+    scope: { provider_id: row.provider_id, provider_revision: row.provider_revision,
+      account_id: row.account_id, endpoint_id: row.endpoint_id, endpoint_revision: row.endpoint_revision },
     summary: { model_count: row.model_count, reason: row.reason }, actions: ['read'] };
 }
 
-function latestJob(db: Reader, providerId: string, kind: Job['kind'], catalogOnly = false) {
+function latestJob(db: Reader, providerId: string, kind: Job['kind']) {
   return db.get<Job>(`SELECT * FROM provider_channel_jobs WHERE provider_id = ? AND kind = ?
-    ${catalogOnly ? "AND status IN ('succeeded', 'partial')" : ''}
-    ORDER BY ${catalogOnly ? "(status = 'succeeded') DESC, " : ''} observed_at DESC, rowid DESC LIMIT 1`, [providerId, kind]);
+    ORDER BY observed_at DESC, rowid DESC LIMIT 1`, [providerId, kind]);
+}
+
+function latestCatalog(db: Reader, provider: Provider, channel: Channel | null, historical = false) {
+  if (!channel) return null;
+  return db.get<Job>(`SELECT * FROM provider_channel_jobs WHERE provider_id = ? AND kind = 'discovery'
+    AND status IN ('succeeded', 'partial') AND ${historical ? 'NOT ' : ''}(provider_revision = ? AND endpoint_id = ? AND endpoint_revision = ?)
+    ORDER BY (status = 'succeeded') DESC, observed_at DESC, rowid DESC LIMIT 1`,
+    [provider.id, provider.revision, channel.endpoint_id, channel.current_revision]);
 }
 
 function reviewable(db: Reader, row: Job) {
   if (row.kind !== 'discovery' || row.status === 'failed') return false;
   const provider = getProvider(db, row.provider_id);
   const channel = getDefault(db, row.provider_id);
-  // Failed and partial pulls preserve the last complete catalogue when one exists.
-  return provider.status === 'active' && provider.revision === row.provider_revision && channel?.current_revision === row.endpoint_revision
-    && latestJob(db, provider.id, 'discovery', true)?.id === row.id;
+  // A complete pull takes priority over partial pulls from the same revision.
+  return provider.status === 'active' && latestCatalog(db, provider, channel)?.id === row.id;
 }
 
 function modelIdentity(db: Reader, id: string) {
@@ -232,12 +239,15 @@ export function providerChannelRoutes(app: Hono, store: Store, opts: ManagementO
     const accounts = store.system.all(`SELECT a.account_id, a.name, a.balance_mode, a.funding_id, d.endpoint_id
       FROM provider_accounts a LEFT JOIN provider_channel_defaults d ON d.account_id = a.account_id
       WHERE a.provider_id = ? ORDER BY a.name, a.account_id`, [provider.id]);
-    function view(kind: Job['kind'], usable = false) {
-      const job = latestJob(store.system, provider.id, kind, usable);
+    const channel = getDefault(store.system, provider.id);
+    function view(job: Job | null) {
       return job ? jobView(job) : null;
     }
-    return c.json({ provider_id: provider.id, revision: provider.revision, accounts, latest_probe: view('connectivity'),
-      latest_discovery: view('discovery'), latest_catalog: view('discovery', true),
+    return c.json({ provider_id: provider.id, revision: provider.revision, accounts,
+      latest_probe: view(latestJob(store.system, provider.id, 'connectivity')),
+      latest_discovery: view(latestJob(store.system, provider.id, 'discovery')),
+      latest_catalog: view(latestCatalog(store.system, provider, channel)),
+      historical_catalog: view(latestCatalog(store.system, provider, channel, true)),
       actions: provider.status === 'active' ? ['probe_connectivity', 'discover'] : [] });
   });
 

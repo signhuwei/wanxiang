@@ -402,7 +402,7 @@ const channelIdentityPath = '/v1/platform/models/{model_id}/identity';
 const channelProviderId = namedPath('provider_id', routingId);
 const channelJobId = namedPath('job_id', routingId);
 const channelJob = object({ id: routingId, kind: { enum: ['connectivity', 'discovery'] }, status: { enum: ['succeeded', 'partial', 'failed'] },
-  location: text, scope: object({ provider_id: routingId, account_id: routingId, endpoint_id: routingId, endpoint_revision: revision }),
+  location: text, scope: object({ provider_id: routingId, provider_revision: revision, account_id: routingId, endpoint_id: routingId, endpoint_revision: revision }),
   observed_at: timestamp, summary: object({ model_count: sequence, reason: nullableText }), actions });
 const channelAccount = object({ account_id: routingId, name: text, balance_mode: text, funding_id: nullableText, endpoint_id: nullableText });
 const channelCatalogItem = object({ catalog_item_id: routingId, discovery_id: routingId, raw_model: text, context_tokens: nullable(revision),
@@ -416,7 +416,8 @@ const channelStart = (input: object) => ({ security: bearer, parameters: [channe
 
 const routingPaths = {
   [channelProvider + '/channel']: { get: policyDetail(object({ provider_id: routingId, revision, accounts: listItems(channelAccount),
-    latest_probe: nullable(channelJob), latest_discovery: nullable(channelJob), latest_catalog: nullable(channelJob), actions }), [channelProviderId]) },
+    latest_probe: nullable(channelJob), latest_discovery: nullable(channelJob), latest_catalog: nullable(channelJob),
+    historical_catalog: nullable(channelJob), actions }), [channelProviderId]) },
   [channelProvider + '/probes']: { post: channelStart(object({ kind: { const: 'connectivity' }, revision })) },
   [channelProvider + '/discoveries']: { post: channelStart(object({ revision })) },
   [channelJobPath]: { get: policyDetail(channelJob, [channelJobId]) },
