@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | `contracts/` | 接口契约：Edge↔Server WebSocket、HTTP API、数据模型、错误码。**改代码前先看契约，契约和代码不一致时以契约为准，并修正其中一方** | Markdown |
 | `edge/` | `onexd`（本机 daemon：router、计价、租约、回流、启动 Agent）、`onex-cli`、`onex-core`（共享消息类型） | Rust、Tokio |
-| `server/` | API、WS 网关、账本、回流写入、监察 | Bun 1.3.5、TypeScript、Hono、bun:sqlite |
+| `server/` | API、WS 网关、账本、回流写入、监察 | Bun、TypeScript、Hono、bun:sqlite |
 | `server/web/` | 管理端，原生 HTML/CSS/ESM，无构建步骤 | 浏览器直接加载 |
 | `desktop-ui/` | Desktop 前端（mock，Tauri 外壳未做） | 原生 HTML/ESM |
 | `deploy/` | 一致的安装、启停、部署脚本（macOS arm64、Ubuntu 22.04） | Bash |
@@ -22,6 +22,8 @@
 | `docs/specs/` | Magpie 参考规格、5 个 Agent 的适配规格、SIMA 教训 | Markdown |
 
 ## 运行测试
+
+开发环境的 Bun 版本由根目录的 [`mise.toml`](mise.toml) 指定。使用 mise 时在仓库根目录运行 `mise install`，并通过 `mise exec -- bun --version` 检查版本。也可以手动安装配置中的版本，使 `bun --version` 与配置一致。
 
 ```sh
 (cd server && bun install --frozen-lockfile)
