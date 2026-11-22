@@ -13,16 +13,22 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
+use onex_core::route_pool::ROUTE_POOL_V1;
+use onex_core::ws::PROTOCOL_VERSION;
 use onexd::outbox::Outbox;
-use onexd::route_apply::{PoolLeaseState, Scope, Store};
+use onexd::route_apply::{PoolLeaseOp, PoolLeaseState, Scope, Store};
 use onexd::router::Router;
 use onexd::secret::DeviceKey;
 use onexd::state::{LaunchBinding, RouteApply, State};
 use onexd::ws::{self, WsOptions};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tokio_util::sync::CancellationToken;
 
 const T: Duration = Duration::from_secs(15);
@@ -402,6 +408,59 @@ async fn joint_lease_gate_first_lease_and_restart() {
     server.stop().await;
 }
 
+async fn wait_reply(socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, id: &str) -> Value {
+    timeout(T, async {
+        while let Some(message) = socket.next().await {
+            let frame = message.unwrap();
+            if let Message::Text(text) = frame {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["re"] == id {
+                    return value;
+                }
+            }
+        }
+        panic!("WebSocket closed awaiting reply to {id}");
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out awaiting reply to {id}"))
+}
+
+async fn replay_settlement(info: &Value, receipt: &Value, settlement: &Value, expected: &Value) {
+    let edge_version = env!("CARGO_PKG_VERSION");
+    let mut request = info["ws_url"].as_str().unwrap().into_client_request().unwrap();
+    let token = info["device_token"].as_str().unwrap();
+    request.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+    request.headers_mut().insert("onex-edge-version", edge_version.parse().unwrap());
+    request.headers_mut().insert("onex-protocol", PROTOCOL_VERSION.parse().unwrap());
+    let (mut socket, _) = timeout(T, connect_async(request)).await.unwrap().unwrap();
+    let hello = json!({
+        "type":"hello", "id":"msg_one_chain_replay", "edge_version":edge_version,
+        "os":onex_core::ipc::os_name(), "arch":onex_core::ipc::arch_name(),
+        "agent_cache":true, "capability_contract_v1":true, "capability_policy_v2":true,
+        "policy_runtime_v1":true, "config_revision":info["config_revision"], "outbox_last_seq":receipt["seq"],
+        "capabilities":[ROUTE_POOL_V1],
+    });
+    socket.send(Message::Text(hello.to_string().into())).await.unwrap();
+    let welcome = wait_reply(&mut socket, "msg_one_chain_replay").await;
+    assert_eq!(welcome["type"], "welcome", "{welcome}");
+    assert_eq!(welcome["capabilities"], json!([ROUTE_POOL_V1]));
+    assert_eq!(welcome["ack_seq"], receipt["seq"]);
+
+    let usage = json!({"type":"usage", "id":"usage_one_chain_replay", "batch":[receipt]});
+    socket.send(Message::Text(usage.to_string().into())).await.unwrap();
+    let ack = wait_reply(&mut socket, "usage_one_chain_replay").await;
+    assert_eq!(ack["type"], "events_ack", "{ack}");
+    assert_eq!(ack["ack_seq"], receipt["seq"]);
+
+    socket.send(Message::Text(settlement.to_string().into())).await.unwrap();
+    let reply = wait_reply(&mut socket, settlement["id"].as_str().unwrap()).await;
+    assert_eq!(reply["type"], expected["type"], "{reply}");
+    assert_eq!(reply["settled_lease_id"], receipt["lease_id"], "{reply}");
+    assert_eq!(reply["lease_id"], expected["lease_id"]);
+    assert_eq!(reply["reason"], expected["reason"]);
+    socket.close(None).await.unwrap();
+}
+
 /// 平台经真实 HTTP 配渠道、签发、充值，Edge 经真实 WS 获取模型池和租约。
 /// 本地原生 Responses 请求用上游终态用量结算，并核对供应商与租户两边台账。
 #[tokio::test]
@@ -425,11 +484,12 @@ async fn run_signed_pool_responses(primary_offline: bool) {
     let value = |field: &str| info[field].as_str().unwrap();
     let scope = Scope::new(value("ws_url"), value("tenant_id"), value("user_id"), value("device_id")).unwrap();
     let edge_dir = tempfile::tempdir().unwrap();
+    let edge_store_path = edge_dir.path().join("route_apply.sqlite");
     let edge = Edge::start_with_execution(
         value("ws_url"),
         value("device_token"),
         value("device_private_key_hex"),
-        &edge_dir.path().join("route_apply.sqlite"),
+        &edge_store_path,
         true,
         true,
     );
@@ -507,6 +567,45 @@ async fn run_signed_pool_responses(primary_offline: bool) {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();
+    http_task.abort();
+    edge.stop().await;
+    let edge_db =
+        rusqlite::Connection::open_with_flags(edge_store_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let op = edge_db
+        .query_row(
+            "SELECT op_id,msg_id,used_milli,model_used_milli FROM pool_lease_ops
+          WHERE lease_id=?1 AND done_at_ms IS NOT NULL AND release_only=0",
+            [&lease.lease_id],
+            |row| {
+                let model_totals: String = row.get(3)?;
+                Ok(PoolLeaseOp {
+                    op_id: row.get(0)?,
+                    msg_id: row.get(1)?,
+                    lease_id: lease.lease_id.clone(),
+                    release_only: false,
+                    used_milli: row.get(2)?,
+                    model_used_milli: serde_json::from_str(&model_totals).unwrap(),
+                    last_failure: None,
+                })
+            },
+        )
+        .unwrap();
+    assert_eq!(op.used_milli, 64);
+    let mut settlement = op.to_frame();
+    settlement["usage_through_seq"] = seq.unwrap().into();
+    let cached: String = db
+        .query_row(
+            "SELECT result_json FROM lease_operations WHERE device_id=?1 AND op_id=?2 AND lease_id=?3",
+            (&scope.device_id, &op.op_id, &lease.lease_id),
+            |row| row.get(0),
+        )
+        .unwrap();
+    let expected: Value = serde_json::from_str(&cached).unwrap();
+    replay_settlement(info, &receipt, &settlement, &expected).await;
+
+    let usage_count: i64 =
+        db.query_row("SELECT count(*) FROM usage WHERE device_id=?1", [&scope.device_id], |row| row.get(0)).unwrap();
+    assert_eq!(usage_count, 1);
     let (charge_count, charges): (i64, i64) = db
         .query_row(
             "SELECT count(*),sum(amount_milli) FROM ledger WHERE kind='settle' AND lease_id=?1",
@@ -581,11 +680,10 @@ async fn run_signed_pool_responses(primary_offline: bool) {
             "deployment_revision": receipt["deployment_revision"], "signed_pool": info["signed_pool"],
             "input_tokens": 10_000, "output_tokens": 2_000, "tenant_debit_milli": charges,
             "primary_offline": primary_offline, "attempts": attempts,
+            "replayed_usage_ack_seq": seq, "replayed_settlement_op_id": op.op_id,
             "supplier_debit_micro": supplier_debit, "supplier_amount_cny_micro": 50_000,
             "supplier_balance_micro": selected_wallet_balance,
         }),
     );
-    http_task.abort();
-    edge.stop().await;
     server.stop().await;
 }
