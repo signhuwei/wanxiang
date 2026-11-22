@@ -219,7 +219,9 @@ try {
   const expired = await openPool('seed v6')
   await expired.locator('tbody tr', { hasText: 'dev_fix' }).waitFor()
   const fixRow = await cells(expired, 'dev_fix', 3, 7)
+  // target_expired 不是独立状态，只是离线或等待应用的原因（applied > superseded > rejected > needs_upgrade > offline > pending）。
   assert.deepEqual([fixRow[0], fixRow[1], fixRow[3]], ['92', '未应用', '目标已过期（target_expired）'])
+  assert.ok(['离线', '等待应用'].includes(fixRow[2]), '过期目标的状态应为离线或等待应用，实际 ' + fixRow[2])
   await capture('v6-expired')
   assert.equal(await stopServer(), 0)
 
