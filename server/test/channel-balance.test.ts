@@ -2,10 +2,19 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { observeRelayBalance } from '../src/channel-balance-upstream';
 import { hash, iso, randomToken } from '../src/credentials';
 import { MemoryPresence } from '../src/presence';
 import { seedTenant } from '../src/seed';
 import { createServer } from '../src/server';
+
+test('real transport rejects insecure and local-control-plane destinations before sending a balance credential', async () => {
+  const account = { adapter: 'sub2api', expected_user_id: '1', quota_per_unit: null } as const;
+  for (const origin of ['http://relay.test', 'https://127.0.0.1', 'https://169.254.169.254', 'https://[::1]']) {
+    expect(await observeRelayBalance({ ...account, source_origin: origin }, 'local-test-management-token'))
+      .toMatchObject({ amount_micro: null, reason_code: 'destination_denied' });
+  }
+});
 
 test('relay balances are verified against the configured account before updating eligible wallets', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'onex-channel-balance-'));
