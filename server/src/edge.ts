@@ -13,6 +13,9 @@ import { bearer, hash, iso, randomToken } from './credentials';
 import { readPolicyHot } from './policy-data';
 import { requiresPolicyRuntime, type ConfigPublisher } from './edge-config';
 import type { Presence } from './presence';
+import { applyReceipt, observeUnsupported, parseReceipt, ROUTE_POOL_CAPABILITY, routePoolLeasePending, selectsRoutePool,
+  sendCurrentTarget, unsupportedRoutePool } from './route-pool-session';
+import type { RoutingProjector } from './route-projection';
 import type { Device, Store } from './store';
 
 const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -20,9 +23,17 @@ const isText = (value: unknown, max = 128): value is string => typeof value === 
 const isSeq = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
 export function edgeGateway(app: Hono, store: Store, presence: Presence, now: () => number, heartbeatMs: number,
-  config: ConfigPublisher, pending: PendingWork, publish: PublishSummary, diag: DiagChannel) {
+  config: ConfigPublisher, pending: PendingWork, publish: PublishSummary, diag: DiagChannel, projector?: RoutingProjector) {
   const current = new Map<string, WSContext>();
   const sockets = new Set<WSContext>();
+  // Online isolated route_pool.v1 sessions; a newly persisted target is sent right away.
+  const routeSessions = new Map<string, { live: () => boolean; resend: () => Promise<void> }>();
+  projector?.subscribe((_tenant, device) => {
+    const session = routeSessions.get(device);
+    if (session?.live()) void pending.track(session.resend().catch(() => {
+      console.error('OneX could not send a device projection', { device_id: device });
+    }));
+  });
   let closing = false;
   let allClosed: (() => void) | undefined;
   const ttl = heartbeatMs * 4;
@@ -52,6 +63,8 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
     let lastRenewal = 0;
     const awaiting = new Set<string>();
     let heartbeatBusy = false;
+    let routePoolSelected = false;
+    let routePoolGated = false;
 
     const live = () => state !== 'closed' && current.get(deviceId) === socket;
     const send = (msg: Record<string, unknown>) => { if (live()) socket.send(JSON.stringify(msg)); };
@@ -97,6 +110,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
       onMessage(event) { return pending.track(onMessage(event.data)); },
       onClose() {
         state = 'closed';
+        if (routeSessions.get(deviceId)?.live === live) routeSessions.delete(deviceId);
         config.disconnect(deviceId, subscription);
         diag.disconnect(deviceId, send);
         clearTimeout(timer);
@@ -134,6 +148,8 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             subscription.macDesktop = msg.mac_desktop_v1 === true;
             subscription.codexDesktop = msg.codex_desktop_v1 === true;
             subscription.claudeDesktop = msg.claude_desktop_v1 === true;
+            const routePool = selectsRoutePool(projector, tenantId, deviceId, msg);
+            routePoolSelected = routePool.selected;
             state = 'starting';
             if (!await renew()) { if (live()) stop(1008, 'device unavailable'); return; }
             if (!live()) return;
@@ -142,8 +158,27 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             clearTimeout(timer);
             state = 'ready';
             send({ type: 'welcome', re: msg.id, device_id: deviceId, user_id: userId, tenant_id: tenantId,
-              server_time: iso(now()), ack_seq: ackCursor(store.tenant(tenantId), deviceId), heartbeat_ms: heartbeatMs });
+              server_time: iso(now()), ack_seq: ackCursor(store.tenant(tenantId), deviceId), heartbeat_ms: heartbeatMs,
+              ...(routePoolSelected && { capabilities: [ROUTE_POOL_CAPABILITY] }) });
             timer = setTimeout(tick, heartbeatMs);
+            if (routePoolSelected && projector) {
+              // Isolated session: no handshake lease and no legacy config/secret frames; resend the persisted target.
+              const resend = () => sendCurrentTarget(store, projector, tenantId, deviceId, now(), live, send).then(() => {});
+              routeSessions.set(deviceId, { live, resend });
+              diag.connect(deviceId, tenantId, send, live);
+              await resend();
+              return;
+            }
+            if (routePool.observedUnsupported) {
+              // Registered for the isolated stage but the hello lacks the capability: never fall back to the legacy
+              // lease or config path for this device.
+              routePoolGated = true;
+              await observeUnsupported(store, tenantId, deviceId, now());
+              send({ type: 'ack', re: msg.id, ok: false, error: unsupportedRoutePool().body() });
+              send({ type: 'cutoff', id: `msg_${ulid()}`, reason: 'contract' });
+              if (live()) diag.connect(deviceId, tenantId, send, live);
+              return;
+            }
             if (msg.lease_id == null) {
               const reply = await initialLease(store, tenantId, deviceId, userId, now(), live,
                 subscription.supportsCapabilityContract, policyCap());
@@ -173,7 +208,14 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             return;
           }
           if (msg.type === 'pong' || (msg.type === 'ack' && isText(msg.re) && typeof msg.ok === 'boolean')) return;
+          if (routePoolGated && ['lease_renew', 'lease_request', 'config_applied'].includes(String(msg.type)) && isText(msg.id)) throw unsupportedRoutePool();
+          if (routePoolSelected && (msg.type === 'lease_renew' || msg.type === 'lease_request') && isText(msg.id)) throw routePoolLeasePending();
           if (msg.type === 'config_applied' && isText(msg.id)) {
+            if (routePoolSelected) {
+              await applyReceipt(store, tenantId, deviceId, parseReceipt(msg), now(), live);
+              send({ type: 'ack', re: msg.id, ok: true });
+              return;
+            }
             const frame = msg;
             if (['projection_id', 'result', 'error'].some((key) => Object.hasOwn(frame, key))) {
               send({ type: 'ack', re: msg.id, ok: false,

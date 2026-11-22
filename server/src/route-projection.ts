@@ -216,11 +216,17 @@ export function latestSnapshot(sql: Reader, deviceId: string) {
 }
 
 export function routingProjector(store: Store, inputs: RoutingProjectionInputs, now: () => number) {
+  const listeners = new Set<(tenantId: string, deviceId: string) => void>();
   /**
    * Persists (or reuses) the device target. The system counter is advanced first; a reused basis or a failed tenant
-   * transaction leaves a gap, which the contract allows.
+   * transaction leaves a gap, which the contract allows. A new target notifies online test sessions.
    */
-  async function project(tenantId: string, deviceId: string, at = now()): Promise<ProjectionTarget> {
+  async function project(tenantId: string, deviceId: string, at = now(), options: { notify?: boolean } = {}): Promise<ProjectionTarget> {
+    const target = await persist(tenantId, deviceId, at);
+    if (!target.reused && options.notify !== false) for (const listener of listeners) listener(tenantId, deviceId);
+    return target;
+  }
+  async function persist(tenantId: string, deviceId: string, at: number): Promise<ProjectionTarget> {
     const db = store.tenant(tenantId);
     const first = buildProjection(store, db, inputs, tenantId, deviceId, at);
     const existing = reusable(db, deviceId, first.source_token, iso(at));
@@ -315,6 +321,7 @@ export function routingProjector(store: Store, inputs: RoutingProjectionInputs, 
     for (const job of jobs) await runRollout(job.job_id);
   }
 
-  return { inputs, project, runRollout, runPending };
+  return { inputs, project, runRollout, runPending,
+    subscribe(listener: (tenantId: string, deviceId: string) => void) { listeners.add(listener); return () => listeners.delete(listener); } };
 }
 export type RoutingProjector = ReturnType<typeof routingProjector>;
