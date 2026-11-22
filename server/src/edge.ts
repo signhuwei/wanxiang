@@ -71,7 +71,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
 
     const live = () => state !== 'closed' && current.get(deviceId) === socket;
     const send = (msg: Record<string, unknown>) => { if (live()) socket.send(JSON.stringify(msg)); };
-    const subscription = { tenant: tenantId, agentCache: false, macDesktop: false, codexDesktop: false, claudeDesktop: false, supportsCapabilityContract: false, supportsCapabilityPolicy: false, supportsPolicyRuntime:false, live, send };
+    const subscription = { tenant: tenantId, agentCache: false, macDesktop: false, windowsDeepseekDesktop: false, codexDesktop: false, claudeDesktop: false, supportsCapabilityContract: false, supportsCapabilityPolicy: false, supportsPolicyRuntime:false, live, send };
     const policyCap = () => subscription.supportsCapabilityPolicy && (subscription.supportsPolicyRuntime ||
       !requiresPolicyRuntime(store,readPolicyHot(store.tenant(tenantId),userId)));
     const stop = (code: number, reason: string) => {
@@ -139,6 +139,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
               || (msg.policy_runtime_v1 !== undefined && typeof msg.policy_runtime_v1 !== 'boolean')
               || (msg.capability_policy_v2 !== undefined && typeof msg.capability_policy_v2 !== 'boolean')
               || (msg.mac_desktop_v1 !== undefined && typeof msg.mac_desktop_v1 !== 'boolean')
+              || (msg.windows_deepseek_desktop_v1 !== undefined && typeof msg.windows_deepseek_desktop_v1 !== 'boolean')
               || (msg.codex_desktop_v1 !== undefined && typeof msg.codex_desktop_v1 !== 'boolean')
               || (msg.claude_desktop_v1 !== undefined && typeof msg.claude_desktop_v1 !== 'boolean')
               || !isSeq(msg.config_revision) || !isSeq(msg.outbox_last_seq) || (msg.lease_id != null && !isText(msg.lease_id))) {
@@ -149,6 +150,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             subscription.supportsCapabilityPolicy = subscription.agentCache && msg.capability_policy_v2 === true;
             subscription.supportsPolicyRuntime = msg.policy_runtime_v1 === true;
             subscription.macDesktop = msg.mac_desktop_v1 === true;
+            subscription.windowsDeepseekDesktop = msg.windows_deepseek_desktop_v1 === true;
             subscription.codexDesktop = msg.codex_desktop_v1 === true;
             subscription.claudeDesktop = msg.claude_desktop_v1 === true;
             const routePool = selectsRoutePool(projector, tenantId, deviceId, msg);

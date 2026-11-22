@@ -49,8 +49,10 @@ export const releaseIdentity = ['id', 'agent', 'version', 'os', 'arch', 'sha256'
 export type AgentPin = { id: string; agent: string; version: string; os: string; arch: string; sha256: string; size: number };
 export type AgentRelease = AgentPin & { url: string; status: string; revision: number };
 export type AgentPolicy = { allowed_agents_json: string; agent_release_pins_json: string; release_ids_json?: string | null; lease_budget_milli: number };
-export type DesktopCapabilities = { macDesktop?: boolean; codexDesktop?: boolean; claudeDesktop?: boolean };
-export const allDesktopCapabilities: DesktopCapabilities = { macDesktop: true, codexDesktop: true, claudeDesktop: true };
+export type DesktopCapabilities = { macDesktop?: boolean; windowsDeepseekDesktop?: boolean; codexDesktop?: boolean; claudeDesktop?: boolean };
+export const allDesktopCapabilities: DesktopCapabilities = {
+  macDesktop: true, windowsDeepseekDesktop: true, codexDesktop: true, claudeDesktop: true,
+};
 
 export function artifactPath(dataDir: string, sha256: string) {
   return join(dataDir, 'agent-artifacts', sha256);
@@ -81,6 +83,13 @@ export function hasPinnedAgentTarget(policy: AgentPolicy | null, os: string, arc
   return !!policy && (JSON.parse(policy.agent_release_pins_json) as AgentPin[]).some(pin => pin.os === os && pin.arch === arch);
 }
 
+function supportsDesktopRelease(release: AgentRelease, desktop: DesktopCapabilities) {
+  if (release.os === 'win32') {
+    return release.arch === 'x64' && release.agent === 'deepseek-desktop' && desktop.windowsDeepseekDesktop;
+  }
+  return release.os === 'darwin' && desktop.macDesktop;
+}
+
 export function allowedAgentReleases(store: Store, dataDir: string, policy: AgentPolicy | null, os: string, arch: string, requireCache: boolean,
   desktop: DesktopCapabilities = {}) {
   if (!policy || policy.lease_budget_milli <= 0) return [];
@@ -90,7 +99,7 @@ export function allowedAgentReleases(store: Store, dataDir: string, policy: Agen
     WHERE status = 'active' AND os = ? AND arch = ? AND agent IN (SELECT value FROM json_each(?))
     ORDER BY id`, [os, arch, policy.allowed_agents_json]);
   return rows.filter(row => {
-    if (requiresDesktopQualification(row.agent) && (!desktop.macDesktop || !requireCache || !qualifiedDesktopRelease(row))) return false;
+    if (requiresDesktopQualification(row.agent) && (!supportsDesktopRelease(row, desktop) || !requireCache || !qualifiedDesktopRelease(row))) return false;
     if (row.agent === 'codex-desktop' && !desktop.codexDesktop) return false;
     if (row.agent === 'claude-desktop' && !desktop.claudeDesktop) return false;
     if (exact && !exact.has(row.id)) return false;

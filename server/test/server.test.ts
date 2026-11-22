@@ -1620,6 +1620,7 @@ test('signed release selections reach only compatible Apple Silicon Edges', asyn
     .toEqual([baseId, staged.id, claudeStage.id].sort());
   for (const { features, expected } of [
     { features: { agent_cache: true, mac_desktop_v1: true }, expected: ['deepseek-desktop'] },
+    { features: { agent_cache: true, windows_deepseek_desktop_v1: true }, expected: [] },
     { features: { agent_cache: true, codex_desktop_v1: true }, expected: [] },
     { features: { agent_cache: true, mac_desktop_v1: true, codex_desktop_v1: true }, expected: ['codex-desktop', 'deepseek-desktop'] },
     { features: { agent_cache: true, mac_desktop_v1: true, claude_desktop_v1: true }, expected: ['claude-desktop', 'deepseek-desktop'] },

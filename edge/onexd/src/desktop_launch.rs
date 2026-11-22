@@ -146,6 +146,11 @@ pub(crate) fn prepare(
                 config
             }
             "deepseek-desktop" => {
+                #[cfg(windows)]
+                {
+                    windows_deepseek_environment(&mut env, &home, &tmp)?;
+                    args.push("--no-proxy-server".into());
+                }
                 let root = profile.join("dsh");
                 let desktop = root.join("profiles/desktop");
                 launch::private_dir(&desktop)?;
@@ -157,12 +162,10 @@ pub(crate) fn prepare(
                 )?;
                 let credentials = run.join("onex-credentials.mjs");
                 launch::write_private(&credentials, include_bytes!("desktop_adapters/deepseek-credentials.mjs"))?;
-                let credentials_url = reqwest::Url::from_file_path(&credentials)
-                    .map_err(|_| anyhow::anyhow!("could not construct desktop credential provider URL"))?;
+                let credentials_url = file_url(&credentials)?;
                 let credential = run.join("desktop.token");
                 launch::write_private(&credential, request.token.as_bytes())?;
-                let plugin_url = reqwest::Url::from_file_path(&plugin)
-                    .map_err(|_| anyhow::anyhow!("could not construct desktop adapter URL"))?;
+                let plugin_url = file_url(&plugin)?;
                 let manifest = json!({
                     "name":"onex-managed-desktop", "version":"1.0.0", "private":true,
                     "dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]}}
@@ -217,6 +220,50 @@ pub(crate) fn prepare(
     result
 }
 
+#[cfg(windows)]
+fn windows_deepseek_environment(
+    env: &mut std::collections::BTreeMap<String, String>,
+    home: &Path,
+    tmp: &Path,
+) -> Result<()> {
+    let roaming = home.join("AppData/Roaming");
+    let local = home.join("AppData/Local");
+    launch::private_dir(&roaming)?;
+    launch::private_dir(&local)?;
+    let system_root = std::env::var_os("SystemRoot").map(PathBuf::from).context("Windows SystemRoot is unavailable")?;
+    let system32 = system_root.join("System32");
+    let shell = system32.join("cmd.exe");
+    anyhow::ensure!(system_root.is_absolute() && shell.is_file(), "Windows command shell is unavailable");
+    let git = ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .flat_map(|base| [base.join("Git/cmd"), base.join("Programs/Git/cmd")])
+        .chain(std::env::var_os("PATH").iter().flat_map(|path| std::env::split_paths(path)))
+        .find(|dir| dir.is_absolute() && dir.join("git.exe").is_file());
+    let path = std::env::join_paths([system32, system_root.clone()].into_iter().chain(git))?;
+    env.insert("PATH".into(), path.into_string().map_err(|_| anyhow::anyhow!("Windows PATH is not UTF-8"))?);
+    env.insert("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into());
+    for (key, path) in [
+        ("USERPROFILE", home),
+        ("APPDATA", &roaming),
+        ("LOCALAPPDATA", &local),
+        ("TEMP", tmp),
+        ("TMP", tmp),
+        ("SystemRoot", &system_root),
+        ("windir", &system_root),
+        ("ComSpec", &shell),
+    ] {
+        env.insert(key.into(), path_text(path)?);
+    }
+    Ok(())
+}
+
+fn file_url(path: &Path) -> Result<reqwest::Url> {
+    reqwest::Url::from_file_path(path_text(path)?)
+        .map_err(|_| anyhow::anyhow!("could not construct desktop adapter URL"))
+}
+
 fn desktop_path(#[cfg(target_os = "macos")] run: &Path, #[cfg(not(target_os = "macos"))] _: &Path) -> Result<String> {
     const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
     #[cfg(target_os = "macos")]
@@ -266,7 +313,70 @@ pub(crate) fn publish(directory: &Path, name: &str, content: &[u8]) -> Result<()
 }
 
 pub(crate) fn path_text(path: &Path) -> Result<String> {
-    path.to_str().map(str::to_owned).context("desktop path is not UTF-8")
+    let path = path.to_str().context("desktop path is not UTF-8")?;
+    #[cfg(windows)]
+    {
+        // canonicalize() uses extended Windows path prefixes that Electron and file URLs do not consume.
+        if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+            return Ok(format!(r"\\{unc}"));
+        }
+        if let Some(drive) = path.strip_prefix(r"\\?\").filter(|path| path.as_bytes().get(1) == Some(&b':')) {
+            return Ok(drive.into());
+        }
+    }
+    Ok(path.into())
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn deepseek_uses_private_windows_profile_and_loadable_adapter_urls() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("OneX #qa");
+    let cwd = root.path().join("workspace");
+    launch::private_dir(&cwd).unwrap();
+    let home = {
+        launch::private_dir(&home).unwrap();
+        home.canonicalize().unwrap()
+    };
+    let request = Request {
+        owner: "test-device",
+        home: &home,
+        agent: "deepseek-desktop",
+        entry: &home.join("DeepSeek.exe"),
+        cwd: &cwd,
+        token: "local-control-test-token",
+        model_bearer: None,
+        router: "127.0.0.1:19876",
+        model: "contract-model",
+        image_input: false,
+    };
+    let prepared = prepare(&request, None).unwrap();
+    let state = &prepared.launch;
+    assert_eq!(state.env["USERPROFILE"], state.env["HOME"]);
+    assert_eq!(state.env["TEMP"], state.env["TMP"]);
+    assert!(Path::new(&state.env["ComSpec"]).is_file());
+    let home = Path::new(&state.env["HOME"]);
+    assert_eq!(Path::new(&state.env["APPDATA"]), home.join("AppData/Roaming"));
+    assert_eq!(Path::new(&state.env["LOCALAPPDATA"]), home.join("AppData/Local"));
+    assert!(state.args.contains(&"--no-proxy-server".into()));
+    assert!(state.args.contains(&format!("--user-data-dir={}", state.env["DSH_DESKTOP_USER_DATA_DIR"])));
+    assert!(!state.env.values().any(|value| value.contains(request.token)));
+    let patch_path = state.config_dir.join("profiles/desktop/cordis.patch.yml");
+    let patch = std::fs::read_to_string(patch_path).unwrap();
+    assert!(!patch.contains(request.token));
+    let patch: serde_json::Value = serde_json::from_str(&patch).unwrap();
+    let plugin =
+        |id| patch.as_array().unwrap().iter().map(|entry| &entry["insert"][0]).find(|entry| entry["id"] == id).unwrap();
+    for (id, name) in
+        [("onex-session-credentials", "onex-credentials.mjs"), ("onex-managed-session", "onex-desktop.mjs")]
+    {
+        let url = reqwest::Url::parse(plugin(id)["name"].as_str().unwrap()).unwrap();
+        assert!(url.as_str().contains("OneX%20%23qa"));
+        assert!(url.to_file_path().unwrap().ends_with(name));
+        assert!(url.to_file_path().unwrap().is_file());
+    }
+    assert_eq!(plugin("onex-managed-session")["config"]["workspace"], path_text(&cwd.canonicalize().unwrap()).unwrap(),);
+    assert!(prepare(&request, None).is_ok());
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]

@@ -1,8 +1,8 @@
-//! Explicit native macOS qualification. The GUI opens against a temporary profile
+//! Explicit native qualification. The GUI opens against a temporary profile
 //! and both model calls terminate at the loopback fixture.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::path::Path;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +14,7 @@ use onex_core::ws::{AgentRelease, Lease, Rate, Route, UpstreamAuth};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 use crate::desktop_launch;
 use crate::{
     outbox::{Outbox, now_ms},
@@ -23,7 +23,7 @@ use crate::{
     state::State,
 };
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 const INPUT_PLUGIN: &str = r#"
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 export const name = 'onex-qualification-input'
@@ -236,30 +236,56 @@ fn original_workbuddy_container_and_apple_signature_match_manifest() -> anyhow::
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "opens a signed DeepSeek GUI twice; set ONEX_DEEPSEEK_QA_BUNDLE to its mounted app"]
 async fn original_gui_restores_native_session_and_settles_each_turn() -> anyhow::Result<()> {
-    run_original_deepseek(false).await
+    run_original_deepseek(false, false).await
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "opens a signed DeepSeek GUI; set ONEX_DEEPSEEK_QA_BUNDLE and ONEX_DEEPSEEK_QA_DAEMON"]
 async fn original_gui_preserves_image_and_document_prompts() -> anyhow::Result<()> {
-    run_original_deepseek(true).await
+    run_original_deepseek(true, false).await
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-async fn run_original_deepseek(attachments: bool) -> anyhow::Result<()> {
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opens the original DeepSeek Windows GUI; set ONEX_DEEPSEEK_QA_INSTALLER and ONEX_DEEPSEEK_QA_BUNDLE"]
+async fn original_windows_gui_restores_native_session_and_settles_each_turn() -> anyhow::Result<()> {
+    let association = std::process::Command::new("reg.exe")
+        .args(["query", r"HKCU\Software\Classes\dsh\shell\open\command", "/ve"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    anyhow::ensure!(!association.success(), "Windows GUI QA needs a clean user without a dsh protocol handler");
+    run_original_deepseek(false, false).await
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opens the packaged DeepSeek Host without the GUI or protocol registration"]
+async fn original_windows_host_restores_native_session_and_settles_each_turn() -> anyhow::Result<()> {
+    run_original_deepseek(false, true).await
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+async fn run_original_deepseek(attachments: bool, host_only: bool) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
     const IMAGE: &str =
         "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGMQL/sPRwzEcQB1UhjB1HLtUgAAAABJRU5ErkJggg==";
+    #[cfg(target_os = "macos")]
     const PDF_TEXT: &str = "Onex fixture PDF has cobalt seven";
+    #[cfg(target_os = "macos")]
     const TXT_TEXT: &str = "Onex fixture text has amber eleven";
-    let bundle_path = std::env::var("ONEX_DEEPSEEK_QA_BUNDLE")?;
-    let release = manifest_release("deepseek-desktop", std::env::var("ONEX_DEEPSEEK_QA_SHA256").ok().as_deref())?;
-    let entry = super::Bundle::candidate(&release).unwrap().verify(Path::new(&bundle_path))?;
+    let (release, entry) = original_deepseek_entry()?;
     let root = tempfile::tempdir()?;
     let cwd = root.path().join("workspace");
     std::fs::create_dir(&cwd)?;
+    #[cfg(target_os = "macos")]
     let (observed, mut incoming) = tokio::sync::mpsc::unbounded_channel();
-    let (state, addr, mut usage) = router_fixture(&release, attachments.then_some(observed)).await?;
+    #[cfg(target_os = "macos")]
+    let observer = attachments.then_some(observed);
+    #[cfg(windows)]
+    let observer = None;
+    let (state, addr, mut usage) = router_fixture(&release, observer).await?;
     let outbox = Arc::new(Outbox::open(&root.path().join("outbox.sqlite"))?);
     let marker = root.path().join("native-id");
     let failure = root.path().join("input-error");
@@ -286,7 +312,10 @@ async fn run_original_deepseek(attachments: bool) -> anyhow::Result<()> {
         std::fs::write(&plugin, INPUT_PLUGIN)?;
         let patch_file = launch.config_dir.join("profiles/desktop/cordis.patch.yml");
         let mut patch: Vec<Value> = serde_json::from_slice(&std::fs::read(&patch_file)?)?;
-        let mut test_config = json!({"workspace":cwd,"marker":marker,"failure":failure,"input":input});
+        let test_config = json!({"workspace":cwd,"marker":marker,"failure":failure,"input":input});
+        #[cfg(target_os = "macos")]
+        let mut test_config = test_config;
+        #[cfg(target_os = "macos")]
         if attachments {
             for entry in
                 patch.iter_mut().filter_map(|row| row.get_mut("insert").and_then(Value::as_array_mut)).flatten()
@@ -314,18 +343,34 @@ async fn run_original_deepseek(attachments: bool) -> anyhow::Result<()> {
             workspace,
             outbox.clone(),
         );
-        let mut child = tokio::process::Command::new(&entry)
-            .args(&launch.args)
+        let mut command = tokio::process::Command::new(&entry);
+        command
             .env_clear()
             .envs(&launch.env)
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()?;
+            .stderr(if cfg!(windows) { Stdio::inherit() } else { Stdio::null() })
+            .kill_on_drop(true);
+        let stop_file = launch.run_dir.join("stop-qualification-host");
+        if host_only {
+            let wrapper = launch.run_dir.join("qualification-host.cjs");
+            std::fs::write(&wrapper, HOST_WRAPPER)?;
+            command
+                .arg(wrapper)
+                .arg(launch.config_dir.join("profiles/desktop"))
+                .arg(&stop_file)
+                .env("ELECTRON_RUN_AS_NODE", "1")
+                .env("DSH_CLIENT_VERSION", &release.version);
+        } else {
+            command.args(&launch.args);
+        }
+        let mut child = command.spawn()?;
         let accepted = tokio::time::timeout(Duration::from_secs(120), async {
             loop {
+                if let Some(status) = child.try_wait()? {
+                    anyhow::bail!("original desktop exited before QA finished: {status}");
+                }
                 if let Ok(message) = std::fs::read_to_string(&failure) {
                     anyhow::bail!("native prompt failed: {message}")
                 }
@@ -350,6 +395,7 @@ async fn run_original_deepseek(attachments: bool) -> anyhow::Result<()> {
                             .as_str()
                             .is_some_and(|text| text.contains(&input)))
                     );
+                    #[cfg(target_os = "macos")]
                     if attachments {
                         let body = incoming.try_recv()?;
                         let messages = body["messages"].to_string();
@@ -372,6 +418,12 @@ async fn run_original_deepseek(attachments: bool) -> anyhow::Result<()> {
                     if let Some(id) = &original {
                         assert_eq!(id, session)
                     }
+                    if host_only {
+                        eprintln!(
+                            "verified Windows Host turn {turn}: session={session}, cost_milli={}",
+                            request.cost_milli
+                        );
+                    }
                     original = Some(session.to_owned());
                     return Ok::<_, anyhow::Error>(());
                 }
@@ -379,15 +431,135 @@ async fn run_original_deepseek(attachments: bool) -> anyhow::Result<()> {
             }
         })
         .await;
-        // A normal termination gives the vendor's native writer time to close and unlock its journal.
-        let stopped =
-            std::process::Command::new("/bin/kill").args(["-TERM", &child.id().unwrap().to_string()]).status()?;
-        assert!(stopped.success());
-        tokio::time::timeout(Duration::from_secs(15), child.wait()).await??;
+        let stopped = if host_only {
+            stop_qualification_host(&mut child, &stop_file).await
+        } else {
+            stop_original_desktop(&mut child).await
+        };
         state.desktop_sessions.stop(&launch_token);
         crate::launch::finish(root.path(), &launch.launch_id)?;
         accepted??;
+        stopped?;
     }
+    Ok(())
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+async fn stop_qualification_host(child: &mut tokio::process::Child, marker: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::write(marker, [])?;
+    let status = tokio::time::timeout(Duration::from_secs(38), child.wait())
+        .await
+        .map_err(|_| anyhow::anyhow!("packaged Host did not exit after its shutdown request"))??;
+    anyhow::ensure!(status.success(), "packaged host failed to shut down: {status}");
+    Ok(())
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+const HOST_WRAPPER: &str = r#"
+const { spawn } = require('node:child_process');
+const { existsSync } = require('node:fs');
+const { dirname, join } = require('node:path');
+const [profile, stop] = process.argv.slice(2);
+const resources = join(dirname(process.execPath), 'resources');
+const packages = join(resources, 'app.asar', 'dsh');
+const runtime = join(resources, 'runtime', 'primary-runtime');
+const host = join(packages, 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'index.js');
+const child = spawn(process.execPath, ['--expose-internals', host, packages, profile, runtime,
+  join(runtime, 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'), join(resources, 'runtime', 'bin')],
+  { cwd: profile, stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
+let stopping = false;
+let completed = false;
+let forced = false;
+let deadline;
+const timer = setInterval(() => {
+  if (stopping || !existsSync(stop)) return;
+  stopping = true;
+  child.send({ type: 'shutdown' }, error => { if (error) console.error('Could not request packaged Host shutdown'); });
+  deadline = setTimeout(() => {
+    forced = child.kill();
+    console.error(`Packaged Host required termination after shutdown (acknowledged=${completed})`);
+  }, 10000);
+}, 200);
+child.on('message', message => {
+  if (message?.type === 'ready') console.error('Packaged Host ready');
+  if (message?.type === 'shutdown-complete') {
+    completed = true;
+    console.error('Packaged Host acknowledged shutdown');
+  }
+  if (message?.type === 'fatal') console.error('Packaged Host reported a startup error');
+});
+child.on('disconnect', () => console.error('Packaged Host IPC disconnected'));
+child.on('error', error => console.error(error.message));
+child.on('exit', code => {
+  clearInterval(timer);
+  clearTimeout(deadline);
+  console.error(`Packaged Host exit: ${code}`);
+  process.exitCode = stopping && completed && (code === 0 || forced) ? 0 : 1;
+});
+"#;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn original_deepseek_entry() -> anyhow::Result<(AgentRelease, std::path::PathBuf)> {
+    let path = std::env::var("ONEX_DEEPSEEK_QA_BUNDLE")?;
+    let release = manifest_release("deepseek-desktop", std::env::var("ONEX_DEEPSEEK_QA_SHA256").ok().as_deref())?;
+    let entry = super::Bundle::candidate(&release).unwrap().verify(Path::new(&path))?;
+    Ok((release, entry))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn original_deepseek_entry() -> anyhow::Result<(AgentRelease, std::path::PathBuf)> {
+    use sha2::{Digest, Sha256};
+
+    let identity = |path: &std::path::Path| -> anyhow::Result<(u64, String)> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hash = Sha256::new();
+        let size = std::io::copy(&mut file, &mut hash)?;
+        Ok((size, crate::capture::hex(&hash.finalize())))
+    };
+    let archive = std::env::var("ONEX_DEEPSEEK_QA_INSTALLER")?;
+    let (size, sha256) = identity(archive.as_ref())?;
+    anyhow::ensure!(
+        size == 289_415_960 && sha256 == "1e3876baaa20c3f26371dba7b6873bb70c3ef9b91403f6d3f87d2b27d4fd1e3a",
+        "Windows QA requires the exact vendor RC3 installer"
+    );
+    let bundle = std::path::PathBuf::from(std::env::var("ONEX_DEEPSEEK_QA_BUNDLE")?);
+    let entry = bundle.join("DeepSeek Harness.exe");
+    anyhow::ensure!(
+        identity(&entry)?.1 == "fd7d298f4ba03ee9bab1719a892afeaef5c09bf50c574a592a64c85f64574c0c"
+            && identity(&bundle.join("resources/app.asar"))?.1
+                == "04b32e3a872826ba15cfb2081c6a929a8d4ecaa65e09a2543e5a6b30e2eff1f0",
+        "installed Windows DeepSeek payload differs from the original release"
+    );
+    Ok((
+        AgentRelease {
+            id: "qa-native-windows".into(),
+            agent: "deepseek-desktop".into(),
+            version: "0.2.1-rc.3".into(),
+            os: "win32".into(),
+            arch: "x64".into(),
+            url: "/v1/edge/agent-artifacts/qa-native-windows".into(),
+            size,
+            sha256,
+        },
+        entry,
+    ))
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+async fn stop_original_desktop(child: &mut tokio::process::Child) -> anyhow::Result<()> {
+    if let Some(id) = child.id() {
+        #[cfg(target_os = "macos")]
+        let stopped = tokio::process::Command::new("/bin/kill").args(["-TERM", &id.to_string()]).status().await?;
+        #[cfg(windows)]
+        let stopped = tokio::process::Command::new("taskkill.exe")
+            .args(["/PID", &id.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await?;
+        anyhow::ensure!(stopped.success(), "original desktop did not terminate");
+    }
+    tokio::time::timeout(Duration::from_secs(15), child.wait()).await??;
     Ok(())
 }
 

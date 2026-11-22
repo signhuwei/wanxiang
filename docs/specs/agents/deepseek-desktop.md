@@ -38,6 +38,12 @@ OneX 只发布自有 profile：同目录独占临时写、同步、原子替换�
 
 在 `edge` 下设置 `ONEX_DEEPSEEK_QA_BUNDLE` 为该应用的完整路径后，运行 `cargo test -p onexd --lib original_gui_restores_native_session_and_settles_each_turn -- --ignored`。该显式真机用例分两次打开签名的原厂进程，通过其公开的 SessionController 提交输入，并恢复同一原生 SID。实测两轮合计 6 个输入 token 和 4 个输出 token。OneX Router 为每轮计入 0.007 块橡皮，归到同一测试租约。持久 outbox 中仅一个会话开始事件、两次原生输入和两次原生回复。上游为本机流式 Chat 测试服务。通过的精确发行在 `server/src/desktop-qualifications.json` 中登记。
 
+## Windows x64 原厂 Host 测试
+
+设置 `ONEX_DEEPSEEK_QA_INSTALLER` 为精确 NSIS 原包路径，`ONEX_DEEPSEEK_QA_BUNDLE` 为从该原包提取的完整应用目录。运行 `cargo test -p onexd --lib original_windows_host_restores_native_session_and_settles_each_turn -- --ignored --nocapture`。测试核对原包、主程序和 ASAR 的 SHA-256，使用原厂 Desktop Host、OneX 私有 profile 和回环上游，核对同一原生会话恢复、两轮对话、outbox 和本机测试租约。
+
+原厂打包 GUI 会注册当前 Windows 用户的 `dsh://` 处理程序。`original_windows_gui_restores_native_session_and_settles_each_turn` 应在干净的普通用户会话运行。Host 测试使用厂商的 Node 模式，Windows 发行资格以原厂 GUI 以及 OneX 工作台的完整链路验证为准。
+
 ## OneX 受管附件
 
 受管 `llm-pi-ai` 在签约型号的实际 Chat 渠道有有效图片审核证据时声明 `input: [text, image]`。原厂附件服务将图片规范化并存入当前受管会话，从同一 `openai-completions` 入口送出图片。Edge 在请求时重新检查实际渠道的能力及有效期，备选也要满足图片能力。输入预留按图片类型和尺寸估算，最终仍按上游报告的用量结算。
