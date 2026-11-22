@@ -58,7 +58,7 @@ try {
   const provisioned = [];
   for (const entry of tenants) {
     const id = `ten_${ulid()}`;
-    const accounts = [];
+    const accounts: (LoginAccount & { userId: string; passwordHash: string })[] = [];
     for (const login of [entry.owner, ...entry.employees]) {
       accounts.push({ ...login, userId: `usr_${ulid()}`, passwordHash: await hashLoginPassword(login.password) });
     }
