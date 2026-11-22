@@ -2,7 +2,7 @@
 // Synthetic data only: A/B supply, a real 4× signature, device key 0x07 × 32 and fixture inference material.
 // Never point it at production data, keys or hosts.
 //
-//   bun --no-env-file tests/e2e/routing/projection-server.ts [--port 18790] [--data-dir DIR] [--unregistered dev_fix]
+//   bun --no-env-file tests/e2e/routing/projection-server.ts [--port 18790] [--data-dir DIR] [--unregistered dev_fix] [--now ISO]
 //
 // Prints one JSON line with URLs, device tokens and keys, then serves until SIGINT/SIGTERM.
 // Restart check: stop it and start again with the same --data-dir; persisted targets are resealed and resent.
@@ -21,6 +21,11 @@ const arg = (name: string) => { const i = argv.indexOf(name); return i >= 0 ? ar
 const given = arg('--data-dir');
 const dir = given ?? mkdtempSync(join(tmpdir(), 'onex-projection-joint-'));
 const unregistered = new Set((arg('--unregistered') ?? '').split(',').filter(Boolean));
+// --now ISO moves the fixed Server clock; use it only when restarting an already seeded --data-dir
+// (for example 2026-11-22T02:11:00Z shows lapsed unapplied targets as target_expired).
+const nowArg = arg('--now');
+const serverNow = nowArg ? Date.parse(nowArg) : clock;
+if (!Number.isFinite(serverNow)) throw new Error('--now must be an ISO timestamp');
 const statePath = join(dir, 'projection-fixture.json');
 type State = { tenant_id: string; user_id: string; pinned_user: string; platform: string; tokens: Record<string, string> };
 let state: State | null = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : null;
@@ -41,9 +46,10 @@ const inputs: RoutingProjectionInputs = {
 };
 
 const service = await createServer({ dataDir: dir, hostname: '127.0.0.1', port: Number(arg('--port') ?? 0), tenantCacheSize: 4,
-  heartbeatMs: 15_000, commit: 'projection-joint', codeSecret: 'projection-joint-only', now: () => clock, presence: new MemoryPresence(),
+  heartbeatMs: 15_000, commit: 'projection-joint', codeSecret: 'projection-joint-only', now: () => serverNow, presence: new MemoryPresence(),
   routingProjection: inputs });
 if (!state) {
+  if (nowArg) throw new Error('--now is only for restarting an already seeded --data-dir');
   const seeded = await seedProjection(service.store, dir, () => clock);
   seededInputs = seeded.inputs;
   state = { tenant_id: seeded.tenantId, user_id: seeded.userId, pinned_user: seeded.pinnedUser, platform: seeded.platform, tokens: seeded.tokens };
@@ -56,7 +62,7 @@ if (!state) {
 
 const http = service.server.url.toString().replace(/\/$/, '');
 console.log(JSON.stringify({
-  http_url: http, ws_url: http.replace(/^http/, 'ws') + '/v1/edge/ws', data_dir: dir, server_time: new Date(clock).toISOString(),
+  http_url: http, ws_url: http.replace(/^http/, 'ws') + '/v1/edge/ws', data_dir: dir, server_time: new Date(serverNow).toISOString(),
   tenant_id: state.tenant_id,
   devices: {
     dev_lin: { token: state.tokens.dev_lin, user_id: state.user_id, registered: !unregistered.has('dev_lin'), grant: 'follow v7 (dep_a, dep_b)', config_revision: 91 },
