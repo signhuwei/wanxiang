@@ -99,8 +99,33 @@ test('another device, configuration identity or key cannot open an envelope', ()
   fails(() => openRouteSecret(devicePrivate, { ...target, revision: 92 }, envelope));
   fails(() => openRouteSecret(devicePrivate, target, { ...envelope, credential_version: 2 }));
   fails(() => openRouteSecret(new Uint8Array(32).fill(9), target, envelope));
-  const sealedForOther = sealRoutePoolConfig(clone(fixture.wire.config), { ...device, device_id: 'dev_other' }, lookup).route_pool.secrets[0]!;
+  const forOther = clone(fixture.wire.config);
+  forOther.policy.device_id = 'dev_other';
+  const sealedForOther = sealRoutePoolConfig(forOther, { ...device, device_id: 'dev_other' }, lookup).route_pool.secrets[0]!;
   fails(() => openRouteSecret(devicePrivate, target, sealedForOther));
+});
+
+test('refuses to seal a configuration for any target other than its own tenant and device', () => {
+  const mismatch = expect.objectContaining({ code: 'invalid_config', reason: 'seal_target_mismatch' });
+  expect(() => sealRoutePoolConfig(clone(fixture.wire.config), { ...device, device_id: 'dev_other' }, lookup)).toThrow(mismatch);
+  expect(() => sealRoutePoolConfig(clone(fixture.wire.config), { ...device, tenant_id: 'ten_other' }, lookup)).toThrow(mismatch);
+  const noPolicy = clone(fixture.wire.config) as Record<string, unknown>;
+  delete noPolicy.policy;
+  expect(() => sealRoutePoolConfig(noPolicy as never, device, lookup)).toThrow(mismatch);
+});
+
+test('the business digest is rebuilt from route credential references, not from the envelopes carried', () => {
+  const config = sealed();
+  const expected = routeProjectionDigest(config);
+  const withSecrets = (secrets: unknown[]) => ({ ...config, route_pool: { ...config.route_pool, secrets } }) as typeof config;
+  expect(routeProjectionDigest(withSecrets([]))).toBe(expected);
+  expect(routeProjectionDigest(withSecrets([config.route_pool.secrets[0]]))).toBe(expected);
+  expect(routeProjectionDigest(withSecrets([...config.route_pool.secrets, ...config.route_pool.secrets,
+    { credential_id: 'cred_x', credential_version: 9, key_id: 'x', nonce: 'x', ciphertext: 'x' }]))).toBe(expected);
+  expect(routeProjectionDigest(withSecrets([...config.route_pool.secrets].reverse()))).toBe(expected);
+  const rotated = clone(fixture.wire.config);
+  rotated.routes[0]!.credential_ref = { credential_id: 'cred_a', credential_version: 2 };
+  expect(routeProjectionDigest(rotated)).not.toBe(expected);
 });
 
 test('management material, missing material and malformed identities are refused', () => {
