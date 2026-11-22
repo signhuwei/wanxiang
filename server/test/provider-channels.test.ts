@@ -14,13 +14,18 @@ test('real HTTP channel actions retain all pages and publish a one-to-many pool 
   const keyB = 'local-test-catalog-key-b';
   const requestLog: { method: string; path: string; cursor: string | null }[] = [];
   let failB = false;
+  let refreshedCatalog: 'partial' | 'failed' | 'succeeded' = 'partial';
   const upstream = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: (req) => {
     const url = new URL(req.url);
     const cursor = url.searchParams.get('after');
     requestLog.push({ method: req.method, path: url.pathname, cursor });
-    if (req.method !== 'GET' || !['/a/v1/models', '/b/v1/models'].includes(url.pathname)) return new Response(null, { status: 404 });
+    if (req.method !== 'GET' || !['/a/v1/models', '/a/refresh/v1/models', '/b/v1/models'].includes(url.pathname)) return new Response(null, { status: 404 });
     if (req.headers.get('authorization') !== `Bearer ${url.pathname.startsWith('/a') ? keyA : keyB}`) return new Response(null, { status: 401 });
     if (url.pathname.startsWith('/b')) return failB ? new Response(null, { status: 403 }) : Response.json({ data: [{ id: 'Supplier-B/M' }] });
+    if (url.pathname === '/a/refresh/v1/models') {
+      if (refreshedCatalog === 'failed') return new Response(null, { status: 503 });
+      return Response.json({ data: [{ id: 'Supplier-A/Refreshed' }], has_more: refreshedCatalog === 'partial' });
+    }
     if (!cursor) return Response.json({ data: [{ id: 'Supplier-A/M', context_window: 128000, capabilities: ['text'] },
       ...Array.from({ length: 220 }, (_, i) => ({ id: `visible-${i}` }))], has_more: true, last_id: 'next-1' });
     return Response.json({ data: [{ id: 'untouched-page-two' }], has_more: false });
@@ -94,9 +99,33 @@ test('real HTTP channel actions retain all pages and publish a one-to-many pool 
     expect(real.members.map((entry: Record<string, any>) => entry.raw_model)).toEqual(['Supplier-A/M', 'Supplier-B/M']);
     expect(requestLog.filter(({ path }) => path === '/a/v1/models').map(({ cursor }) => cursor)).toEqual([null, null, 'next-1']);
     expect(requestLog.every(({ method }) => method === 'GET')).toBe(true);
+
+    const refreshed = await api(`/providers/${a.id}`, { revision: a.revision, base_url: new URL('/a/refresh/v1', upstream.url).href });
+    const viewChannel = () => api(`/providers/${a.id}/channel`);
+    const pullRefreshed = () => api(`/providers/${a.id}/discoveries`, { revision: refreshed.revision }, 202);
+    expect(await viewChannel()).toMatchObject({ latest_catalog: null,
+      historical_catalog: { id: resultA.id, scope: { provider_revision: a.revision } } });
+    const partial = await pullRefreshed();
+    expect(partial).toMatchObject({ status: 'partial', summary: { reason: 'pagination_incomplete', model_count: 1 } });
+    expect(await viewChannel()).toMatchObject({ latest_catalog: { id: partial.id, scope: { provider_revision: refreshed.revision } },
+      historical_catalog: { id: resultA.id } });
+    expect((await api(`/probe-jobs/${resultA.id}/results`)).actions).toEqual(['read']);
+    expect((await api(`/probe-jobs/${partial.id}/results`)).actions).toEqual(['read', 'review_candidates']);
+
+    refreshedCatalog = 'failed';
+    const failed = await pullRefreshed();
+    expect(await viewChannel()).toMatchObject({ latest_discovery: { id: failed.id, status: 'failed' },
+      latest_catalog: { id: partial.id }, historical_catalog: { id: resultA.id } });
+    refreshedCatalog = 'succeeded';
+    const succeeded = await pullRefreshed();
+    refreshedCatalog = 'partial';
+    const newerPartial = await pullRefreshed();
+    expect(await viewChannel()).toMatchObject({ latest_discovery: { id: newerPartial.id }, latest_catalog: { id: succeeded.id },
+      historical_catalog: { id: resultA.id } });
+
     const changed = new URL('/a/v1', upstream.url);
     changed.hostname = '127.0.0.2';
-    const edited = await api(`/providers/${a.id}`, { revision: a.revision, base_url: changed.href });
+    const edited = await api(`/providers/${a.id}`, { revision: refreshed.revision, base_url: changed.href });
     const count = requestLog.length;
     expect(await api(`/providers/${a.id}/probes`, { revision: edited.revision, kind: 'connectivity' }, 202))
       .toMatchObject({ status: 'failed', summary: { reason: 'credential_scope_changed' } });
