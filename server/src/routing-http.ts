@@ -54,7 +54,7 @@ export const conflict = (reason: string, current_revision?: number | string | nu
   new ApiError('conflict', { reason, ...(current_revision !== undefined && { current_revision }), ...(changed.length && { changed }) });
 
 /** Replays a stored success before any revision check; a reused key with another body is idempotency_mismatch. */
-export function replay(op: { read: (sql: Pick<Transaction, 'get'>) => Response | undefined }, sql: Transaction) {
+export function replay(op: { read: (sql: Pick<Transaction, 'get'>) => Response | undefined }, sql: Pick<Transaction, 'get'>) {
   try { return op.read(sql); } catch (error) {
     if (error instanceof ApiError && error.code === 'conflict') throw new ApiError('conflict', { reason: 'idempotency_mismatch' });
     throw error;

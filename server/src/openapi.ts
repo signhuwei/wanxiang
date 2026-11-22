@@ -396,7 +396,38 @@ const rolloutTarget = object({ tenant_id: text, user_id: text, device_id: text, 
   applied_config_revision: nullable(revision), state: rolloutState, reason: { ...nullableText, description: '稳定原因码；设备拒绝时为脱敏的 error.detail.reason。' },
   last_seen_at: nullable(timestamp), last_receipt_at: { ...nullable(timestamp), description: '仅指本目标的最近回执。' }, actions: { ...actions, const: [] } });
 
+const channelProvider = '/v1/platform/providers/{provider_id}';
+const channelJobPath = '/v1/platform/probe-jobs/{job_id}';
+const channelIdentityPath = '/v1/platform/models/{model_id}/identity';
+const channelProviderId = namedPath('provider_id', routingId);
+const channelJobId = namedPath('job_id', routingId);
+const channelJob = object({ id: routingId, kind: { enum: ['connectivity', 'discovery'] }, status: { enum: ['succeeded', 'partial', 'failed'] },
+  location: text, scope: object({ provider_id: routingId, account_id: routingId, endpoint_id: routingId, endpoint_revision: revision }),
+  observed_at: timestamp, summary: object({ model_count: sequence, reason: nullableText }), actions });
+const channelAccount = object({ account_id: routingId, name: text, balance_mode: text, funding_id: nullableText, endpoint_id: nullableText });
+const channelCatalogItem = object({ catalog_item_id: routingId, discovery_id: routingId, raw_model: text, context_tokens: nullable(revision),
+  snapshot_claim: nullableText, variant_claim: nullableText, capabilities_claim: listItems(text) });
+const channelIdentity = { maker_id: text, model_family: text, model_variant: text, identity_mode: { enum: ['family_follow', 'pinned_snapshot'] },
+  model_snapshot: nullableText, capability_floor: listItems(text) };
+const channelModelIdentity = object({ model_id: routingId, revision, identity: nullable(object({ ...channelIdentity, identity_revision: revision })), actions });
+const channelStart = (input: object) => ({ security: bearer, parameters: [channelProviderId, ...contractIdempotency], requestBody: requestBody(input),
+  responses: { 202: { ...response('本次连接检查或目录拉取的已记录结果', channelJob), headers: { Location: { schema: text } } },
+    404: error('供应商不存在'), ...status } });
+
 const routingPaths = {
+  [channelProvider + '/channel']: { get: policyDetail(object({ provider_id: routingId, revision, accounts: listItems(channelAccount),
+    latest_probe: nullable(channelJob), latest_discovery: nullable(channelJob), latest_catalog: nullable(channelJob), actions }), [channelProviderId]) },
+  [channelProvider + '/probes']: { post: channelStart(object({ kind: { const: 'connectivity' }, revision })) },
+  [channelProvider + '/discoveries']: { post: channelStart(object({ revision })) },
+  [channelJobPath]: { get: policyDetail(channelJob, [channelJobId]) },
+  [channelJobPath + '/results']: { get: routingList(channelCatalogItem, [channelJobId, ...listParams], actions) },
+  [channelIdentityPath]: { get: policyDetail(channelModelIdentity, [routingModelId]),
+    post: policyWrite(object({ revision, ...channelIdentity }, ['revision', 'maker_id', 'model_family', 'model_variant', 'identity_mode', 'capability_floor']),
+      channelModelIdentity, 'create', [routingModelId]) },
+  [routingPoolPath + '/candidates/review']: { post: policyWrite(object({ expected_identity_revision: revision, reason: text,
+    decisions: listItems(object({ discovery_id: routingId, catalog_item_id: routingId, decision: { enum: ['accept', 'reject'] }, capabilities: listItems(text) })) }),
+  object({ items: listItems(object({ deployment_id: routingId, deployment_revision: revision, approved_match_id: nullableText, evidence_ids: listItems(routingId),
+    raw_model: text, status: { enum: ['accepted', 'rejected'] } })) }), 'update', [routingModelId]) },
   '/v1/platform/providers/{provider_id}/deployments': {
     get: routingList(providerDeployment, [namedPath('provider_id', routingId), routingSearch, ...routingPagination], { ...actions, const: [] }),
   },
