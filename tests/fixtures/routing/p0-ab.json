@@ -533,6 +533,7 @@
         "code": "missing_route_credential",
         "message": "新配置缺少可用的渠道凭据",
         "detail": {
+          "reason": "missing_envelope",
           "deployment_id": "dep_b"
         }
       }

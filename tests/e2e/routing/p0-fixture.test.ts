@@ -21,6 +21,12 @@ test('pool draft, Edge projection, and use share the same model and deployment v
   expect(lease.model_budgets.mdl_m).toBeGreaterThan(debit.cost_milli);
   expect(lease_renew.model_used_milli.mdl_m).toBe(debit.cost_milli);
   expect(events_ack.ack_seq).toBe(debit.seq);
+  for (const receipt of [fixture.wire.config_applied_ok, fixture.wire.config_applied_rejected]) {
+    expect(receipt.config_revision).toBe(config.revision);
+    expect(receipt.policy_revision).toBe(config.policy.policy_revision);
+    expect(receipt.projection_id).toBe(config.route_pool.projection_id);
+  }
+  expect(fixture.wire.config_applied_rejected.error.detail.reason).toBe('missing_envelope');
 });
 
 test('published procurement values and the frozen sales rate reconcile independently', () => {
