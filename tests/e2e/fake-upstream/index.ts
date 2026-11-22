@@ -2,7 +2,10 @@ import { once } from 'node:events';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 
 const parts = ['Hello ', 'from OneX.'];
-type Protocol = 'anthropic' | 'openai';
+const protocols = { '/v1/messages': 'anthropic', '/v1/chat/completions': 'openai', '/v1/responses': 'responses' } as const;
+type Endpoint = keyof typeof protocols;
+type Protocol = typeof protocols[Endpoint];
+type Usage = { input: number; output: number };
 
 function integer(value: string | undefined, fallback: number, max: number) {
   if (value === undefined) return fallback;
@@ -35,7 +38,8 @@ async function sse(res: ServerResponse, frames: string[], delayMs: number, disco
   }
 }
 
-async function readBody(req: IncomingMessage): Promise<{ model?: unknown; stream?: unknown; messages?: unknown; stream_options?: { include_usage?: unknown } }> {
+async function readBody(req: IncomingMessage): Promise<{ model?: unknown; stream?: unknown; messages?: unknown; input?: unknown;
+  stream_options?: { include_usage?: unknown } }> {
   const chunks: Buffer[] = [];
   let bytes = 0;
   for await (const part of req) {
@@ -46,15 +50,38 @@ async function readBody(req: IncomingMessage): Promise<{ model?: unknown; stream
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-async function reply(req: IncomingMessage, res: ServerResponse) {
+function responsesReply(res: ServerResponse, model: string, stream: boolean, { input, output }: Usage, delay: number, disconnect: boolean) {
+  const content = { type: 'output_text', text: parts.join(''), annotations: [] };
+  const item = { id: 'msg_' + crypto.randomUUID(), type: 'message', role: 'assistant', status: 'completed', content: [content] };
+  const response = { id: 'resp_' + crypto.randomUUID(), object: 'response', created_at: Math.floor(Date.now() / 1000), model };
+  const completed = { ...response, status: 'completed', output: [item], usage: { input_tokens: input, output_tokens: output,
+    input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: input + output } };
+  if (!stream) return json(res, completed);
+  const event = (type: string, payload: object) => `event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`;
+  const indexes = { item_id: item.id, output_index: 0, content_index: 0 };
+  const frames = [
+    event('response.created', { response: { ...response, status: 'in_progress', output: [] } }),
+    event('response.output_item.added', { output_index: 0, item: { ...item, status: 'in_progress', content: [] } }),
+    ...parts.map((delta) => event('response.output_text.delta', { ...indexes, delta })),
+    event('response.output_item.done', { output_index: 0, item }),
+    event('response.completed', { response: completed }),
+  ];
+  return sse(res, frames, delay, disconnect ? 3 : undefined);
+}
+
+async function reply(req: IncomingMessage, res: ServerResponse, defaults: Usage, received: Map<Endpoint, number>) {
   const path = req.url?.split('?')[0];
-  if (path !== '/v1/messages' && path !== '/v1/chat/completions') { res.writeHead(404).end(); return; }
+  if (path !== '/v1/messages' && path !== '/v1/chat/completions' && path !== '/v1/responses') { res.writeHead(404).end(); return; }
   if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }).end(); return; }
-  const protocol: Protocol = path === '/v1/messages' ? 'anthropic' : 'openai';
+  received.set(path, (received.get(path) ?? 0) + 1);
+  const protocol = protocols[path];
   const body = await readBody(req).catch(() => null);
-  if (!body || typeof body.model !== 'string' || !body.model || !Array.isArray(body.messages)
+  const hasInput = protocol === 'responses'
+    ? typeof body?.input === 'string' || Array.isArray(body?.input)
+    : Array.isArray(body?.messages);
+  if (!body || typeof body.model !== 'string' || !body.model || !hasInput
     || (body.stream !== undefined && typeof body.stream !== 'boolean')) {
-    return problem(res, protocol, 400, 'Expected model, messages and optional stream');
+    return problem(res, protocol, 400, `Expected model, ${protocol === 'responses' ? 'input' : 'messages'} and optional stream`);
   }
   const { model, stream = false } = body;
   const header = (name: string) => {
@@ -69,8 +96,8 @@ async function reply(req: IncomingMessage, res: ServerResponse) {
     settings = {
       fault,
       delay: integer(header('x-fake-delay-ms') ?? /^fake-delay-(\d+)$/.exec(model)?.[1], 0, 30_000),
-      input: integer(header('x-fake-input-tokens'), 12, 1_000_000_000),
-      output: integer(header('x-fake-output-tokens'), 5, 1_000_000_000),
+      input: integer(header('x-fake-input-tokens'), defaults.input, 1_000_000_000),
+      output: integer(header('x-fake-output-tokens'), defaults.output, 1_000_000_000),
     };
   } catch {
     return problem(res, protocol, 400, 'Invalid fake upstream controls');
@@ -79,6 +106,7 @@ async function reply(req: IncomingMessage, res: ServerResponse) {
   if (delay && (!stream || fault === '429' || fault === '500')) await Bun.sleep(delay);
   if (fault === '429' || fault === '500') return problem(res, protocol, Number(fault), `Fake upstream ${fault}`);
 
+  if (protocol === 'responses') return responsesReply(res, model, stream, { input, output }, delay, fault === 'disconnect');
   const id = `${protocol === 'anthropic' ? 'msg' : 'chatcmpl'}_${crypto.randomUUID()}`;
   if (protocol === 'anthropic') {
     const usage = { input_tokens: input, output_tokens: output, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
@@ -111,15 +139,18 @@ async function reply(req: IncomingMessage, res: ServerResponse) {
   ], delay, fault === 'disconnect' ? 2 : undefined);
 }
 
-export async function startFakeUpstream(options: { port?: number } = {}) {
+export async function startFakeUpstream(options: { port?: number; usage?: Usage } = {}) {
   const hostname = '127.0.0.1';
-  const server = createServer((req, res) => { void reply(req, res).catch(() => res.destroy()); });
+  const usage = options.usage ?? { input: 12, output: 5 };
+  const received = new Map<Endpoint, number>();
+  const server = createServer((req, res) => { void reply(req, res, usage, received).catch(() => res.destroy()); });
   server.listen(options.port ?? 3456, hostname);
   await once(server, 'listening');
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('No fake upstream listening address');
   return {
     url: new URL(`http://${hostname}:${address.port}`),
+    requestCount: (path: Endpoint) => received.get(path) ?? 0,
     async stop() {
       const stopped = new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       server.closeAllConnections();

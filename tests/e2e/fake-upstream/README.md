@@ -1,11 +1,12 @@
 # OneX fake upstream
 
-Requires Bun; no external dependencies or credentials. From the repository root, run `bun tests/e2e/fake-upstream/index.ts`. The default address is `http://127.0.0.1:3456` (`ONEX_FAKE_UPSTREAM_PORT` overrides the port). Tests can import and await `startFakeUpstream({ port: 0 })` to bind an ephemeral port and call `await server.stop()` to shut it down.
+Run `bun tests/e2e/fake-upstream/index.ts` from the repository root. The default address is `http://127.0.0.1:3456` (`ONEX_FAKE_UPSTREAM_PORT` overrides the port). Tests can use `startFakeUpstream({ port: 0, usage: { input: 10000, output: 2000 } })` for an ephemeral port and specific token counts. Use `server.requestCount(path)` to count received POSTs and `await server.stop()` to shut it down.
 
 - Anthropic: `POST /v1/messages`
-- OpenAI: `POST /v1/chat/completions`
+- OpenAI Chat Completions: `POST /v1/chat/completions`
+- OpenAI Responses: `POST /v1/responses`
 
-Both accept a test `model` string and a `messages` array and return `Hello from OneX.` Set `stream: true` for SSE. To receive usage in an OpenAI stream set `stream_options: { "include_usage": true }`. Anthropic always reports usage. The streaming `disconnect` fault closes the HTTP connection after the first text delta without a terminal SSE event.
+Each endpoint accepts a test `model` string and returns `Hello from OneX.` Use a `messages` array for Messages and Chat Completions, and an `input` string or array for Responses. Set `stream: true` for SSE. Chat Completions reports streaming usage when `stream_options.include_usage` is true. The Responses `response.completed` event carries usage. The streaming `disconnect` fault closes the HTTP connection after the first text delta.
 
 | Header | Values | Model alias (when header omitted) |
 | --- | --- | --- |
@@ -22,4 +23,4 @@ curl -N http://127.0.0.1:3456/v1/messages \
   -d '{"model":"fake-model","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"ping"}]}'
 ```
 
-Run `bun test tests/e2e/fake-upstream` for both protocols and their fault cases.
+Run `bun test tests/e2e/fake-upstream` to verify all three endpoints and their fault cases.

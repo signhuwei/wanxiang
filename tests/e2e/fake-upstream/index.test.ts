@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
+import { request } from 'node:http';
+import fixture from '../../fixtures/routing/p0-ab.json';
 import { startFakeUpstream } from './index';
 
 let server: Awaited<ReturnType<typeof startFakeUpstream>>;
@@ -99,4 +101,53 @@ test('rejects invalid controls and malformed request bodies', async () => {
   const response = await fetch(new URL('/v1/messages', server.url), { method: 'POST', body: '{' });
   expect(response.status).toBe(400);
   expect(await response.json()).toMatchObject({ type: 'error', error: { type: 'invalid_request_error' } });
+});
+
+test('Responses reports fixture token usage only after a complete turn', async () => {
+  const { input_tokens, output_tokens, deployment_id } = fixture.wire.usage.batch[0]!;
+  const model = fixture.wire.config.routes.find(route => route.deployment_id === deployment_id)!.upstream_model;
+  const usage = { input_tokens, output_tokens, total_tokens: input_tokens + output_tokens };
+  const upstream = await startFakeUpstream({ port: 0, usage: { input: input_tokens, output: output_tokens } });
+  const path = '/v1/responses';
+  const call = (stream: boolean, fault?: string) => fetch(new URL(path, upstream.url), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(fault && { 'x-fake-fault': fault }) },
+    body: JSON.stringify({ model, input: 'ping', stream }),
+  });
+  try {
+    expect(upstream.requestCount(path)).toBe(0);
+    const completion = await call(false);
+    expect(completion.status).toBe(200);
+    expect(await completion.json()).toMatchObject({ object: 'response', model, status: 'completed',
+      output: [{ role: 'assistant', content: [{ type: 'output_text', text: 'Hello from OneX.' }] }],
+      usage,
+    });
+    const streamed = await call(true);
+    expect(streamed.headers.get('content-type')).toContain('text/event-stream');
+    const frames = (await streamed.text()).trim().split('\n\n').map(frame => JSON.parse(frame.split('\n')[1]!.slice(6)));
+    expect(frames.filter(frame => frame.type === 'response.output_text.delta').map(frame => frame.delta).join('')).toBe('Hello from OneX.');
+    expect(frames.at(-1)).toMatchObject({ type: 'response.completed', response: { usage } });
+    expect(upstream.requestCount(path)).toBe(2);
+
+    // Use a single explicit HTTP connection so the client cannot transparently retry the broken response.
+    const { received, failed } = await new Promise<{ received: string; failed: boolean }>((resolve, reject) => {
+      const body = JSON.stringify({ model, input: 'ping', stream: true });
+      const req = request(new URL(path, upstream.url), { method: 'POST', agent: false, headers: {
+        'content-type': 'application/json', 'content-length': Buffer.byteLength(body), 'x-fake-fault': 'disconnect',
+      } }, res => {
+        let received = '';
+        res.setEncoding('utf8');
+        res.on('data', chunk => { received += chunk; });
+        res.once('end', () => resolve({ received, failed: false }));
+        res.once('aborted', () => resolve({ received, failed: true }));
+        res.once('error', () => resolve({ received, failed: true }));
+      });
+      req.once('error', reject);
+      req.end(body);
+    });
+    expect(failed).toBe(true);
+    expect(received).toContain('response.output_text.delta');
+    expect(received).not.toContain('response.completed');
+    expect(upstream.requestCount(path)).toBe(3);
+  } finally { await upstream.stop(); }
 });
