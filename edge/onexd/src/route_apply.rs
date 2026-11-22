@@ -17,7 +17,8 @@ use sha2::{Digest, Sha256};
 
 use crate::route_stage::AppliedIdentity;
 
-const SCHEMA_VERSION: i64 = 1;
+/// 2：加隔离租约表（`contracts/routing-lease-gate.md`）。1 的库打开时就地升级。
+const SCHEMA_VERSION: i64 = 3;
 
 /// 配置域：服务、租户、成员、设备。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -149,6 +150,42 @@ impl Store {
                  last_failure TEXT,
                  superseded_at_ms INTEGER,
                  PRIMARY KEY (server_origin, tenant_id, user_id, device_id, receipt_id)
+             );
+             -- 隔离租约：只记账面身份，不进生产 lease.json，也不放行任何请求。
+             CREATE TABLE IF NOT EXISTS pool_leases (
+                 server_origin TEXT NOT NULL, tenant_id TEXT NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                 lease_id TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK (state IN ('accepted', 'refused', 'settled')),
+                 config_revision INTEGER NOT NULL,
+                 projection_id TEXT NOT NULL,
+                 signature_id TEXT NOT NULL,
+                 commerce_plan_id TEXT,
+                 expires_at_ms INTEGER NOT NULL,
+                 budget_milli INTEGER NOT NULL,
+                 model_budgets TEXT NOT NULL,
+                 reason TEXT,
+                 updated_at_ms INTEGER NOT NULL,
+                 PRIMARY KEY (server_origin, tenant_id, user_id, device_id, lease_id)
+             );
+             -- 发送前持久化的续租操作；重发沿用同一 msg_id、op_id 和数值。
+             CREATE TABLE IF NOT EXISTS pool_lease_ops (
+                 server_origin TEXT NOT NULL, tenant_id TEXT NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                 op_id TEXT NOT NULL,
+                 msg_id TEXT NOT NULL,
+                 lease_id TEXT NOT NULL,
+                 release_only INTEGER NOT NULL,
+                 used_milli INTEGER NOT NULL,
+                 model_used_milli TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 done_at_ms INTEGER,
+                 last_failure TEXT,
+                 PRIMARY KEY (server_origin, tenant_id, user_id, device_id, op_id)
+             );
+             CREATE TABLE IF NOT EXISTS pool_runtime_receipts (
+                 server_origin TEXT NOT NULL, tenant_id TEXT NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                 lease_id TEXT NOT NULL, request_id TEXT NOT NULL, seq INTEGER, payload TEXT, acked INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY(server_origin,tenant_id,user_id,device_id,lease_id),
+                 UNIQUE(server_origin,tenant_id,user_id,device_id,seq)
              );",
         )?;
         let version: Option<i64> =
@@ -156,6 +193,10 @@ impl Store {
         match version {
             None => {
                 conn.execute("INSERT INTO meta (k, v) VALUES ('schema', ?1)", [SCHEMA_VERSION])?;
+            }
+            // Previous versions only need the additive tables defined above.
+            Some(1 | 2) => {
+                conn.execute("UPDATE meta SET v = ?1 WHERE k = 'schema'", [SCHEMA_VERSION])?;
             }
             Some(SCHEMA_VERSION) => {}
             Some(other) => bail!("route apply store schema {other} is newer than {SCHEMA_VERSION}"),
@@ -380,6 +421,468 @@ impl Store {
         let n = conn.execute(&sql, params![origin, tenant, user, device, receipt_id, value])?;
         Ok(if n == 0 { AckMatch::Unknown } else { AckMatch::Recorded })
     }
+}
+
+/// 隔离租约的状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolLeaseState {
+    /// 首次接受时与当时已确认应用视图精确匹配。
+    Accepted,
+    /// 本认证代次明确拒用、从未接纳或放行过请求。
+    Refused,
+    /// 已按原租约结清或释放。
+    Settled,
+}
+
+impl PoolLeaseState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Refused => "refused",
+            Self::Settled => "settled",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "accepted" => Some(Self::Accepted),
+            "refused" => Some(Self::Refused),
+            "settled" => Some(Self::Settled),
+            _ => None,
+        }
+    }
+}
+
+/// 一份隔离租约的账面身份。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolLease {
+    pub lease_id: String,
+    pub state: PoolLeaseState,
+    pub config_revision: u64,
+    pub projection_id: String,
+    pub signature_id: String,
+    pub commerce_plan_id: Option<String>,
+    pub expires_at_ms: i64,
+    pub budget_milli: i64,
+    pub model_budgets: BTreeMap<String, i64>,
+}
+
+/// 已持久、等待回复的续租操作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolLeaseOp {
+    pub op_id: String,
+    pub msg_id: String,
+    pub lease_id: String,
+    pub release_only: bool,
+    pub used_milli: i64,
+    pub model_used_milli: BTreeMap<String, i64>,
+    pub last_failure: Option<String>,
+}
+
+impl Store {
+    /// One durable intent per isolated lease. An unconfirmed upstream result keeps the lease unavailable.
+    pub fn reserve_isolated_request(&self, scope: &Scope, lease_id: &str, request_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        Ok(conn.execute(
+            "INSERT OR IGNORE INTO pool_runtime_receipts(server_origin,tenant_id,user_id,device_id,lease_id,request_id)
+             SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS(SELECT 1 FROM pool_leases WHERE server_origin=?1 AND tenant_id=?2
+             AND user_id=?3 AND device_id=?4 AND lease_id=?5 AND state='accepted') AND NOT EXISTS(SELECT 1 FROM pool_lease_ops
+             WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3 AND device_id=?4 AND lease_id=?5 AND done_at_ms IS NULL)",
+            params![origin, tenant, user, device, lease_id, request_id],
+        )? == 1)
+    }
+
+    /// Write the metered response and its replay sequence atomically before returning it to the local client.
+    pub fn complete_isolated_request(
+        &self,
+        scope: &Scope,
+        lease_id: &str,
+        request_id: &str,
+        mut payload: Value,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let [origin, tenant, user, device] = scope_params(scope);
+        let seq: u64 = tx.query_row(
+            "SELECT coalesce(max(seq),0)+1 FROM pool_runtime_receipts WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3 AND device_id=?4",
+            params![origin, tenant, user, device], |r| r.get(0),
+        )?;
+        payload["seq"] = seq.into();
+        let updated = tx.execute(
+            "UPDATE pool_runtime_receipts SET seq=?7,payload=?8 WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3
+             AND device_id=?4 AND lease_id=?5 AND request_id=?6 AND payload IS NULL",
+            params![origin, tenant, user, device, lease_id, request_id, seq, payload.to_string()],
+        )?;
+        if updated != 1 {
+            bail!("isolated route receipt has no open intent");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_isolated_usage(&self, scope: &Scope) -> Result<Option<(u64, Value)>> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        let row: Option<(u64, String)> = conn
+            .query_row(
+                "SELECT seq,payload FROM pool_runtime_receipts WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3
+             AND device_id=?4 AND acked=0 AND payload IS NOT NULL ORDER BY seq LIMIT 1",
+                params![origin, tenant, user, device],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(seq, payload)| Ok((seq, serde_json::from_str(&payload)?))).transpose()
+    }
+
+    pub fn ack_isolated_usage(&self, scope: &Scope, through: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        conn.execute(
+            "UPDATE pool_runtime_receipts SET acked=1 WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3
+            AND device_id=?4 AND seq<=?5",
+            params![origin, tenant, user, device, through],
+        )?;
+        Ok(())
+    }
+
+    pub fn isolated_usage_for_lease(
+        &self,
+        scope: &Scope,
+        lease_id: &str,
+    ) -> Result<Option<(Option<u64>, Option<Value>, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        let row: Option<(Option<u64>, Option<String>, bool)> = conn.query_row(
+            "SELECT seq,payload,acked FROM pool_runtime_receipts WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3 AND device_id=?4 AND lease_id=?5",
+            params![origin, tenant, user, device, lease_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        row.map(|(seq, payload, acked)| Ok((seq, payload.map(|p| serde_json::from_str(&p)).transpose()?, acked)))
+            .transpose()
+    }
+
+    pub fn begin_isolated_metered_settlement(
+        &self,
+        scope: &Scope,
+        lease: &PoolLease,
+        payload: &Value,
+        now_ms: i64,
+    ) -> Result<PoolLeaseOp> {
+        let mut op = PoolLeaseOp::zero(lease, false);
+        op.used_milli = payload["cost_milli"].as_i64().context("invalid measured cost")?;
+        let model = payload["model_id"].as_str().context("invalid measured model")?;
+        if let Some(amount) = op.model_used_milli.get_mut(model) {
+            *amount = op.used_milli;
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_op(&tx, scope, &op, now_ms)?;
+        tx.commit()?;
+        Ok(op)
+    }
+}
+
+impl PoolLeaseOp {
+    /// 常规结清一份从未放行过请求的租约：真实累计用量为零，逐型号报零。
+    /// 仅在隔离流程中成立（真实入口被执行门禁拒绝）；有执行后不能再用。
+    fn settle_unused(lease: &PoolLease) -> Self {
+        Self::zero(lease, false)
+    }
+
+    /// 每个已分配型号报零用量（Server 结清要求逐键上报）。
+    pub fn zero(lease: &PoolLease, release_only: bool) -> Self {
+        Self {
+            op_id: crate::id::new("op"),
+            msg_id: crate::id::new("msg"),
+            lease_id: lease.lease_id.clone(),
+            release_only,
+            used_milli: 0,
+            model_used_milli: lease.model_budgets.keys().map(|k| (k.clone(), 0)).collect(),
+            last_failure: None,
+        }
+    }
+
+    pub fn to_frame(&self) -> Value {
+        let mut frame = serde_json::json!({
+            "type": "lease_renew", "id": self.msg_id, "op_id": self.op_id, "lease_id": self.lease_id,
+            "used_milli": self.used_milli, "model_used_milli": self.model_used_milli,
+        });
+        if self.release_only {
+            frame["release_only"] = true.into();
+        }
+        frame
+    }
+}
+
+impl Store {
+    pub fn pool_lease(&self, scope: &Scope, lease_id: &str) -> Result<Option<PoolLease>> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        conn.query_row(
+            "SELECT lease_id, state, config_revision, projection_id, signature_id, commerce_plan_id, expires_at_ms,
+                    budget_milli, model_budgets
+             FROM pool_leases WHERE server_origin = ?1 AND tenant_id = ?2 AND user_id = ?3 AND device_id = ?4
+               AND lease_id = ?5",
+            params![origin, tenant, user, device, lease_id],
+            read_pool_lease,
+        )
+        .optional()?
+        .transpose()
+    }
+
+    /// 本作用域仍未结清的已接受租约（最多一份）。
+    pub fn accepted_pool_lease(&self, scope: &Scope) -> Result<Option<PoolLease>> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        conn.query_row(
+            "SELECT lease_id, state, config_revision, projection_id, signature_id, commerce_plan_id, expires_at_ms,
+                    budget_milli, model_budgets
+             FROM pool_leases WHERE server_origin = ?1 AND tenant_id = ?2 AND user_id = ?3 AND device_id = ?4
+               AND state = 'accepted' ORDER BY updated_at_ms DESC LIMIT 1",
+            params![origin, tenant, user, device],
+            read_pool_lease,
+        )
+        .optional()?
+        .transpose()
+    }
+
+    /// 尚未得到结清回复的续租操作，按创建顺序。每份租约最多一份。
+    pub fn pending_pool_ops(&self, scope: &Scope) -> Result<Vec<PoolLeaseOp>> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        let mut stmt = conn.prepare(
+            "SELECT op_id, msg_id, lease_id, release_only, used_milli, model_used_milli, last_failure
+             FROM pool_lease_ops WHERE server_origin = ?1 AND tenant_id = ?2 AND user_id = ?3 AND device_id = ?4
+               AND done_at_ms IS NULL ORDER BY created_at_ms, op_id",
+        )?;
+        let rows = stmt.query_map(params![origin, tenant, user, device], |r| {
+            let models: String = r.get(5)?;
+            Ok((
+                PoolLeaseOp {
+                    op_id: r.get(0)?,
+                    msg_id: r.get(1)?,
+                    lease_id: r.get(2)?,
+                    release_only: r.get::<_, i64>(3)? != 0,
+                    used_milli: r.get(4)?,
+                    model_used_milli: BTreeMap::new(),
+                    last_failure: r.get(6)?,
+                },
+                models,
+            ))
+        })?;
+        rows.map(|row| {
+            let (mut op, models) = row?;
+            op.model_used_milli = serde_json::from_str(&models).context("stored model_used_milli")?;
+            Ok(op)
+        })
+        .collect()
+    }
+
+    /// 某租约的在途续租操作。
+    pub fn pending_pool_op(&self, scope: &Scope, lease_id: &str) -> Result<Option<PoolLeaseOp>> {
+        Ok(self.pending_pool_ops(scope)?.into_iter().find(|op| op.lease_id == lease_id))
+    }
+
+    /// 本作用域当前视图的成功回执是否已获得成功 ACK（含重启前持久的确认）。
+    pub fn view_receipt_acked(&self, scope: &Scope, revision: u64, projection_id: &str) -> Result<bool> {
+        match self.applied_receipt_id(scope, revision, projection_id)? {
+            Some(id) => self.receipt_acked(scope, &id),
+            None => Ok(false),
+        }
+    }
+
+    /// 接受一份与当前已确认应用视图精确匹配的租约。`settled` 是同一回复里结清的旧操作。
+    pub fn accept_pool_lease(
+        &self,
+        scope: &Scope,
+        lease: &PoolLease,
+        settled: Option<&PoolLeaseOp>,
+        now_ms: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(op) = settled {
+            settle_op(&tx, scope, op, now_ms)?;
+        }
+        upsert_pool_lease(&tx, scope, lease, PoolLeaseState::Accepted, None, now_ms)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 拒用一份从未接纳的租约：拒用标记和零用量的 release_only 操作在同一事务里落盘，之后才发送。
+    pub fn refuse_pool_lease(
+        &self,
+        scope: &Scope,
+        lease: &PoolLease,
+        reason: &str,
+        settled: Option<&PoolLeaseOp>,
+        now_ms: i64,
+    ) -> Result<PoolLeaseOp> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(op) = settled {
+            settle_op(&tx, scope, op, now_ms)?;
+        }
+        let [origin, tenant, user, device] = scope_params(scope);
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT state FROM pool_leases WHERE server_origin = ?1 AND tenant_id = ?2 AND user_id = ?3
+                   AND device_id = ?4 AND lease_id = ?5",
+                params![origin, tenant, user, device, lease.lease_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if existing.as_deref().and_then(PoolLeaseState::parse) == Some(PoolLeaseState::Accepted) {
+            bail!("lease {} was already accepted; it must be settled normally", lease.lease_id);
+        }
+        upsert_pool_lease(&tx, scope, lease, PoolLeaseState::Refused, Some(reason), now_ms)?;
+        let op = PoolLeaseOp::zero(lease, true);
+        insert_op(&tx, scope, &op, now_ms)?;
+        tx.commit()?;
+        Ok(op)
+    }
+
+    /// 为已接受租约开始常规结清。该租约已有在途操作时返回它，不新开。
+    ///
+    /// 常规续租须上报真实累计用量和分模型用量（Server 按 min(used,budget) 只扣一次），报零会少计。
+    /// 本批隔离租约从不放行请求（`State::route_pool_engaged` 拒绝全部真实模型入口），累计用量就是零，
+    /// 所以这里逐型号报零是真实值。接入逐请求执行时必须改为从持久用量凭证取值，不能沿用零。
+    pub fn begin_settlement(&self, scope: &Scope, lease: &PoolLease, now_ms: i64) -> Result<PoolLeaseOp> {
+        if let Some(op) = self.pending_pool_op(scope, &lease.lease_id)? {
+            return Ok(op);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let op = PoolLeaseOp::settle_unused(lease);
+        insert_op(&tx, scope, &op, now_ms)?;
+        tx.commit()?;
+        Ok(op)
+    }
+
+    /// 回复确认旧租约已结清：只按在途操作的 `re` 和匹配的旧租约 ID 完成，不动之后接受的租约。
+    pub fn complete_settlement(&self, scope: &Scope, op: &PoolLeaseOp, now_ms: i64) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        settle_op(&tx, scope, op, now_ms)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 续租收到失败 ACK：保留操作和原数值，记脱敏错误码。
+    pub fn pool_op_failed(&self, scope: &Scope, msg_id: &str, code: &str) -> Result<AckMatch> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        let n = conn.execute(
+            "UPDATE pool_lease_ops SET last_failure = ?6
+             WHERE server_origin = ?1 AND tenant_id = ?2 AND user_id = ?3 AND device_id = ?4 AND msg_id = ?5
+               AND done_at_ms IS NULL",
+            params![origin, tenant, user, device, msg_id, code],
+        )?;
+        Ok(if n == 0 { AckMatch::Unknown } else { AckMatch::Recorded })
+    }
+}
+
+fn read_pool_lease(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<PoolLease>> {
+    let state: String = r.get(1)?;
+    let models: String = r.get(8)?;
+    let lease = (|| {
+        Ok(PoolLease {
+            lease_id: r.get(0)?,
+            state: PoolLeaseState::parse(&state).context("stored lease state")?,
+            config_revision: r.get::<_, i64>(2)? as u64,
+            projection_id: r.get(3)?,
+            signature_id: r.get(4)?,
+            commerce_plan_id: r.get(5)?,
+            expires_at_ms: r.get(6)?,
+            budget_milli: r.get(7)?,
+            model_budgets: serde_json::from_str(&models).context("stored model_budgets")?,
+        })
+    })();
+    Ok(lease)
+}
+
+fn upsert_pool_lease(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &Scope,
+    lease: &PoolLease,
+    state: PoolLeaseState,
+    reason: Option<&str>,
+    now_ms: i64,
+) -> Result<()> {
+    let [origin, tenant, user, device] = scope_params(scope);
+    tx.execute(
+        "INSERT INTO pool_leases (server_origin, tenant_id, user_id, device_id, lease_id, state, config_revision,
+             projection_id, signature_id, commerce_plan_id, expires_at_ms, budget_milli, model_budgets, reason,
+             updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+         ON CONFLICT (server_origin, tenant_id, user_id, device_id, lease_id) DO UPDATE SET
+             state = excluded.state, reason = excluded.reason, updated_at_ms = excluded.updated_at_ms",
+        params![
+            origin,
+            tenant,
+            user,
+            device,
+            lease.lease_id,
+            state.as_str(),
+            lease.config_revision as i64,
+            lease.projection_id,
+            lease.signature_id,
+            lease.commerce_plan_id,
+            lease.expires_at_ms,
+            lease.budget_milli,
+            serde_json::to_string(&lease.model_budgets)?,
+            reason,
+            now_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_op(tx: &rusqlite::Transaction<'_>, scope: &Scope, op: &PoolLeaseOp, now_ms: i64) -> Result<()> {
+    let [origin, tenant, user, device] = scope_params(scope);
+    let pending: i64 = tx.query_row(
+        "SELECT count(*) FROM pool_lease_ops WHERE server_origin = ?1 AND tenant_id = ?2 AND user_id = ?3
+           AND device_id = ?4 AND lease_id = ?5 AND done_at_ms IS NULL",
+        params![origin, tenant, user, device, op.lease_id],
+        |r| r.get(0),
+    )?;
+    if pending > 0 {
+        bail!("lease {} already has a lease_renew waiting for its reply", op.lease_id);
+    }
+    tx.execute(
+        "INSERT INTO pool_lease_ops (server_origin, tenant_id, user_id, device_id, op_id, msg_id, lease_id,
+             release_only, used_milli, model_used_milli, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            origin,
+            tenant,
+            user,
+            device,
+            op.op_id,
+            op.msg_id,
+            op.lease_id,
+            op.release_only as i64,
+            op.used_milli,
+            serde_json::to_string(&op.model_used_milli)?,
+            now_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn settle_op(tx: &rusqlite::Transaction<'_>, scope: &Scope, op: &PoolLeaseOp, now_ms: i64) -> Result<()> {
+    let [origin, tenant, user, device] = scope_params(scope);
+    tx.execute(
+        "UPDATE pool_lease_ops SET done_at_ms = coalesce(done_at_ms, ?6)
+         WHERE server_origin = ?1 AND tenant_id = ?2 AND user_id = ?3 AND device_id = ?4 AND op_id = ?5",
+        params![origin, tenant, user, device, op.op_id, now_ms],
+    )?;
+    tx.execute(
+        "UPDATE pool_leases SET state = 'settled', updated_at_ms = ?6
+         WHERE server_origin = ?1 AND tenant_id = ?2 AND user_id = ?3 AND device_id = ?4 AND lease_id = ?5",
+        params![origin, tenant, user, device, op.lease_id, now_ms],
+    )?;
+    Ok(())
 }
 
 fn scope_params(scope: &Scope) -> [&str; 4] {

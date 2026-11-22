@@ -133,7 +133,11 @@ pub(crate) enum RouteSelectionError {
     ReleaseNotAllowed,
     ModelNotAllowed,
     BalanceExhausted,
+    /// 模型池隔离流程中，执行等结算联验。
+    RoutePoolPending,
 }
+
+pub(crate) const ROUTE_POOL_PENDING_MESSAGE: &str = "OneX 模型池正在联验，暂不执行模型请求。";
 
 pub(crate) struct SelectedRoute {
     pub execution: Execution,
@@ -395,6 +399,7 @@ fn is_business_error_body(v: &Value) -> bool {
 
 pub struct Router {
     pub(crate) state: Arc<State>,
+    pub(crate) isolated_pool_store: Option<Arc<crate::route_apply::Store>>,
     local_token: String,
     gate: crate::runtime_gate::Gate,
     /// 遵从环境变量代理的默认客户端
@@ -415,6 +420,7 @@ impl Router {
         let direct = client_builder().no_proxy().build().expect("http client");
         Arc::new(Self {
             state,
+            isolated_pool_store: None,
             local_token,
             http,
             direct,
@@ -422,6 +428,12 @@ impl Router {
             gate: Default::default(),
             usage_tx,
         })
+    }
+
+    #[doc(hidden)]
+    pub fn with_isolated_pool_execution(mut self: Arc<Self>, store: Arc<crate::route_apply::Store>) -> Arc<Self> {
+        Arc::get_mut(&mut self).expect("configure isolated router before sharing").isolated_pool_store = Some(store);
+        self
     }
 
     pub fn app(self: Arc<Self>) -> AxumRouter {
@@ -493,6 +505,10 @@ impl Router {
         protocol: AgentProtocol,
         binding: Option<&crate::state::LaunchBinding>,
     ) -> Result<SelectedRoute, RouteSelectionError> {
+        // 显式路由门禁：模型池隔离流程中不走任何上游，先于旧配置判断。
+        if self.state.route_pool_engaged() {
+            return Err(RouteSelectionError::RoutePoolPending);
+        }
         let cfg = self.state.config.read().unwrap();
         if cfg.policy_blocked
             || ((cfg.capability_contract.is_some()
@@ -729,6 +745,9 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
                 return anthropic_error(StatusCode::FORBIDDEN, "permission_error", "此模型已不在生效合约中。");
             }
             Err(RouteSelectionError::BalanceExhausted) => return block_response(Block::Cutoff(CutoffReason::Balance)),
+            Err(RouteSelectionError::RoutePoolPending) => {
+                return anthropic_error(StatusCode::FORBIDDEN, "permission_error", ROUTE_POOL_PENDING_MESSAGE);
+            }
             Err(RouteSelectionError::NotFound) => {
                 return anthropic_error(
                     StatusCode::NOT_FOUND,

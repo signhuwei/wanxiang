@@ -14,9 +14,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use onexd::outbox::Outbox;
-use onexd::route_apply::{Scope, Store};
+use onexd::route_apply::{PoolLeaseState, Scope, Store};
+use onexd::router::Router;
 use onexd::secret::DeviceKey;
-use onexd::state::{RouteApply, State};
+use onexd::state::{LaunchBinding, RouteApply, State};
 use onexd::ws::{self, WsOptions};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -36,8 +37,9 @@ struct Server {
 }
 
 impl Server {
-    async fn start(checkout: &Path, data_dir: &Path, port: u16) -> Self {
-        let mut child = Command::new("bun")
+    async fn start(checkout: &Path, data_dir: &Path, port: u16, lease_gate: bool) -> Self {
+        let mut command = Command::new("bun");
+        command
             .args([
                 "--no-env-file",
                 "tests/e2e/routing/projection-server.ts",
@@ -45,7 +47,21 @@ impl Server {
                 &port.to_string(),
                 "--data-dir",
             ])
-            .arg(data_dir)
+            .arg(data_dir);
+        if lease_gate {
+            command.arg("--lease-gate");
+        }
+        Self::spawn(checkout, command).await
+    }
+
+    async fn start_one_chain(checkout: &Path, data_dir: &Path) -> Self {
+        let mut command = Command::new("bun");
+        command.args(["--no-env-file", "tests/e2e/routing/one-chain-server.ts", "--data-dir"]).arg(data_dir);
+        Self::spawn(checkout, command).await
+    }
+
+    async fn spawn(checkout: &Path, mut command: Command) -> Self {
+        let mut child = command
             .current_dir(checkout)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -84,7 +100,18 @@ struct Edge {
 }
 
 impl Edge {
-    fn start(url: &str, token: &str, key_hex: &str, store_path: &Path) -> Self {
+    fn start(url: &str, token: &str, key_hex: &str, store_path: &Path, lease_gate: bool) -> Self {
+        Self::start_with_execution(url, token, key_hex, store_path, lease_gate, false)
+    }
+
+    fn start_with_execution(
+        url: &str,
+        token: &str,
+        key_hex: &str,
+        store_path: &Path,
+        lease_gate: bool,
+        execution: bool,
+    ) -> Self {
         let bytes: [u8; 32] = (0..32)
             .map(|i| u8::from_str_radix(&key_hex[i * 2..i * 2 + 2], 16).unwrap())
             .collect::<Vec<_>>()
@@ -96,6 +123,12 @@ impl Edge {
         let state = Arc::new(State { device_key: DeviceKey::from_bytes(bytes), ..Default::default() });
         state.replace_token(Some(token.into()));
         let mut o = WsOptions::new(url).with_route_pool_for_isolated_test(store.clone());
+        if lease_gate {
+            o = o.with_route_pool_leases_for_isolated_test();
+        }
+        if execution {
+            o = o.with_route_pool_execution_for_isolated_test();
+        }
         o.backoff_min = Duration::from_millis(50);
         o.backoff_max = Duration::from_millis(300);
         o.connect_timeout = Duration::from_secs(3);
@@ -165,7 +198,7 @@ async fn joint_projection_receipt_ledger_and_reconnect() {
     let port = free_port();
 
     // 1. Server 首次启动，投影 rol_v7（dev_lin 91）和 rol_v6（dev_fix 92）。
-    let server = Server::start(&checkout, server_dir.path(), port).await;
+    let server = Server::start(&checkout, server_dir.path(), port, false).await;
     let info = server.info.clone();
     let ws_url = info["ws_url"].as_str().unwrap().to_owned();
     let key_hex = info["device_private_key_hex"].as_str().unwrap().to_owned();
@@ -180,7 +213,7 @@ async fn joint_projection_receipt_ledger_and_reconnect() {
     assert!(row["state"] != "applied", "{row}");
 
     // 2. 真实 onexd WS：应用 v91，发 config_applied，等 Server 的成功 ACK。
-    let edge = Edge::start(&ws_url, &lin_token, &key_hex, &store_path);
+    let edge = Edge::start(&ws_url, &lin_token, &key_hex, &store_path, false);
     wait_until("edge applies v91", || edge.ready().is_some()).await;
     let scope = Scope::new(&ws_url, &tenant, &lin_user, "dev_lin").unwrap();
     let (revision, projection) = edge.ready().unwrap();
@@ -223,7 +256,7 @@ async fn joint_projection_receipt_ledger_and_reconnect() {
     // 3. Server 重启（同数据目录、同端口）：Edge 自动重连，收到重封；已确认的回执不再发送。
     server.stop().await;
     evidence("server_stopped", json!({}));
-    let server = Server::start(&checkout, server_dir.path(), port).await;
+    let server = Server::start(&checkout, server_dir.path(), port, false).await;
     evidence("server_restarted", json!({"ws_url": server.info["ws_url"]}));
     let connects = edge.state.conn.lock().unwrap().connects;
     wait_until("edge reconnects", || edge.state.conn.lock().unwrap().connects > connects).await;
@@ -235,7 +268,7 @@ async fn joint_projection_receipt_ledger_and_reconnect() {
 
     // 4. Edge 重启（新进程状态、同应用库）：先待同步，拿到本会话重封后恢复，无新回执。
     edge.stop().await;
-    let edge = Edge::start(&ws_url, &lin_token, &key_hex, &store_path);
+    let edge = Edge::start(&ws_url, &lin_token, &key_hex, &store_path, false);
     wait_until("edge ready after its own restart", || edge.ready() == Some((91, projection.clone()))).await;
     let notices_after = edge.state.route.read().unwrap().ready().unwrap().new_notice_ids.clone();
     let pending_after = edge.store.pending_receipt(&scope, 91, &projection).unwrap().map(|p| p.id);
@@ -255,7 +288,7 @@ async fn joint_projection_receipt_ledger_and_reconnect() {
     // 6. 固定 v6 设备（dev_fix，92）：只见 A，台账 applied。
     let fix_token = server.info["devices"]["dev_fix"]["token"].as_str().unwrap().to_owned();
     let fix_store = edge_dir.path().join("route_apply_fix.sqlite");
-    let fix = Edge::start(&ws_url, &fix_token, &key_hex, &fix_store);
+    let fix = Edge::start(&ws_url, &fix_token, &key_hex, &fix_store, false);
     wait_until("dev_fix applies v92", || fix.ready().is_some()).await;
     let deployments: Vec<String> = {
         let route = fix.state.route.read().unwrap();
@@ -268,5 +301,220 @@ async fn joint_projection_receipt_ledger_and_reconnect() {
     assert_eq!(fixed["applied_config_revision"], 92);
     assert!(matches!(*fix.state.route.read().unwrap(), RouteApply::Ready(_)));
     fix.stop().await;
+    server.stop().await;
+}
+
+/// 租约门禁（`--lease-gate`）：applied ACK 之后首领，精确绑定 91/prj_91；Edge 重启后等同投影
+/// 重封才恢复，已接受租约沿用，不再首领；固定 v6 设备的首领绑定 92/prj_92；隔离租约不进生产
+/// Ledger，真实模型入口拒绝。
+#[tokio::test]
+async fn joint_lease_gate_first_lease_and_restart() {
+    let Some(checkout) = checkout() else {
+        eprintln!("skipped: set ONEX_PROJECTION_SERVER_CHECKOUT to run the joint check");
+        return;
+    };
+    let server_dir = tempfile::tempdir().unwrap();
+    let edge_dir = tempfile::tempdir().unwrap();
+    let store_path = edge_dir.path().join("route_apply.sqlite");
+    let server = Server::start(&checkout, server_dir.path(), free_port(), true).await;
+    let info = server.info.clone();
+    evidence("lease_gate_server_started", json!({"lease_gate": info["lease_gate"], "ws_url": info["ws_url"]}));
+    assert_eq!(info["lease_gate"], true, "projection-server.ts must report lease_gate:true");
+    let ws_url = info["ws_url"].as_str().unwrap().to_owned();
+    let key_hex = info["device_private_key_hex"].as_str().unwrap().to_owned();
+    let token = info["devices"]["dev_lin"]["token"].as_str().unwrap().to_owned();
+    let scope = Scope::new(
+        &ws_url,
+        info["tenant_id"].as_str().unwrap(),
+        info["devices"]["dev_lin"]["user_id"].as_str().unwrap(),
+        "dev_lin",
+    )
+    .unwrap();
+
+    let edge = Edge::start(&ws_url, &token, &key_hex, &store_path, true);
+    wait_until("dev_lin accepts the first isolated lease", || {
+        edge.store.accepted_pool_lease(&scope).unwrap().is_some()
+    })
+    .await;
+    let held = edge.store.accepted_pool_lease(&scope).unwrap().unwrap();
+    evidence(
+        "first_lease_accepted",
+        json!({"lease_id": held.lease_id, "config_revision": held.config_revision, "projection_id": held.projection_id,
+            "signature_id": held.signature_id, "commerce_plan_id": held.commerce_plan_id,
+            "budget_milli": held.budget_milli, "model_budgets": held.model_budgets,
+            "view": edge.ready(), "production_ledger_lease": edge.state.lease.lease_id()}),
+    );
+    assert_eq!(Some((held.config_revision, held.projection_id.clone())), edge.ready());
+    assert!(edge.state.lease.lease_id().is_none(), "isolated leases never enter the production Ledger");
+    assert!(edge.state.route_pool_engaged(), "the real model entry stays closed");
+
+    // Edge 重启：同一隔离存储；等同投影重封恢复，已接受租约沿用，不再首领。
+    edge.stop().await;
+    let edge = Edge::start(&ws_url, &token, &key_hex, &store_path, true);
+    wait_until("view restored after reseal", || edge.ready().is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = edge.store.accepted_pool_lease(&scope).unwrap().unwrap();
+    evidence(
+        "restart_keeps_lease",
+        json!({"lease_id": after.lease_id, "view": edge.ready(),
+            "pending_ops": edge.store.pending_pool_ops(&scope).unwrap().len()}),
+    );
+    assert_eq!(after.lease_id, held.lease_id);
+    assert!(edge.store.pending_pool_ops(&scope).unwrap().is_empty());
+    edge.stop().await;
+
+    // 固定 v6 设备：首领绑定 92/prj_92。
+    let fix_token = info["devices"]["dev_fix"]["token"].as_str().unwrap().to_owned();
+    let fix_scope = Scope::new(
+        &ws_url,
+        info["tenant_id"].as_str().unwrap(),
+        info["devices"]["dev_fix"]["user_id"].as_str().unwrap(),
+        "dev_fix",
+    )
+    .unwrap();
+    let fix = Edge::start(&ws_url, &fix_token, &key_hex, &edge_dir.path().join("fix.sqlite"), true);
+    wait_until("dev_fix accepts its lease", || fix.store.accepted_pool_lease(&fix_scope).unwrap().is_some()).await;
+    let fixed = fix.store.accepted_pool_lease(&fix_scope).unwrap().unwrap();
+    evidence(
+        "pinned_v6_lease",
+        json!({"lease_id": fixed.lease_id, "config_revision": fixed.config_revision, "projection_id": fixed.projection_id}),
+    );
+    assert_eq!((fixed.config_revision, fixed.projection_id.as_str()), (92, "prj_92"));
+    assert_ne!(fixed.lease_id, held.lease_id);
+    fix.stop().await;
+    server.stop().await;
+}
+
+/// 平台经真实 HTTP 配渠道、签发、充值，Edge 经真实 WS 获取模型池和租约。
+/// 本地原生 Responses 请求用上游终态用量结算，并核对供应商与租户两边台账。
+#[tokio::test]
+async fn signed_pool_native_responses_settles_both_ledgers() {
+    let Some(checkout) = std::env::var_os("ONEX_ONE_CHAIN_SERVER_CHECKOUT").map(PathBuf::from) else {
+        eprintln!("skipped: set ONEX_ONE_CHAIN_SERVER_CHECKOUT to run the signed pool chain");
+        return;
+    };
+    let server_dir = tempfile::tempdir().unwrap();
+    let server = Server::start_one_chain(&checkout, server_dir.path()).await;
+    let info = &server.info;
+    let value = |field: &str| info[field].as_str().unwrap();
+    let scope = Scope::new(value("ws_url"), value("tenant_id"), value("user_id"), value("device_id")).unwrap();
+    let edge_dir = tempfile::tempdir().unwrap();
+    let edge = Edge::start_with_execution(
+        value("ws_url"),
+        value("device_token"),
+        value("device_private_key_hex"),
+        &edge_dir.path().join("route_apply.sqlite"),
+        true,
+        true,
+    );
+    wait_until("signed pool lease", || edge.store.accepted_pool_lease(&scope).unwrap().is_some()).await;
+    let lease = edge.store.accepted_pool_lease(&scope).unwrap().unwrap();
+    assert_eq!(lease.config_revision, info["config_revision"].as_u64().unwrap());
+    assert_eq!(lease.projection_id, value("projection_id"));
+    let model = value("model_id");
+    let view = edge.state.route.read().unwrap().ready().unwrap().clone();
+    let binding = view.config.route_pool.bindings.iter().find(|b| b.model_id == model).unwrap();
+    assert_eq!(binding.deployment_ids.len(), 2);
+    let rate = &info["signed_rate"]["rate_version_id"];
+    let release_id = binding.agent_release_id.clone();
+    let token = "one-chain-native-launch";
+    edge.state.launch_tokens.write().unwrap().insert(
+        token.into(),
+        LaunchBinding {
+            session_id: "ses_one_chain".into(),
+            agent: "codex".into(),
+            release_id: Some(release_id),
+            approved_model: Some(model.into()),
+            first_native_session: None,
+        },
+    );
+    let http = reqwest::Client::builder().no_proxy().timeout(T).build().unwrap();
+    let (usage, _legacy_usage) = tokio::sync::mpsc::unbounded_channel();
+    let router = Router::new(edge.state.clone(), "separate-local-token".into(), http.clone(), usage)
+        .with_isolated_pool_execution(edge.store.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = listener.local_addr().unwrap();
+    let http_task = tokio::spawn(async move { axum::serve(listener, router.app()).await.unwrap() });
+    let answer = http
+        .post(format!("http://{local}/v1/responses"))
+        .bearer_auth(token)
+        .json(&json!({"model": model, "input": "loopback e2e", "max_output_tokens": 2048, "stream": false}))
+        .send()
+        .await
+        .unwrap();
+    let status = answer.status();
+    let answer: Value = answer.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "native response: {answer}");
+    assert_eq!(answer["usage"]["input_tokens"], 10_000);
+    assert_eq!(answer["usage"]["output_tokens"], 2_000);
+
+    wait_until("metered lease settlement", || {
+        edge.store.pool_lease(&scope, &lease.lease_id).unwrap().unwrap().state == PoolLeaseState::Settled
+    })
+    .await;
+    let (seq, receipt, acked) = edge.store.isolated_usage_for_lease(&scope, &lease.lease_id).unwrap().unwrap();
+    let receipt = receipt.unwrap();
+    assert!(acked);
+    assert_eq!(seq, Some(1));
+    assert_eq!(receipt["lease_id"], lease.lease_id);
+    assert_eq!(receipt["rate_version_id"], *rate);
+    assert_eq!(receipt["projection_id"], lease.projection_id);
+    assert_eq!(receipt["measurement_basis"], "upstream_usage");
+    assert_eq!(receipt["cost_milli"], 64);
+
+    let db = rusqlite::Connection::open_with_flags(
+        server_dir.path().join(format!("tenant-{}.sqlite", value("tenant_id"))),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let charges: i64 = db
+        .query_row(
+            "SELECT sum(amount_milli) FROM ledger WHERE kind='settle' AND lease_id=?1",
+            [&lease.lease_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(charges, 64);
+    let expected_fields = [
+        receipt["request_id"].as_str().unwrap(),
+        receipt["attempt_id"].as_str().unwrap(),
+        &lease.projection_id,
+        receipt["deployment_id"].as_str().unwrap(),
+        rate.as_str().unwrap(),
+    ];
+    let runtime_rows: (i64, i64) = db.query_row(
+        "SELECT count(*),coalesce(sum(u.cost_milli),0) FROM route_runtime_usage r JOIN usage u USING(device_id,seq)
+          WHERE r.request_id=?1 AND r.attempt_id=?2 AND r.projection_id=?3 AND r.deployment_id=?4 AND r.rate_version_id=?5
+            AND r.procurement_state='posted' AND u.settlement_status='reconciled'
+            AND u.input_tokens=10000 AND u.output_tokens=2000",
+        expected_fields, |row| Ok((row.get(0)?,row.get(1)?)),
+    ).unwrap();
+    assert_eq!(runtime_rows, (1, 64));
+    let wallet: Value = http
+        .get(format!("{}/v1{}", value("http_url"), value("origin_channel")))
+        .bearer_auth(value("platform_session"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(wallet["accounts"][0]["spent_micro"], 50_000);
+    assert_eq!(wallet["accounts"][0]["balance_micro"], 3_200_000);
+    evidence(
+        "native_responses_channel_and_tenant_charged",
+        json!({
+            "lease_id": lease.lease_id, "projection_id": lease.projection_id, "request_id": receipt["request_id"],
+            "attempt_id": receipt["attempt_id"], "rate_version_id": receipt["rate_version_id"],
+            "provider_id": receipt["provider_id"], "deployment_id": receipt["deployment_id"],
+            "deployment_revision": receipt["deployment_revision"], "signed_pool": info["signed_pool"],
+            "input_tokens": 10_000, "output_tokens": 2_000, "tenant_debit_milli": charges,
+            "supplier_debit_micro": 50_000, "supplier_balance_micro": 3_200_000,
+        }),
+    );
+    http_task.abort();
+    edge.stop().await;
     server.stop().await;
 }
