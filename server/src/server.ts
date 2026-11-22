@@ -22,6 +22,7 @@ import { personalLoginTokenRoutes } from './personal-login-tokens';
 import { platformRoutes } from './platform-management';
 import { modelPoolRoutes } from './model-pool';
 import { procurementRoutes } from './procurement';
+import { inputMultiplierRoutes } from './input-multiplier';
 import { policyDiscountRoutes, settleUnclosedDiscountMonths } from './policy-discounts';
 import { commerceRoutes } from './commerce';
 import { upstreamRoutes } from './tenant-upstreams';
@@ -107,6 +108,7 @@ export async function createServer(opts: Options) {
     platformRoutes(app, store, management);
     modelPoolRoutes(app, store, management);
     procurementRoutes(app, store, management);
+    inputMultiplierRoutes(app, store, management);
     capabilityRoutes(app, store, management);
     policyRoutes(app, store, management);
     upstreamRoutes(app,store,management);

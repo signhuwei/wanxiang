@@ -13,7 +13,7 @@ test('routing migrations keep legacy tables readable and foreign keys consistent
     const models = await body(await f.call(f.platform, '/models'));
     const byId = Object.fromEntries(models.items.map((row: Json) => [row.id, row]));
     expect(byId.mdl_m).toMatchObject({ provider_id: 'prv_a', upstream_name: 'vendor-a/m-20261121', revision: 1,
-      actions: ['read', 'update'], current_pool_revision: 6, channel_count: 1 });
+      actions: ['read', 'update', 'preview_input_multiplier'], current_pool_revision: 6, channel_count: 1 });
     expect(byId.mdl_legacy).toMatchObject({ current_pool_revision: 0, channel_count: 0 });
     expect(models.actions).toEqual(['create_model']);
     expect((await f.call(f.platform, '/models?provider_id=prv_b')).status).toBe(200);
