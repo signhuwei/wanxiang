@@ -278,7 +278,9 @@ const TARGET_REASONS = {
   sales_rate_outside_window: '签约售价不在有效期', signature_changed: '签发已变更', agent_release_unavailable: 'Agent 发行不可用',
   no_eligible_deployment: '没有合格部署', no_active_pool: '没有活动池', pool_revision_missing: '池版本不存在',
   device_unavailable: '设备不可用', target_expired: '目标已过期', revocation_changed: '撤销修订已变化', authorization_changed: '授权已变化',
-  missing_envelope: '缺推理密钥信封'
+  missing_envelope: '缺推理密钥信封', stale_revision: '配置修订过旧', revocation_regressed: '撤销修订倒退',
+  projection_conflict: '投影冲突', projection_mismatch: '投影标识不匹配', content_changed: '同一修订内容已变化',
+  expired: '设备收到的配置已过期', invalid_config: '配置无效'
 }
 // 设备拒绝时 reason 取自已脱敏的 error.detail.reason；未知码原样显示。
 export const targetReasonLabel = code => code ? (TARGET_REASONS[code] ? TARGET_REASONS[code] + '（' + code + '）' : code) : '—'

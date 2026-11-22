@@ -62,6 +62,8 @@ test('target states follow the contract and device reasons come from detail.reas
   expect(targetStateLabel('sent')).toBe('sent')
   const reason = fixture.wire.config_applied_rejected.error.detail.reason
   expect(targetReasonLabel(reason)).toBe('缺推理密钥信封（missing_envelope）')
+  expect(targetReasonLabel('stale_revision')).toBe('配置修订过旧（stale_revision）')
+  expect(targetReasonLabel('revocation_regressed')).toBe('撤销修订倒退（revocation_regressed）')
   expect(targetReasonLabel('new_code')).toBe('new_code')
   expect(targetReasonLabel(null)).toBe('—')
   expect(jobStatusLabel('done')).toBe('已完成')
