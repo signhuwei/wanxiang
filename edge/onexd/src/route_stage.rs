@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use onex_core::route_pool::{
     AvailabilityState, CredentialRef, FEATURES, INPUT_MULTIPLIER_BASIS, PoolConfig, PoolFrame, PoolRate,
-    ROUTE_POOL_ABI, Strategy, apply_error,
+    ROUTE_POOL_ABI, RouteSecret, Strategy, apply_error,
 };
 use onex_core::ws::ErrorBody;
 use serde_json::{Map, Value, json};
@@ -25,6 +25,9 @@ const MAX_ATTEMPTS: u32 = 8;
 const MAX_RESOURCES: usize = 4096;
 const MAX_CIPHERTEXT: usize = 16 * 1024;
 const PROTOCOLS: [&str; 3] = ["anthropic", "openai_chat", "openai_responses"];
+/// 本 Edge 已注册并验证的协议转换器 `(adapter_id, adapter_revision)`。首条联验只有原生
+/// Responses，因此为空：任何非原生绑定或携带 adapter 引用的路由都被拒绝。
+pub const SUPPORTED_ADAPTERS: [(&str, u64); 0] = [];
 
 /// 认证会话确定的身份；帧内身份只用于比对，信封 AAD 取这里的值。
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +52,8 @@ pub struct Input<'a> {
     pub applied: Option<&'a AppliedIdentity>,
     /// 本地已落盘的最高撤销修订。
     pub revocation_revision: u64,
+    /// 已注册的转换器；生产入口传 [`SUPPORTED_ADAPTERS`]。
+    pub adapters: &'a [(&'a str, u64)],
 }
 
 /// 成员可见的生效模型标签。
@@ -164,15 +169,23 @@ fn valid_url(base: &str) -> bool {
     })
 }
 
-/// 有效内容摘要：去掉帧 `id` 与信封的 `key_id/nonce/ciphertext`，保留凭据 ID 和版本。
+/// 有效内容摘要：去掉帧 `id`，信封列表按 `routes[].credential_ref` 的唯一
+/// `(credential_id, credential_version)` 排序重建，只保留凭据身份。实际收到的信封顺序、
+/// 漏发、多发或重复不改变摘要，由后面的信封集合检查单独报错。
 pub fn content_digest(config: &PoolConfig) -> [u8; 32] {
     let mut c = config.clone();
     c.id.clear();
-    for s in &mut c.route_pool.secrets {
-        s.key_id.clear();
-        s.nonce.clear();
-        s.ciphertext.clear();
-    }
+    let refs: BTreeSet<&CredentialRef> = config.routes.iter().map(|r| &r.credential_ref).collect();
+    c.route_pool.secrets = refs
+        .into_iter()
+        .map(|r| RouteSecret {
+            credential_id: r.credential_id.clone(),
+            credential_version: r.credential_version,
+            key_id: String::new(),
+            nonce: String::new(),
+            ciphertext: String::new(),
+        })
+        .collect();
     Sha256::digest(serde_json::to_vec(&c).expect("typed config serializes")).into()
 }
 
@@ -340,6 +353,13 @@ pub fn stage(frame: &Value, input: &Input<'_>) -> Result<Staged, StageError> {
         if route.availability.state == AvailabilityState::Unknown {
             return Err(at(StageError::unsupported("unknown_availability")));
         }
+        if let Some(adapter) = route.adapter_id.as_deref().zip(route.adapter_revision)
+            && !input.adapters.contains(&adapter)
+        {
+            return Err(at(StageError::unsupported("unregistered_adapter"))
+                .at("adapter_id", adapter.0)
+                .at("adapter_revision", adapter.1));
+        }
         if let Some(f) = route.features.iter().find(|f| !FEATURES.contains(&f.as_str())) {
             return Err(at(StageError::unsupported("unknown_feature")).at("feature", f.as_str()));
         }
@@ -406,9 +426,15 @@ pub fn stage(frame: &Value, input: &Input<'_>) -> Result<Staged, StageError> {
             if !seen.insert(id.as_str()) {
                 return Err(at(StageError::invalid("duplicate_deployment")).at("deployment_id", id.as_str()));
             }
-            match routes.get(id.as_str()) {
-                Some(route) if route.base.model_id == b.model_id => {}
+            let route = match routes.get(id.as_str()) {
+                Some(route) if route.base.model_id == b.model_id => route,
                 _ => return Err(at(StageError::invalid("unresolved_deployment")).at("deployment_id", id.as_str())),
+            };
+            // 非原生协议只能经已注册的转换器承接（注册检查已在路由阶段完成）。
+            if route.base.protocol != b.ingress_protocol && route.adapter_id.is_none() {
+                return Err(
+                    at(StageError::unsupported("protocol_mismatch_without_adapter")).at("deployment_id", id.as_str())
+                );
             }
             referenced.insert(id.as_str());
         }
@@ -534,12 +560,30 @@ pub fn stage_with_state(
         return Err(StageError::invalid("no_session"));
     };
     let session = Session { tenant_id: &tenant_id, user_id: &user_id, device_id: &device_id };
-    stage(frame, &Input { session, now_ms, device_key: &state.device_key, applied, revocation_revision })
+    let adapters = &SUPPORTED_ADAPTERS;
+    stage(frame, &Input { session, now_ms, device_key: &state.device_key, applied, revocation_revision, adapters })
+}
+
+/// 供诊断：脱敏的暂存摘要，不含密钥、URL 和采购数据。
+pub fn summary(staged: &Staged) -> Value {
+    json!({
+        "config_revision": staged.identity.revision,
+        "projection_id": staged.identity.projection_id,
+        "policy_revision": staged.policy_revision,
+        "signature_id": staged.signature_id,
+        "revocation_revision": staged.revocation_revision,
+        "resealed": staged.resealed,
+        "credentials": staged.credentials().len(),
+        "labels": staged.labels.iter().map(|l| &l.label).collect::<Vec<_>>(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 对样例配置做一处修改，配上期望的拒绝原因。
+    type Case<'a> = (&'a dyn Fn(&mut Value), &'a str);
     use crate::pricing::{Tokens, cost_milli};
     use crate::secret::seal_route_for_test;
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -614,7 +658,88 @@ mod tests {
     }
 
     fn input<'a>(key: &'a DeviceKey) -> Input<'a> {
-        Input { session: SESSION, now_ms: now(), device_key: key, applied: None, revocation_revision: 0 }
+        Input { session: SESSION, now_ms: now(), device_key: key, applied: None, revocation_revision: 0, adapters: &[] }
+    }
+
+    #[test]
+    fn digest_ignores_envelope_order_and_omissions() {
+        let key = device();
+        let applied = stage(&frame(), &input(&key)).unwrap().identity;
+        let digest = |f: &Value| match serde_json::from_value::<PoolFrame>(f.clone()).unwrap() {
+            PoolFrame::Config(c) => content_digest(&c),
+            _ => unreachable!(),
+        };
+        let mut reversed = frame();
+        reversed["route_pool"]["secrets"].as_array_mut().unwrap().reverse();
+        let mut missing = frame();
+        missing["route_pool"]["secrets"].as_array_mut().unwrap().pop();
+        let mut extra = frame();
+        let stray = seal("ten_demo", "dev_lin", "prj_91", 91, "cred_z", 1, "z");
+        extra["route_pool"]["secrets"].as_array_mut().unwrap().push(stray);
+        let mut doubled = frame();
+        let copy = doubled["route_pool"]["secrets"][0].clone();
+        doubled["route_pool"]["secrets"].as_array_mut().unwrap().push(copy);
+        for f in [&reversed, &missing, &extra, &doubled] {
+            assert_eq!(digest(f), applied.digest);
+        }
+
+        let with = Input { applied: Some(&applied), ..input(&key) };
+        // 顺序不同：仍是同内容重封。
+        assert!(stage(&reversed, &with).unwrap().resealed);
+        // 同版漏发：报缺凭据，不报 conflict。
+        let e = stage(&missing, &with).unwrap_err();
+        assert_eq!((e.code, e.reason), (apply_error::MISSING_ROUTE_CREDENTIAL, "missing_envelope"));
+        assert_eq!(e.detail["credential_id"], "cred_b");
+        // 同版多发或重复：报信封集合错误，不报 conflict。
+        assert_eq!(rejects(&extra, &with), (apply_error::INVALID_CONFIG, "extra_envelope"));
+        assert_eq!(rejects(&doubled, &with), (apply_error::INVALID_CONFIG, "duplicate_envelope"));
+        // 首次下发时同样。
+        assert_eq!(rejects(&missing, &input(&key)).0, apply_error::MISSING_ROUTE_CREDENTIAL);
+    }
+
+    #[test]
+    fn bindings_require_native_protocol_or_registered_adapter() {
+        let key = device();
+        // 原生 Responses 是首条联验路径，无需转换器。
+        assert!(stage(&frame(), &input(&key)).is_ok());
+
+        // 入口与部署协议不同，又没有转换器。
+        let mut mismatch = frame();
+        mismatch["routes"][1]["protocol"] = json!("openai_chat");
+        let e = stage(&mismatch, &input(&key)).unwrap_err();
+        assert_eq!((e.code, e.reason), (apply_error::UNSUPPORTED_CAPABILITY, "protocol_mismatch_without_adapter"));
+        assert_eq!((&e.detail["binding_id"], &e.detail["deployment_id"]), (&json!("bnd_codex_m"), &json!("dep_b")));
+
+        // 带转换器引用但本 Edge 没有注册：生产入口为空注册表，一律拒绝。
+        let mut converted = mismatch.clone();
+        converted["routes"][1]["adapter_id"] = json!("responses_to_chat");
+        converted["routes"][1]["adapter_revision"] = json!(1);
+        let e = stage(&converted, &input(&key)).unwrap_err();
+        assert_eq!((e.code, e.reason), (apply_error::UNSUPPORTED_CAPABILITY, "unregistered_adapter"));
+        assert_eq!(e.detail["adapter_id"], "responses_to_chat");
+        // 原生路由附带未注册的转换器引用同样拒绝。
+        let mut native_with_ref = frame();
+        native_with_ref["routes"][0]["adapter_id"] = json!("responses_to_chat");
+        native_with_ref["routes"][0]["adapter_revision"] = json!(1);
+        assert_eq!(
+            rejects(&native_with_ref, &input(&key)),
+            (apply_error::UNSUPPORTED_CAPABILITY, "unregistered_adapter")
+        );
+        // 版本不符也算未注册。
+        let registered = [("responses_to_chat", 2)];
+        let wrong_rev = Input { adapters: &registered, ..input(&key) };
+        assert_eq!(rejects(&converted, &wrong_rev).1, "unregistered_adapter");
+        // 注册表命中时才接受（为后续批次保留的形状）。
+        let registered = [("responses_to_chat", 1)];
+        assert!(stage(&converted, &Input { adapters: &registered, ..input(&key) }).is_ok());
+        // 生产入口使用空注册表，同一帧被拒。
+        let state = State { device_key: device(), ..Default::default() };
+        {
+            let mut c = state.conn.lock().unwrap();
+            (c.tenant_id, c.user_id, c.device_id) =
+                (Some("ten_demo".into()), Some("usr_lin".into()), Some("dev_lin".into()));
+        }
+        assert_eq!(stage_with_state(&state, &converted, now(), None, 0).unwrap_err().reason, "unregistered_adapter");
     }
 
     fn rejects(frame: &Value, input: &Input<'_>) -> (&'static str, &'static str) {
@@ -794,7 +919,7 @@ mod tests {
             f(&mut v);
             v
         };
-        let cases: [(&dyn Fn(&mut Value), &str); 7] = [
+        let cases: [Case; 7] = [
             (&|v| v["rates"][0]["input_multiplier_ppm"] = json!(3_999_000), "rate_mismatch"),
             (&|v| v["rates"][0]["input_multiplier_ppm"] = json!(4_000_500), "rate_mismatch"),
             (&|v| v["rates"][0]["input_multiplier_basis"] = json!("usd_1_per_mtok_input"), "rate_mismatch"),
@@ -833,7 +958,7 @@ mod tests {
             f(&mut v);
             v
         };
-        let invalid: [(&dyn Fn(&mut Value), &str); 9] = [
+        let invalid: [Case; 9] = [
             (&|v| v["route_pool"]["expires_at"] = json!("2026-11-22T02:00:12Z"), "expired"),
             (&|v| v["route_pool"]["bindings"][0]["deployment_ids"] = json!(["dep_a"]), "orphan_route"),
             (
@@ -857,7 +982,7 @@ mod tests {
         for (change, reason) in invalid {
             assert_eq!(rejects(&edit(change), &input(&key)), (apply_error::INVALID_CONFIG, reason), "{reason}");
         }
-        let unsupported: [(&dyn Fn(&mut Value), &str); 5] = [
+        let unsupported: [Case; 5] = [
             (&|v| v["route_pool"]["abi"] = json!(2), "route_pool_abi"),
             (&|v| v["route_pool"]["pools"][0]["strategy"] = json!("weighted"), "unsupported_strategy"),
             (&|v| v["routes"][0]["features"] = json!(["text", "telepathy"]), "unknown_feature"),
@@ -918,18 +1043,4 @@ mod tests {
             assert_eq!(format_multiplier(ppm), s);
         }
     }
-}
-
-/// 供诊断：脱敏的暂存摘要，不含密钥、URL 和采购数据。
-pub fn summary(staged: &Staged) -> Value {
-    json!({
-        "config_revision": staged.identity.revision,
-        "projection_id": staged.identity.projection_id,
-        "policy_revision": staged.policy_revision,
-        "signature_id": staged.signature_id,
-        "revocation_revision": staged.revocation_revision,
-        "resealed": staged.resealed,
-        "credentials": staged.credentials().len(),
-        "labels": staged.labels.iter().map(|l| &l.label).collect::<Vec<_>>(),
-    })
 }
