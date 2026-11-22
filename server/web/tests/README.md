@@ -2,6 +2,14 @@
 
 从 worktree 根目录执行。页面是无构建原生 ESM；Playwright 仅用于验收。
 
+### 多渠道路由首批（contracts/routing-p0.md）
+
+```sh
+bun --no-env-file server/web/tests/routing-check.js .local/routing-shots
+```
+
+启动临时 Server 与 SQLite，用非安全上下文源（`onex-routing.test` 映射回环）登录真实平台会话并新建 Provider。首批路由接口（渠道卡片、签约型号台账、候选、池预览/发布/版本）在 Server 落地前由 `tests/fixtures/routing/p0-ab.json` 驱动的浏览器拦截应答，其余 `/v1` 转发到真实 Server。覆盖：卡片只读与分页查询、未获准原因、预览请求与共享草稿逐字节一致、响应丢失后同键重试只得一个 v7、同优先级、409 保留草稿、`idempotency_mismatch` 后换键、`preview_stale` 后重新核对候选并显式采用新证据。
+
 ### 能力合约 v2
 
 ```sh

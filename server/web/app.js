@@ -12,6 +12,7 @@ import { billingPage } from './billing.js'
 import { auditPage } from './audit.js'
 import { agentReleasesPage } from './agent-releases.js'
 import { catalog } from './catalog.js'
+import { signedModelsPage } from './routing-models.js'
 import { platformPolicyContracts, platformPolicyDefinitions, platformPolicyTemplates } from './policy-platform.js'
 import { tenantPolicyPage, organizationPolicyPage, quotaPolicyPage } from './policy-configuration.js'
 import { mountTabs, tenantPolicy } from './policy-controls.js'
@@ -96,7 +97,7 @@ function appendQuotaItem(items, quota) {
 
 const platformNavigation = [
   ['能力合约', [['contracts', '平台合约'], ['templates', '合约模板'], ['definitions', '条目库'], ['commerce','商业计费']]],
-  ['能力管理', [['catalog', 'Provider'], ['agents', 'Agent'], ['tools', 'Tools']]],
+  ['能力管理', [['catalog', 'Provider'], ['models', '签约型号'], ['agents', 'Agent'], ['tools', 'Tools']]],
   ['运维管理', [['maintenance', '维护与发布'], ['releases', 'Edge 安装包']]]
 ]
 const platformPath = hash => hash.split('/')[2] || 'contracts'
@@ -325,6 +326,7 @@ function route() {
     else if (path === 'tools') platformToolsPage(view, platformApi, signal)
     else if (path === 'releases') releasesPage(view, platformApi, session.globalActions || [])
     else if (path === 'catalog') catalog(view, platformApi, session.globalActions || [])
+    else if (path === 'models') signedModelsPage(view, platformApi, signal)
     else location.replace('#/platform/contracts')
     return
   }
