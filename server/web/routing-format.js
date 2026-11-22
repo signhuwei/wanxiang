@@ -271,10 +271,14 @@ export const TARGET_STATES = [['applied', '已应用'], ['superseded', '已被�
 export const targetStateLabel = state => TARGET_STATES.find(([key]) => key === state)?.[1] ?? (state || '—')
 const JOB_STATUS = { pending: '排队中', running: '执行中', done: '已完成', failed: '失败' }
 export const jobStatusLabel = status => JOB_STATUS[status] ?? (status || '—')
+// 稳定码按 contracts/errors.md「隔离阶段 route_pool.v1」登记；设备拒绝时另有设备侧 detail.reason。
 const TARGET_REASONS = {
-  missing_envelope: '缺推理密钥信封', missing_route_credential: '缺渠道凭据', target_expired: '目标已过期',
-  stale_revision: '配置修订过旧', revocation_regressed: '撤销修订倒退', projection_conflict: '投影冲突',
-  unsupported_capability: '设备未协商路由池能力', invalid_config: '配置无效'
+  awaiting_receipt: '已发送，等待回执', not_projected: '目标尚未生成', device_offline: '设备离线', pool_superseded: '已被更新池取代',
+  unsupported_capability: '设备未协商路由池能力', missing_route_credential: '缺渠道凭据', missing_sales_rate: '缺签约售价',
+  sales_rate_outside_window: '签约售价不在有效期', signature_changed: '签发已变更', agent_release_unavailable: 'Agent 发行不可用',
+  no_eligible_deployment: '没有合格部署', no_active_pool: '没有活动池', pool_revision_missing: '池版本不存在',
+  device_unavailable: '设备不可用', target_expired: '目标已过期', revocation_changed: '撤销修订已变化', authorization_changed: '授权已变化',
+  missing_envelope: '缺推理密钥信封'
 }
 // 设备拒绝时 reason 取自已脱敏的 error.detail.reason；未知码原样显示。
 export const targetReasonLabel = code => code ? (TARGET_REASONS[code] ? TARGET_REASONS[code] + '（' + code + '）' : code) : '—'
