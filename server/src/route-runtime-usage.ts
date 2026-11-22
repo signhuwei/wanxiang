@@ -2,7 +2,7 @@ import { ApiError, invalid } from './api';
 import { deviceAllowed } from './billing';
 import { modelBudgetWire } from './commerce-data';
 import { iso } from './credentials';
-import { ackCursor, advanceCursor, batchItems, markSequence, usageItems } from './ingest';
+import { ackCursor, advanceCursor, batchItems, markSequence, usageItems, type IngestSummary, type PublishSummary } from './ingest';
 import { enumField, int } from './management';
 import { MAX_ATTEMPTS } from './model-pool';
 import type { QuoteItem } from './procurement';
@@ -174,8 +174,8 @@ function persistReceipt(store: Store, sql: Transaction, tenant: string, device: 
   return charge;
 }
 
-export async function ingestRouteUsage(store: Store, tenant: string, device: string, batch: unknown, at: number,
-  postProcurement?: PostRouteProcurement, live: () => boolean = () => true): Promise<number> {
+export async function ingestRouteUsage(store: Store, tenant: string, device: string, user: string, batch: unknown, at: number,
+  postProcurement: PostRouteProcurement, live: () => boolean, publish: PublishSummary): Promise<number> {
   const items = parseBatch(batch);
   const db = store.tenant(tenant);
   const pending = await db.write(sql => {
@@ -184,21 +184,29 @@ export async function ingestRouteUsage(store: Store, tenant: string, device: str
   });
   for (const charge of pending) {
     if (!charge) continue;
-    if (!postProcurement) throw refused('route_procurement_not_configured');
     await postProcurement(charge);
   }
-  return db.write(sql => {
+  const { ack, summaries } = await db.write(sql => {
     if (!live()) throw new ApiError('forbidden');
+    const summaries: IngestSummary[] = [];
     for (const row of items) {
       sql.run(`UPDATE route_runtime_usage SET procurement_state='posted'
         WHERE device_id=? AND seq=? AND procurement_state='pending'`, [device, row.seq]);
-      markSequence(sql, device, row.seq);
+      if (markSequence(sql, device, row.seq) && row.session) {
+        sql.run('UPDATE agent_sessions SET revision=revision+1 WHERE id=? AND device_id=?', [row.session, device]);
+        summaries.push({ type: 'usage', session_id: row.session, user_id: user, seq: row.seq });
+      }
     }
-    return advanceCursor(sql, device);
+    const previous = ackCursor(sql, device);
+    const ack = advanceCursor(sql, device);
+    if (ack > previous) summaries.push({ type: 'cursor', user_id: user, seq: ack });
+    return { ack, summaries };
   });
+  publish(tenant, summaries);
+  return ack;
 }
 
-/** An isolated route lease can settle only through a contiguous ACK of validated receipts. */
+/** A metered route lease can settle only through a contiguous ACK of validated receipts. */
 export function settleRouteUsage(sql: Transaction, device: string, lease: string, through: number | null | undefined,
   used: number, modelUsed: Record<string, number> | null, releaseOnly: boolean) {
   const rows = sql.all<{ seq: number; model_id: string; cost_milli: number; procurement_state: string }>(`

@@ -16,9 +16,9 @@ import { bearer, hash, iso, randomToken } from './credentials';
 import { readPolicyHot } from './policy-data';
 import { requiresPolicyRuntime, type ConfigPublisher } from './edge-config';
 import type { Presence } from './presence';
-import { applyReceipt, observeUnsupported, parseReceipt, ROUTE_POOL_CAPABILITY, routePoolLeasePending, selectsRoutePool,
+import { applyReceipt, observeUnsupported, parseReceipt, ROUTE_POOL_CAPABILITY, ROUTE_POOL_EXECUTION_CAPABILITY, routePoolLeasePending, selectsRoutePool,
   sendCurrentTarget, unsupportedRoutePool } from './route-pool-session';
-import type { RoutingProjector } from './route-projection';
+import { meteredRouteExecution, type RoutingProjector } from './route-projection';
 import type { Device, Store } from './store';
 
 const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -29,7 +29,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
   config: ConfigPublisher, pending: PendingWork, publish: PublishSummary, diag: DiagChannel, projector?: RoutingProjector) {
   const current = new Map<string, WSContext>();
   const sockets = new Set<WSContext>();
-  // Online isolated route_pool.v1 sessions; a newly persisted target is sent right away.
+  // A newly persisted target is delivered to online route_pool.v1 sessions.
   const routeSessions = new Map<string, { live: () => boolean; resend: () => Promise<void> }>();
   projector?.subscribe((_tenant, device) => {
     const session = routeSessions.get(device);
@@ -162,10 +162,11 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             state = 'ready';
             send({ type: 'welcome', re: msg.id, device_id: deviceId, user_id: userId, tenant_id: tenantId,
               server_time: iso(now()), ack_seq: ackCursor(store.tenant(tenantId), deviceId), heartbeat_ms: heartbeatMs,
-              ...(routePoolSelected && { capabilities: [ROUTE_POOL_CAPABILITY] }) });
+              ...(routePoolSelected && { capabilities: routePool.productionExecution
+                ? [ROUTE_POOL_CAPABILITY, ROUTE_POOL_EXECUTION_CAPABILITY] : [ROUTE_POOL_CAPABILITY] }) });
             timer = setTimeout(tick, heartbeatMs);
             if (routePoolSelected && projector) {
-              // Isolated session: no handshake lease and no legacy config/secret frames; resend the persisted target.
+            // The device requests a lease after applying its persisted target.
               const resend = () => sendCurrentTarget(store, projector, tenantId, deviceId, now(), live, send).then(() => {});
               routeSessions.set(deviceId, { live, resend });
               diag.connect(deviceId, tenantId, send, live);
@@ -211,7 +212,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             return;
           }
           if (msg.type === 'pong' || (msg.type === 'ack' && isText(msg.re) && typeof msg.ok === 'boolean')) return;
-          if (routePoolGated && ['lease_renew', 'lease_request', 'config_applied'].includes(String(msg.type)) && isText(msg.id)) throw unsupportedRoutePool();
+          if (routePoolGated && ['lease_renew', 'lease_request', 'config_applied', 'usage'].includes(String(msg.type)) && isText(msg.id)) throw unsupportedRoutePool();
           if (routePoolSelected && projector?.inputs.leaseGate && msg.type === 'lease_request' && isText(msg.id)) {
             if (!isText(msg.op_id)) throw new ApiError('invalid', { fields: ['op_id'] });
             const reply = await requestRouteLease(store, projector.inputs, tenantId, deviceId, userId, now(), live);
@@ -220,7 +221,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             return;
           }
           if (routePoolSelected && projector?.inputs.leaseGate && msg.type === 'lease_renew' && isText(msg.id)) {
-            const reply = await renewRouteLease(store, projector.inputs, tenantId, deviceId, userId, now(), live, parseRenew(msg, projector.inputs.executionTest));
+            const reply = await renewRouteLease(store, projector.inputs, tenantId, deviceId, userId, now(), live, parseRenew(msg, meteredRouteExecution(projector.inputs)));
             await config.balanceChanged(tenantId);
             send({ ...reply, re: msg.id });
             return;
@@ -246,7 +247,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
           }
           if (msg.type === 'lease_renew' && isText(msg.id)) {
             if (!isText(msg.lease_id)) throw new ApiError('invalid', { fields: ['lease_id'] });
-            // release_only exists only on isolated route_pool sessions; the production entry never enables it.
+            // release_only is part of the route-pool protocol.
             if (Object.hasOwn(msg, 'release_only')) throw new ApiError('invalid', { fields: ['release_only'] });
             const opId = msg.op_id ?? msg.id;
             if (!isText(opId)) throw new ApiError('invalid', { fields: ['op_id'] });
@@ -265,14 +266,14 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             return;
           }
           if (msg.type === 'usage' && isText(msg.id)) {
-            const ack_seq = routePoolSelected && projector?.inputs.executionTest
-              ? await ingestRouteUsage(store, tenantId, deviceId, msg.batch, now(), async (charge) => {
+            const ack_seq = routePoolSelected && meteredRouteExecution(projector?.inputs)
+              ? await ingestRouteUsage(store, tenantId, deviceId, userId, msg.batch, now(), async (charge) => {
                 await store.system.write(sql => appendChannelEntry(sql, charge.provider_id, charge.account_id, 'system:routing', now(), {
                   kind: 'expense', currency: charge.currency, amount_micro: Number(charge.amount_micro),
                   reference: [charge.tenant_id, charge.device_id, charge.request_id, charge.attempt_id].join('/'),
                   note: `采购报价 ${charge.quote_id}@${charge.quote_revision}`,
                 }));
-              }, live)
+              }, live, publish)
               : await ingestUsage(store, tenantId, deviceId, userId, now(), live, usageItems(msg.batch), publish);
             send({ type: 'events_ack', re: msg.id, ack_seq });
             return;

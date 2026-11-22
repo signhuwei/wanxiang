@@ -1,9 +1,10 @@
 import { ulid } from 'ulid';
 import { artifactDownloadPath } from './agent-catalog';
+import { balance } from './billing';
 import { iso } from './credentials';
 import { deviceRuntime } from './edge-config';
 import { assessMember, currentIdentity, headRevision, poolMembers } from './model-pool';
-import { balanceFallbackModels, balancePolicyEnabled, readBalanceMode } from './policy-balance';
+import { balanceFallbackModels, balancePolicyEnabled, balancePolicyMode, readBalanceMode } from './policy-balance';
 import { readPolicyDevice, readPolicyHot } from './policy-data';
 import { routeProjectionDigest, type RouteSecretMaterial } from './route-secret';
 import { digest } from './routing-http';
@@ -12,8 +13,7 @@ import type { QueuedDatabase, Store, Transaction } from './store';
 
 /**
  * Persistent device targets for route_pool.v1 (contracts/routing-projection.md).
- * Isolated stage: bindings and exact credential versions are injected by tests; production never passes inputs,
- * so tenants keep the current effective configuration and release jobs are not executed.
+ * Binding and credential sources are supplied by the activation cohort or the protocol fixtures.
  */
 export type RouteGrant = {
   binding_id: string; binding_revision: number; agent_release_id: string; model_id: string;
@@ -29,7 +29,7 @@ export type RoutingProjectionInputs = {
   grants(tenantId: string): RouteGrant[];
   credentialRef(deploymentId: string, deploymentRevision: number): CredentialRef | null;
   credentialMaterial(credentialId: string, credentialVersion: number): RouteSecretMaterial | null;
-  /** Test sessions only: whether this device's connection selects route_pool.v1. */
+  /** Whether this device is included in the configured route pool scope. */
   selectRoutePool(tenantId: string, deviceId: string): boolean;
   revocationRevision?(tenantId: string, deviceId: string): number;
   projectionId?(): string;
@@ -38,7 +38,19 @@ export type RoutingProjectionInputs = {
   leaseGate?: boolean;
   /** Loopback fixture only. Billable routing requires a validated usage watermark. */
   executionTest?: boolean;
+  productionExecution?: boolean;
+  productionCandidate?(deploymentId: string, deploymentRevision: number, sourceRateKey: string | null): boolean;
 };
+
+export function meteredRouteExecution(inputs: RoutingProjectionInputs | undefined) {
+  return inputs?.productionExecution === true || inputs?.executionTest === true;
+}
+
+function credentialAvailable(inputs: RoutingProjectionInputs, ref: CredentialRef) {
+  const material = inputs.credentialMaterial(ref.credential_id, ref.credential_version);
+  material?.dispose?.();
+  return !!material;
+}
 
 export class ProjectionFailure extends Error {
   constructor(readonly reason: string, readonly detail: Record<string, unknown> = {}) { super(reason); }
@@ -91,9 +103,22 @@ export function buildProjection(store: Store, db: Reader, inputs: RoutingProject
   const stale = grants.find(grant => grant.platform_revision !== policy.platform_revision);
   if (stale) throw new ProjectionFailure('signature_changed', { binding_id: stale.binding_id });
   const providers: Set<string> | null = policy.provider_ids_json == null ? null : new Set(JSON.parse(policy.provider_ids_json));
-  const mode = balancePolicyEnabled(policy) ? readBalanceMode(db) : null;
+  let mode = balancePolicyEnabled(policy) ? readBalanceMode(db) : null;
+  if (mode !== null && inputs.productionExecution) {
+    const wallet = balance(db, at);
+    const reserve = Math.min(wallet.balance_milli, policy.lease_budget_milli, Math.max(1, Math.floor(wallet.balance_milli / 20)));
+    mode = balancePolicyMode(policy, wallet);
+    // Project the fallback set before issuing a reservation that could cross the configured threshold.
+    if ((mode === 'normal' || mode === 'warn') && reserve > 0 && balancePolicyMode(policy, {
+      balance_milli: wallet.balance_milli - reserve, reserved_milli: wallet.reserved_milli + reserve,
+    }) === 'restricted') mode = 'restricted';
+  }
+  const runtime = deviceRuntime(policy);
+  const unavailableRuntime = inputs.productionExecution && (runtime['network.public'] === false || [
+    'rate.member_rpm', 'rate.member_tpm', 'rate.member_concurrent', 'rate.key_concurrent',
+  ].some(key => Object.hasOwn(runtime, key)));
   const fallback = mode === 'restricted' ? new Set(balanceFallbackModels(policy)) : null;
-  const active = policy.lease_budget_milli <= 0 || mode === 'stopped' ? [] : grants.filter(grant =>
+  const active = policy.lease_budget_milli <= 0 || mode === 'stopped' || unavailableRuntime ? [] : grants.filter(grant =>
     authorized(store, policy, grant) && (!fallback || fallback.has(grant.model_id)));
 
   const salesRates = new Map(readSalesRateSnapshots(db as Transaction, policy.platform_revision).map(rate => [rate.model_id, rate]));
@@ -120,6 +145,7 @@ export function buildProjection(store: Store, db: Reader, inputs: RoutingProject
     const release = system.get<{ id: string; agent: string; version: string; os: string; arch: string; sha256: string; size: number }>(
       `SELECT id, agent, version, os, arch, sha256, size FROM agent_releases WHERE id = ? AND status = 'active' AND os = ? AND arch = ?`,
       [grant.agent_release_id, device.os, device.arch]);
+    if (!release && inputs.productionExecution) continue;
     if (!release) throw new ProjectionFailure('agent_release_unavailable', { agent_release_id: grant.agent_release_id });
 
     const identity = currentIdentity(system, grant.model_id);
@@ -128,6 +154,7 @@ export function buildProjection(store: Store, db: Reader, inputs: RoutingProject
     let narrowed = 0;
     for (const member of poolMembers(system, grant.model_id, poolRevision)) {
       if (assessMember(system, grant.model_id, identity, member, now).codes.length) continue;
+      if (inputs.productionCandidate && !inputs.productionCandidate(member.deployment_id, member.deployment_revision, rate.source_rate_key)) continue;
       const row = system.get<{ provider_id: string; upstream_model: string; capabilities_json: string; context_tokens: number | null;
         max_output_tokens: number | null; protocol: string; base_url: string; auth_adapter: string }>(
         `SELECT d.provider_id, r.upstream_model, r.capabilities_json, r.context_tokens, r.max_output_tokens, er.protocol, er.base_url, er.auth_adapter
@@ -139,7 +166,8 @@ export function buildProjection(store: Store, db: Reader, inputs: RoutingProject
       // A provider outside the member's narrowed policy is never projected, and its credential is never requested.
       if (providers && !providers.has(row.provider_id)) { narrowed++; continue; }
       const ref = inputs.credentialRef(member.deployment_id, member.deployment_revision);
-      if (!ref || !inputs.credentialMaterial(ref.credential_id, ref.credential_version)) {
+      if (!ref || !credentialAvailable(inputs, ref)) {
+        if (inputs.productionExecution) continue;
         throw new ProjectionFailure('missing_route_credential', { deployment_id: member.deployment_id });
       }
       const evidence = system.get<{ observed_at: string; valid_until: string | null }>(`SELECT max(observed_at) AS observed_at,
@@ -154,7 +182,7 @@ export function buildProjection(store: Store, db: Reader, inputs: RoutingProject
     }
     if (!deploymentIds.length) {
       // Narrowed away by the member's provider policy: the binding is simply not granted to this device.
-      if (narrowed) continue;
+      if (narrowed || inputs.productionExecution) continue;
       throw new ProjectionFailure('no_eligible_deployment', { model_id: grant.model_id, pool_revision: poolRevision });
     }
     pools.set(poolKey, { model_id: grant.model_id, pool_revision: poolRevision, ...pool, cost_bands: [] });
@@ -184,7 +212,7 @@ export function buildProjection(store: Store, db: Reader, inputs: RoutingProject
     type: 'config', revision, agent_cache: true,
     policy: { abi: 2, tenant_id: tenantId, user_id: device.user_id, device_id: deviceId, policy_revision: policy.policy_revision,
       platform_revision: policy.platform_revision, tenant_revision: policy.tenant_revision, groups: policy.groups.slice(-maxPolicyScopeRefs),
-      member: policy.member, display: policy.display, notices: policy.notices, secrets: [], runtime: deviceRuntime(policy),
+      member: policy.member, display: policy.display, notices: policy.notices, secrets: [], runtime,
       ...(policy.commerce_plan_id && { commerce_plan_id: policy.commerce_plan_id }), ...(mode && { balance: { mode, aliases: [] } }) },
     agents: structuredClone([...agents.values()]), tools: [], routes: structuredClone([...routes.values()]), rates: structuredClone([...rates.values()]),
     route_pool: { abi: 1, projection_id, signature_id: `sig_${policy.platform_revision}`, expires_at: validUntil, revocation_revision,
@@ -254,7 +282,7 @@ export function projectionStillAuthorized(store: Store, db: Reader, inputs: Rout
     if (!member || assessMember(system, route.model_id, currentIdentity(system, route.model_id), member, now).codes.length) return false;
     const ref = inputs.credentialRef(route.deployment_id, route.deployment_revision);
     if (!ref || ref.credential_id !== route.credential_ref?.credential_id || ref.credential_version !== route.credential_ref?.credential_version
-      || !inputs.credentialMaterial(ref.credential_id, ref.credential_version)) return false;
+      || !credentialAvailable(inputs, ref)) return false;
   }
   return true;
 }
@@ -273,14 +301,15 @@ export function routingProjector(store: Store, inputs: RoutingProjectionInputs, 
   async function persist(tenantId: string, deviceId: string, at: number): Promise<ProjectionTarget> {
     const db = store.tenant(tenantId);
     const first = buildProjection(store, db, inputs, tenantId, deviceId, at);
-    const existing = reusable(db, deviceId, first.source_token, iso(at));
+    const reusableAfter = (built: Built) => iso(at + (inputs.productionExecution && Date.parse(built.valid_until) > at + 60_000 ? 60_000 : 0));
+    const existing = reusable(db, deviceId, first.source_token, reusableAfter(first));
     if (existing) return existing;
     const revision = await store.system.write(sql => sql.get<{ revision: number }>(
       'UPDATE edge_config_counter SET revision = revision + 1 WHERE id = 1 RETURNING revision')!.revision);
     return db.write(sql => {
       // Re-check member, device, signature and source_token inside the tenant transaction.
       const built = buildProjection(store, sql, inputs, tenantId, deviceId, at);
-      const again = reusable(sql, deviceId, built.source_token, iso(at));
+      const again = reusable(sql, deviceId, built.source_token, reusableAfter(built));
       if (again) return again;
       const projection_id = inputs.projectionId?.() ?? `prj_${ulid()}`;
       const payload = built.render(revision, projection_id);
@@ -327,6 +356,7 @@ export function routingProjector(store: Store, inputs: RoutingProjectionInputs, 
       let db: QueuedDatabase;
       try { db = store.tenant(tenantId); } catch { continue; }
       const roster = db.all<Recipient>(`${recipientQuery} ORDER BY d.id`, [stamp]).filter(device => {
+        if (inputs.productionExecution && !inputs.selectRoutePool(tenantId, device.id)) return false;
         const hot = readPolicyHot(db, device.user_id);
         return !!hot && relevant.some(grant => covers(grant, device.user_id) && authorized(store, hot, grant));
       });

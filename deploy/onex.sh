@@ -34,6 +34,11 @@ load_settings() {
     echo 'Invalid ONEX_HOST or NODE_ENV' >&2; exit 2
   fi
   export ONEX_ALLOW_LAN_DEV=${ONEX_ALLOW_LAN_DEV:-0}
+  export ONEX_ROUTE_POOL_DEVICES=${ONEX_ROUTE_POOL_DEVICES:-}
+  local route_pair='ten_[0-9A-HJKMNP-TV-Z]{26}:dev_[0-9A-HJKMNP-TV-Z]{26}'
+  if [[ -n $ONEX_ROUTE_POOL_DEVICES && ! $ONEX_ROUTE_POOL_DEVICES =~ ^$route_pair(,$route_pair)*$ ]]; then
+    echo 'Invalid ONEX_ROUTE_POOL_DEVICES' >&2; exit 2
+  fi
   if [[ $ONEX_ALLOW_LAN_DEV != 0 && $ONEX_ALLOW_LAN_DEV != 1 ]]; then
     echo 'ONEX_ALLOW_LAN_DEV must be 0 or 1' >&2; exit 2
   fi
@@ -159,6 +164,7 @@ start_linux() {
       'TimeoutStopSec=35s' 'KillMode=mixed' 'NoNewPrivileges=true' 'UMask=0077' "WorkingDirectory=$release" \
       "Environment=ONEX_HOST=$ONEX_HOST" "Environment=ONEX_PORT=$ONEX_PORT" "Environment=ONEX_VALKEY_PORT=$ONEX_VALKEY_PORT" \
       "Environment=ONEX_RUSTFS_PORT=$ONEX_RUSTFS_PORT" "Environment=NODE_ENV=$NODE_ENV" "Environment=ONEX_ALLOW_LAN_DEV=$ONEX_ALLOW_LAN_DEV" \
+      "Environment=ONEX_ROUTE_POOL_DEVICES=$ONEX_ROUTE_POOL_DEVICES" \
       "ExecStart=/bin/bash $release/deploy/run-service.sh $home $app $release" '' '[Install]' 'WantedBy=multi-user.target' > "$tmp"
     install -m 0644 "$tmp" "$unit"
     rm -f -- "$tmp"

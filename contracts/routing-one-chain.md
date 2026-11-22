@@ -11,3 +11,11 @@
 平台资金接口为 `GET /v1/platform/providers/:provider_id/channel-ledger` 及其 `POST /recharges`、`/observations`、`/expenses`。提交包含 `account_id,currency,reference,note`，充值与费用用 `amount_micro`，余额观测用 `balance_micro`。账本只允许追加，幂等重放返回同一记录，凭证异参报冲突。真实调用的渠道费用凭证使用该次尝试与报价版本的组合标识。
 
 联验使用独立实例配置中的 `executionTest`，Server、Edge 和两家测试上游均绑定本机回环地址。平台表单可用 `bun --no-env-file server/web/tests/channel-workspace-check.js` 验证。设备用量与双账本由 `edge/onexd/tests/route_apply_server.rs` 联验。
+
+## 正式运行入口
+
+Server 用 `ONEX_ROUTE_POOL_DEVICES` 指定试运行范围，值为逗号分隔的 `tenant_id:device_id`，留空时不启用。Linux 服务从 `service.env` 读取这份范围。设备以 `ONEX_ROUTE_POOL=1` 通过 WSS 连接，同时声明 `route_pool.v1`、`route_pool.exec.v1` 和原有的策略与发行能力。Server 在欢迎帧同时确认两个路由能力后，设备才启用本地路由。试运行设备使用独立的新设备注册，避免尚未结清的旧租约阻塞首次领用。
+
+Server 从现行签发的固定模型池与明确签发的 Codex CLI 发行求交，再应用租户内部的模型、发行和 Provider 限制。下发仅包含已审核且仍然有效的 HTTPS 原生 Responses 渠道及其精确版本的推理凭据信封。租约只能在 ACK 已应用配置后领取。计费用量必须经过已冻结的投影、费率和上游终态凭证校验，使用协议共用的设备序列及 ACK 游标。
+
+渠道资金页可用独立的管理令牌主动查询 New API 账户额度及 Sub2API 账户美元余额。查询记录保留账户范围、有效期和最近成功值。明确绑定的 Sub2API 预付钱包可把已核验余额同步到渠道台账。New API 额度折算在观测区单独展示。正式采购报价继续从采购页发布。

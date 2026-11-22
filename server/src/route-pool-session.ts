@@ -7,10 +7,10 @@ import { digest, routeIdPattern } from './routing-http';
 import type { Store, Transaction } from './store';
 
 /**
- * Isolated route_pool.v1 device sessions (contracts/routing-projection.md, device protocol).
- * Only reachable when tests inject routing inputs; production handshakes never select the capability.
+ * route_pool.v1 device sessions (contracts/routing-projection.md, device protocol).
  */
 export const ROUTE_POOL_CAPABILITY = 'route_pool.v1';
+export const ROUTE_POOL_EXECUTION_CAPABILITY = 'route_pool.exec.v1';
 export const routePoolLeasePending = () => new ApiError('forbidden', { reason: 'route_pool_lease_pending' });
 /** A device registered for the isolated stage connected without the capability: show needs_upgrade, no legacy fallback. */
 export const unsupportedRoutePool = () => new ApiError('unsupported_capability', { reason: 'route_pool_required' });
@@ -23,12 +23,14 @@ const deviceQuery = `SELECT d.id, d.public_key FROM devices d JOIN members m ON 
 export type Receipt = { id: string; config_revision: number; policy_revision: number; projection_id: string; result: 'applied' | 'rejected';
   error_code: string | null; error_reason: string | null; content_digest: string };
 
-/** The hello must declare the capability together with its prerequisites; the server-side test factory decides selection. */
+/** The hello must declare the capabilities together with their prerequisites, within Server's configured scope. */
 export function selectsRoutePool(projector: RoutingProjector | undefined, tenantId: string, deviceId: string, hello: Record<string, unknown>) {
-  if (!projector?.inputs.selectRoutePool(tenantId, deviceId)) return { selected: false, observedUnsupported: false };
+  if (!projector?.inputs.selectRoutePool(tenantId, deviceId)) return { selected: false, observedUnsupported: false, productionExecution: false };
+  const productionExecution = projector.inputs.productionExecution === true;
   const declared = Array.isArray(hello.capabilities) && hello.capabilities.includes(ROUTE_POOL_CAPABILITY)
+    && (!productionExecution || hello.capabilities.includes(ROUTE_POOL_EXECUTION_CAPABILITY))
     && hello.capability_policy_v2 === true && hello.policy_runtime_v1 === true && hello.agent_cache === true;
-  return { selected: declared, observedUnsupported: !declared };
+  return { selected: declared, observedUnsupported: !declared, productionExecution };
 }
 
 /**

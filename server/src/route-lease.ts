@@ -5,22 +5,21 @@ import { modelBudgetWire, modelReport } from './commerce-data';
 import { settleRouteUsage } from './route-runtime-usage';
 import { iso } from './credentials';
 import { readPolicyDevice } from './policy-data';
-import { projectionStillAuthorized, type RoutePoolConfig, type RoutingProjectionInputs } from './route-projection';
+import { buildProjection, meteredRouteExecution, ProjectionFailure, projectionStillAuthorized, type RoutePoolConfig, type RoutingProjectionInputs } from './route-projection';
 import type { Store, Transaction } from './store';
 
 /**
- * Isolated lease gate for route_pool.v1 sessions (contracts/routing-lease-gate.md). Reachable only when tests inject
- * routing inputs with leaseGate on; production handshakes never select route_pool.v1 and keep the legacy lease path.
+ * Lease gate for route_pool.v1 sessions (contracts/routing-lease-gate.md).
  */
 export const leaseGateReasons = ['projection_not_applied', 'projection_signature_stale', 'projection_plan_changed', 'projection_revoked',
   'projection_expired', 'projection_authorization_changed'] as const;
 export type LeaseGateReason = typeof leaseGateReasons[number];
 
 type Snapshot = { device_id: string; config_revision: number; projection_id: string; user_id: string; platform_revision: number;
-  revocation_revision: number; payload_json: string; valid_until: string };
+  revocation_revision: number; payload_json: string; valid_until: string; source_token: string };
 type Context = { store: Store; inputs: RoutingProjectionInputs; tenantId: string; deviceId: string; userId: string; at: number };
 
-const snapshotQuery = `SELECT device_id, config_revision, projection_id, user_id, platform_revision, revocation_revision, payload_json, valid_until
+const snapshotQuery = `SELECT device_id, config_revision, projection_id, user_id, platform_revision, revocation_revision, payload_json, valid_until, source_token
   FROM routing_config_snapshots WHERE device_id = ? AND config_revision = ? AND projection_id = ?`;
 
 /** The exact applied head of the authenticated device, backed by its own persisted snapshot and a stored applied receipt. */
@@ -44,6 +43,15 @@ function projectionFault(ctx: Context, sql: Transaction, snapshot: Snapshot): Ex
   if (snapshot.revocation_revision < (ctx.inputs.revocationRevision?.(ctx.tenantId, ctx.deviceId) ?? 0)) return 'projection_revoked';
   if (snapshot.valid_until <= iso(ctx.at)) return 'projection_expired';
   if (!projectionStillAuthorized(ctx.store, sql, ctx.inputs, ctx.tenantId, ctx.deviceId, config, ctx.at)) return 'projection_authorization_changed';
+  if (ctx.inputs.productionExecution) {
+    try {
+      const expected = buildProjection(ctx.store, sql, ctx.inputs, ctx.tenantId, ctx.deviceId, ctx.at);
+      if (snapshot.source_token !== expected.source_token) return 'projection_authorization_changed';
+    } catch (error) {
+      if (!(error instanceof ProjectionFailure)) throw error;
+      return 'projection_authorization_changed';
+    }
+  }
   return null;
 }
 
@@ -58,7 +66,7 @@ export function gateNewLease(ctx: Context, sql: Transaction): { snapshot: Snapsh
 /** The immutable projection link of a lease, if any. */
 export function leaseProjection(sql: Transaction, lease: Pick<LeaseRow, 'id' | 'device_id'>): Snapshot | null {
   return sql.get<Snapshot>(`SELECT s.device_id, s.config_revision, s.projection_id, s.user_id, s.platform_revision, s.revocation_revision,
-    s.payload_json, s.valid_until FROM routing_lease_projections p JOIN routing_config_snapshots s ON s.device_id = p.device_id
+    s.payload_json, s.valid_until, s.source_token FROM routing_lease_projections p JOIN routing_config_snapshots s ON s.device_id = p.device_id
     AND s.config_revision = p.config_revision AND s.projection_id = p.projection_id WHERE p.lease_id = ? AND p.device_id = ?`,
     [lease.id, lease.device_id]) ?? null;
 }
@@ -84,6 +92,8 @@ export function routeLeaseFrame(sql: Transaction, lease: LeaseRow, snapshot: Sna
  * contract cutoffs keep the legacy decision; the lease never outlives the projection.
  */
 export function issueBound(ctx: Context, sql: Transaction, snapshot: Snapshot, settledLeaseId?: string): LeaseReply | RouteLease {
+  const config = JSON.parse(snapshot.payload_json) as RoutePoolConfig;
+  if (ctx.inputs.productionExecution && !config.route_pool.bindings.length) return cutoff('contract', settledLeaseId);
   const reply = issueLeaseInTransaction(ctx.store, sql, ctx.deviceId, ctx.userId, ctx.at, true, true, settledLeaseId,
     { notAfter: snapshot.valid_until });
   if (reply.type !== 'lease') return reply;
@@ -167,7 +177,10 @@ export function renewRouteLease(store: Store, inputs: RoutingProjectionInputs, t
     const lease = sql.get<LeaseRow>('SELECT * FROM leases WHERE id = ? AND device_id = ?', [frame.lease_id, deviceId]);
     if (!lease) throw new ApiError('not_found');
     if (lease.status !== 'active') throw new ApiError('conflict');
-    if (inputs.executionTest) settleRouteUsage(sql, deviceId, lease.id, frame.usage_through_seq, frame.used_milli, frame.model_used_milli, frame.release_only);
+    if (meteredRouteExecution(inputs)) {
+      if (!leaseProjection(sql, lease)) throw new ApiError('forbidden', { reason: 'route_pool_lease_required' });
+      settleRouteUsage(sql, deviceId, lease.id, frame.usage_through_seq, frame.used_milli, frame.model_used_milli, frame.release_only);
+    }
     let response: LeaseReply | RouteLease | RouteCutoff;
     if (frame.release_only) {
       // Only a bound lease the device never accepted: zero in total and for every allocated model.

@@ -1,7 +1,8 @@
-import { randomBytes } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { artifactPath } from '../../../server/src/agent-catalog';
 import { createServer } from '../../../server/src/server';
 import { MemoryPresence } from '../../../server/src/presence';
 import { hash, iso, randomToken } from '../../../server/src/credentials';
@@ -9,7 +10,7 @@ import { seedTenant } from '../../../server/src/seed';
 import { decryptProviderSecret } from '../../../server/src/provider-secret';
 import { x25519PublicKey } from '../../../server/src/route-secret';
 import { readSignedPools } from '../../../server/src/signed-routing-pools';
-import type { RoutingProjectionInputs } from '../../../server/src/route-projection';
+import { latestSnapshot, type RoutingProjectionInputs } from '../../../server/src/route-projection';
 import { startFakeUpstream } from '../fake-upstream';
 
 const deviceKey = Buffer.alloc(32, 7);
@@ -44,7 +45,7 @@ async function channel(letter: string) {
   return { secret, raw, hits, url, stopListening, async close() { await stopListening(); await upstream.stop(); } };
 }
 
-export async function startOneChain(directory?: string, primaryOffline = false) {
+export async function startOneChain(directory?: string, primaryOffline = false, production = false) {
   const clock = Date.now();
   const dataDir = directory ?? mkdtempSync(join(tmpdir(), 'onex-one-chain-'));
   const [a,b] = await Promise.all([channel('a'),channel('b')]);
@@ -79,9 +80,15 @@ export async function startOneChain(directory?: string, primaryOffline = false) 
     if (!directory) rmSync(dataDir,{recursive:true,force:true});
   };
   try {
-    service=await createServer({dataDir,hostname:'127.0.0.1',port:0,tenantCacheSize:2,heartbeatMs:15_000,commit:'one-chain-test',
-      codeSecret:'one-chain-fixture-only',masterKey,presence:new MemoryPresence(),now:Date.now,routingProjection:inputs,
-      providerChannelFetch: (url,headers,signal) => fetch(url,{headers,signal}) });
+    const baseOptions = {dataDir,hostname:'127.0.0.1',port:0,tenantCacheSize:2,heartbeatMs:15_000,commit:'one-chain-test',
+      codeSecret:'one-chain-fixture-only',masterKey,now:Date.now};
+    service=await createServer({...baseOptions,presence:new MemoryPresence(),routingProjection:inputs,
+      providerChannelFetch: (url,headers,signal) => {
+        if (!production) return fetch(url,{headers,signal});
+        const local = {'channel-a.fixture.test':a.url, 'channel-b.fixture.test':b.url}[url.hostname];
+        if (!local) throw new Error('Unexpected fixture channel');
+        return fetch(new URL(url.pathname+url.search,local),{headers,signal});
+      }});
     const earlier=iso(clock-60_000), expires=iso(clock+86_400_000);
     const tenant=await seedTenant(service.store,{target:'owner@one-chain.test',name:'One chain',platformAdmin:true,now:clock});
     const platform=randomToken(), owner=randomToken();
@@ -90,7 +97,7 @@ export async function startOneChain(directory?: string, primaryOffline = false) 
       for(const [token,scope] of [[platform,null],[owner,fixtureTenant]] as const) sql.run(`INSERT INTO sessions
         (token_hash,user_id,tenant_id,kind,expires_at) VALUES (?,?,?,'web',?)`,[hash(token),tenant.userId,scope,expires]);
     });
-    const url=service.server.url.origin;
+    let url=service.server.url.origin;
     let command=0;
     const api=async(path:string,payload?:object,key?:string,token=platform) => {
       const response=await fetch(url+'/v1'+path,{method:payload?'POST':'GET',headers:{authorization:`Bearer ${token}`,
@@ -101,7 +108,8 @@ export async function startOneChain(directory?: string, primaryOffline = false) 
     };
     const supplies=[];
     for(const [index, source] of [a,b].entries()) {
-      const provider=await api('/platform/providers',{name:`测试渠道 ${index+1}`,protocol:'openai_responses',base_url:source.url,secret:source.secret,auth:'bearer'});
+      const base_url=production ? `https://channel-${index ? 'b' : 'a'}.fixture.test/v1` : source.url;
+      const provider=await api('/platform/providers',{name:`测试渠道 ${index+1}`,protocol:'openai_responses',base_url,secret:source.secret,auth:'bearer'});
       const path=`/platform/providers/${provider.id}`;
       const probe=await api(path+'/probes',{kind:'connectivity',revision:provider.revision});
       const discovery=await api(path+'/discoveries',{revision:provider.revision});
@@ -153,9 +161,17 @@ export async function startOneChain(directory?: string, primaryOffline = false) 
     if(multiplier.recommended_input_multiplier_ppm!==3_000_000) throw new Error('The A/B purchase prices did not give 3×');
     const rate=await api(modelPath+'/input-multiplier/revisions',{...prices,pricing_at:multiplier.pricing_at,preview_basis:multiplier.preview_basis});
     const plan=await api('/platform/commerce/plans',{name:'联验计费方案',expected_version:0,terms:{model_prices:[{model_id:logical.id,source_rate_key:rate.source_rate_key}]}});
-    release=(await api('/platform/agent-releases',{agent:'codex',version:'0.0.1',os:'darwin',arch:'arm64',url:'https://fixture.test/codex',sha256:'a'.repeat(64),size:8})).id;
+    const artifact=Buffer.from('fixture-release');
+    const sha256=createHash('sha256').update(artifact).digest('hex');
+    release=(await api('/platform/agent-releases',{agent:'codex',version:'0.0.1',os:'darwin',arch:'arm64',url:'https://fixture.test/codex',sha256,size:artifact.length})).id;
+    if (production) {
+      const path=artifactPath(dataDir,sha256);
+      mkdirSync(dirname(path),{recursive:true});
+      writeFileSync(path,artifact);
+    }
     const contract=`/platform/policy/contracts/${fixtureTenant}`;
-    const entries=[['access.models',[logical.id]],['access.agents',['codex']],['access.releases',[release]],['billing.plan',[plan.id]],['lease.budget',100_000]]
+    const entries=[['access.models',[logical.id]],['access.agents',['codex']],['access.releases',[release]],['billing.plan',[plan.id]],
+      ['lease.budget',100_000],['route.failover',true],['model.max_output_tokens',2048]]
       .map(([id,adjustment])=>({template_ref:null,clause_ref:{id,version:1},adjustment}));
     const sign={expected_platform_revision:0,expected_policy_revision:0,base_revision:null,reason:'首次签发双渠道型号',entries,
       route_pools:[{model_id:logical.id,pool_revision:pool,mode:'pinned'}]};
@@ -173,10 +189,22 @@ export async function startOneChain(directory?: string, primaryOffline = false) 
     }
     const device=await api('/devices',{name:'one-chain-fixture',os:'darwin',arch:'arm64',public_key:x25519PublicKey(deviceKey)},undefined,owner);
     fixtureDevice=device.device_id;
-    const projected=await service.projection!.project(fixtureTenant,fixtureDevice,Date.now());
+    if (production) {
+      await service.close();
+      service=await createServer({...baseOptions,presence:new MemoryPresence(),routePoolDevices:[{tenantId:fixtureTenant,deviceId:fixtureDevice}]});
+      url=service.server.url.origin;
+    }
+    let projected;
+    if (production) {
+      for (let i=0;i<50 && !projected;i++) {
+        projected=latestSnapshot(service.store.tenant(fixtureTenant),fixtureDevice);
+        if (!projected) await Bun.sleep(10);
+      }
+      if (!projected) throw new Error('Production start did not project the selected device');
+    } else projected=await service.projection!.project(fixtureTenant,fixtureDevice,Date.now());
     if (primaryOffline) await a.stopListening();
     return {close,service,api,info:{data_dir:dataDir,http_url:url,ws_url:url.replace(/^http/,'ws')+'/v1/edge/ws',tenant_id:fixtureTenant,user_id:tenant.userId,
-      device_id:fixtureDevice,device_token:device.device_token,device_private_key_hex:deviceKey.toString('hex'),model_id:logical.id,
+      device_id:fixtureDevice,device_token:device.device_token,device_private_key_hex:deviceKey.toString('hex'),model_id:logical.id,agent_release_id:release,
       config_revision:projected.config_revision,projection_id:projected.projection_id,signed_pool:signed.route_pools[0],
       signed_rate:signed.sales_rate_snapshots[0],origin_channel:supplies[0]!.wallet,backup_channel:supplies[1]!.wallet,
       primary_deployment_id:members[0]!.deployment_id,backup_deployment_id:members[1]!.deployment_id,

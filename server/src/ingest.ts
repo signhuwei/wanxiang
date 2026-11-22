@@ -157,6 +157,9 @@ export async function ingestUsage(store: Store, tenant: string, device: string, 
     const summaries: IngestSummary[] = [];
     let reconcile = false;
     for (const row of items) {
+      if (row.lease && sql.get('SELECT 1 FROM routing_lease_projections WHERE lease_id=? AND device_id=?', [row.lease, device])) {
+        throw new ApiError('forbidden', { reason: 'route_pool_required' });
+      }
       if (!markSequence(sql, device, row.seq)) continue;
       const lease = row.lease && sql.get<{ budget_milli: number }>('SELECT budget_milli FROM leases WHERE id = ? AND device_id = ?', [row.lease, device]);
       const leaseId = lease ? row.lease : null;

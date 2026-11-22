@@ -6,7 +6,6 @@ import { canonical, digest } from './routing-http';
  * Route-pool inference secret envelopes (routing-pricing-and-staging.md, device staging).
  * X25519 sender ephemeral key in `key_id`, empty HKDF salt, 32-byte HKDF-SHA256 key, 24-byte nonce,
  * XChaCha20-Poly1305 with the 16-byte tag appended, RFC 4648 standard base64.
- * Not wired to the live WS path: route_pool.v1 stays unnegotiated until the activation batch.
  */
 export const ROUTE_SECRET_INFO = 'onex-edge-route-secret-v1';
 const spki = Buffer.from('302a300506032b656e032100', 'hex');
@@ -17,7 +16,7 @@ export type RouteSecretContext = {
   tenant_id: string; device_id: string; projection_id: string; revision: number; credential_id: string; credential_version: number;
 };
 export type RouteSecretEnvelope = { credential_id: string; credential_version: number; key_id: string; nonce: string; ciphertext: string };
-export type RouteSecretMaterial = { purpose: string; material_class: string; plaintext: Uint8Array };
+export type RouteSecretMaterial = { purpose: string; material_class: string; plaintext: Uint8Array; dispose?: () => void };
 
 export class RouteSecretError extends Error {
   constructor(readonly code: 'invalid_config' | 'missing_route_credential' | 'management_credential_forbidden', readonly reason: string,
@@ -127,8 +126,10 @@ export function sealRoutePoolConfig<T extends RouteConfig>(config: T, target: { 
   const secrets = routeCredentialRefs(config).map((ref) => {
     const found = material(ref.credential_id, ref.credential_version);
     if (!found) throw new RouteSecretError('missing_route_credential', 'missing_material', ref);
-    return sealRouteSecret({ recipient_public_key: target.recipient_public_key, material: found,
-      context: { tenant_id: target.tenant_id, device_id: target.device_id, projection_id: config.route_pool.projection_id, revision: config.revision, ...ref } });
+    try {
+      return sealRouteSecret({ recipient_public_key: target.recipient_public_key, material: found,
+        context: { tenant_id: target.tenant_id, device_id: target.device_id, projection_id: config.route_pool.projection_id, revision: config.revision, ...ref } });
+    } finally { found.dispose?.(); }
   });
   return { ...config, route_pool: { ...config.route_pool, secrets } };
 }

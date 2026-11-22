@@ -32,7 +32,8 @@ import { policyRoutes } from './policy-routes';
 import { tenantRoutes } from './tenant-management';
 import { TOOL_ARTIFACT_DOWNLOAD_PATH, TOOL_ARTIFACT_UPLOAD_PATH, toolReleaseRoutes } from './tool-releases';
 import type { Presence } from './presence';
-import { routingProjector, type RoutingProjectionInputs } from './route-projection';
+import { ProjectionFailure, routingProjector, type RoutingProjectionInputs } from './route-projection';
+import { productionRouting, type RoutePoolDevice } from './route-production';
 import { rolloutRoutes } from './route-rollouts';
 import { Store } from './store';
 import { statisticsRoutes } from './statistics';
@@ -53,13 +54,17 @@ type Options = {
   /** 诊断日志包的对象存储；缺省时诊断功能对外报 `not_found`（见 diag.ts）。 */
   objectStorage?: ObjectStorage;
   releaseRuntime?: ReleaseRuntime;
-  /** Isolated route_pool.v1 stage only: tests inject grants and synthetic credential versions. Production never sets it. */
+  /** Fixtures can supply their own grants and synthetic credential versions. */
   routingProjection?: RoutingProjectionInputs;
+  routePoolDevices?: readonly RoutePoolDevice[];
 };
 
 export async function createServer(opts: Options) {
   if (opts.routingProjection?.executionTest && (opts.hostname !== '127.0.0.1' || !opts.routingProjection.leaseGate)) {
     throw new Error('The routing execution fixture requires a loopback server and the lease gate');
+  }
+  if (opts.routePoolDevices?.length && (!opts.masterKey || opts.routingProjection)) {
+    throw new Error('Production route execution requires the master key and its standard projection inputs');
   }
   const store = new Store(opts.dataDir, opts.tenantCacheSize);
   const now = opts.now ?? Date.now;
@@ -108,10 +113,13 @@ export async function createServer(opts: Options) {
     app.get('/v1/openapi.json', (c) => c.json(openapi));
     const pending = new PendingWork();
     const config = configPublisher(store, opts.dataDir, now, opts.masterKey);
-    const projection = opts.routingProjection ? routingProjector(store, opts.routingProjection, now) : undefined;
+    const cohort = opts.routePoolDevices ?? [];
+    const routing = cohort.length ? productionRouting(store, opts.dataDir, opts.masterKey!, cohort) : opts.routingProjection;
+    const projection = routing ? routingProjector(store, routing, now) : undefined;
+    let refreshRouteTargets = () => {};
     const management = { ...opts, now,
-      onConfigChange: (id?: string) => { void pending.track(config.changed(id)); },
-      onBalanceChange: (id: string) => { void pending.track(config.balanceChanged(id)); },
+      onConfigChange: (id?: string) => { void pending.track(config.changed(id)); refreshRouteTargets(); },
+      onBalanceChange: (id: string) => { void pending.track(config.balanceChanged(id)); refreshRouteTargets(); },
     };
     authRoutes(app, store, management);
     personalLoginTokenRoutes(app, store, management);
@@ -144,6 +152,25 @@ export async function createServer(opts: Options) {
       // Each raw upload route applies its own cap. Other routes remain limited to small JSON requests.
       maxRequestBodySize: DESKTOP_ARTIFACT_MAX_BYTES,
     });
+    let routingRefreshInProgress = false;
+    refreshRouteTargets = () => {
+      if (!projection || !cohort.length || shuttingDown || routingRefreshInProgress) return;
+      routingRefreshInProgress = true;
+      void pending.track((async () => {
+        for (const { tenantId, deviceId } of cohort) {
+          if (shuttingDown) return;
+          if (!store.system.get("SELECT 1 FROM tenants WHERE id=? AND status='active'", [tenantId])) continue;
+          try { await projection.project(tenantId, deviceId); }
+          catch (error) {
+            if (!(error instanceof ProjectionFailure)) console.warn('OneX could not refresh routing target', { device_id: deviceId });
+          }
+        }
+        if (!shuttingDown) await projection.runPending();
+      })().catch(() => console.warn('OneX could not finish route-pool rollout')).finally(() => { routingRefreshInProgress = false; }));
+    };
+    const routingRefreshInterval = cohort.length ? setInterval(refreshRouteTargets, 15_000) : undefined;
+    routingRefreshInterval?.unref();
+    refreshRouteTargets();
     let sweeping = false;
     const expire = () => {
       if (!opts.objectStorage || sweeping || shuttingDown) return;
@@ -182,6 +209,7 @@ export async function createServer(opts: Options) {
         return closing ??= (async () => {
           shuttingDown = true;
           if (retention) clearInterval(retention);
+          if (routingRefreshInterval) clearInterval(routingRefreshInterval);
           clearInterval(discountInterval);
           // Bun 1.3.5 can retain the WS count after a server-initiated close.
           void server.stop().catch(() => {});

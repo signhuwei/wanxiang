@@ -198,7 +198,8 @@ function issue(store:Store, sql: Transaction, deviceId: string, userId: string, 
     return cutoff('contract', settledLeaseId);
   }
   const outstanding = sql.get<LeaseRow>("SELECT * FROM leases WHERE device_id = ? AND status = 'active'", [deviceId]);
-  if (outstanding) return leaseView(outstanding,sql);
+  if (outstanding) return sql.get('SELECT 1 FROM routing_lease_projections WHERE lease_id=?', [outstanding.id])
+    ? cutoff('contract', settledLeaseId) : leaseView(outstanding,sql);
   const plan=readPlan(store,policy);
   grantPackage(sql,plan,at);
   settlePendingTools(sql,at);
@@ -308,6 +309,9 @@ export function renewLease(store: Store, tenantId: string, deviceId: string, use
     const lease = sql.get<LeaseRow>('SELECT * FROM leases WHERE id = ? AND device_id = ?', [leaseId, deviceId]);
     if (!lease) throw new ApiError('not_found');
     if (lease.status !== 'active') throw new ApiError('conflict');
+    if (sql.get('SELECT 1 FROM routing_lease_projections WHERE lease_id=?', [leaseId])) {
+      throw new ApiError('forbidden', { reason: 'route_pool_required' });
+    }
     settleLease(sql, deviceId, lease, used, report, opId, at);
     // 旧租约已经在上面结清；如果这次裁决回 cutoff，带上 settled_lease_id 让 Edge 知道这份租约不用再保留或重放（v0.13）。
     const response = issue(store, sql, deviceId, userId, at, supportsCapabilityContract, supportsCapabilityPolicy, lease.id);

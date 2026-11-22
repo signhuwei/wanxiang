@@ -3,6 +3,7 @@ import { RustfsObjectStorage } from './object-storage';
 import { MemoryPresence, ValkeyPresence } from './presence';
 import { createServer } from './server';
 import { masterKeyFromEnv } from './provider-secret';
+import { configuredRoutePoolDevices } from './route-production';
 
 const env = process.env;
 const dev = env.NODE_ENV !== 'production';
@@ -35,6 +36,7 @@ try {
     dataDir: env.ONEX_DATA_DIR ?? '.local', hostname: env.ONEX_HOST ?? '127.0.0.1',
     port: integer('ONEX_PORT', 3000, 0, 65_535), tenantCacheSize: integer('ONEX_TENANT_CACHE_SIZE', 16, 1, 1_000),
     heartbeatMs: 15_000, commit: env.ONEX_COMMIT ?? 'unknown', codeSecret, masterKey, presence, objectStorage,
+    routePoolDevices: configuredRoutePoolDevices(env.ONEX_ROUTE_POOL_DEVICES),
     releaseRuntime: env.ONEX_RELEASE_PUBLIC_KEY && env.ONEX_RELEASE_HEARTBEAT
       ? { publicKeyPath: env.ONEX_RELEASE_PUBLIC_KEY, heartbeatPath: env.ONEX_RELEASE_HEARTBEAT } : undefined,
     deliverCode: dev ? (target, code) => console.info(`[onex-dev] login code for ${target}: ${code}`) : undefined,
