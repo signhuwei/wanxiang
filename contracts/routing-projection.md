@@ -25,6 +25,8 @@
 
 ## 管理端
 
+应用回执后的隔离发租及原租约结清见[已应用投影与租约](routing-lease-gate.md)。设备发布台账仍以投影和回执展示到达情况。
+
 - `GET /v1/platform/model-pool-rollouts/:rollout_id` 返回 `rollout_id,model_id,pool_revision,total,counts,actions`，`counts` 分别列 `pending,applied,rejected,offline,needs_upgrade,superseded`。精确目标有已持久成功回执时为 applied，否则按 superseded、rejected、已观测不支持、离线、等待的顺序折叠。发布任务记录自身状态另作为 `job_status` 返回。详细状态基于已登记的名册。
 - `GET /v1/platform/model-pool-rollouts/:rollout_id/targets` 接受 `state,limit,cursor`，回 `{items,total,next_cursor,actions}`。行含 `tenant_id,user_id,device_id,target_config_revision,applied_config_revision,state,reason,last_seen_at,last_receipt_at,actions`。缺值为 null，`reason` 为稳定码，设备拒绝时采用已脱敏的 `error.detail.reason`。回执时间仅指本目标。分页总数是过滤后总数，游标绑定 rollout、筛选与操作者。页面使用当前池版本右栏和原有台账收窄，目标行本批无写操作。
 - 既有商业方案表单用 `GET /v1/platform/models` 的 `current_source_rate_key` 选择当前可签版本，精确版本详情沿用倍率回读。手填完整四项仍可用。编辑或复制旧方案保留原费率引用和显式手调值。仅有显示倍率、无版本引用的型号不能作为来源选项。
