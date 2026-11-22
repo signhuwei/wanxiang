@@ -73,6 +73,10 @@ test('immutable plan prices survive repricing, signature replay, tenant narrowin
     expect(issued.sales_rate_snapshots).toHaveLength(1);
     expect(snapshot).toMatchObject({...preview.sales_rate_snapshots[0], platform_revision:1,valid_from:minutes(0),valid_until:null});
     expect(snapshot.rate_version_id).toMatch(/^rate_/);
+    const tenantAccount = await body(await call('/commerce/account', undefined, 'tenant-account', tenant));
+    expect(tenantAccount.plan.terms.model_prices[0]).toEqual({ model_id: 'mdl_m', ...rates });
+    const platformAccount = await body(await call('/platform/commerce/tenants/' + tenantId));
+    expect(platformAccount.plan.terms.model_prices[0]).toEqual({ ...modelPrice, ...rates });
     await expect(db.write(sql => sql.run('UPDATE sales_rate_snapshots SET output_milli_per_mtok=1'))).rejects.toThrow('immutable');
     await expect(db.write(sql => sql.run('DELETE FROM sales_rate_snapshots'))).rejects.toThrow('immutable');
     expect(await body(await call(signatures,draft,'first'))).toEqual(issued);

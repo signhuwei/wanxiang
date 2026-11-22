@@ -99,6 +99,9 @@ export function commerceRoutes(app: Hono, store: Store, opts: ManagementOptions)
   app.get('/v1/commerce/account', async c => {
     const at = opts.now(), actor = tenantActor(store, c, at);
     if (actor.role !== 'owner') throw new ApiError('forbidden');
-    return c.json(await actor.db.write(sql => account(store, actor.id, sql, at)));
+    const { plan, ...view } = await actor.db.write(sql => account(store, actor.id, sql, at));
+    return c.json({ ...view, plan: plan && {
+      ...plan, terms: { ...plan.terms, model_prices: plan.terms.model_prices.map(({ source_rate_key: _, ...price }) => price) },
+    } });
   });
 }
