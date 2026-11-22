@@ -8,6 +8,7 @@ import { iso } from './credentials';
 import { enumField, expectRevision, int, pagination, platformActor, urlField, type ManagementOptions } from './management';
 import { encryptProviderSecret } from './provider-secret';
 import { modelPoolSummary } from './model-pool';
+import { modelPricingSummary } from './input-multiplier';
 import { indexMember, type Store, type Transaction } from './store';
 
 const statuses = ['active', 'disabled'] as const;
@@ -101,7 +102,12 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
     } });
   register({ path: 'models', table: 'models', columns: '*', search: "display_name || ' ' || upstream_name", prefix: 'mod', action: 'create_model',
     // Pool fields are read-only additions; legacy writes and responses keep their shape.
-    listProject: (row) => ({ ...view(row), ...modelPoolSummary(store.system, String(row.id)) }),
+    listProject: (row) => {
+      const base = view(row);
+      const pricing = modelPricingSummary(store.system, String(row.id), row.status === 'active', iso(opts.now()));
+      return { ...base, ...modelPoolSummary(store.system, String(row.id)), current_source_rate_key: pricing.current_source_rate_key,
+        input_multiplier_ppm: pricing.input_multiplier_ppm, actions: [...base.actions, ...pricing.actions] };
+    },
     parse: (body, row, sql) => {
       const provider_id = text(body, row, 'provider_id');
       if (!sql.get('SELECT 1 FROM providers WHERE id = ?', [provider_id])) invalid('provider_id');

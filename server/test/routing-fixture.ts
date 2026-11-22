@@ -6,6 +6,7 @@ import { Hono } from 'hono';
 import fixture from '../../tests/fixtures/routing/p0-ab.json';
 import { ApiError } from '../src/api';
 import { hash, iso, randomToken } from '../src/credentials';
+import { inputMultiplierRoutes } from '../src/input-multiplier';
 import { modelPoolRoutes } from '../src/model-pool';
 import { platformRoutes } from '../src/platform-management';
 import { procurementRoutes } from '../src/procurement';
@@ -102,6 +103,7 @@ export async function setup() {
   platformRoutes(app, store, opts);
   modelPoolRoutes(app, store, opts);
   procurementRoutes(app, store, opts);
+  inputMultiplierRoutes(app, store, opts);
   const call = (token: string, path: string, payload?: unknown, key?: string) => app.request(`/v1/platform${path}`, {
     method: payload === undefined ? 'GET' : 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...(key && { 'Idempotency-Key': key }) },
