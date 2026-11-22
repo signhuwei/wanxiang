@@ -59,6 +59,8 @@ test('the runtime cohort parses only explicit tenant and device IDs and boots fr
       cache_read_tokens: 0, cache_write_tokens: 0, cost_milli: 64, at: iso(Date.now()), complete: true, status: 'ok', measurement_basis: 'upstream_usage' };
     expect(await edge.call({ type: 'usage', id: 'forged', batch: [{ ...item, cost_milli: 2 }] })).toMatchObject({ ok: false,
       error: { detail: { reason: 'route_usage_cost_mismatch' } } });
+    expect(await edge.call({ type: 'usage', id: 'invalid-cache', batch: [{ ...item, cache_write_tokens: 1 }] })).toMatchObject({ ok: false,
+      error: { detail: { fields: ['cache_write_tokens'] } } });
     expect(await edge.call({ type: 'usage', id: 'measured', batch: [item] })).toMatchObject({ type: 'events_ack', ack_seq: 1 });
     const renew = { type: 'lease_renew', id: 'settle', op_id: 'settle', lease_id: lease.lease_id, used_milli: 64,
       ...(lease.model_budgets && { model_used_milli: { [info.model_id]: 64 } }), usage_through_seq: 1 };

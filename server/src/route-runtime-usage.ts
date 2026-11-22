@@ -47,6 +47,8 @@ function parseBatch(value: unknown): Usage[] {
   return rows.map((raw, i) => {
     const item = base[i]!;
     if (!item.lease || !item.complete || item.status !== 'ok' || raw.measurement_basis !== 'upstream_usage') invalid('measurement_basis');
+    // Native Responses reports ordinary input, cached input and output. Cache writes are not a native measurement.
+    if (item.cacheWrite !== 0) invalid('cache_write_tokens');
     return { ...item, attemptId: routeId(raw.attempt_id, 'attempt_id'), deploymentId: routeId(raw.deployment_id, 'deployment_id'),
       deploymentRevision: int(raw.deployment_revision, 'deployment_revision', 1),
       configRevision: int(raw.config_revision, 'config_revision', 1), projectionId: routeId(raw.projection_id, 'projection_id'),
