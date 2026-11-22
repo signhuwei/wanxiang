@@ -10,6 +10,7 @@ import { encryptProviderSecret } from './provider-secret';
 import { modelPoolSummary } from './model-pool';
 import { modelPricingSummary } from './input-multiplier';
 import { indexMember, type Store, type Transaction } from './store';
+import { normalizeLoginName } from './tenant-passwords';
 
 const statuses = ['active', 'disabled'] as const;
 const protocols = ['anthropic', 'openai_chat', 'openai_responses'] as const;
@@ -193,8 +194,14 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
     return result.response;
   });
 
-  const tenantColumns = 'id, name, owner_user_id, status, created_at, revision';
-  list('/v1/platform/tenants', 'tenants', tenantColumns, 'name', 'id', 'create_tenant');
+  const tenantColumns = 'id, name, short_name, owner_user_id, status, created_at, revision';
+  list('/v1/platform/tenants', 'tenants', tenantColumns, "name || ' ' || id || ' ' || coalesce(short_name, '')", 'id', 'create_tenant');
+  app.get('/v1/platform/tenants/:id', (c) => {
+    platformActor(store, c, opts.now());
+    const row = store.system.get<RecordRow>(`SELECT ${tenantColumns} FROM tenants WHERE id = ?`, [c.req.param('id')]);
+    if (!row) throw new ApiError('not_found');
+    return c.json(view(row));
+  });
   const provisioning = new Map<string, Promise<Response>>();
   const writeTenant = async (c: Context) => {
     const body = await json(c);
@@ -202,6 +209,8 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
     const actor = platformActor(store, c, at);
     const requested = c.req.param('id') ?? (body.id === undefined ? undefined : field(body.id, 'id'));
     const op = operation(c, opts.codeSecret, at, actor, body);
+    const shortName = body.short_name == null ? null : normalizeLoginName(body.short_name);
+    if (body.short_name != null && !shortName) invalid('short_name');
     if (requested) {
       const result = await store.system.write((sql) => {
         requirePlatform(sql, actor);
@@ -212,8 +221,9 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
         expectRevision(body.revision, previous.revision);
         if (body.owner_user_id !== undefined && body.owner_user_id !== previous.owner_user_id) invalid('owner_user_id');
         const row = { ...previous, name: text(body, previous, 'name'),
+          short_name: body.short_name === undefined ? previous.short_name : shortName?.display ?? null,
           status: enumField(value(body, previous, 'status'), 'status', ['active', 'suspended']), revision: previous.revision + 1 };
-        change(sql, 'tenants', row, 'id = ?', [requested]);
+        change(sql, 'tenants', body.short_name === undefined ? row : { ...row, short_name_key: shortName?.key ?? null }, 'id = ?', [requested]);
         return { response: op.complete(sql, { status: 200, payload: view(row) }), changed: true };
       });
       if (result.changed) opts.onConfigChange?.(requested);
@@ -237,8 +247,8 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
         requirePlatform(sql, actor);
         const replay = op.read(sql);
         if (replay) return replay;
-        const row = { id, name, owner_user_id: owner, status: newStatus, created_at: iso(at), revision: 1 };
-        add(sql, 'tenants', { ...row, db_file: `tenant-${id}.sqlite` });
+        const row = { id, name, short_name: shortName?.display ?? null, owner_user_id: owner, status: newStatus, created_at: iso(at), revision: 1 };
+        add(sql, 'tenants', { ...row, short_name_key: shortName?.key ?? null, db_file: `tenant-${id}.sqlite` });
         indexMember(sql, id, member);
         return op.complete(sql, { status: 201, payload: view(row) });
       });

@@ -22,6 +22,7 @@ export function personalLoginTokenRoutes(app: Hono, store: Store, opts: { codeSe
   app.get('/v1/auth/personal-tokens', (c) => {
     const at = now();
     const s = authenticate(store, c, at);
+    if (s.tenant_password_login) throw new ApiError('forbidden');
     const p = pagination(c);
     const where = 'WHERE user_id = ? AND instr(lower(name), lower(?)) > 0';
     const params = [s.user_id, p.query];
@@ -36,7 +37,7 @@ export function personalLoginTokenRoutes(app: Hono, store: Store, opts: { codeSe
     return store.system.write((sql) => {
       const at = now();
       const s = authenticate(store, c, at);
-      if (s.kind !== 'web') throw new ApiError('forbidden');
+      if (s.kind !== 'web' || s.tenant_password_login) throw new ApiError('forbidden');
       const name = field(body.name, 'name');
       const op = operation(c, codeSecret, at, s.user_id, [name]);
       const cached = op.read(sql);
@@ -62,6 +63,7 @@ export function personalLoginTokenRoutes(app: Hono, store: Store, opts: { codeSe
     return store.system.write((sql) => {
       const at = now();
       const s = authenticate(store, c, at);
+      if (s.tenant_password_login) throw new ApiError('forbidden');
       const op = operation(c, codeSecret, at, s.user_id, [revision]);
       const cached = op.read(sql);
       if (cached) return cached;

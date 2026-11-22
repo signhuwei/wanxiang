@@ -91,7 +91,8 @@ const searchReply = object({ receipt: searchReceipt, results: { type: 'array', i
 const toolBundle = object({ files: { type: 'array', minItems: 1, maxItems: 256, items: object({
   path: { ...text, maxLength: 240 }, data: { ...text, contentEncoding: 'base64' },
 }) } });
-const tenantFields = { id: tenantId, name: text, owner_user_id: text, status: { type: 'string', enum: ['active', 'suspended'] } };
+const shortName = { ...nullableText, maxLength: 64, description: '可用作登录选择器的租户简称，允许多个租户使用相同简称。' };
+const tenantFields = { id: tenantId, name: text, short_name: shortName, owner_user_id: text, status: { type: 'string', enum: ['active', 'suspended'] } };
 const rates = { model_id: text, effective_from: { ...text, format: 'date-time' }, input_milli_per_mtok: sequence,
   output_milli_per_mtok: sequence, cache_read_milli_per_mtok: sequence, cache_write_milli_per_mtok: sequence };
 const memberInput = { user_id: text, role, group_id: nullableText, status: text, quota_milli: { type: ['integer', 'null'], minimum: 0 } };
@@ -177,7 +178,7 @@ const policyEffectiveEntry = object({ clause_ref: policyRef, definition: policyD
   effective_value: policyValue, source: object({ scope: text, subject_id: text, revision }) });
 const policyHead = { platform_revision: sequence, policy_revision: sequence };
 const policyExpected = { expected_platform_revision: sequence, expected_policy_revision: sequence };
-const policyContractRow = { tenant_id: tenantId, name: text, ...policyHead, actions };
+const policyContractRow = { tenant_id: tenantId, name: text, short_name: shortName, ...policyHead, actions };
 const policySign = object({ ...policyExpected, base_revision: nullable(revision), reason: text,
   entries: listItems(object(policyDraftEntry, ['clause_ref', 'template_ref'])) });
 const policySignature = { tenant_id: tenantId, revision, current: boolean, ...policyHead, reason: text, issued_by: text, issued_at: timestamp, actions };
@@ -320,7 +321,8 @@ const invite = object({ id: text, role, group_id: nullableText, max_uses: sequen
   created_by: text, revision, actions, code_returned: { type: 'boolean' }, invite_code: text },
 ['id', 'role', 'group_id', 'max_uses', 'used', 'expires_at', 'created_by', 'revision', 'actions', 'code_returned']);
 
-function platformPaths(path: string, fields: Record<string, unknown>, required: string[], additionalInput = {}, additionalOutput = {}, listOutput = additionalOutput) {
+function platformPaths(path: string, fields: Record<string, unknown>, required: string[], additionalInput = {}, additionalOutput = {},
+  listOutput = additionalOutput, detail = false) {
   const result = managed({ ...fields, ...additionalOutput });
   const listResult = object({ ...fields, revision, actions, ...listOutput });
   const input = { ...fields, ...additionalInput, revision };
@@ -328,7 +330,7 @@ function platformPaths(path: string, fields: Record<string, unknown>, required: 
   return {
     [path]: { get: listOf(listResult, path.endsWith('/models') ? [{ name: 'provider_id', in: 'query', schema: text }] : []), post: { ...write({ oneOf: [{ ...object(input, required), not: { required: ['id'] } }, object(input, ['id', 'revision'])] }, result, 'upsert'),
       description: '新建时不传 id；更新已有对象时传 id 和 revision。' } },
-    [`${path}/{id}`]: { post: item, patch: item },
+    [`${path}/{id}`]: { ...(detail && { get: detailOf(result) }), post: item, patch: item },
   };
 }
 
@@ -600,6 +602,16 @@ export const openapi = {
       requestBody: requestBody(object({ target: text, code: { type: 'string', pattern: '^[0-9]{6}$' }, invite_code: text, kind: { ...kind, default: 'web' } }, ['target', 'code'])),
       responses: { 200: response('全局令牌', loginResponse),
         404: error('邀请码无效或已用完'), 429: error('验证码暂时锁定'), ...status } } },
+    '/v1/auth/password-login': { post: { summary: '使用租户、用户名和密码登录',
+      requestBody: requestBody(object({
+        tenant: { ...text, minLength: 1, maxLength: 64, description: '完整租户 ID 或简称' },
+        username: { ...text, minLength: 1, maxLength: 64 },
+        password: { ...text, format: 'password', minLength: 1, maxLength: 256, writeOnly: true },
+        kind: { ...kind, default: 'web' },
+      }, ['tenant', 'username', 'password'])),
+      responses: { 200: response('租户范围的会话令牌', loginResponse), 401: status[401], 422: status[422],
+        429: error('登录请求过快'), 500: status[500] },
+    } },
     '/v1/auth/token-login': { post: { summary: '使用个人登录令牌换取 Web 会话',
       requestBody: requestBody(object({ token: personalToken })),
       responses: { 200: response('Web 全局会话令牌', loginResponse), 401: status[401], 422: status[422], 500: status[500] } } },
@@ -620,7 +632,9 @@ export const openapi = {
       responses: { 204: response('退出成功'), 401: status[401], 422: status[422], 500: status[500] } } },
     '/v1/me': { get: { summary: '当前用户与权限范围', security: bearer, responses: {
       200: response('用户与当前租户', object({ user: ref('User'), tenant: { anyOf: [ref('Tenant'), { type: 'null' }] },
-        role: { anyOf: [role, { type: 'null' }] }, agents: { type: 'array', items: text }, is_platform_admin: { type: 'boolean' }, actions, quota: meQuota })), 401: status[401], 403: status[403], 500: status[500],
+        role: { anyOf: [role, { type: 'null' }] }, agents: { type: 'array', items: text }, is_platform_admin: { type: 'boolean' }, actions, quota: meQuota,
+        tenant_password_login: { const: true, description: '当前会话通过租户范围的密码登录签发。' } },
+      ['user', 'tenant', 'role', 'agents', 'is_platform_admin', 'actions', 'quota'])), 401: status[401], 403: status[403], 500: status[500],
     } } },
     '/v1/devices': { post: { summary: '注册设备，需要租户令牌', security: bearer, parameters: headers,
       requestBody: requestBody(object({ name: { ...text, maxLength: 128 }, os: { ...text, maxLength: 32 }, arch: { ...text, maxLength: 32 },
@@ -715,7 +729,7 @@ export const openapi = {
     },
     '/v1/platform/capability-contracts/{tenant_id}/history': { get: listOf(object({ ...platformContractFields, actions }), [contractTenantPath]) },
     '/v1/platform/capability-contracts/{tenant_id}/preview': { post: contractPreview(platformContractInput, [contractTenantPath]) },
-    ...platformPaths('/v1/platform/tenants', tenantFields, ['name', 'owner_user_id'], {}, { created_at: text }),
+    ...platformPaths('/v1/platform/tenants', tenantFields, ['name', 'owner_user_id'], {}, { created_at: text }, undefined, true),
     ...platformPaths('/v1/platform/providers', providers, ['name', 'protocol', 'base_url', 'secret'], { secret: { ...text, writeOnly: true } }),
     ...platformPaths('/v1/platform/models', models, ['provider_id', 'upstream_name', 'display_name', 'context_window'], {}, {}, {
       current_identity_revision: nullable(revision), current_pool_revision: { ...sequence, description: '0 表示未发布模型池。' },

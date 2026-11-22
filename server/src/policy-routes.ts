@@ -80,7 +80,7 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
     const actor=platformActor(store,c,at);
     const id=c.req.param('tenant_id');
     if (!isTenantId(id)) throw new ApiError('not_found');
-    const row=system.get<Lookup>('SELECT id AS tenant_id, name FROM tenants WHERE id = ?',[id]);
+    const row=system.get<Lookup & { short_name: string | null }>('SELECT id AS tenant_id, name, short_name FROM tenants WHERE id = ?',[id]);
     if (!row) throw new ApiError('not_found');
     return {actor, id, db:store.tenant(id), row};
   }
@@ -284,9 +284,10 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
   app.get(contracts,c=>{
     platformActor(store,c,opts.now());
     const p=pagination(c);
-    const where="WHERE instr(lower(name || ' ' || id), lower(?)) > 0";
+    const where="WHERE instr(lower(name || ' ' || id || ' ' || coalesce(short_name, '')), lower(?)) > 0";
     const {n}=system.get<{n:number}>(`SELECT count(*) AS n FROM tenants ${where}`,[p.query])!;
-    const rows=system.all<Lookup>(`SELECT id AS tenant_id,name FROM tenants ${where} ORDER BY id LIMIT ? OFFSET ?`,[p.query,p.limit,p.offset]);
+    const rows=system.all<Lookup & { short_name: string | null }>(
+      `SELECT id AS tenant_id, name, short_name FROM tenants ${where} ORDER BY id LIMIT ? OFFSET ?`,[p.query,p.limit,p.offset]);
     return c.json(p.page(rows.map(row=>({...row,...(readHead(store.tenant(row.tenant_id))??noPolicy),actions:['read']})),n));
   });
   app.get(`${contracts}/:tenant_id`,c=>{
