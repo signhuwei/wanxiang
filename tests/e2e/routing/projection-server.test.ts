@@ -8,9 +8,9 @@ const script = join(import.meta.dir, 'projection-server.ts');
 const clean: (() => unknown)[] = [];
 afterEach(async () => { for (const dispose of clean.splice(0).reverse()) await dispose(); });
 
-async function start(dir: string) {
+async function start(dir: string, extra: string[] = []) {
   // Kept as a handle: the process is ended through it, never by name.
-  const child = Bun.spawn(['bun', '--no-env-file', script, '--data-dir', dir], { stdout: 'pipe', stderr: 'inherit' });
+  const child = Bun.spawn(['bun', '--no-env-file', script, '--data-dir', dir, ...extra], { stdout: 'pipe', stderr: 'inherit' });
   clean.push(async () => { child.kill('SIGTERM'); await child.exited; });
   const reader = child.stdout.getReader();
   let text = '';
@@ -74,4 +74,16 @@ test('the joint-check server serves sealed v91, records the receipt, and resends
   expect(opened(resent)).toEqual(opened(config));
   device.send({ type: 'config_applied', id: 'ca91', config_revision: 91, policy_revision: config.policy.policy_revision, projection_id: 'prj_91', result: 'applied' });
   expect(await device.nextOf('ack')).toEqual({ type: 'ack', re: 'ca91', ok: true });
+  // Later restart with a moved clock: dev_fix's unapplied v6 target has lapsed, dev_lin's applied one stays applied,
+  // and dev_lin's row in the v6 rollout is superseded by the active v7 head.
+  device.close();
+  child.kill('SIGTERM');
+  expect(await child.exited).toBe(0);
+  ({ child, info } = await start(dir, ['--now', '2026-11-22T02:11:00Z']));
+  expect(info.server_time).toBe('2026-11-22T02:11:00.000Z');
+  const rows = async (url: string) => (await (await fetch(url, { headers: { authorization: `Bearer ${info.platform_session}` } })).json() as any).items;
+  expect(await rows(info.ledger[1])).toMatchObject([
+    { device_id: 'dev_fix', state: 'offline', reason: 'target_expired', target_config_revision: 92 },
+    { device_id: 'dev_lin', state: 'superseded', reason: 'pool_superseded' }]);
+  expect(await rows(info.ledger[0])).toMatchObject([{ device_id: 'dev_lin', state: 'applied', applied_config_revision: 91 }]);
 }, 30_000);
