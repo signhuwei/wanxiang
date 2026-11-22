@@ -34,10 +34,17 @@ async function channel(letter: string) {
     hits.inference++;
     return fetch(new URL(path, upstream.url), { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(call) });
   }});
-  return { secret, raw, hits, url: server.url.origin + '/v1', async close() { server.stop(true); await upstream.stop(); } };
+  const url = server.url.origin + '/v1';
+  let stopped = false;
+  async function stopListening() {
+    if (stopped) return;
+    stopped = true;
+    await server.stop(true);
+  }
+  return { secret, raw, hits, url, stopListening, async close() { await stopListening(); await upstream.stop(); } };
 }
 
-export async function startOneChain(directory?: string) {
+export async function startOneChain(directory?: string, primaryOffline = false) {
   const clock = Date.now();
   const dataDir = directory ?? mkdtempSync(join(tmpdir(), 'onex-one-chain-'));
   const [a,b] = await Promise.all([channel('a'),channel('b')]);
@@ -135,7 +142,7 @@ export async function startOneChain(directory?: string) {
       deployment_revision:member.deployment_revision,expected_quote_revision:0,currency:index?'USD':'CNY',tariff_scope:{kind:'deployment'},
       valid_from:earlier,valid_until:null,source,reason:'联验采购价',items:[
         {dimension:'input',rate_micro:index?'400000':'2000000',quantity_basis:1_000_000,unit:'token'},
-        {dimension:'output',rate_micro:index?'2000000':'15000000',quantity_basis:1_000_000,unit:'token'},
+        {dimension:'output',rate_micro:index?'1333333':'15000000',quantity_basis:1_000_000,unit:'token'},
       ]});
     await api('/platform/procurement/fx-rates',{base_currency:'USD',quote_currency:'CNY',expected_fx_revision:0,rate_numerator:'15',
       rate_denominator:'2',observed_at:earlier,valid_from:earlier,valid_until:expires,source,reason:'联验汇率'});
@@ -161,16 +168,19 @@ export async function startOneChain(directory?: string) {
     const device=await api('/devices',{name:'one-chain-fixture',os:'darwin',arch:'arm64',public_key:x25519PublicKey(deviceKey)},undefined,owner);
     fixtureDevice=device.device_id;
     const projected=await service.projection!.project(fixtureTenant,fixtureDevice,Date.now());
+    if (primaryOffline) await a.stopListening();
     return {close,service,api,info:{data_dir:dataDir,http_url:url,ws_url:url.replace(/^http/,'ws')+'/v1/edge/ws',tenant_id:fixtureTenant,user_id:tenant.userId,
       device_id:fixtureDevice,device_token:device.device_token,device_private_key_hex:deviceKey.toString('hex'),model_id:logical.id,
       config_revision:projected.config_revision,projection_id:projected.projection_id,signed_pool:signed.route_pools[0],
-      signed_rate:signed.sales_rate_snapshots[0],origin_channel:supplies[0]!.wallet,platform_session:platform,owner_session:owner},hits:[a.hits,b.hits]};
+      signed_rate:signed.sales_rate_snapshots[0],origin_channel:supplies[0]!.wallet,backup_channel:supplies[1]!.wallet,
+      primary_deployment_id:members[0]!.deployment_id,backup_deployment_id:members[1]!.deployment_id,
+      platform_session:platform,owner_session:owner},hits:[a.hits,b.hits]};
   } catch(error) { await close(); throw error; }
 }
 
 if(import.meta.main) {
   const index=process.argv.indexOf('--data-dir');
-  const fixture=await startOneChain(index===-1 ? undefined : process.argv[index+1]);
+  const fixture=await startOneChain(index===-1 ? undefined : process.argv[index+1],process.argv.includes('--primary-offline'));
   console.log(JSON.stringify(fixture.info));
   for(const signal of ['SIGTERM','SIGINT'] as const) process.once(signal,async()=>{await fixture.close();process.exit(0);});
 }

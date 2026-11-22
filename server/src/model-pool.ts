@@ -15,7 +15,8 @@ type Routing = { strategy: 'ordered'; max_attempts: number; attempt_timeout_ms: 
 type Draft = { expected_pool_revision: number; members: Member[]; routing: Routing; reason: string };
 type Issue = { code: string; message: string; deployment_id?: string; field?: string };
 
-const MAX_MEMBERS = 32, MAX_ATTEMPTS = 8, MAX_TIMEOUT_MS = 600_000;
+const MAX_MEMBERS = 32, MAX_TIMEOUT_MS = 600_000;
+export const MAX_ATTEMPTS = 8;
 const messages: Record<string, string> = {
   deployment_not_found: '渠道部署不存在',
   deployment_unavailable: '渠道部署、账号、端点或 Provider 已停用',

@@ -179,8 +179,12 @@ const policyEffectiveEntry = object({ clause_ref: policyRef, definition: policyD
 const policyHead = { platform_revision: sequence, policy_revision: sequence };
 const policyExpected = { expected_platform_revision: sequence, expected_policy_revision: sequence };
 const policyContractRow = { tenant_id: tenantId, name: text, short_name: shortName, ...policyHead, actions };
+const poolChoice = { model_id: text, pool_revision: revision, mode: { type: 'string', enum: ['pinned', 'follow'] } };
+const ownerSignedPools = listItems(object({ ...poolChoice, member_count: revision }));
+const platformSignedPools = listItems(object({ ...poolChoice, member_count: revision, source_rate_key: text }));
 const policySign = object({ ...policyExpected, base_revision: nullable(revision), reason: text,
-  entries: listItems(object(policyDraftEntry, ['clause_ref', 'template_ref'])) });
+  entries: listItems(object(policyDraftEntry, ['clause_ref', 'template_ref'])), route_pools: listItems(object(poolChoice)) },
+['expected_platform_revision', 'expected_policy_revision', 'base_revision', 'reason', 'entries']);
 const policySignature = { tenant_id: tenantId, revision, current: boolean, ...policyHead, reason: text, issued_by: text, issued_at: timestamp, actions };
 const policyConfigInput = {oneOf:[object({ ...policyExpected, template_ref: nullable(policyRef), selections: listItems(object(policyChoice)) }),
   object({...policyExpected,restore_revision:revision})]};
@@ -283,18 +287,21 @@ const policyPaths = {
   [policyPlatform + '/contracts']: { get: listOf(object(policyContractRow)) },
   [policyContractPath]: { get: policyDetail(object({ ...policyContractRow, balance: policyBalance }), [contractTenantPath]) },
   [policyContractPath + '/signatures']: { get: listOf(object(policySignature), [contractTenantPath]),
-    post: policyWrite(policySign, object({ ...policySignature, entries: listItems(policySignedEntry), sales_rate_snapshots:signedSalesRates }), 'create', [contractTenantPath]) },
-  [policyContractPath + '/signatures/{revision}']: { get: policyDetail(object({ ...policySignature, entries: listItems(policySignedEntry), sales_rate_snapshots:signedSalesRates }),
+    post: policyWrite(policySign, object({ ...policySignature, entries: listItems(policySignedEntry), sales_rate_snapshots:signedSalesRates,
+      route_pools:platformSignedPools }), 'create', [contractTenantPath]) },
+  [policyContractPath + '/signatures/{revision}']: { get: policyDetail(object({ ...policySignature, entries: listItems(policySignedEntry),
+    sales_rate_snapshots:signedSalesRates, route_pools:platformSignedPools }),
     [contractTenantPath, namedPath('revision', revision)]) },
   [policyContractPath + '/preview']: { post: policyPreview(policySign, object({ tenant_id: tenantId, ...policyHead,
-    entries: listItems(policySignedEntry), previous_entries: listItems(policySignedEntry), sales_rate_snapshots:listItems(object(salesRateFields)), actions,
+    entries: listItems(policySignedEntry), previous_entries: listItems(policySignedEntry), sales_rate_snapshots:listItems(object(salesRateFields)),
+    route_pools:platformSignedPools, actions,
     seats:object({limit:sequence,active:sequence,over_limit:sequence}),impact:object({member_count:sequence,device_count:sequence,
       members:object({items:listItems(impactMember),total:sequence,next_cursor:nullableText,actions}),
       devices:object({items:listItems(impactRow),total:sequence,next_cursor:nullableText,actions})}) }),
     [contractTenantPath,...listParams,{name:'member_cursor',in:'query',schema:text,description:'受影响成员的分页游标。cursor 用于受影响设备。'}]) },
   [policyTenant + '/signatures']: { get: listOf(object(policySignature)) },
   [policyTenant + '/signatures/{revision}']: { get: {
-    ...policyDetail(object({ revision,issued_at:timestamp,sales_rate_snapshots:tenantSignedSalesRates,actions }),
+    ...policyDetail(object({ revision,issued_at:timestamp,sales_rate_snapshots:tenantSignedSalesRates,route_pools:ownerSignedPools,actions }),
       [namedPath('revision', revision)]),
     summary: '户主读取本租户签发版本的销售费率',
   } },
@@ -401,6 +408,19 @@ const channelJobPath = '/v1/platform/probe-jobs/{job_id}';
 const channelIdentityPath = '/v1/platform/models/{model_id}/identity';
 const channelProviderId = namedPath('provider_id', routingId);
 const channelJobId = namedPath('job_id', routingId);
+const channelLedgerPath = channelProvider + '/channel-ledger';
+const channelCurrency = { ...text, pattern: '^[A-Z]{3}$' };
+const channelLedgerCommon = { account_id: routingId, currency: channelCurrency,
+  reference: { ...text, minLength: 1, maxLength: 128 }, note: { ...text, minLength: 1, maxLength: 512 } };
+const channelLedgerEntry = object({ ...channelLedgerCommon, id: routingId, funding_id: routingId,
+  kind: { type: 'string', enum: ['recharge', 'balance_observation', 'expense'] }, amount_micro: sequence, recorded_at: timestamp });
+const channelWallet = object({ account_id: routingId, funding_id: routingId, label: text, status: text, currency: nullable(channelCurrency),
+  balance_micro: { ...nullable({ type: 'integer' }), description: '最近一次余额观测，加上后续充值，减去后续费用。' },
+  observed_balance_micro: nullable(sequence), observed_at: nullableTimestamp, credited_micro: sequence, spent_micro: sequence, actions });
+const channelLedgerWrite = (balance: boolean) => ({
+  ...write(object({ ...channelLedgerCommon, ...(balance ? { balance_micro: sequence } : { amount_micro: revision }) }), channelLedgerEntry, 'upsert'),
+  parameters: [channelProviderId, ...contractIdempotency],
+});
 const channelJob = object({ id: routingId, kind: { enum: ['connectivity', 'discovery'] }, status: { enum: ['succeeded', 'partial', 'failed'] },
   location: text, scope: object({ provider_id: routingId, account_id: routingId, endpoint_id: routingId, endpoint_revision: revision }),
   observed_at: timestamp, summary: object({ model_count: sequence, reason: nullableText }), actions });
@@ -415,6 +435,11 @@ const channelStart = (input: object) => ({ security: bearer, parameters: [channe
     404: error('供应商不存在'), ...status } });
 
 const routingPaths = {
+  [channelLedgerPath]: { get: routingList(channelLedgerEntry, [channelProviderId, ...routingPagination,
+    { name: 'account_id', in: 'query', schema: routingId }], actions, { accounts: listItems(channelWallet) }) },
+  [channelLedgerPath + '/recharges']: { post: channelLedgerWrite(false) },
+  [channelLedgerPath + '/observations']: { post: channelLedgerWrite(true) },
+  [channelLedgerPath + '/expenses']: { post: channelLedgerWrite(false) },
   [channelProvider + '/channel']: { get: policyDetail(object({ provider_id: routingId, revision, accounts: listItems(channelAccount),
     latest_probe: nullable(channelJob), latest_discovery: nullable(channelJob), latest_catalog: nullable(channelJob), actions }), [channelProviderId]) },
   [channelProvider + '/probes']: { post: channelStart(object({ kind: { const: 'connectivity' }, revision })) },

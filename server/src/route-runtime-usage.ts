@@ -3,27 +3,43 @@ import { deviceAllowed } from './billing';
 import { modelBudgetWire } from './commerce-data';
 import { iso } from './credentials';
 import { ackCursor, advanceCursor, batchItems, markSequence, usageItems } from './ingest';
-import { int } from './management';
+import { enumField, int } from './management';
+import { MAX_ATTEMPTS } from './model-pool';
 import type { QuoteItem } from './procurement';
-import { digest, routeId } from './routing-http';
+import { digest, routeId, strictObject } from './routing-http';
 import { procurementCostCnyMicro, salesCostMilli, type ProcurementPrice, type RoutingSalesRates, type RoutingTokenUsage } from './routing-money';
 import type { Store, Transaction } from './store';
 
 export type RouteProcurementCharge = {
   tenant_id: string; device_id: string; request_id: string; attempt_id: string;
   provider_id: string; account_id: string; deployment_id: string; deployment_revision: number;
-  quote_id: string; quote_revision: number; currency: string; amount_micro: string; observed_at: string;
+  quote_id: string; quote_revision: number; currency: string; amount_micro: string;
+  fx_revision: number | null; amount_cny_micro: string | null; observed_at: string;
 };
 export type PostRouteProcurement = (charge: RouteProcurementCharge) => Promise<void>;
 
 type Usage = ReturnType<typeof usageItems>[number] & {
   attemptId: string; deploymentId: string; deploymentRevision: number; configRevision: number; projectionId: string; rateId: string;
+  attempts: Attempt[];
 };
+type Attempt = { attempt_id: string; deployment_id: string; deployment_revision: number; outcome: 'connect_refused' | 'completed' };
 type Snapshot = { projection_id: string; platform_revision: number; payload_json: string; valid_until: string; created_at: string };
 type Rate = RoutingSalesRates & { source_rate_key: string | null; valid_from: string; valid_until: string | null };
 type Plan = { routes: Array<{ model_id: string; provider_id: string; deployment_id: string; deployment_revision: number; pool_revision: number }>;
   rates: Array<{ model_id: string; rate_version_id: string }>;
-  route_pool: { bindings: Array<{ model_id: string; aliases: string[]; deployment_ids: string[] }> } };
+  route_pool: { bindings: Array<{ model_id: string; aliases: string[]; deployment_ids: string[] }>;
+    pools: Array<{ model_id: string; pool_revision: number; max_attempts: number }> } };
+
+function parseAttempts(input: unknown): Attempt[] {
+  if (!Array.isArray(input) || !input.length || input.length > MAX_ATTEMPTS) invalid('attempts');
+  return input.map((value, index) => {
+    const name = `attempts.${index}`;
+    const item = strictObject(value, name, ['attempt_id', 'deployment_id', 'deployment_revision', 'outcome']);
+    return { attempt_id: routeId(item.attempt_id, `${name}.attempt_id`), deployment_id: routeId(item.deployment_id, `${name}.deployment_id`),
+      deployment_revision: int(item.deployment_revision, `${name}.deployment_revision`, 1),
+      outcome: enumField(item.outcome, `${name}.outcome`, ['connect_refused', 'completed']) };
+  });
+}
 
 function parseBatch(value: unknown): Usage[] {
   const rows = batchItems(value);
@@ -34,7 +50,7 @@ function parseBatch(value: unknown): Usage[] {
     return { ...item, attemptId: routeId(raw.attempt_id, 'attempt_id'), deploymentId: routeId(raw.deployment_id, 'deployment_id'),
       deploymentRevision: int(raw.deployment_revision, 'deployment_revision', 1),
       configRevision: int(raw.config_revision, 'config_revision', 1), projectionId: routeId(raw.projection_id, 'projection_id'),
-      rateId: routeId(raw.rate_version_id, 'rate_version_id') };
+      rateId: routeId(raw.rate_version_id, 'rate_version_id'), attempts: parseAttempts(raw.attempts) };
   });
 }
 
@@ -45,8 +61,10 @@ const refused = (reason: string) => new ApiError('conflict', { reason });
 
 function frozenProcurement(store: Store, tenant: string, device: string, row: Usage, rate: Rate, poolRevision: number): RouteProcurementCharge | null {
   if (!rate.source_rate_key) return null;
-  type Quote = Pick<RouteProcurementCharge, 'quote_id' | 'quote_revision' | 'account_id' | 'currency'>;
-  const q = store.system.get<Quote>(`SELECT p.quote_id,p.quote_revision,p.account_id,p.currency FROM platform_rate_channels c
+  type Quote = Pick<RouteProcurementCharge, 'quote_id' | 'quote_revision' | 'account_id' | 'currency' | 'fx_revision'> &
+    { rate_numerator: string | null; rate_denominator: string | null };
+  const q = store.system.get<Quote>(`SELECT p.quote_id,p.quote_revision,p.account_id,p.currency,c.fx_revision,c.rate_numerator,c.rate_denominator
+    FROM platform_rate_channels c
     JOIN platform_rate_versions v ON v.source_rate_key=c.source_rate_key
     JOIN procurement_quotes p ON p.quote_id=c.quote_id AND p.quote_revision=c.quote_revision
       AND p.deployment_id=c.deployment_id AND p.deployment_revision=c.deployment_revision
@@ -56,18 +74,42 @@ function frozenProcurement(store: Store, tenant: string, device: string, row: Us
   const items = store.system.all<QuoteItem>(`SELECT dimension,rate_micro,quantity_basis,unit FROM procurement_quote_items
     WHERE quote_id=? AND quote_revision=?`, [q.quote_id, q.quote_revision]);
   if (!items.length) return null;
-  const price: ProcurementPrice = { currency: 'CNY', items: Object.fromEntries(items.map(item => [item.dimension, item])) };
-  let amount: string;
+  const price: ProcurementPrice = { currency: q.currency, items: Object.fromEntries(items.map(item => [item.dimension, item])) };
+  const { rate_numerator, rate_denominator, ...quote } = q;
+  const fx = rate_numerator && rate_denominator
+    ? { base_currency: q.currency, quote_currency: 'CNY', rate_numerator, rate_denominator } : null;
+  let amount: string, cny: string | null;
   try {
-    // Compute in native micro-units. An identity FX factor leaves the supplier's original currency untouched.
-    amount = procurementCostCnyMicro(tokens(row), price, null, 'ceil');
+    const measured = tokens(row);
+    amount = procurementCostCnyMicro(measured, { ...price, currency: 'CNY' }, null, 'ceil');
+    cny = q.currency === 'CNY' ? amount : fx ? procurementCostCnyMicro(measured, price, fx, 'ceil') : null;
   } catch (error) {
     if (!(error instanceof RangeError)) throw error;
     return null;
   }
-  return { ...q, tenant_id: tenant, device_id: device, request_id: row.request, attempt_id: row.attemptId,
+  return { ...quote, tenant_id: tenant, device_id: device, request_id: row.request, attempt_id: row.attemptId,
     provider_id: row.provider, deployment_id: row.deploymentId, deployment_revision: row.deploymentRevision,
-    amount_micro: amount, observed_at: row.at };
+    amount_micro: amount, amount_cny_micro: cny, observed_at: row.at };
+}
+
+function validateAttempts(sql: Transaction, device: string, plan: Plan, row: Usage, poolRevision: number) {
+  const pool = plan.route_pool.pools.find(item => item.model_id === row.modelId && item.pool_revision === poolRevision);
+  const final = row.attempts.at(-1)!;
+  if (!pool || row.attempts.length > pool.max_attempts || final.outcome !== 'completed' || final.attempt_id !== row.attemptId ||
+      final.deployment_id !== row.deploymentId || final.deployment_revision !== row.deploymentRevision ||
+      row.attempts.slice(0, -1).some(attempt => attempt.outcome !== 'connect_refused') ||
+      new Set(row.attempts.map(attempt => attempt.deployment_id)).size !== row.attempts.length ||
+      new Set(row.attempts.map(attempt => attempt.attempt_id)).size !== row.attempts.length) throw refused('route_usage_attempts_mismatch');
+  const sameBinding = plan.route_pool.bindings.some(binding => binding.model_id === row.modelId &&
+    binding.aliases.some(alias => alias.endsWith('*') ? row.model.startsWith(alias.slice(0, -1)) : alias === row.model) &&
+    row.attempts.every(attempt => binding.deployment_ids.includes(attempt.deployment_id) && plan.routes.some(route =>
+      route.model_id === row.modelId && route.pool_revision === poolRevision && route.deployment_id === attempt.deployment_id &&
+      route.deployment_revision === attempt.deployment_revision)));
+  if (!sameBinding) throw refused('route_usage_deployment_mismatch');
+  const attemptIds = JSON.stringify(row.attempts.map(attempt => attempt.attempt_id));
+  if (sql.get('SELECT 1 FROM route_runtime_attempts WHERE device_id=? AND attempt_id IN (SELECT value FROM json_each(?))', [device, attemptIds])) {
+    throw refused('route_usage_replay_conflict');
+  }
 }
 
 function persistReceipt(store: Store, sql: Transaction, tenant: string, device: string, at: number, row: Usage) {
@@ -96,9 +138,8 @@ function persistReceipt(store: Store, sql: Transaction, tenant: string, device: 
   const plan = JSON.parse(snapshot.payload_json) as Plan;
   const route = plan.routes.find(r => r.model_id === row.modelId && r.provider_id === row.provider &&
     r.deployment_id === row.deploymentId && r.deployment_revision === row.deploymentRevision);
-  const grants = plan.route_pool.bindings.some(b => b.model_id === row.modelId && b.deployment_ids.includes(row.deploymentId)
-    && b.aliases.some(alias => alias.endsWith('*') ? row.model.startsWith(alias.slice(0, -1)) : alias === row.model));
-  if (!route || !grants) throw refused('route_usage_deployment_mismatch');
+  if (!route) throw refused('route_usage_deployment_mismatch');
+  validateAttempts(sql, device, plan, row, route.pool_revision);
   if (!plan.rates.some(rate => rate.model_id === row.modelId && rate.rate_version_id === row.rateId)) {
     throw refused('route_usage_rate_mismatch');
   }
@@ -127,6 +168,9 @@ function persistReceipt(store: Store, sql: Transaction, tenant: string, device: 
     deployment_id,deployment_revision,rate_version_id,digest,procurement_json,procurement_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [device, row.seq, row.request, row.attemptId, snapshot.projection_id, row.configRevision, route.pool_revision,
       row.deploymentId, row.deploymentRevision, row.rateId, fingerprint, charge ? JSON.stringify(charge) : null, charge ? 'pending' : 'unavailable']);
+  for (const [index, attempt] of row.attempts.entries()) sql.run(`INSERT INTO route_runtime_attempts
+    (device_id,seq,ordinal,attempt_id,deployment_id,deployment_revision,outcome) VALUES(?,?,?,?,?,?,?)`,
+    [device, row.seq, index + 1, attempt.attempt_id, attempt.deployment_id, attempt.deployment_revision, attempt.outcome]);
   return charge;
 }
 
