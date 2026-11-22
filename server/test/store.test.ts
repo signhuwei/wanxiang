@@ -26,7 +26,7 @@ test('migrations persist version, WAL mode and independent tenant databases', as
     expect(db.system.all('SELECT user_id FROM platform_admins')).toEqual([{ user_id: a.userId }]);
     const first = db.tenant(a.tenantId);
     expect(first.get('PRAGMA journal_mode')).toEqual({ journal_mode: 'wal' });
-    expect(first.get('PRAGMA user_version')).toEqual({ user_version: 20 });
+    expect(first.get('PRAGMA user_version')).toEqual({ user_version: 21 });
     // 006_lease_overage：整表重建后索引还在，CHECK 放开到包含 overage_pending 但仍拒绝别的字符串
     expect(first.get("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'ledger_by_kind_and_at'"))
       .toEqual({ name: 'ledger_by_kind_and_at' });
@@ -37,7 +37,7 @@ test('migrations persist version, WAL mode and independent tenant databases', as
     expect(db.tenant(b.tenantId).get('SELECT user_id FROM members')).toEqual({ user_id: b.userId });
     expect(() => first.get('SELECT 1')).toThrow();
     expect(db.tenant(a.tenantId).get('SELECT user_id FROM members')).toEqual({ user_id: a.userId });
-    expect(db.system.get('PRAGMA user_version')).toEqual({ user_version: 17 });
+    expect(db.system.get('PRAGMA user_version')).toEqual({ user_version: 18 });
     const starter = db.system.get<{ entries_json: string }>(
       "SELECT entries_json FROM policy_templates WHERE id = 'team' AND version = 1")!;
     const choices = Object.fromEntries((JSON.parse(starter.entries_json) as { clause_ref: { id: string }; value: unknown }[])

@@ -30,6 +30,7 @@ import { policyRoutes } from './policy-routes';
 import { tenantRoutes } from './tenant-management';
 import { TOOL_ARTIFACT_DOWNLOAD_PATH, TOOL_ARTIFACT_UPLOAD_PATH, toolReleaseRoutes } from './tool-releases';
 import type { Presence } from './presence';
+import { routingProjector, type RoutingProjectionInputs } from './route-projection';
 import { Store } from './store';
 import { statisticsRoutes } from './statistics';
 
@@ -48,6 +49,8 @@ type Options = {
   /** 诊断日志包的对象存储；缺省时诊断功能对外报 `not_found`（见 diag.ts）。 */
   objectStorage?: ObjectStorage;
   releaseRuntime?: ReleaseRuntime;
+  /** Isolated route_pool.v1 stage only: tests inject grants and synthetic credential versions. Production never sets it. */
+  routingProjection?: RoutingProjectionInputs;
 };
 
 export async function createServer(opts: Options) {
@@ -98,6 +101,7 @@ export async function createServer(opts: Options) {
     app.get('/v1/openapi.json', (c) => c.json(openapi));
     const pending = new PendingWork();
     const config = configPublisher(store, opts.dataDir, now, opts.masterKey);
+    const projection = opts.routingProjection ? routingProjector(store, opts.routingProjection, now) : undefined;
     const management = { ...opts, now,
       onConfigChange: (id?: string) => { void pending.track(config.changed(id)); },
       onBalanceChange: (id: string) => { void pending.track(config.balanceChanged(id)); },
@@ -164,7 +168,7 @@ export async function createServer(opts: Options) {
     closeDiscounts();
     let closing: Promise<void> | undefined;
     return {
-      server, store,
+      server, store, projection,
       close() {
         return closing ??= (async () => {
           shuttingDown = true;
