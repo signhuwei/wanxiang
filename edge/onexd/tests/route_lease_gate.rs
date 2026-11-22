@@ -385,7 +385,9 @@ async fn reseal_restores_then_pool_moves_keep_and_signature_change_settles() {
     let renew = p.recv().await;
     assert_eq!(renew["type"], "lease_renew", "{renew}");
     assert_eq!((renew["lease_id"].as_str(), renew.get("release_only")), (Some("lse_91"), None));
-    assert_eq!(renew["model_used_milli"], json!({"mdl_m":0}));
+    // 常规结清报真实累计用量。隔离租约从不放行请求（真实入口被执行门禁拒绝），真实值就是零，
+    // 每个已分配型号都在。
+    assert_eq!((renew["used_milli"].as_i64(), &renew["model_used_milli"]), (Some(0), &json!({"mdl_m":0})));
     let mut successor = lease(&renew["id"], "lse_93", 93, "prj_93");
     successor["signature_id"] = json!("sig_13");
     successor["settled_lease_id"] = json!("lse_91");

@@ -474,6 +474,12 @@ pub struct PoolLeaseOp {
 }
 
 impl PoolLeaseOp {
+    /// 常规结清一份从未放行过请求的租约：真实累计用量为零，逐型号报零。
+    /// 仅在隔离流程中成立（真实入口被执行门禁拒绝）；有执行后不能再用。
+    fn settle_unused(lease: &PoolLease) -> Self {
+        Self::zero(lease, false)
+    }
+
     /// 每个已分配型号报零用量（Server 结清要求逐键上报）。
     pub fn zero(lease: &PoolLease, release_only: bool) -> Self {
         Self {
@@ -628,13 +634,17 @@ impl Store {
     }
 
     /// 为已接受租约开始常规结清。该租约已有在途操作时返回它，不新开。
+    ///
+    /// 常规续租须上报真实累计用量和分模型用量（Server 按 min(used,budget) 只扣一次），报零会少计。
+    /// 本批隔离租约从不放行请求（`State::route_pool_engaged` 拒绝全部真实模型入口），累计用量就是零，
+    /// 所以这里逐型号报零是真实值。接入逐请求执行时必须改为从持久用量凭证取值，不能沿用零。
     pub fn begin_settlement(&self, scope: &Scope, lease: &PoolLease, now_ms: i64) -> Result<PoolLeaseOp> {
         if let Some(op) = self.pending_pool_op(scope, &lease.lease_id)? {
             return Ok(op);
         }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let op = PoolLeaseOp::zero(lease, false);
+        let op = PoolLeaseOp::settle_unused(lease);
         insert_op(&tx, scope, &op, now_ms)?;
         tx.commit()?;
         Ok(op)
