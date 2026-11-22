@@ -115,7 +115,7 @@ export async function startOneChain(directory?: string) {
     const modelPath=`/platform/models/${logical.id}`;
     const identity=await api(modelPath+'/identity',{revision:logical.revision,maker_id:'fixture',model_family:'M',model_variant:'flash',
       identity_mode:'pinned_snapshot',model_snapshot:'20261121',capability_floor:['text','stream']});
-    await api(modelPath+'/pool/candidates/review',{expected_identity_revision:identity.identity_revision,reason:'分别核实两个本地测试渠道为同一测试快照',
+    await api(modelPath+'/pool/candidates/review',{expected_identity_revision:identity.identity.identity_revision,reason:'分别核实两个本地测试渠道为同一测试快照',
       decisions:supplies.map(({picked})=>({discovery_id:picked.discovery_id,catalog_item_id:picked.catalog_item_id,decision:'accept',capabilities:['text','stream']}))});
     const candidates=(await api(`/platform/deployments?target_model_id=${logical.id}`)).items as Json[];
     const members=supplies.map(({provider},index)=>{
