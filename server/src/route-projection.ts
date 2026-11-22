@@ -153,7 +153,8 @@ export function buildProjection(store: Store, db: Reader, inputs: RoutingProject
     const grantRoutes: Record<string, any>[] = [];
     let narrowed = 0;
     for (const member of poolMembers(system, grant.model_id, poolRevision)) {
-      if (assessMember(system, grant.model_id, identity, member, now).codes.length) continue;
+      const assessment = assessMember(system, grant.model_id, identity, member, now);
+      if (assessment.codes.length) continue;
       if (inputs.productionCandidate && !inputs.productionCandidate(member.deployment_id, member.deployment_revision, rate.source_rate_key)) continue;
       const row = system.get<{ provider_id: string; upstream_model: string; capabilities_json: string; context_tokens: number | null;
         max_output_tokens: number | null; protocol: string; base_url: string; auth_adapter: string }>(
@@ -177,6 +178,7 @@ export function buildProjection(store: Store, db: Reader, inputs: RoutingProject
         deployment_revision: member.deployment_revision, pool_revision: poolRevision, provider_id: row.provider_id, protocol: row.protocol,
         base_url: row.base_url, upstream_model: row.upstream_model, auth: row.auth_adapter, priority: member.priority,
         features: JSON.parse(row.capabilities_json), max_context_tokens: row.context_tokens, max_output_tokens: row.max_output_tokens,
+        ...(assessment.inputCapabilities && { input_capabilities: assessment.inputCapabilities }),
         valid_until: evidence.valid_until, availability: { state: 'eligible', observed_at: evidence.observed_at, valid_until: evidence.valid_until },
         credential_ref: { credential_id: ref.credential_id, credential_version: ref.credential_version } });
     }

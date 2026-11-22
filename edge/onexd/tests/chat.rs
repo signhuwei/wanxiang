@@ -356,6 +356,7 @@ async fn env_with_base(base: impl FnOnce(SocketAddr) -> String) -> Env {
             upstream_model: Some("wire-m".into()),
             auth: UpstreamAuth::Bearer,
             proxy: None,
+            input_capabilities: None,
         }],
         rates: vec![Rate {
             model_id: "mdl_q".into(),

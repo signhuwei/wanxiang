@@ -44,6 +44,8 @@ v0.15 的 `config` 可携带平台合约和租户配置修订，字段和兼容�
 | `diag` | `diag_id`、`kind`（`logs`、`status`）、`upload_url` | `logs` 将白名单日志打包，经当前控制连接同源的 `/v1/diag/:id/upload` 上传，使用该连接的设备令牌。`status` 直接回 `diag_result` |
 | `agent_cmd` | `agent`、`action`（`stop`） | 管理指令 |
 
+`routes[].input_capabilities` 可含 `modalities: ["text", "image"]` 和可选 `valid_until`（UTC 时间）。Edge 将缺失或已过期的字段按仅支持文本处理。Server 只对经审核且有有效图片输入证据的 `openai_chat` 路由下发该字段。普通 Provider 路由还须匹配当前活动池中的默认账户、端点、认证方式和原始型号。
+
 ## Edge → Server
 
 | type | 字段 | 作用 |

@@ -196,6 +196,7 @@ fn route(model: &str) -> onex_core::ws::Route {
         upstream_model: None,
         auth: onex_core::ws::UpstreamAuth::Bearer,
         proxy: None,
+        input_capabilities: None,
     }
 }
 

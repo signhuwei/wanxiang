@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import fixture from '../../tests/fixtures/routing/p0-ab.json';
 import { iso } from '../src/credentials';
+import { effectiveModelConfig } from '../src/edge-config';
 import { routingProjector } from '../src/route-projection';
 import { openRouteSecret, routeProjectionDigest, sealRoutePoolConfig } from '../src/route-secret';
 import { QueuedDatabase, Store } from '../src/store';
@@ -35,6 +36,42 @@ const narrow = (f: { db: Store['system'] }, user: string, hot: Record<string, st
   for (const [key, value] of Object.entries(hot)) {
     sql.run(`UPDATE policy_effective SET document_json = json_set(document_json, '$.hot.' || ?, ?) WHERE scope = 'member' AND subject_id = ?`, [key, value, user]);
   }
+});
+
+test('projects image input only for the matching chat deployment and live reviewed evidence', async () => {
+  const f = await projectionSetup();
+  const at = minutes(0);
+  const media = '["text","stream","images"]';
+  await f.store.system.write(sql => {
+    sql.run("UPDATE providers SET protocol = 'openai_chat' WHERE id IN ('prv_a','prv_b')");
+    sql.run("UPDATE provider_endpoint_revisions SET protocol = 'openai_chat' WHERE endpoint_id IN ('ep_a','ep_b')");
+    sql.run("INSERT INTO provider_channel_defaults (provider_id,account_id,endpoint_id,credential_scope) VALUES ('prv_a','acct_a','ep_a','[]')");
+    sql.run("UPDATE model_deployment_revisions SET capabilities_json = ? WHERE deployment_id IN ('dep_a','dep_b')", [media]);
+    sql.run("UPDATE model_evidence SET capabilities_json = ? WHERE evidence_id IN ('ev_a','ev_b')", [media]);
+    sql.run("UPDATE model_evidence SET source_kind = 'channel_declaration' WHERE evidence_id = 'ev_b'");
+  });
+  const verified = { modalities: ['text', 'image'] as ['text', 'image'], valid_until: minutes(60) };
+  const contract = { allowed_models_json: '["mdl_m"]', lease_budget_milli: 1000 };
+  const legacy = (now = clock) => effectiveModelConfig(f.store, contract, now).routes[0]?.input_capabilities;
+  expect(legacy()).toEqual(verified);
+  expect(legacy(Date.parse(minutes(60)))).toBeUndefined();
+
+  f.setGrants([{ ...follow, ingress_protocol: 'openai_chat', user_ids: [f.userId] }]);
+  await f.projector.project(f.tenantId, 'dev_lin');
+  const projected = payload(f, 'dev_lin').routes;
+  expect(projected.map((route: any) => [route.deployment_id, route.input_capabilities])).toEqual([['dep_a', verified], ['dep_b', undefined]]);
+
+  await f.store.system.write(sql => {
+    sql.run("INSERT INTO provider_accounts (account_id,provider_id,name,status,created_at) VALUES ('acct_other','prv_a','Other','active',?)", [at]);
+    sql.run("INSERT INTO provider_account_endpoints (provider_id,account_id,endpoint_id,state) VALUES ('prv_a','acct_other','ep_a','enabled')");
+    sql.run("UPDATE provider_channel_defaults SET account_id = 'acct_other' WHERE provider_id = 'prv_a'");
+  });
+  expect(legacy()).toBeUndefined();
+  await f.store.system.write(sql => {
+    sql.run("UPDATE provider_channel_defaults SET account_id = 'acct_a' WHERE provider_id = 'prv_a'");
+    sql.run("UPDATE models SET upstream_name = 'different-model' WHERE id = 'mdl_m'");
+  });
+  expect(legacy()).toBeUndefined();
 });
 
 test('pinned v6 projects only A, follow v7 projects A/B with the signed 4× rate and the exact binding', async () => {

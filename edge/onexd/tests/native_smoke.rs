@@ -151,6 +151,7 @@ async fn local_installed_agent_receipt() {
             upstream_model: None,
             auth: UpstreamAuth::Bearer,
             proxy: None,
+            input_capabilities: None,
         }],
         rates: vec![Rate {
             model_id: "mod_smoke".into(),

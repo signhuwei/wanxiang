@@ -902,6 +902,7 @@ mod tests {
                 upstream_model: Some(model.into()),
                 auth: UpstreamAuth::XApiKey,
                 proxy: None,
+                input_capabilities: None,
             });
             cfg.rates.push(Rate {
                 model_id: "fixture-model".into(),

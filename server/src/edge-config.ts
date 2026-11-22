@@ -8,6 +8,7 @@ import { tenantUpstreamTargets,platformUpstreamPriority,upstreamOrder } from './
 import { balance } from './billing';
 import { iso } from './credentials';
 import { allowedAgentReleases, artifactDownloadPath, hasPinnedAgentTarget, type DesktopCapabilities } from './agent-catalog';
+import { legacyInputCapabilities } from './model-pool';
 import { decryptProviderSecret } from './provider-secret';
 import { balanceFallbackModels, balanceLabels, balanceNotices, balancePolicyEnabled, balancePolicyMode,
   readBalanceMode, recordBalanceMode } from './policy-balance';
@@ -84,6 +85,7 @@ export function requiresPolicyRuntime(store: Store, policy: {
 
 export function effectiveModelConfig(store: Store, contract: { allowed_models_json: string; lease_budget_milli: number; commerce_plan_id?: string|null } | null, now: number) {
   const allowed = contract && contract.lease_budget_milli > 0 ? contract.allowed_models_json : '[]';
+  const at = iso(now);
   const rows = store.system.all<RouteRow>(`SELECT m.id AS model_id, m.route_model, m.upstream_name AS upstream_model,
     m.display_name AS name, p.id AS provider_id, p.protocol, p.base_url, p.auth, p.proxy,
     r.input_milli_per_mtok, r.output_milli_per_mtok, r.cache_read_milli_per_mtok, r.cache_write_milli_per_mtok, r.effective_from
@@ -91,10 +93,14 @@ export function effectiveModelConfig(store: Store, contract: { allowed_models_js
     JOIN rates r ON r.model_id = m.id AND r.effective_from = (
       SELECT max(r2.effective_from) FROM rates r2 WHERE r2.model_id = m.id AND r2.effective_from <= ?
     ) WHERE m.status = 'active' AND p.status = 'active' AND p.protocol IN ('anthropic', 'openai_chat', 'openai_responses')
-    AND m.id IN (SELECT value FROM json_each(?)) ORDER BY m.id`, [iso(now), allowed]);
-  const routes = rows.map(({ model_id, route_model, upstream_model, provider_id, protocol, base_url, auth, proxy }) =>
-    ({ model_id, model: route_model ?? upstream_model, upstream_model, provider_id, protocol, base_url,
-      auth: auth ?? (protocol === 'anthropic' ? 'x_api_key' : 'bearer'), ...(proxy && { proxy }) }));
+    AND m.id IN (SELECT value FROM json_each(?)) ORDER BY m.id`, [at, allowed]);
+  const routes = rows.map(row => {
+    const { model_id, route_model, upstream_model, provider_id, protocol, base_url, proxy } = row;
+    const auth = row.auth ?? (protocol === 'anthropic' ? 'x_api_key' : 'bearer');
+    const inputCapabilities = legacyInputCapabilities(store.system, row, at);
+    return { model_id, model: route_model ?? upstream_model, upstream_model, provider_id, protocol, base_url,
+      auth, ...(proxy && { proxy }), ...(inputCapabilities && { input_capabilities: inputCapabilities }) };
+  });
   const rates = commerceRates(store, contract, rows.map(({ model_id, input_milli_per_mtok, output_milli_per_mtok, cache_read_milli_per_mtok,
     cache_write_milli_per_mtok, effective_from }) =>
     ({ model_id, input_milli_per_mtok, output_milli_per_mtok, cache_read_milli_per_mtok, cache_write_milli_per_mtok, effective_from })));

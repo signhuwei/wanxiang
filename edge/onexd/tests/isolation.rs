@@ -178,6 +178,7 @@ async fn env() -> Env {
             upstream_model: None,
             auth: UpstreamAuth::XApiKey,
             proxy: None,
+            input_capabilities: None,
         }],
         rates: vec![Rate {
             model_id: "mdl_1".into(),

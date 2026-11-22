@@ -338,6 +338,7 @@ async fn env_with(auth: UpstreamAuth, upstream_model: Option<&str>) -> Env {
             upstream_model: upstream_model.map(String::from),
             auth,
             proxy: None,
+            input_capabilities: None,
         }],
         rates: vec![rate()],
     };

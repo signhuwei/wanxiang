@@ -306,6 +306,25 @@ pub struct Route {
     /// `"none"` 直连，URL 用指定代理；不填时遵从环境变量代理。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    /// Reviewed input modes for this exact route. Missing or expired means text only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_capabilities: Option<InputCapabilities>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputCapabilities {
+    pub modalities: Vec<InputModality>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputModality {
+    Text,
+    Image,
+    #[serde(other)]
+    Unknown,
 }
 
 /// 单价，单位毫橡皮每百万 token。
@@ -514,6 +533,23 @@ mod tests {
     fn unknown_type_does_not_fail() {
         let m: Msg = serde_json::from_value(json!({"type":"from_the_future","id":"x","n":1})).unwrap();
         assert_eq!(m, Msg::Unknown);
+    }
+
+    #[test]
+    fn route_input_capabilities_are_optional_and_typed() {
+        let mut wire = json!({"model":"model-a","model_id":"mdl_a","provider_id":"prv_a","protocol":"openai_chat",
+            "base_url":"https://fixture.example.test","auth":"bearer"});
+        let legacy = serde_json::from_value::<Route>(wire.clone()).unwrap();
+        assert!(legacy.input_capabilities.is_none());
+        assert!(serde_json::to_value(legacy).unwrap().get("input_capabilities").is_none());
+
+        wire["input_capabilities"] = json!({"modalities":["text","image"],"valid_until":"2026-11-23T12:00:00Z"});
+        let selected: Route = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            selected.input_capabilities.as_ref().unwrap().modalities,
+            [InputModality::Text, InputModality::Image]
+        );
+        assert_eq!(serde_json::to_value(selected).unwrap(), wire);
     }
 
     #[test]

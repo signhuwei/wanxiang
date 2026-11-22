@@ -238,6 +238,7 @@ async fn env_with(protocol: &str) -> Env {
             upstream_model: None,
             auth: UpstreamAuth::Bearer,
             proxy: None,
+            input_capabilities: None,
         }],
         rates: vec![rate()],
     };

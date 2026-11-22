@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import fixture from '../../tests/fixtures/routing/p0-ab.json';
+import { effectiveModelConfig } from '../src/edge-config';
 import { orderMembers } from '../src/model-pool';
 import type { Transaction } from '../src/store';
 import { body, clock, minutes, setup, type Json } from './routing-fixture';
@@ -151,6 +152,33 @@ test('shared sample publishes v6 to v7 once, replays idempotently and rejects st
     expect(cards.items[0].archive_blockers).toEqual([{ kind: 'active_pool', model_id: 'mdl_m', pool_revision: 7 }]);
     const again = await body(await f.call(f.platform, '/models/mdl_m/pool/preview', { ...draft, expected_pool_revision: 7 }));
     expect(again).toMatchObject({ publishable: false, blocking: [{ code: 'no_change' }], diff: { added: [], removed: [], updated: [] } });
+  } finally { f.close(); }
+});
+
+test('publishing away from the verified legacy image deployment refreshes only once', async () => {
+  const f = await setup();
+  try {
+    await f.store.system.write(sql => {
+      sql.run("UPDATE providers SET protocol = 'openai_chat' WHERE id = 'prv_a'");
+      sql.run("UPDATE provider_endpoint_revisions SET protocol = 'openai_chat' WHERE endpoint_id = 'ep_a'");
+      sql.run("INSERT INTO provider_channel_defaults (provider_id,account_id,endpoint_id,credential_scope) VALUES ('prv_a','acct_a','ep_a','[]')");
+      const images = '["text","stream","images"]';
+      sql.run("UPDATE model_deployment_revisions SET capabilities_json = ? WHERE deployment_id = 'dep_a'", [images]);
+      sql.run("UPDATE model_evidence SET capabilities_json = ? WHERE evidence_id = 'ev_a'", [images]);
+    });
+    const contract = { allowed_models_json: '["mdl_m"]', lease_budget_milli: 1000 };
+    const route = () => effectiveModelConfig(f.store, contract, clock).routes[0];
+    expect(route()?.input_capabilities?.modalities).toEqual(['text', 'image']);
+    const base = fixture.http.draft;
+    const draft = { ...base, members: [base.members[1]!], routing: { ...base.routing, max_attempts: 1 } };
+    const preview = await body(await f.call(f.platform, '/models/mdl_m/pool/preview', draft));
+    const submit = { ...draft, preview_basis: preview.preview_basis };
+    const publish = () => f.call(f.platform, '/models/mdl_m/pool/revisions', submit, 'drop-images');
+    expect((await publish()).status).toBe(201);
+    expect(route()?.input_capabilities).toBeUndefined();
+    expect(f.configChanges()).toBe(1);
+    expect((await publish()).status).toBe(201);
+    expect(f.configChanges()).toBe(1);
   } finally { f.close(); }
 });
 

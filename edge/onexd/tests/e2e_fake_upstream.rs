@@ -43,6 +43,7 @@ async fn anthropic_client_through_chat_fake_upstream() {
             upstream_model: None,
             auth: UpstreamAuth::Bearer,
             proxy: None,
+            input_capabilities: None,
         }],
         rates: vec![Rate {
             model_id: "m".into(),

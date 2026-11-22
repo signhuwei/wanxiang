@@ -10,6 +10,9 @@ import type { Store, Transaction } from './store';
 
 type Reader = Pick<Transaction, 'get' | 'all'>;
 export type PoolMember = { deployment_id: string; deployment_revision: number; priority: number; approved_match_id: string; evidence_ids: string[] };
+type InputCapabilities = { modalities: ['text', 'image']; valid_until?: string };
+type LegacyCapabilityRoute = { model_id: string; upstream_model: string; provider_id: string; protocol: string;
+  base_url: string; auth: string | null; proxy: string | null };
 type Member = PoolMember;
 type Routing = { strategy: 'ordered'; max_attempts: number; attempt_timeout_ms: number; total_timeout_ms: number };
 type Draft = { expected_pool_revision: number; members: Member[]; routing: Routing; reason: string };
@@ -91,12 +94,13 @@ type DeploymentState = {
   current_revision: number; edit_revision: number; provider_status: string; account_status: string; endpoint_status: string;
   endpoint_current_revision: number; revision_endpoint_id: string | null; endpoint_revision: number | null;
   link_state: string | null; fault_domain_id: string | null; protocol: string | null; upstream_model: string | null; capabilities_json: string | null;
+  base_url: string | null; auth_adapter: string | null;
 };
 function deploymentState(sql: Reader, deploymentId: string, revision: number) {
   return sql.get<DeploymentState>(`SELECT d.deployment_id, d.provider_id, d.account_id, d.endpoint_id, d.display_name, d.status,
       d.current_revision, d.edit_revision, p.status AS provider_status, a.status AS account_status, e.status AS endpoint_status,
       e.current_revision AS endpoint_current_revision, r.endpoint_id AS revision_endpoint_id, r.endpoint_revision,
-      l.state AS link_state, er.fault_domain_id, er.protocol, r.upstream_model, r.capabilities_json
+      l.state AS link_state, er.fault_domain_id, er.protocol, er.base_url, er.auth_adapter, r.upstream_model, r.capabilities_json
     FROM model_deployments d JOIN providers p ON p.id = d.provider_id JOIN provider_accounts a ON a.account_id = d.account_id
     JOIN provider_endpoints e ON e.endpoint_id = d.endpoint_id
     LEFT JOIN provider_account_endpoints l ON l.account_id = d.account_id AND l.endpoint_id = d.endpoint_id
@@ -105,7 +109,7 @@ function deploymentState(sql: Reader, deploymentId: string, revision: number) {
     WHERE d.deployment_id = ?`, [revision, deploymentId]) ?? null;
 }
 type MatchRow = { candidate_id: string; model_id: string; identity_revision: number; deployment_id: string; deployment_revision: number; status: string; decided_at: string | null };
-type EvidenceRow = { evidence_id: string; deployment_id: string; deployment_revision: number; outcome: string; identity_verified: number;
+type EvidenceRow = { evidence_id: string; deployment_id: string; deployment_revision: number; source_kind: string; outcome: string; identity_verified: number;
   capabilities_json: string; valid_until: string | null; observed_at: string };
 
 /**
@@ -118,7 +122,7 @@ function assessMember(sql: Reader, modelId: string, identity: { identity_revisio
   const match = sql.get<MatchRow>(`SELECT candidate_id, model_id, identity_revision, deployment_id, deployment_revision, status, decided_at
     FROM model_discovery_matches WHERE candidate_id = ?`, [member.approved_match_id]) ?? null;
   const evidence = member.evidence_ids.map((evidenceId) => sql.get<EvidenceRow>(`SELECT evidence_id, deployment_id, deployment_revision, outcome,
-    identity_verified, capabilities_json, valid_until, observed_at FROM model_evidence WHERE evidence_id = ?`, [evidenceId]) ?? null);
+    source_kind, identity_verified, capabilities_json, valid_until, observed_at FROM model_evidence WHERE evidence_id = ?`, [evidenceId]) ?? null);
   if (!deployment || !deployment.upstream_model) codes.push('deployment_not_found');
   else {
     if (deployment.status !== 'active' || deployment.provider_status !== 'active' || deployment.account_status !== 'active'
@@ -144,16 +148,42 @@ function assessMember(sql: Reader, modelId: string, identity: { identity_revisio
   const declared = new Set(deployment?.capabilities_json ? JSON.parse(deployment.capabilities_json) as string[] : []);
   const floor = identity ? JSON.parse(identity.capability_floor_json) as string[] : [];
   if (!evidenceProblem && floor.some((capability) => !verified.has(capability) || !declared.has(capability))) codes.push('capability_unverified');
+  // A catalogue claim is not evidence that an authenticated Chat Completions route accepts image input.
+  let inputCapabilities: InputCapabilities | undefined;
+  if (!codes.length && deployment?.protocol === 'openai_chat' && declared.has('images') && live.some(row =>
+    (row.source_kind === 'manual_review' || row.source_kind === 'runtime_probe') && (JSON.parse(row.capabilities_json) as string[]).includes('images'))) {
+    const expires = live.map(row => row.valid_until).filter((value): value is string => value !== null).sort()[0];
+    inputCapabilities = { modalities: ['text', 'image'], ...(expires && { valid_until: expires }) };
+  }
   const dependency = {
     deployment: deployment && [deployment.status, deployment.current_revision, deployment.edit_revision, deployment.provider_status,
       deployment.account_status, deployment.endpoint_status, deployment.link_state, deployment.fault_domain_id,
       deployment.endpoint_current_revision, deployment.revision_endpoint_id, deployment.endpoint_revision],
     match: match && [match.status, match.model_id, match.identity_revision, match.deployment_id, match.deployment_revision, match.decided_at],
-    evidence: evidence.map((row) => row && [row.evidence_id, row.deployment_id, row.deployment_revision, row.outcome, row.identity_verified,
+    evidence: evidence.map((row) => row && [row.evidence_id, row.deployment_id, row.deployment_revision, row.source_kind, row.outcome, row.identity_verified,
       row.capabilities_json, row.observed_at, row.valid_until, superseded.has(row.evidence_id)]),
     blocking: [...new Set(codes)].sort(),
   };
-  return { codes: [...new Set(codes)], deployment, dependency };
+  return { codes: [...new Set(codes)], deployment, dependency, inputCapabilities };
+}
+
+export function legacyInputCapabilities(sql: Reader, route: LegacyCapabilityRoute, now: string) {
+  if (route.protocol !== 'openai_chat' || route.upstream_model.includes('*') || (route.proxy && route.proxy !== 'none')) return undefined;
+  const current = headRevision(sql, route.model_id);
+  if (!current) return undefined;
+  // Legacy inference uses only the default Provider credential. Evidence for a different account is not transferable.
+  const origin = sql.get<{ account_id: string; endpoint_id: string }>(
+    'SELECT account_id, endpoint_id FROM provider_channel_defaults WHERE provider_id = ?', [route.provider_id]);
+  if (!origin) return undefined;
+  const identity = currentIdentity(sql, route.model_id);
+  const auth = route.auth ?? 'bearer';
+  for (const member of poolMembers(sql, route.model_id, current)) {
+    const { deployment, inputCapabilities } = assessMember(sql, route.model_id, identity, member, now);
+    if (inputCapabilities && deployment?.provider_id === route.provider_id && deployment.account_id === origin.account_id &&
+      deployment.endpoint_id === origin.endpoint_id && deployment.base_url === route.base_url && deployment.auth_adapter === auth &&
+      deployment.upstream_model === route.upstream_model) return inputCapabilities;
+  }
+  return undefined;
 }
 
 function impact(store: Store, modelId: string) {
@@ -331,10 +361,10 @@ export function modelPoolRoutes(app: Hono, store: Store, opts: ManagementOptions
     const draft = parseDraft(body, ['preview_basis']);
     const basis = field(body.preview_basis, 'preview_basis', 256);
     const op = operation(c, opts.codeSecret, at, actor, { ...draft, preview_basis: basis });
-    return store.system.write((sql) => {
+    const result = await store.system.write((sql) => {
       actorPlatform(sql, actor);
       const cached = replay(op, sql);
-      if (cached) return cached;
+      if (cached) return { response: cached, changed: false };
       requireDraftableModel(sql, modelId);
       const now = iso(at);
       const result = evaluatePool(sql, opts.codeSecret, actor, modelId, draft, now);
@@ -342,6 +372,10 @@ export function modelPoolRoutes(app: Hono, store: Store, opts: ManagementOptions
       if (result.preview_basis !== basis || !result.publishable || !result.identity) {
         throw stale('preview_stale', result.current, [...new Set(result.blocking.map((row) => row.deployment_id ?? row.field ?? row.code))]);
       }
+      const legacy = sql.get<LegacyCapabilityRoute>(`SELECT m.id AS model_id, m.upstream_name AS upstream_model, m.provider_id,
+        p.protocol, p.base_url, p.auth, p.proxy FROM models m JOIN providers p ON p.id = m.provider_id
+        WHERE m.id = ? AND p.protocol = 'openai_chat' AND p.status = 'active'`, [modelId]);
+      const beforeInput = legacy && legacyInputCapabilities(sql, legacy, now);
       const latest = sql.get<{ n: number }>('SELECT coalesce(max(pool_revision), 0) AS n FROM model_pool_revisions WHERE model_id = ?', [modelId])!.n;
       const revision = Math.max(latest, result.current) + 1;
       const content = { model_id: modelId, pool_revision: revision, identity_revision: result.identity.identity_revision,
@@ -358,14 +392,18 @@ export function modelPoolRoutes(app: Hono, store: Store, opts: ManagementOptions
       }
       sql.run(`INSERT INTO model_pool_heads (model_id, pool_revision, updated_at) VALUES (?, ?, ?)
         ON CONFLICT(model_id) DO UPDATE SET pool_revision = excluded.pool_revision, updated_at = excluded.updated_at`, [modelId, revision, now]);
+      const afterInput = legacy && legacyInputCapabilities(sql, legacy, now);
       const rollout_id = `rol_${ulid()}`;
       sql.run(`INSERT INTO route_release_jobs (job_id, model_id, pool_revision, job_kind, source_digest, status, created_at)
         VALUES (?, ?, ?, 'project', ?, 'pending', ?)`, [rollout_id, modelId, revision, contentDigest, now]);
       sql.run('INSERT INTO platform_audit (id, actor, action, target, detail_json, at) VALUES (?, ?, ?, ?, ?, ?)',
         [`aud_${ulid()}`, actor, 'model_pool.publish', modelId, JSON.stringify({ pool_revision: revision, based_on_revision: result.current,
           digest: contentDigest, reason: draft.reason, diff: result.diff }), now]);
-      return op.complete(sql, { status: 201, payload: { model_id: modelId, pool_revision: revision, rollout_id, actions: ['read'] } });
+      const response = op.complete(sql, { status: 201, payload: { model_id: modelId, pool_revision: revision, rollout_id, actions: ['read'] } });
+      return { response, changed: JSON.stringify(beforeInput) !== JSON.stringify(afterInput) };
     });
+    if (result.changed) opts.onConfigChange?.();
+    return result.response;
   });
 
   app.get(`${P}/models/:model_id/pool/revisions`, (c) => {
