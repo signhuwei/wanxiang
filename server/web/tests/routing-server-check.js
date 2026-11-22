@@ -14,7 +14,9 @@ const target = 'routing-qa@example.test'
 const copy = value => JSON.parse(JSON.stringify(value))
 const { draft } = fixture.http
 const modelId = fixture.model.id
-const at = new Date().toISOString()
+const now = Date.now()
+const at = new Date(now).toISOString()
+const expires = new Date(now + 3600000).toISOString()
 let loginCode
 let browser
 let app
@@ -72,7 +74,7 @@ function seedCatalog(sql, userId) {
     sql.run(`INSERT INTO model_evidence (evidence_id,deployment_id,deployment_revision,source_kind,outcome,identity_verified,
       capabilities_json,observed_at,valid_until,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)`,
       [member.evidence_ids[0], id, revision, 'manual_review', accepted ? 'passed' : 'unknown', Number(accepted), capabilities,
-        at, new Date(Date.now() + 3600000).toISOString(), userId])
+        at, expires, userId])
     sql.run(`INSERT INTO model_discovery_matches (candidate_id,model_id,identity_revision,deployment_id,deployment_revision,
       catalog_item_id,discovery_id,match_rule_id,rule_revision,match_kind,normalized_key,confidence,reasons_json,
       status,decided_by,decided_at,decision_reason,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -94,17 +96,40 @@ function seedCatalog(sql, userId) {
   sql.run('INSERT INTO model_pool_heads (model_id,pool_revision,updated_at) VALUES (?,?,?)',[modelId,initial,at])
 }
 
+function seedExistingEntitlements(sql, tenantId, userId) {
+  const deviceId = 'dev_routing_qa'
+  const leaseId = 'lse_routing_qa'
+  sql.run('INSERT INTO policy_signatures (revision,reason,issued_by,issued_at,entries_json) VALUES (1,?,?,?,?)',
+    ['联验已有签发', userId, at, '[]'])
+  sql.run('INSERT INTO policy_head (id,platform_revision,policy_revision) VALUES (1,1,1)')
+  sql.run("INSERT INTO policy_effective (scope,subject_id,document_json) VALUES ('tenant',?,?)",
+    [tenantId, JSON.stringify({ hot:{ allowed_models_json:JSON.stringify([modelId]) } })])
+  sql.run(`INSERT INTO devices (id,user_id,name,os,arch,public_key,token_hash,token_expires_at,status)
+    VALUES (?,?,'联验设备','darwin','arm64','test-only','test-only-no-login',?,'active')`, [deviceId,userId,expires])
+  sql.run('INSERT INTO policy_device_applications (device_id,config_revision,policy_revision,applied_at) VALUES (?,1,1,?)',
+    [deviceId, at])
+  sql.run(`INSERT INTO leases (id,device_id,user_id,budget_milli,used_milli,expires_at,status)
+    VALUES (?,?,?,1000,10,?,'active')`, [leaseId,deviceId,userId,expires])
+  sql.run(`INSERT INTO ledger (id,kind,amount_milli,user_id,lease_id,at) VALUES
+    ('ldg_routing_topup','topup',12345,?,NULL,?),
+    ('ldg_routing_reserve','reserve',-1000,?,?,?)`,
+    [userId,at,userId,leaseId,at])
+}
+
 try {
   app = await createServer({ dataDir: scratch, hostname: '127.0.0.1', port: 0, heartbeatMs: 15000, tenantCacheSize: 2,
     presence: new MemoryPresence(), commit: 'test', codeSecret: crypto.randomUUID(), masterKey: crypto.getRandomValues(new Uint8Array(32)),
-    deliverCode: (_, value) => { loginCode = value } })
-  const { tenantId, userId } = await seedTenant(app.store, { target, name: '路由联验租户', platformAdmin: true })
+    now: () => now, deliverCode: (_, value) => { loginCode = value } })
+  const { tenantId, userId } = await seedTenant(app.store, { target, name: '路由联验租户', platformAdmin: true, now })
   await app.store.system.write(sql => seedCatalog(sql, userId))
   const tenant = app.store.tenant(tenantId)
+  await tenant.write(sql => seedExistingEntitlements(sql, tenantId, userId))
   const snapshot = () => ({
     modelRate: app.store.system.all('SELECT * FROM rates WHERE model_id=?', [modelId]),
     contracts: tenant.all('SELECT * FROM contract ORDER BY revision'),
-    signatures: tenant.all('SELECT revision,reason,entries_json FROM policy_signatures ORDER BY revision'),
+    policyHead: tenant.get('SELECT * FROM policy_head'),
+    signatures: tenant.all('SELECT * FROM policy_signatures ORDER BY revision'),
+    effective: tenant.all('SELECT * FROM policy_effective ORDER BY scope,subject_id'),
     applications: tenant.all('SELECT * FROM policy_device_applications ORDER BY device_id'),
     leases: tenant.all('SELECT * FROM leases ORDER BY id'),
     ledger: tenant.all('SELECT * FROM ledger ORDER BY id'),
@@ -154,6 +179,7 @@ try {
   const proposal = await pre.json()
   assert.equal(proposal.publishable, true)
   assert.deepEqual(proposal.diff.added, ['dep_b'])
+  assert.deepEqual(proposal.impact, { tenant_count:1, device_count:1 })
   assert.equal(app.store.system.get('SELECT pool_revision FROM model_pool_heads WHERE model_id=?',[modelId]).pool_revision, 6)
   assert.deepEqual(snapshot(),before)
 
