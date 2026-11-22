@@ -81,7 +81,7 @@ try {
   await link('能力管理').click()
   const reviewed = []
   const signedName = '跨渠道样例 M'
-  let modelId
+  let modelId, providerToRotate
   for (const [index, setting] of settings.entries()) {
     await button('新建 Provider').click()
     await label('名称').fill(setting.label)
@@ -89,6 +89,7 @@ try {
     await label('服务地址').fill(upstreams[index].url.href)
     await label('上游密钥').fill(setting.key)
     const provider = await submit('保存', '/platform/providers', 201)
+    if (index === 0) providerToRotate = provider
     await cell(setting.label).click()
     await right().getByRole('heading', { name: '渠道管理', exact: true }).waitFor()
     const probe = await submit('测试连通性', '/probes', 202)
@@ -209,8 +210,29 @@ try {
   await page.getByRole('table', { name: '签约模型池' }).getByRole('cell', { name: '固定本版' }).waitFor()
   const persisted = await call(contract + '/signatures/' + signature.revision)
   assert.equal(persisted.route_pools.find(row => row.model_id === modelId).pool_revision, 1)
+
+  await link('能力管理').click()
+  const source = settings[0]
+  await cell(source.label).click()
+  await button('编辑').click()
+  source.key += '-rotated'
+  await label('上游密钥').fill(source.key)
+  await submit('保存', '/platform/providers/' + providerToRotate.id, 200)
+  await cell(source.label).click()
+  const history = page.getByRole('region', { name: '历史目录（只读）' })
+  await history.getByText('共 27 个', { exact: true }).waitFor()
+  await history.getByText('此目录来自渠道修订 v' + providerToRotate.revision + '。拉取当前修订的目录后可继续归并。', { exact: true }).waitFor()
+  await button('下一页目录').click()
+  await history.getByText('z-full-directory-last', { exact: true }).waitFor()
+  await label('查询已拉取模型').fill(source.model)
+  await history.getByText(source.model, { exact: true }).waitFor()
+  assert.equal(await history.getByRole('button', { name: '归并 ' + source.model }).count(), 0)
+  assert.equal((await submit('拉取模型', '/discoveries', 202)).status, 'succeeded')
+  const refreshed = page.getByRole('region', { name: '上游发现目录' })
+  await refreshed.getByRole('button', { name: '归并 ' + source.model }).waitFor()
+  assert.equal(await history.count(), 0)
   assert.deepEqual(errors, [])
-  console.log('channel-workspace-check ok', JSON.stringify({ discovered: 28, one_to_many: 2, signed_pool: 1, multiplier: 4, balance_micro: 11150000 }))
+  console.log('channel-workspace-check ok', JSON.stringify({ discovered: 28, one_to_many: 2, signed_pool: 1, multiplier: 4, balance_micro: 11150000, historical_catalog_read_only: true }))
 } finally {
   await browser?.close()
   await app?.close()

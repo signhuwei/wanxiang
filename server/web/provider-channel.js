@@ -51,14 +51,15 @@ function describeJob(job, discovery) {
 
 function discoveryResults(host, api, job, signal, onReview) {
   const section = el('section', 'deployment-section')
-  section.setAttribute('aria-label', '上游发现目录')
+  const title = onReview ? '上游发现目录' : '历史目录（只读）'
+  section.setAttribute('aria-label', title)
   const header = el('div', 'deployment-toolbar')
   const count = el('span', 'muted')
   const search = el('input', 'search')
   search.type = 'search'
   search.placeholder = '查询上游原始型号'
   search.setAttribute('aria-label', '查询已拉取模型')
-  header.append(el('h3', null, '上游发现目录'), count, search)
+  header.append(el('h3', null, title), count, search)
   const cards = el('div', 'deployment-grid')
   const nav = el('div', 'card-pager')
   const currentPage = el('span', 'muted')
@@ -66,7 +67,13 @@ function discoveryResults(host, api, job, signal, onReview) {
   const prev = button('上一页目录', () => { if (pager.prev()) load() })
   const next = button('下一页目录', () => { if (pager.next()) load() })
   nav.append(prev, next, currentPage)
-  section.append(header, cards, nav)
+  section.append(header)
+  if (!onReview) {
+    const revision = job.scope?.provider_revision
+    const source = revision == null ? '较早的渠道修订' : '渠道修订 v' + revision
+    section.append(el('p', 'muted', '此目录来自' + source + '。拉取当前修订的目录后可继续归并。'))
+  }
+  section.append(cards, nav)
   host.replaceChildren(section)
 
   function card(row, reviewable) {
@@ -97,7 +104,8 @@ function discoveryResults(host, api, job, signal, onReview) {
       pager.applyResult(page.next_cursor ?? null)
       count.textContent = '共 ' + page.total + ' 个'
       const rows = page.items ?? []
-      cards.replaceChildren(...(rows.length ? rows.map(row => card(row, hasAction(page, 'review_candidates'))) :
+      const reviewable = Boolean(onReview) && hasAction(page, 'review_candidates')
+      cards.replaceChildren(...(rows.length ? rows.map(row => card(row, reviewable)) :
         [el('p', 'muted', q ? '没有匹配的上游型号' : '本批目录为空')]))
     } catch (error) {
       if (!requestSignal.aborted && section.isConnected) {
@@ -128,14 +136,15 @@ export function channelOperations(host, api, provider, signal, onReview) {
   const tools = el('div', 'actions')
   const summary = el('dl', 'policy-facts')
   const directory = el('div')
-  operations.append(el('h3', null, '渠道管理'), notice, tools, summary, directory)
+  operations.append(el('h3', null, '渠道管理'), notice, tools,
+    el('p', 'muted', '连通测试仅访问授权目录接口。拉取范围为当前渠道授权凭据可见的全部模型。'), summary, directory)
   host.append(operations)
-  let busy = false, lastJob, request = 0
+  let busy = false, lastDirectory, directoryController, request = 0
 
   function draw(state) {
     summary.replaceChildren()
     const descriptions = [['渠道账户', (state.accounts ?? []).map(row => row.name).join('、') || '尚未建立'],
-      ['最近连通测试', describeJob(state.latest_probe)], ['最近模型拉取', describeJob(state.latest_discovery, true)]]
+      ['最近目录连通测试', describeJob(state.latest_probe)], ['最近模型拉取', describeJob(state.latest_discovery, true)]]
     for (const [label, value] of descriptions) {
       const row = el('div')
       row.append(el('dt', null, label), el('dd', null, value))
@@ -145,11 +154,16 @@ export function channelOperations(host, api, provider, signal, onReview) {
     if (hasAction(state, 'probe_connectivity')) tools.append(button('测试连通性', () => run('probe', state.revision)))
     if (hasAction(state, 'discover')) tools.append(button('拉取模型', () => run('discovery', state.revision), 'primary'))
     tools.append(button('刷新渠道状态', () => load()))
-    const fresh = state.latest_catalog ?? (['succeeded', 'partial'].includes(state.latest_discovery?.status) ? state.latest_discovery : null)
-    if (fresh?.id && fresh.id !== lastJob) {
-      lastJob = fresh.id
-      discoveryResults(directory, api, fresh, signal, onReview)
-    }
+    const current = state.latest_catalog
+    const catalog = current ?? state.historical_catalog
+    const key = catalog ? (current ? 'current:' : 'history:') + catalog.id : null
+    if (key === lastDirectory) return
+    lastDirectory = key
+    directoryController?.abort()
+    if (!catalog) { directory.replaceChildren(); return }
+    directoryController = new AbortController()
+    const catalogSignal = AbortSignal.any([signal, directoryController.signal])
+    discoveryResults(directory, api, catalog, catalogSignal, current ? onReview : null)
   }
 
   async function load() {
@@ -167,7 +181,7 @@ export function channelOperations(host, api, provider, signal, onReview) {
     if (busy || signal.aborted) return
     busy = true
     const discovery = type === 'discovery'
-    const headline = discovery ? '拉取模型' : '连通测试'
+    const headline = discovery ? '拉取模型' : '目录连通测试'
     for (const control of tools.children) control.disabled = true
     success(notice, headline + '中…')
     try {
