@@ -312,11 +312,21 @@ details.section > summary .muted { font-weight: 400; margin-left: 8px; }
   padding: 0;
   min-width: 0;
 }
+.policy-record-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow-y: auto;
+}
+.policy-record-sections > section { flex: none; min-width: 0; }
+.policy-record-sections .table-scroll { max-height: min(29vh, 232px); }
+.policy-records-workspace > .inline-drill > .drill-context { width: clamp(104px, 13%, 128px); }
+.policy-records-workspace .drill-context :is(.balance-summary, .policy-commercial-account) { display: none; }
 .policy-contracts > .inline-drill > .drill-context { width: clamp(102px,14vw,144px); }
-.policy-contracts > .inline-drill:has(.policy-signatures .inline-drill, .policy-recharges .inline-drill) > .drill-context {
+.policy-contracts > .inline-drill:has(.policy-records-workspace > .inline-drill) > .drill-context {
   width: clamp(94px,11.75vw,120px);
 }
-.policy-contracts :is(.policy-signatures,.policy-recharges) .drill-context { width: clamp(104px,13%,128px); }
 .policy-recharges > .page { min-height: 0; }
 .policy-recharges .balance-summary { flex-wrap: wrap; gap: 8px 24px; }
 .policy-row-link { padding: 0; text-align: left; white-space: normal; overflow-wrap: anywhere; }
@@ -356,10 +366,10 @@ details.section > summary .muted { font-weight: 400; margin-left: 8px; }
   .policy-tabs { padding: 0 6px; gap: 1px; }
   .policy-tabs :is(a,button) { padding: 6px 7px; }
   .policy-contracts > .inline-drill,
-  .policy-contracts :is(.policy-signatures,.policy-recharges) .inline-drill { flex-direction: column; }
+  .policy-records-workspace > .inline-drill { flex-direction: column; }
   .policy-contracts > .inline-drill > .drill-context,
-  .policy-contracts > .inline-drill:has(.policy-signatures .inline-drill, .policy-recharges .inline-drill) > .drill-context,
-  .policy-contracts :is(.policy-signatures,.policy-recharges) .drill-context { width: 100%; border-bottom: 1px solid var(--line); }
+  .policy-contracts > .inline-drill:has(.policy-records-workspace > .inline-drill) > .drill-context,
+  .policy-records-workspace > .inline-drill > .drill-context { width: 100%; border-bottom: 1px solid var(--line); }
   .policy-contracts .drill-context .toolbar,
   .policy-contracts .drill-context .pager,
   .policy-contracts .drill-context table thead,

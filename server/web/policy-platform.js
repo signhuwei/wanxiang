@@ -5,7 +5,7 @@ import { button, detailPanel, el } from './panel.js'
 import { formatDateTime } from './format.js'
 import { previewPublisher } from './contract-controls.js'
 import { policyVersionsPage, versionEntries } from './policy-authoring.js'
-import { encode, fetchPolicyPage, hasAction, inputField, mountTabs, platformPolicy, policyValue, previewEntries, refText } from './policy-controls.js'
+import { encode, fetchPolicyPage, hasAction, inputField, platformPolicy, policyValue, previewEntries, refText } from './policy-controls.js'
 import { rechargePage } from './policy-recharge.js'
 
 const contracts = platformPolicy + '/contracts'
@@ -97,10 +97,10 @@ function signaturePreview(value, nextPage) {
   return body
 }
 
-function signaturesPage(host, api, endpoint, tenant, onChange, signal) {
+function signaturesPage(host, api, endpoint, tenant, onChange, signal, openRecord) {
   host.classList.add('policy-signatures')
   let ledger
-  const open = detailPanel(host, () => ledger)
+  const open = (title, draw) => openRecord(title, draw, ledger)
   function show(row) {
     open(row ? '合约条目 · v' + row.revision : '首次签发', async pane => {
       let data
@@ -197,21 +197,31 @@ export function platformPolicyContracts(host, api, signal) {
       const tenant = await api.get(endpoint, { signal })
       if (signal?.aborted) return
       pane.body.replaceChildren()
-      pane.body.classList.add('policy-contract-workspace')
-      const tabs = [
-        ['recharges', '充值记录', (area, tabSignal) => rechargePage(area, {
-          api, endpoint: endpoint + '/recharges', tenantName: tenant.name, balance: tenant.balance, signal: tabSignal,
-          getBalance: async () => {
-            const result = await api.get(endpoint, { signal: tabSignal })
-            tenant.balance = result.balance
-            return tenant.balance
-          },
-          account: accountPane=>commerceAccountPanel(accountPane.body,api,row.tenant_id,tabSignal),
-          onChange: pane.changed
-        })],
-        ['signatures', '签发记录', (area, tabSignal) => signaturesPage(area, api, endpoint, tenant, pane.changed, tabSignal)]
-      ]
-      mountTabs(pane.body, tabs, signal)
+      pane.body.classList.add('policy-contract-workspace', 'policy-records-workspace')
+      const sections = el('div', 'policy-record-sections')
+      const recharge = el('section'), signatures = el('section')
+      sections.append(recharge, signatures)
+      pane.body.append(sections)
+      let recordLedger
+      const drawRecord = detailPanel(pane.body, () => recordLedger)
+      const openRecord = (title, draw, ledger) => {
+        recordLedger = ledger
+        drawRecord(title, draw)
+      }
+      const refreshRecharge = rechargePage(recharge, {
+        api, endpoint: endpoint + '/recharges', tenantName: tenant.name, balance: tenant.balance, signal, openRecord,
+        getBalance: async () => {
+          const result = await api.get(endpoint, { signal })
+          tenant.balance = result.balance
+          return tenant.balance
+        },
+        account: accountPane=>commerceAccountPanel(accountPane.body,api,row.tenant_id,signal),
+        onChange: pane.changed
+      })
+      signaturesPage(signatures, api, endpoint, tenant, () => {
+        pane.changed()
+        refreshRecharge()
+      }, signal, openRecord)
     })
   }
   ledger = createLedger(host, {

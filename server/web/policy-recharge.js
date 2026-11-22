@@ -28,7 +28,7 @@ function receipt(pane, row) {
   ])
 }
 
-export function rechargePage(host, { api, endpoint, tenantName, balance, getBalance, onChange, account, signal }) {
+export function rechargePage(host, { api, endpoint, tenantName, balance, getBalance, onChange, account, signal, openRecord }) {
   host.classList.add('policy-recharges')
   const summary = el('section', 'balance-summary')
   const list = el('div')
@@ -54,8 +54,8 @@ export function rechargePage(host, { api, endpoint, tenantName, balance, getBala
   drawBalance(balance)
   if (!balance) void refreshBalance()
   let ledger
-  const drill = detailPanel(list, () => ledger)
-  if(account) host.insertBefore(button('查看商业计费',()=>drill('商业计费',account)),list)
+  const drill = openRecord ? (title, draw) => openRecord(title, draw, ledger) : detailPanel(list, () => ledger)
+  if(account) host.insertBefore(button('查看商业计费',()=>drill('商业计费',account),'policy-commercial-account'),list)
   ledger = createLedger(list, {
     title: '充值记录', searchLabel: '流水号或备注', signal, rowKey: 'ledger_id', createAction: 'topup', createLabel: '充值',
     columns: [
@@ -91,4 +91,8 @@ export function rechargePage(host, { api, endpoint, tenantName, balance, getBala
       })
     })
   })
+  return () => {
+    ledger.refresh()
+    void refreshBalance()
+  }
 }
