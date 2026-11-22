@@ -326,7 +326,8 @@ async fn applies_once_and_replays_original_receipt_until_acked() {
     // 成功回执丢失：同身份重封、整帧重复，都用原 ID 重发，通知不再出现。
     for frame in [config(91, "prj_91"), first.clone()] {
         let again = p.apply(&frame).await;
-        assert_eq!(again["id"], receipt, "{again}");
+        // 重发整帧逐字相同，Server 才按同内容重放确认。
+        assert_eq!(again, r, "{again}");
         assert_applied(&again, 91, "prj_91");
         assert!(edge.route().ready().unwrap().new_notice_ids.is_empty());
     }
@@ -364,7 +365,8 @@ async fn restart_waits_for_reseal_then_replays_persisted_receipt() {
     let edge = Edge::start(&srv.url, &store_path(&dir));
     let mut p = srv.accept().await;
     p.sample_welcome().await;
-    let receipt = p.apply(&config(91, "prj_91")).await["id"].clone();
+    let original = p.apply(&config(91, "prj_91")).await;
+    let receipt = original["id"].clone();
     edge.stop().await;
     drop(p);
 
@@ -381,7 +383,7 @@ async fn restart_waits_for_reseal_then_replays_persisted_receipt() {
     assert!(edge.labels().is_empty(), "execution gate stays closed while pending sync");
 
     let r = p.apply(&config(91, "prj_91")).await;
-    assert_eq!(r["id"], receipt);
+    assert_eq!(r, original, "restart resends the persisted receipt byte for byte");
     assert_eq!(edge.labels(), ["DeepSeek V4.1 Flash · 4×"]);
     assert!(edge.route().ready().unwrap().new_notice_ids.is_empty(), "notice already shown before restart");
     p.ack(&receipt, true).await;
@@ -476,7 +478,8 @@ async fn rejections_keep_applied_head_and_have_stable_ids() {
     let mut resent = missing.clone();
     resent["id"] = json!("cfg92_resend");
     let second = p.apply(&resent).await;
-    assert_eq!(first["id"], second["id"]);
+    // 同一拒绝 ID 的整帧逐字相同（含 error.message），否则 Server 回 conflict/receipt_changed。
+    assert_eq!(first, second);
     p.ack(&first["id"], true).await;
     p.quiet().await;
     assert_eq!(edge.ready_revision(), Some((91, "prj_91".into())));
@@ -493,7 +496,7 @@ async fn rejections_keep_applied_head_and_have_stable_ids() {
     let pending = edge.store.pending_receipt(&scope(&srv.url), 92, "prj_92").unwrap().unwrap();
     assert_eq!(pending.last_failure.as_deref(), Some("conflict"));
     let again = p.apply(&config(92, "prj_92")).await;
-    assert_eq!(again["id"], applied["id"]);
+    assert_eq!(again, applied);
     edge.stop().await;
 }
 
@@ -624,7 +627,7 @@ async fn applies_and_reseals_server_sealed_envelopes() {
     p.sample_welcome().await;
     let r = p.apply(&initial).await;
     assert_applied(&r, 91, "prj_91");
-    assert_eq!(p.apply(&resealed).await["id"], r["id"]);
+    assert_eq!(p.apply(&resealed).await, r);
     let cred = onex_core::route_pool::CredentialRef { credential_id: "cred_b".into(), credential_version: 2 };
     assert_eq!(edge.route().ready().unwrap().key(&cred), Some("fixture-inference-key-b"));
     assert_eq!(edge.labels(), ["DeepSeek V4.1 Flash · 4×"]);
