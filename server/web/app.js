@@ -206,7 +206,9 @@ function renderTop(hash) {
     account.addEventListener('focusout', e => {
       if (!account.contains(e.relatedTarget)) account.open = false
     })
-    items.append(download, tokens, logout)
+    items.append(download)
+    if (!session.tenant_password_login) items.append(tokens)
+    items.append(logout)
     account.append(summary, items)
     tools.append(account)
     top.appendChild(tools)
@@ -300,7 +302,8 @@ function route() {
   }
 
   if (hash === '#/account/tokens') {
-    personalTokensPage(ws, api, lifecycle.signal)
+    if (session.tenant_password_login) location.replace(defaultHash())
+    else personalTokensPage(ws, api, lifecycle.signal)
     return
   }
 

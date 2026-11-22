@@ -1,6 +1,7 @@
 // 真实 Server 配额联调（S2B-W2）：临时库、真实 Edge WS 握手签发并续租一笔租约，
 // 核对成员/组台账「本月已用/配额」、钻取详情的已结算/预留/剩余、个人菜单 /me.quota 与 API 返回一致。
 // 参照 workspace-check.js 的真实 Server 起法和 observe-live.js 的 Edge WS 握手写法。
+import { openCodeLogin } from './login-flow.js'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -38,6 +39,7 @@ try {
 
   async function login(target) {
     await page.goto(app.server.url.href)
+    await openCodeLogin(page)
     await page.getByPlaceholder('邮箱或手机号').fill(target)
     await button('发送验证码').click()
     await page.getByText('验证码已发送，请查收').waitFor()

@@ -1,6 +1,7 @@
 // 设备投影阶段 WebUI 验收：真实临时 Server 与隔离 SQLite，Chrome 走真实商业方案、签发和户主历史售价接口；
 // 设备目标两个接口在 Server 落地前由 routing-projection-stub.js 拦截应答。
 // 用法：bun --no-env-file server/web/tests/routing-projection-check.js [截图目录]
+import { openCodeLogin } from './login-flow.js'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -77,6 +78,7 @@ try {
   }
 
   await page.goto('/')
+  await openCodeLogin(page)
   await page.getByPlaceholder('邮箱或手机号').fill(target)
   await button('发送验证码').click()
   await page.getByText('验证码已发送，请查收').waitFor()

@@ -1,3 +1,4 @@
+import { openCodeLogin } from './login-flow.js'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -27,6 +28,7 @@ try {
   const pane = page.locator('.inline-pane').last()
   const label = name => pane.getByLabel(name, { exact: true })
   await page.goto(app.server.url.href)
+  await openCodeLogin(page)
   await page.getByPlaceholder('邮箱或手机号').fill(target)
   await button('发送验证码').click()
   await page.getByText('验证码已发送，请查收').waitFor()

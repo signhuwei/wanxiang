@@ -1,4 +1,5 @@
 // 首批真实联验：Chrome 直接使用 Server 的路由 API 和持久化模型池。
+import { openCodeLogin } from './login-flow.js'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -220,6 +221,7 @@ try {
   const link = name => page.getByRole('link', { name, exact:true })
   const document = await page.goto('/')
   assert.equal(document?.status(), 200, 'Server must serve the real WebUI at /')
+  await openCodeLogin(page)
   await page.getByPlaceholder('邮箱或手机号').fill(target)
   await button('发送验证码').click()
   await page.getByText('验证码已发送，请查收').waitFor()

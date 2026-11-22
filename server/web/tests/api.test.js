@@ -87,6 +87,16 @@ test('a rejected login stays on the form and explains the invalid credentials', 
   expect(kicked).toBe(0)
 })
 
+test('password sign-in refuses redirects and leaves the login form in place on 401', async () => {
+  const fetchImpl = fakeFetch([{ ok: false, status: 401 }])
+  let kicked = 0
+  const api = createApi({ fetchImpl, onUnauthorized: () => kicked++ })
+  const err = await api.post('/auth/password-login', {}).catch(e => e)
+  expect(err.message).toContain('租户、用户名或密码')
+  expect(fetchImpl.calls[0].opts.redirect).toBe('error')
+  expect(kicked).toBe(0)
+})
+
 test('network failure maps to a Chinese network error', async () => {
   const fetchImpl = fakeFetch([{ networkError: true }])
   const api = createApi({ fetchImpl })
