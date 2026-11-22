@@ -9,7 +9,7 @@
 | 方法和路径 | 请求及结果 |
 | --- | --- |
 | `POST /deployments/:deployment_id/quotes` | `{deployment_revision,expected_quote_revision,currency,tariff_scope:{kind:"deployment"},valid_from,valid_until?,source:{kind:"manual",reference?},reason,items:[{dimension,rate_micro,quantity_basis,unit}]}`。发布返回完整不可变报价及 `quote_id,quote_revision`。第一版的范围是明确适用于该部署及其所归账户的固定单价。 |
-| `GET /deployments/:deployment_id/quotes` | 沿用 `{items,total,next_cursor,actions}`。额外返回 `head_revision`，无发布头时为 0。传 `as_of` 时额外返回 `applicable`，命中为该版报价，缺失为 null。集合动作 `publish_quote`。 |
+| `GET /deployments/:deployment_id/quotes` | 沿用 `{items,total,next_cursor,actions}`。额外返回 `deployment_revision`（当前不可变部署修订）和 `head_revision`（报价发布头，无发布头时为 0）。传 `as_of` 时额外返回 `applicable`，命中为该版报价，缺失为 null。集合动作 `publish_quote`。 |
 | `GET /deployments/:deployment_id/quotes/:quote_id/revisions/:quote_revision` | 精确回读发布版本，核对路径部署和报价归属。条目动作 `read`。 |
 | `POST /procurement/fx-rates` | `{base_currency,quote_currency:"CNY",expected_fx_revision,rate_numerator,rate_denominator,observed_at,valid_from,valid_until,source:{kind:"manual",reference?},reason}`。返回完整版本及 `fx_revision`。 |
 | `GET /procurement/fx-rates` | 按 `base_currency` 查询到人民币的发布史。分页、`head_revision`、`as_of` 和 `applicable` 同报价。集合动作 `publish_fx_rate`。 |
@@ -17,12 +17,12 @@
 
 - 币种为三位大写 ASCII；价格和汇率整数以规范十进制字符串传输，最多 38 位。价格非负；汇率分子分母为正，方向为原币一单位可换多少人民币。人民币报价直接用 1/1。原报价无需等待汇率即可登记。
 - 维度限 `input/output/cache_read/cache_write/request`，每个维度至多一项。数量单位为 `token` 或 `request`，`quantity_basis` 为正安全整数。明确零价和缺项区分；缺项也不计作零价。单位、用途和未知字段在 Server 校验。自动采样、阶梯、分时和多资费适用性后续使用评审稿中保留的结构。
-- 期望修订比对同系列最后发布版，包括未来生效版本。有效区间采用 UTC 的左闭右开。按生效时间顺序发布；下一生效时点截断前一版本的有效查找区间，原历史行保持可回读。下一版到期后也不会自动恢复早先报价。报价当前适用性还要求准确的部署修订。
-- 报价列表和历史、汇率列表和历史均只对有读取采购权限的平台角色开放。版本关系从服务端派生。金额、汇率及凭据之外的人工说明也随采购明细留在平台。
+- 期望修订比对同系列最后发布版，包括未来生效版本。有效区间采用 UTC 的左闭右开。按生效时间顺序发布；下一生效时点截断前一版本的有效查找区间，原历史行保持可回读。下一版到期后也不会自动恢复早先报价。报价当前适用性还要求准确的部署修订。Provider 卡片的 `revision` 表示可编辑资料修订，写报价须用报价列表给出的 `deployment_revision`。
+- 报价列表和历史、汇率列表和历史均只对有读取采购权限的平台角色开放。渠道卡片增加 `read_quotes` 动作作为报价入口。版本关系从服务端派生。金额、汇率及凭据之外的人工说明也随采购明细留在平台。
 
 ## 可签输入倍率
 
-沿用现有 HTTP 评审约定的 `POST /models/:model_id/input-multiplier/preview`、`POST /models/:model_id/input-multiplier/revisions`、`GET /models/:model_id/input-multiplier/revisions/:source_rate_key`。三端沿用 `input_multiplier_basis="cny_1_per_mtok_input"`。台账增加 `current_source_rate_key`（无新版时为 null）和 `input_multiplier_ppm`（无可展示费率时为 null）。
+沿用现有 HTTP 评审约定的 `POST /models/:model_id/input-multiplier/preview`、`POST /models/:model_id/input-multiplier/revisions`、`GET /models/:model_id/input-multiplier/revisions/:source_rate_key`。三端沿用 `input_multiplier_basis="cny_1_per_mtok_input"`。台账增加 `current_source_rate_key`（无新版时为 null）和 `input_multiplier_ppm`（无可展示费率时为 null），行上的 `preview_input_multiplier` 动作控制表单入口。版本冲突详情提供当前 `current_pool_revision,current_source_rate_key`，供表单保留草稿后重算。
 
 - 预览请求 `{expected_pool_revision,expected_source_rate_key,pricing_at?,manual_input_multiplier_ppm?,reason?}`；响应含 `pricing_at,input_multiplier_basis,recommended_input_multiplier_ppm,input_multiplier_ppm,input_milli_per_mtok,calculation_status,channels,preview_basis,actions`。渠道项保留部署及其修订、报价引用、原币及金额、数量单位、汇率引用和展示换算，未得到有效值时带 `reason_code`。池资格由 Server 判断，短时冷却和余额变化不挪走仍合格的定价样本。
 - 建议取合格样本的最高普通输入价，以人民币 1 元／百万为基价，用整数或有理数计算并只在最终向上取整一次。A/B 公用样例得到 3×。手调 4× 为 `4000000` ppm、`4000` 毫橡皮／百万输入 Token。缺报价、缺汇率和过期汇率按渠道显示；存在缺项、偏离建议、手调零须附理由。输出、缓存读写保持各自独立的费率。
