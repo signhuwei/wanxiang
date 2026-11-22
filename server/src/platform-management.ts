@@ -11,6 +11,7 @@ import { modelPoolSummary } from './model-pool';
 import { modelPricingSummary } from './input-multiplier';
 import { indexMember, type Store, type Transaction } from './store';
 import { normalizeLoginName } from './tenant-passwords';
+import { channelLedgerRoutes } from './channel-ledger';
 
 const statuses = ['active', 'disabled'] as const;
 const protocols = ['anthropic', 'openai_chat', 'openai_responses'] as const;
@@ -31,6 +32,7 @@ function change(sql: Transaction, table: string, row: RecordRow, where: string, 
 }
 
 export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions) {
+  channelLedgerRoutes(app, store, opts);
   const requirePlatform = (sql: Transaction, userId: string) => {
     if (!sql.get('SELECT 1 FROM platform_admins WHERE user_id = ?', [userId])) throw new ApiError('forbidden');
   };

@@ -70,6 +70,9 @@ test('immutable plan prices survive repricing, signature replay, tenant narrowin
     const count=()=>db.get<{n:number}>('SELECT count(*) n FROM sales_rate_snapshots')!.n;
     const draft=terms(first.id,0);
     const preview=await body(await call(contract+'/preview', draft));
+    expect(preview.route_pools).toEqual([{model_id:'mdl_m',pool_revision:6,mode:'pinned',member_count:1,source_rate_key:'prate_4'}]);
+    expect((await call(contract+'/preview',{...draft,route_pools:[{model_id:'mdl_m',pool_revision:7,mode:'follow'}]})).status).toBe(422);
+    expect((await body(await call(contract+'/preview',{...draft,route_pools:[{model_id:'mdl_m',pool_revision:6,mode:'follow'}]}))).route_pools[0].mode).toBe('follow');
     expect(preview.sales_rate_snapshots).toMatchObject([{model_id:'mdl_m',source_rate_key:'prate_4',input_multiplier_ppm:4000000,...rates}]);
     expect(preview.sales_rate_snapshots[0]).not.toHaveProperty('rate_version_id');
     expect(count()).toBe(0);
@@ -89,7 +92,8 @@ test('immutable plan prices survive repricing, signature replay, tenant narrowin
     const adminHistory=await body(await call(signatureHistory,undefined,'admin-history',admin));
     expect(adminHistory.items[0].actions).toEqual(['read']);
     const tenantDetail=await body(await call(signatureHistory+'/1',undefined,'tenant-signature',tenant));
-    expect(tenantDetail).toEqual({ revision:1,issued_at:minutes(0),actions:['read'],sales_rate_snapshots:[{
+    expect(tenantDetail).toEqual({ revision:1,issued_at:minutes(0),actions:['read'],
+      route_pools:[{model_id:'mdl_m',pool_revision:6,mode:'pinned',member_count:1}],sales_rate_snapshots:[{
       rate_version_id:snapshot.rate_version_id,model_id:'mdl_m',input_multiplier_basis:'cny_1_per_mtok_input',
       input_multiplier_ppm:4000000,valid_from:minutes(0),valid_until:null,...rates,
     }] });

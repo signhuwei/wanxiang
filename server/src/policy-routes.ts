@@ -1,5 +1,6 @@
 import { refreshCommerce } from './commerce';
 import { insertSalesRateSnapshots, readSalesRateSnapshots, signatureSalesRates } from './sales-rate-snapshots';
+import { readSignedPools, signatureRoutingPools, writeSignedPools } from './signed-routing-pools';
 import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
 import { ApiError, invalid, json, operation } from './api';
@@ -109,10 +110,10 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
   function signatureView(sql:PolicyReader,tenantId:string,row:Signature) {
     const head=readHead(sql)??noPolicy;
     return {...head,...row,tenant_id:tenantId,current:row.revision===head.platform_revision,
-      sales_rate_snapshots:readSalesRateSnapshots(sql,row.revision),actions:['read','sign']};
+      sales_rate_snapshots:readSalesRateSnapshots(sql,row.revision),route_pools:readSignedPools(sql,row.revision),actions:['read','sign']};
   }
   function signingDraft(sql:PolicyReader, body:Record<string,unknown>) {
-    object(body,'body',['expected_policy_revision','expected_platform_revision','base_revision','entries','reason']);
+    object(body,'body',['expected_policy_revision','expected_platform_revision','base_revision','entries','reason','route_pools']);
     const head=readHead(sql)??noPolicy;
     expectHead(body,head);
     const base=body.base_revision===null?null:int(body.base_revision,'base_revision',1);
@@ -325,7 +326,8 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
       input_milli_per_mtok:rate.input_milli_per_mtok,output_milli_per_mtok:rate.output_milli_per_mtok,
       cache_read_milli_per_mtok:rate.cache_read_milli_per_mtok,cache_write_milli_per_mtok:rate.cache_write_milli_per_mtok,
     }));
-    return c.json({revision,issued_at:signature.issued_at,sales_rate_snapshots,actions:['read']});
+    const route_pools=readSignedPools(actor.db,revision).map(({model_id,pool_revision,mode,member_count})=>({model_id,pool_revision,mode,member_count}));
+    return c.json({revision,issued_at:signature.issued_at,sales_rate_snapshots,route_pools,actions:['read']});
   });
   app.get(`${contracts}/:tenant_id/signatures/:revision`,c=>{
     const {db,id}=platformTenant(c,opts.now());
@@ -340,8 +342,9 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
     const prospective={revision,entries,reason,issued_at:iso(at),issued_by:''};
     const current=db.get<{n:number}>("SELECT count(*) AS n FROM members WHERE status='active'")!.n;
     const affected=calculatePolicy(db,id,prospective);
+    const sales_rate_snapshots=signatureSalesRates(store,entries);
     return c.json({...head,tenant_id:id,previous_entries:readSignature(db,head.platform_revision)?.entries??[],entries,
-      sales_rate_snapshots:signatureSalesRates(store,entries),
+      sales_rate_snapshots,route_pools:signatureRoutingPools(store,sales_rate_snapshots,body.route_pools),
       impact:signatureImpact(store,db,affected,opts.dataDir,at,{devices:pagination(c),members:pagination(c,'member_cursor')}),
       seats:{limit:affected.tenant.hot.seat_limit,active:current,over_limit:Math.max(0,current-affected.tenant.hot.seat_limit)},
       revoked:affected.revised.map(({scope,subject_id,revoked})=>({scope,subject_id,revoked})),actions:['sign']});
@@ -357,7 +360,9 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
       const projection=calculatePolicy(sql,id,signature);
       sql.run('INSERT INTO policy_signatures (revision,reason,issued_by,issued_at,entries_json) VALUES (?, ?, ?, ?, ?)',
         [signature.revision,reason,actor,signature.issued_at,JSON.stringify(entries)]);
-      insertSalesRateSnapshots(sql,signature.revision,signature.issued_at,signatureSalesRates(store,entries));
+      const rates=signatureSalesRates(store,entries);
+      insertSalesRateSnapshots(sql,signature.revision,signature.issued_at,rates);
+      writeSignedPools(sql,signature.revision,signatureRoutingPools(store,rates,body.route_pools));
       const next={platform_revision:signature.revision,policy_revision:head.policy_revision+1};
       publishProjection(sql,projection,next,actor,at);
       refreshCommerce(store,id,sql,at);
