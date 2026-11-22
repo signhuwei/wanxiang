@@ -129,6 +129,13 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
             Err(RouteSelectionError::BalanceExhausted) => {
                 return err_before_headers_block(Block::Cutoff(crate::lease::CutoffReason::Balance));
             }
+            Err(RouteSelectionError::RoutePoolPending) => {
+                return err_before_headers(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    crate::router::ROUTE_POOL_PENDING_MESSAGE,
+                );
+            }
             Err(RouteSelectionError::NotFound) => {
                 return err_before_headers(
                     StatusCode::NOT_FOUND,

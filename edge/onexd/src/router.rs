@@ -133,7 +133,11 @@ pub(crate) enum RouteSelectionError {
     ReleaseNotAllowed,
     ModelNotAllowed,
     BalanceExhausted,
+    /// 模型池隔离流程中，执行等结算联验。
+    RoutePoolPending,
 }
+
+pub(crate) const ROUTE_POOL_PENDING_MESSAGE: &str = "OneX 模型池正在联验，暂不执行模型请求。";
 
 pub(crate) struct SelectedRoute {
     pub execution: Execution,
@@ -493,6 +497,10 @@ impl Router {
         protocol: AgentProtocol,
         binding: Option<&crate::state::LaunchBinding>,
     ) -> Result<SelectedRoute, RouteSelectionError> {
+        // 显式路由门禁：模型池隔离流程中不走任何上游，先于旧配置判断。
+        if self.state.route_pool_engaged() {
+            return Err(RouteSelectionError::RoutePoolPending);
+        }
         let cfg = self.state.config.read().unwrap();
         if cfg.policy_blocked
             || ((cfg.capability_contract.is_some()
@@ -729,6 +737,9 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
                 return anthropic_error(StatusCode::FORBIDDEN, "permission_error", "此模型已不在生效合约中。");
             }
             Err(RouteSelectionError::BalanceExhausted) => return block_response(Block::Cutoff(CutoffReason::Balance)),
+            Err(RouteSelectionError::RoutePoolPending) => {
+                return anthropic_error(StatusCode::FORBIDDEN, "permission_error", ROUTE_POOL_PENDING_MESSAGE);
+            }
             Err(RouteSelectionError::NotFound) => {
                 return anthropic_error(
                     StatusCode::NOT_FOUND,

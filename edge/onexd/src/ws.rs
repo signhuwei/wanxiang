@@ -11,6 +11,7 @@ use onex_core::ws::{
     Ack, BalanceMode, Config, ConfigApplied, DiagResult, ErrorBody, Hello, LeaseRenew, LeaseRequest, Msg,
     PROTOCOL_VERSION, Welcome,
 };
+// `Msg` 的 `lease`/`cutoff` 解析在模型池连接上不用：租约门禁打开时原始 JSON 交给隔离租约存储。
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
@@ -46,6 +47,9 @@ pub struct WsOptions {
     pub url: String,
     /// 只在隔离测试入口设置：声明 `route_pool.v1` 并把应用结果写入这个本地库。生产 `main.rs` 不设。
     route_pool: Option<Arc<RouteStore>>,
+    /// 只在隔离测试入口设置：模型池连接上领取、结清隔离租约（`contracts/routing-lease-gate.md`）。
+    /// 关闭时隔离连接照旧对租约回 `forbidden/route_pool_lease_pending`。
+    route_pool_leases: bool,
     pub edge_version: String,
     pub backoff_min: Duration,
     pub backoff_max: Duration,
@@ -63,6 +67,7 @@ impl WsOptions {
             url: url.into(),
             edge_version: env!("CARGO_PKG_VERSION").into(),
             route_pool: None,
+            route_pool_leases: false,
             backoff_min: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
@@ -85,6 +90,14 @@ impl WsOptions {
         self
     }
 
+    /// 隔离测试入口的租约门禁开关，默认关闭。须与 [`Self::with_route_pool_for_isolated_test`] 同用。
+    /// 租约只记在隔离租约存储里，不进生产 `Ledger`，也不打开真实模型入口。
+    #[doc(hidden)]
+    pub fn with_route_pool_leases_for_isolated_test(mut self) -> Self {
+        self.route_pool_leases = true;
+        self
+    }
+
     fn declared_capabilities(&self) -> Vec<String> {
         let mut declared: Vec<String> = DECLARED_CAPABILITIES.map(String::from).to_vec();
         if self.route_pool.is_some() {
@@ -99,6 +112,7 @@ impl std::fmt::Debug for WsOptions {
         f.debug_struct("WsOptions")
             .field("url", &self.url)
             .field("route_pool", &self.route_pool.is_some())
+            .field("route_pool_leases", &self.route_pool_leases)
             .finish_non_exhaustive()
     }
 }
@@ -359,12 +373,18 @@ async fn connected(
     let mut renew_rx = state.lease.subscribe_renew();
     let mut lease_request_rx = state.lease.subscribe_lease_request();
     let mut diagnostic_tasks = JoinSet::new();
-    // 模型池测试连接本批不领、不续租约（Server 侧对 lease_request/lease_renew 回 forbidden）。
+    // 模型池测试连接不碰生产 Ledger：不领、不续旧租约。租约门禁打开时只用隔离租约存储。
     let leases = pool.is_none();
+    let lease_gate = pool.is_some() && opts.route_pool_leases;
+    let mut pool_leases = PoolLeases::new();
     if leases {
         state.lease.on_connected();
         send_renew(state, tx).await?;
         send_lease_request(state, tx).await?;
+    }
+    // 重连时先重发在途续租；首领要等同投影的合法重封恢复视图后再发。
+    if lease_gate && let Some(p) = &pool {
+        p.drive_leases(state, tx, &mut pool_leases).await?;
     }
 
     flush(opts, outbox, tx, &mut sent, acked).await?;
@@ -404,14 +424,35 @@ async fn connected(
                     send(tx, &Msg::DiagResult(result)).await?;
                 }
             }
-            m = recv_frame(rx, &capabilities) => {
+            m = recv_frame(rx, &capabilities, lease_gate) => {
                 missed = 0;
                 let m = match m? {
                     Frame::Msg(m) => *m,
                     Frame::PoolConfig(value) => {
                         let Some(pool) = &pool else { continue };
+                        let before = state.route.read().unwrap().ready().map(|v| v.identity.clone());
                         if !pool.handle_config(state, tx, value).await? {
                             bail!("authentication changed");
+                        }
+                        let after = state.route.read().unwrap().ready().map(|v| v.identity.clone());
+                        if lease_gate {
+                            // 新应用身份：之前的门禁拒绝不再适用。
+                            if after.is_some() && after != before {
+                                pool_leases.gated = None;
+                            }
+                            pool.drive_leases(state, tx, &mut pool_leases).await?;
+                        }
+                        continue;
+                    }
+                    Frame::PoolLease(value) => {
+                        if let Some(pool) = &pool {
+                            pool.handle_lease(state, tx, &mut pool_leases, value).await?;
+                        }
+                        continue;
+                    }
+                    Frame::PoolCutoff(value) => {
+                        if let Some(pool) = &pool {
+                            pool.handle_cutoff(state, tx, &mut pool_leases, value).await?;
                         }
                         continue;
                     }
@@ -510,7 +551,18 @@ async fn connected(
                         let reply = DiagResult { id: id::new("msg"), diag_id: job.diag_id, ok: false, detail: json!({"reason": "busy"}) };
                         send(tx, &Msg::DiagResult(reply)).await?;
                     }
-                    Msg::Ack(a) if pool.as_ref().is_some_and(|p| p.handle_ack(&a)) => {}
+                    Msg::Ack(a) if pool.as_ref().is_some_and(|p| p.handle_ack(&a)) => {
+                        // 成功回执得到匹配的成功 ACK 后，才对该身份首领。
+                        if lease_gate && a.ok && let Some(p) = &pool {
+                            p.drive_leases(state, tx, &mut pool_leases).await?;
+                        }
+                    }
+                    Msg::Ack(a) if lease_gate && pool.is_some() => {
+                        let p = pool.as_ref().unwrap();
+                        if !p.handle_lease_ack(tx, &mut pool_leases, &a).await? && !a.ok {
+                            warn!(re = %a.re, error = ?a.error, "server rejected message");
+                        }
+                    }
                     Msg::Ack(Ack { re, ok: false, error }) => warn!(%re, ?error, "server rejected message"),
                     other => debug!(?other, "ignored"),
                 }
@@ -890,6 +942,303 @@ impl PoolSession {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 隔离租约（contracts/routing-lease-gate.md）。只记在 route_apply 库，不进生产 Ledger，
+// 不放行任何请求：真实模型入口在模型池流程中由 State::route_pool_engaged 一律拒绝。
+// ---------------------------------------------------------------------------
+
+/// 模型池连接上的隔离租约协调。
+struct PoolLeases {
+    /// 在途 `lease_request`：(msg id, op_id)。回复前不再发第二份。
+    request: Option<(String, String)>,
+    /// 最近一次门禁拒绝原因；新目标应用、回执确认后清除再请求。
+    gated: Option<String>,
+}
+
+impl PoolLeases {
+    fn new() -> Self {
+        Self { request: None, gated: None }
+    }
+}
+
+/// `lease` 帧里本批要核对的字段。
+struct LeaseFrame {
+    id: String,
+    re: Option<String>,
+    settled_lease_id: Option<String>,
+    lease: route_apply::PoolLease,
+}
+
+impl LeaseFrame {
+    fn parse(value: &Value) -> Option<Self> {
+        let s = |k: &str| value.get(k).and_then(Value::as_str).map(str::to_owned);
+        let expires_at_ms = crate::pricing::parse_ms(value.get("expires_at")?.as_str()?)?;
+        let model_budgets = match value.get("model_budgets") {
+            None | Some(Value::Null) => Default::default(),
+            Some(v) => serde_json::from_value(v.clone()).ok()?,
+        };
+        Some(Self {
+            id: s("id")?,
+            re: s("re"),
+            settled_lease_id: s("settled_lease_id"),
+            lease: route_apply::PoolLease {
+                lease_id: s("lease_id")?,
+                state: route_apply::PoolLeaseState::Accepted,
+                config_revision: value.get("config_revision")?.as_u64()?,
+                projection_id: s("projection_id")?,
+                signature_id: s("signature_id")?,
+                commerce_plan_id: s("commerce_plan_id"),
+                expires_at_ms,
+                budget_milli: value.get("budget_milli")?.as_i64()?,
+                model_budgets,
+            },
+        })
+    }
+}
+
+impl PoolSession {
+    /// 当前可接受租约的应用视图：Ready，且其成功回执已获得成功 ACK（含重启前持久的确认）。
+    fn acked_view(&self, state: &State) -> Option<Arc<RouteView>> {
+        let view = state.route.read().unwrap().ready().cloned()?;
+        if !self.current(state) || !view.executable() {
+            return None;
+        }
+        let acked = self.store.view_receipt_acked(&self.scope, view.identity.revision, &view.identity.projection_id);
+        acked.ok().filter(|a| *a).map(|_| view)
+    }
+
+    fn signature_of(view: &RouteView) -> (&str, Option<&str>) {
+        (view.config.route_pool.signature_id.as_str(), view.config.policy.commerce_plan_id.as_deref())
+    }
+
+    /// 首次接受：签发、方案、修订与投影 ID 必须和当前已确认应用视图精确匹配。
+    fn matches_view(lease: &route_apply::PoolLease, view: &RouteView) -> bool {
+        let (signature, plan) = Self::signature_of(view);
+        lease.signature_id == signature
+            && lease.commerce_plan_id.as_deref() == plan
+            && lease.config_revision == view.identity.revision
+            && lease.projection_id == view.identity.projection_id
+            && lease.expires_at_ms <= view.expires_at_ms
+    }
+
+    /// 已接受的租约在纯换池后继续可用：同签发、同方案、未过期，且不早于本设备不再授权的边界。
+    fn still_usable(lease: &route_apply::PoolLease, view: &RouteView) -> bool {
+        let (signature, plan) = Self::signature_of(view);
+        lease.signature_id == signature
+            && lease.commerce_plan_id.as_deref() == plan
+            && lease.config_revision <= view.identity.revision
+            && view.clock.now_ms() < lease.expires_at_ms
+    }
+
+    /// 检查是否该发续租或首领。在连接建立、回执 ACK、lease/cutoff 处理后调用。
+    async fn drive_leases(&self, state: &State, tx: &mut Tx, leases: &mut PoolLeases) -> Result<()> {
+        if !self.current(state) {
+            return Ok(());
+        }
+        // 1. 在途或待重发的续租，原样重发（同 msg id、op_id 和数值）。
+        let ops = match self.store.pending_pool_ops(&self.scope) {
+            Ok(ops) => ops,
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "could not read pending lease_renew");
+                return Ok(());
+            }
+        };
+        if let Some(op) = ops.first() {
+            send_value(tx, &op.to_frame()).await?;
+            return Ok(());
+        }
+        let Some(view) = self.acked_view(state) else { return Ok(()) };
+        // 2. 已接受但不再可用的租约：先结清。
+        if let Ok(Some(held)) = self.store.accepted_pool_lease(&self.scope) {
+            if Self::still_usable(&held, &view) {
+                return Ok(());
+            }
+            let op = self.store.begin_settlement(&self.scope, &held, self.clock.now_ms())?;
+            info!(lease_id = %held.lease_id, op_id = %op.op_id, "settling route_pool lease no longer valid for the applied view");
+            send_value(tx, &op.to_frame()).await?;
+            return Ok(());
+        }
+        // 3. 首领。门禁拒绝后等新目标应用再请求。
+        if leases.request.is_some() || leases.gated.is_some() {
+            return Ok(());
+        }
+        let request = (id::new("msg"), id::new("op"));
+        info!(op_id = %request.1, revision = view.identity.revision, "route_pool lease_request");
+        send(tx, &Msg::LeaseRequest(LeaseRequest { id: request.0.clone(), op_id: request.1.clone() })).await?;
+        leases.request = Some(request);
+        Ok(())
+    }
+
+    /// 处理租约门禁打开时的 `lease`。
+    async fn handle_lease(&self, state: &State, tx: &mut Tx, leases: &mut PoolLeases, value: Value) -> Result<()> {
+        let Some(frame) = LeaseFrame::parse(&value) else {
+            let id = value.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            send(tx, &lease_mismatch(id, "lease_fields_missing")).await?;
+            return Ok(());
+        };
+        let now = self.clock.now_ms();
+        // 本帧是对哪个在途操作的回复。
+        let op = match frame.re.as_deref() {
+            Some(re) => self.store.pending_pool_ops(&self.scope)?.into_iter().find(|op| op.msg_id == re),
+            None => None,
+        };
+        let settled = op.filter(|op| frame.settled_lease_id.as_deref() == Some(op.lease_id.as_str()));
+        if frame.re.is_some() && leases.request.as_ref().is_some_and(|(id, _)| Some(id) == frame.re.as_ref()) {
+            leases.request = None;
+        }
+        // 重申：已接受的同一份租约。
+        if let Ok(Some(existing)) = self.store.pool_lease(&self.scope, &frame.lease.lease_id) {
+            match existing.state {
+                route_apply::PoolLeaseState::Accepted => {
+                    if let Some(op) = &settled {
+                        self.store.complete_settlement(&self.scope, op, now)?;
+                    }
+                    send(tx, &ack_ok(frame.id)).await?;
+                    return self.drive_leases(state, tx, leases).await;
+                }
+                // 已拒用或已结清的租约再出现：不再接受，按其在途操作处理。
+                _ => {
+                    send(tx, &lease_mismatch(frame.id, "lease_already_closed")).await?;
+                    return self.drive_leases(state, tx, leases).await;
+                }
+            }
+        }
+        let view = self.acked_view(state);
+        let accept = view.as_ref().is_some_and(|v| Self::matches_view(&frame.lease, v));
+        if accept {
+            if let Err(e) = self.store.accept_pool_lease(&self.scope, &frame.lease, settled.as_ref(), now) {
+                warn!(error = %format!("{e:#}"), "could not persist route_pool lease; not using it");
+                return Ok(());
+            }
+            leases.gated = None;
+            info!(lease_id = %frame.lease.lease_id, revision = frame.lease.config_revision,
+                projection_id = %frame.lease.projection_id, "route_pool lease accepted (synthetic ledger only)");
+            send(tx, &ack_ok(frame.id)).await?;
+            return Ok(());
+        }
+        // 拒用：拒用标记与零用量 release_only 先落盘，再发送；失败 ACK 本身不结清。
+        let (view_revision, view_projection) = view
+            .as_ref()
+            .map(|v| (Some(v.identity.revision), Some(v.identity.projection_id.clone())))
+            .unwrap_or_default();
+        warn!(lease_id = %frame.lease.lease_id, lease_revision = frame.lease.config_revision,
+            lease_projection_id = %frame.lease.projection_id, signature_id = %frame.lease.signature_id,
+            ?view_revision, ?view_projection, "lease_projection_mismatch");
+        let op = match self.store.refuse_pool_lease(
+            &self.scope,
+            &frame.lease,
+            "lease_projection_mismatch",
+            settled.as_ref(),
+            now,
+        ) {
+            Ok(op) => op,
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "could not persist route_pool lease refusal");
+                send(tx, &lease_mismatch(frame.id, "lease_projection_mismatch")).await?;
+                return Ok(());
+            }
+        };
+        send(tx, &lease_mismatch(frame.id, "lease_projection_mismatch")).await?;
+        send_value(tx, &op.to_frame()).await?;
+        Ok(())
+    }
+
+    /// 租约门禁打开时的普通 `cutoff`：只按在途操作的 `re` 和匹配的旧租约 ID 移除结清记录。
+    async fn handle_cutoff(&self, state: &State, tx: &mut Tx, leases: &mut PoolLeases, value: Value) -> Result<()> {
+        let id = value.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let re = value.get("re").and_then(Value::as_str);
+        let settled = value.get("settled_lease_id").and_then(Value::as_str);
+        let detail = value.get("detail").and_then(|d| d.get("reason")).and_then(Value::as_str);
+        let next_lease = value.get("detail").and_then(|d| d.get("lease_id")).and_then(Value::as_str);
+        let ops = self.store.pending_pool_ops(&self.scope)?;
+        if let Some(op) = ops.iter().find(|op| Some(op.msg_id.as_str()) == re && Some(op.lease_id.as_str()) == settled)
+        {
+            self.store.complete_settlement(&self.scope, op, self.clock.now_ms())?;
+            info!(lease_id = %op.lease_id, release_only = op.release_only, reason = ?detail, "route_pool lease settled");
+        }
+        send(tx, &ack_ok(id)).await?;
+        // 重放回复里仍有待结清的后继：它是 Edge 可能从未见过的租约，按 lease_settlement_required 处理。
+        if detail == Some("successor_lease_unavailable")
+            && let Some(next) = next_lease
+        {
+            self.settle_unknown(tx, next).await?;
+            return Ok(());
+        }
+        self.drive_leases(state, tx, leases).await
+    }
+
+    /// `lease_request` 的失败 ACK。返回 true 表示已处理。
+    async fn handle_lease_ack(&self, tx: &mut Tx, leases: &mut PoolLeases, ack: &Ack) -> Result<bool> {
+        if !ack.ok && leases.request.as_ref().is_some_and(|(id, _)| id == &ack.re) {
+            leases.request = None;
+            let reason = ack
+                .error
+                .as_ref()
+                .and_then(|e| e.detail.as_ref())
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str);
+            let lease_id = ack
+                .error
+                .as_ref()
+                .and_then(|e| e.detail.as_ref())
+                .and_then(|d| d.get("lease_id"))
+                .and_then(Value::as_str);
+            match (reason, lease_id) {
+                (Some("lease_settlement_required"), Some(lease_id)) => {
+                    match self.store.pool_lease(&self.scope, lease_id)? {
+                        Some(held) if held.state == route_apply::PoolLeaseState::Accepted => {
+                            let op = self.store.begin_settlement(&self.scope, &held, self.clock.now_ms())?;
+                            send_value(tx, &op.to_frame()).await?;
+                        }
+                        _ => self.settle_unknown(tx, lease_id).await?,
+                    }
+                }
+                (reason, _) => {
+                    // projection_* 及其余：保持门禁，等新目标应用、回执确认后再请求。
+                    info!(?reason, "route_pool lease_request refused; waiting for a new applied target");
+                    leases.gated = Some(reason.unwrap_or("unknown").to_owned());
+                }
+            }
+            return Ok(true);
+        }
+        if !ack.ok
+            && let Ok(AckMatch::Recorded) = self.store.pool_op_failed(
+                &self.scope,
+                &ack.re,
+                ack.error.as_ref().map_or("unknown", |e| e.code.as_str()),
+            )
+        {
+            warn!(re = %ack.re, error = ?ack.error, "server refused lease_renew; keeping the operation for replay");
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// 结清一份 Edge 从未见过的租约。Edge 不知道它的 model_budgets，也从未用它放行过请求；
+    /// 冻结契约未给出这种形状，本批只记脱敏故障，不臆造用量。
+    async fn settle_unknown(&self, _tx: &mut Tx, lease_id: &str) -> Result<()> {
+        warn!(%lease_id, "server asks to settle a lease this device never saw; waiting for an authoritative resend");
+        Ok(())
+    }
+}
+
+fn lease_mismatch(re: String, reason: &str) -> Msg {
+    Msg::Ack(Ack {
+        re,
+        ok: false,
+        error: Some(ErrorBody {
+            code: "invalid".into(),
+            message: "租约与设备已应用的配置不符".into(),
+            detail: Some(json!({"reason": reason})),
+        }),
+    })
+}
+
+async fn send_value(tx: &mut Tx, v: &Value) -> Result<()> {
+    tx.send(Message::text(v.to_string())).await?;
+    Ok(())
+}
+
 fn note_ack(outbox: &Outbox, ack_seq: u64) -> Result<()> {
     if outbox.ack(ack_seq)? == AckOutcome::Clamped {
         warn!(ack_seq, last_seq = outbox.last_seq(), "server acked seq that was never sent");
@@ -943,6 +1292,10 @@ enum Frame {
     Unnegotiated(Unnegotiated),
     /// 已协商 `route_pool.v1` 的连接上的 `config`，保留原始 JSON 交给投影应用。
     PoolConfig(Value),
+    /// 租约门禁打开时模型池连接上的 `lease`，交给隔离租约存储。
+    PoolLease(Value),
+    /// 租约门禁打开时模型池连接上的普通 `cutoff`（不含目标撤销）。
+    PoolCutoff(Value),
     /// 已协商连接上本批不处理的帧：回失败 ACK，不改任何状态。
     PoolRefused {
         id: String,
@@ -954,13 +1307,13 @@ enum Frame {
 
 async fn recv(rx: &mut Rx) -> Result<Msg> {
     loop {
-        if let Frame::Msg(m) = recv_frame(rx, &[]).await? {
+        if let Frame::Msg(m) = recv_frame(rx, &[], false).await? {
             return Ok(*m);
         }
     }
 }
 
-async fn recv_frame(rx: &mut Rx, capabilities: &[String]) -> Result<Frame> {
+async fn recv_frame(rx: &mut Rx, capabilities: &[String], lease_gate: bool) -> Result<Frame> {
     let pool = capabilities.iter().any(|c| c == onex_core::route_pool::ROUTE_POOL_V1);
     loop {
         match rx.next().await {
@@ -981,8 +1334,12 @@ async fn recv_frame(rx: &mut Rx, capabilities: &[String]) -> Result<Frame> {
                 }
                 if pool {
                     let id = || value.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                    let targeted = onex_core::route_pool::extension_of(&value) == Some("cutoff.targets");
                     match value.get("type").and_then(Value::as_str) {
                         Some("config") => return Ok(Frame::PoolConfig(value)),
+                        // 隔离租约：交给模型池会话，决不进生产 Ledger。
+                        Some("lease") if lease_gate => return Ok(Frame::PoolLease(value)),
+                        Some("cutoff") if lease_gate && !targeted => return Ok(Frame::PoolCutoff(value)),
                         Some("lease") => {
                             return Ok(Frame::PoolRefused {
                                 id: id(),

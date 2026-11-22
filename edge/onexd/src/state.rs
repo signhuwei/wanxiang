@@ -276,10 +276,23 @@ impl State {
         self.token.send_replace(token);
     }
 
-    /// 认证结束（退出、被拒或换号）：封闭旧投影并推进代次。
+    /// 认证结束（退出、被拒或换号）：封闭旧投影并推进代次。从未进入模型池的设备保持 `None`，
+    /// 生产路径的执行判断不受影响。
     pub fn end_authentication(&self) {
-        *self.route.write().unwrap() = RouteApply::Closed;
+        {
+            let mut route = self.route.write().unwrap();
+            if !matches!(*route, RouteApply::None) {
+                *route = RouteApply::Closed;
+            }
+        }
         self.auth_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 本进程已进入 `route_pool.v1` 隔离流程。此后真实模型入口一律拒绝：联验租约只消费合成账本，
+    /// 路由执行等逐请求用量与按租约结清联验（`contracts/routing-lease-gate.md`）。残留的旧配置、
+    /// 旧密钥或旧租约都不能借此访问上游。
+    pub fn route_pool_engaged(&self) -> bool {
+        !matches!(*self.route.read().unwrap(), RouteApply::None)
     }
 
     pub fn generation(&self) -> u64 {
