@@ -36,6 +36,8 @@ export type RoutingProjectionInputs = {
   ttlMs?: number;
   /** Isolated lease gate (contracts/routing-lease-gate.md). Off by default: sessions keep route_pool_lease_pending. */
   leaseGate?: boolean;
+  /** Loopback fixture only. Billable routing requires a validated usage watermark. */
+  executionTest?: boolean;
 };
 
 export class ProjectionFailure extends Error {

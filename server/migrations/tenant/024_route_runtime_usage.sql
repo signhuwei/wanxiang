@@ -17,3 +17,4 @@ CREATE TABLE route_runtime_usage (
   UNIQUE(device_id,attempt_id),
   FOREIGN KEY(device_id,seq) REFERENCES usage(device_id,seq)
 ) STRICT;
+ALTER TABLE lease_operations ADD COLUMN usage_through_seq INTEGER CHECK (usage_through_seq >= 0);

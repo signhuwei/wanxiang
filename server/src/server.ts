@@ -55,6 +55,9 @@ type Options = {
 };
 
 export async function createServer(opts: Options) {
+  if (opts.routingProjection?.executionTest && (opts.hostname !== '127.0.0.1' || !opts.routingProjection.leaseGate)) {
+    throw new Error('The routing execution fixture requires a loopback server and the lease gate');
+  }
   const store = new Store(opts.dataDir, opts.tenantCacheSize);
   const now = opts.now ?? Date.now;
   let closeStatistics: (() => void) | undefined;

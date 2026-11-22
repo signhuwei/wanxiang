@@ -2,6 +2,7 @@ import { ulid } from 'ulid';
 import { ApiError } from './api';
 import { cutoff, deviceAllowed, issueLeaseInTransaction, leaseView, settleLease, type Cutoff, type LeaseReply, type LeaseRow } from './billing';
 import { modelBudgetWire, modelReport } from './commerce-data';
+import { settleRouteUsage } from './route-runtime-usage';
 import { iso } from './credentials';
 import { readPolicyDevice } from './policy-data';
 import { projectionStillAuthorized, type RoutePoolConfig, type RoutingProjectionInputs } from './route-projection';
@@ -114,22 +115,26 @@ export function requestRouteLease(store: Store, inputs: RoutingProjectionInputs,
   });
 }
 
-export type RenewFrame = { lease_id: string; op_id: string; used_milli: number; model_used_milli: Record<string, number> | null; release_only: boolean };
+export type RenewFrame = { lease_id: string; op_id: string; used_milli: number; model_used_milli: Record<string, number> | null; release_only: boolean;
+  usage_through_seq?: number | null };
 type RouteCutoff = Cutoff & { detail?: { reason: string; lease_id?: string } };
 const contractCutoff = (settledLeaseId: string, reason: string, leaseId?: string): RouteCutoff =>
   ({ ...cutoff('contract', settledLeaseId), detail: { reason, ...(leaseId !== undefined && { lease_id: leaseId }) } });
 
 /** Strict isolated lease_renew fields; op_id is required and release_only must be a boolean when present. */
-export function parseRenew(msg: Record<string, unknown>): RenewFrame {
+export function parseRenew(msg: Record<string, unknown>, execution = false): RenewFrame {
   const fields: string[] = [];
   const text = (value: unknown) => typeof value === 'string' && value.length > 0 && value.length <= 128;
   if (!text(msg.lease_id)) fields.push('lease_id');
   if (!text(msg.op_id)) fields.push('op_id');
   if (typeof msg.used_milli !== 'number' || !Number.isSafeInteger(msg.used_milli) || msg.used_milli < 0) fields.push('used_milli');
   if (msg.release_only !== undefined && typeof msg.release_only !== 'boolean') fields.push('release_only');
+  if (msg.usage_through_seq !== undefined && (!execution || typeof msg.usage_through_seq !== 'number' ||
+      !Number.isSafeInteger(msg.usage_through_seq) || msg.usage_through_seq < 0)) fields.push('usage_through_seq');
   if (fields.length) throw new ApiError('invalid', { fields });
   return { lease_id: msg.lease_id as string, op_id: msg.op_id as string, used_milli: msg.used_milli as number,
-    model_used_milli: modelReport(msg.model_used_milli), release_only: msg.release_only === true };
+    model_used_milli: modelReport(msg.model_used_milli), release_only: msg.release_only === true,
+    ...(msg.usage_through_seq !== undefined && {usage_through_seq: msg.usage_through_seq as number}) };
 }
 
 /**
@@ -145,10 +150,11 @@ export function renewRouteLease(store: Store, inputs: RoutingProjectionInputs, t
   const reportJson = frame.model_used_milli ? JSON.stringify(frame.model_used_milli) : null;
   return store.tenant(tenantId).write((sql): LeaseReply | RouteLease | RouteCutoff => {
     if (!live() || !deviceAllowed(store, sql, tenantId, deviceId, at)) return cutoff('disabled');
-    const cached = sql.get<{ lease_id: string; used_milli: number; result_json: string; model_used_json: string | null; mode: string }>(
-      'SELECT lease_id, used_milli, result_json, model_used_json, mode FROM lease_operations WHERE device_id = ? AND op_id = ?', [deviceId, frame.op_id]);
+    const cached = sql.get<{ lease_id: string; used_milli: number; result_json: string; model_used_json: string | null; mode: string;
+      usage_through_seq: number | null }>('SELECT lease_id, used_milli, result_json, model_used_json, mode, usage_through_seq FROM lease_operations WHERE device_id = ? AND op_id = ?', [deviceId, frame.op_id]);
     if (cached) {
-      if (cached.lease_id !== frame.lease_id || cached.used_milli !== frame.used_milli || cached.model_used_json !== reportJson || cached.mode !== mode) {
+      if (cached.lease_id !== frame.lease_id || cached.used_milli !== frame.used_milli || cached.model_used_json !== reportJson || cached.mode !== mode ||
+          cached.usage_through_seq !== (frame.usage_through_seq ?? null)) {
         throw new ApiError('conflict');
       }
       const first = JSON.parse(cached.result_json) as RouteLease | RouteCutoff;
@@ -161,6 +167,7 @@ export function renewRouteLease(store: Store, inputs: RoutingProjectionInputs, t
     const lease = sql.get<LeaseRow>('SELECT * FROM leases WHERE id = ? AND device_id = ?', [frame.lease_id, deviceId]);
     if (!lease) throw new ApiError('not_found');
     if (lease.status !== 'active') throw new ApiError('conflict');
+    if (inputs.executionTest) settleRouteUsage(sql, deviceId, lease.id, frame.usage_through_seq, frame.used_milli, frame.model_used_milli, frame.release_only);
     let response: LeaseReply | RouteLease | RouteCutoff;
     if (frame.release_only) {
       // Only a bound lease the device never accepted: zero in total and for every allocated model.
@@ -178,8 +185,8 @@ export function renewRouteLease(store: Store, inputs: RoutingProjectionInputs, t
       const gate = gateNewLease(ctx, sql);
       response = 'reason' in gate ? contractCutoff(lease.id, gate.reason) : issueBound(ctx, sql, gate.snapshot, lease.id);
     }
-    sql.run('INSERT INTO lease_operations (device_id, op_id, lease_id, used_milli, result_json, model_used_json, mode) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [deviceId, frame.op_id, lease.id, frame.used_milli, JSON.stringify(response), reportJson, mode]);
+    sql.run('INSERT INTO lease_operations (device_id, op_id, lease_id, used_milli, result_json, model_used_json, mode, usage_through_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [deviceId, frame.op_id, lease.id, frame.used_milli, JSON.stringify(response), reportJson, mode, frame.usage_through_seq ?? null]);
     return response;
   });
 }

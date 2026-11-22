@@ -6,6 +6,8 @@ import { ApiError } from './api';
 import { deviceTtl } from './auth';
 import { initialLease, renewLease, requestLease } from './billing';
 import { parseRenew, renewRouteLease, requestRouteLease } from './route-lease';
+import { appendChannelEntry } from './channel-ledger';
+import { ingestRouteUsage } from './route-runtime-usage';
 import type { DiagChannel } from './diag';
 import { ackCursor, eventItems, ingestEvents, ingestUsage, usageItems, type PublishSummary } from './ingest';
 import { int } from './management';
@@ -218,7 +220,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             return;
           }
           if (routePoolSelected && projector?.inputs.leaseGate && msg.type === 'lease_renew' && isText(msg.id)) {
-            const reply = await renewRouteLease(store, projector.inputs, tenantId, deviceId, userId, now(), live, parseRenew(msg));
+            const reply = await renewRouteLease(store, projector.inputs, tenantId, deviceId, userId, now(), live, parseRenew(msg, projector.inputs.executionTest));
             await config.balanceChanged(tenantId);
             send({ ...reply, re: msg.id });
             return;
@@ -263,7 +265,15 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             return;
           }
           if (msg.type === 'usage' && isText(msg.id)) {
-            const ack_seq = await ingestUsage(store, tenantId, deviceId, userId, now(), live, usageItems(msg.batch), publish);
+            const ack_seq = routePoolSelected && projector?.inputs.executionTest
+              ? await ingestRouteUsage(store, tenantId, deviceId, msg.batch, now(), async (charge) => {
+                await store.system.write(sql => appendChannelEntry(sql, charge.provider_id, charge.account_id, 'system:routing', now(), {
+                  kind: 'expense', currency: charge.currency, amount_micro: Number(charge.amount_micro),
+                  reference: [charge.tenant_id, charge.device_id, charge.request_id, charge.attempt_id].join('/'),
+                  note: `采购报价 ${charge.quote_id}@${charge.quote_revision}`,
+                }));
+              }, live)
+              : await ingestUsage(store, tenantId, deviceId, userId, now(), live, usageItems(msg.batch), publish);
             send({ type: 'events_ack', re: msg.id, ack_seq });
             return;
           }
