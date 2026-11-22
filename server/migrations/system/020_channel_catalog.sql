@@ -3,6 +3,7 @@ CREATE TABLE provider_channel_defaults (
   provider_id TEXT PRIMARY KEY REFERENCES providers(id),
   account_id TEXT NOT NULL,
   endpoint_id TEXT NOT NULL,
+  credential_scope TEXT NOT NULL,
   FOREIGN KEY (provider_id, account_id) REFERENCES provider_accounts(provider_id, account_id),
   FOREIGN KEY (provider_id, endpoint_id) REFERENCES provider_endpoints(provider_id, endpoint_id),
   FOREIGN KEY (account_id, endpoint_id) REFERENCES provider_account_endpoints(account_id, endpoint_id)

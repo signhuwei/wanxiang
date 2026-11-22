@@ -12,7 +12,7 @@ type Reader = Pick<Transaction, 'get' | 'all'>;
 type Provider = { id: string; revision: number; status: 'active' | 'disabled'; base_url: string; protocol: CatalogTarget['protocol'];
   auth: CatalogTarget['auth'] | null; proxy: string | null; secret_ciphertext: Uint8Array };
 type Channel = { account_id: string; endpoint_id: string; current_revision: number; protocol: CatalogTarget['protocol'];
-  base_url: string; auth_adapter: CatalogTarget['auth'] };
+  base_url: string; auth_adapter: CatalogTarget['auth']; credential_scope: string };
 type Job = { id: string; kind: 'connectivity' | 'discovery'; status: CatalogResult['status']; reason: string | null;
   provider_id: string; provider_revision: number; account_id: string; endpoint_id: string; endpoint_revision: number;
   observed_at: string; model_count: number };
@@ -35,17 +35,26 @@ function getProvider(db: Reader, id: string) {
 }
 
 function getDefault(db: Reader, id: string) {
-  return db.get<Channel>(`SELECT d.account_id, d.endpoint_id, e.current_revision, er.protocol, er.base_url, er.auth_adapter
+  return db.get<Channel>(`SELECT d.account_id, d.endpoint_id, d.credential_scope, e.current_revision, er.protocol, er.base_url, er.auth_adapter
     FROM provider_channel_defaults d JOIN provider_endpoints e ON e.endpoint_id = d.endpoint_id
     JOIN provider_endpoint_revisions er ON er.endpoint_id = e.endpoint_id AND er.endpoint_revision = e.current_revision
     WHERE d.provider_id = ?`, [id]);
 }
 
+function authFor(provider: Provider) {
+  return provider.auth ?? (provider.protocol === 'anthropic' ? 'x_api_key' : 'bearer');
+}
+
+function credentialScope(provider: Provider) {
+  return JSON.stringify([URL.parse(provider.base_url)?.origin ?? null, provider.protocol, authFor(provider)]);
+}
+
 /** Keep the default channel's stable IDs and immutable endpoint versions in sync with Provider edits. */
 export function syncProviderChannel(db: Transaction, providerId: string, at: number, credentialsChanged = false): Channel {
   const provider = getProvider(db, providerId);
-  const auth = provider.auth ?? (provider.protocol === 'anthropic' ? 'x_api_key' : 'bearer');
+  const auth = authFor(provider);
   const previous = getDefault(db, providerId);
+  const scoped = credentialsChanged || !previous ? credentialScope(provider) : previous.credential_scope;
   const now = iso(at);
   const accountId = previous?.account_id ?? `acct_${ulid()}`;
   const endpointId = previous?.endpoint_id ?? `end_${ulid()}`;
@@ -58,14 +67,19 @@ export function syncProviderChannel(db: Transaction, providerId: string, at: num
       VALUES (?, ?, ?, ?, ?)`, [endpointId, providerId, provider.status, revision, now]);
     db.run(`INSERT INTO provider_account_endpoints (provider_id, account_id, endpoint_id, state)
       VALUES (?, ?, ?, 'enabled')`, [providerId, accountId, endpointId]);
-    db.run('INSERT INTO provider_channel_defaults (provider_id, account_id, endpoint_id) VALUES (?, ?, ?)', [providerId, accountId, endpointId]);
+    db.run('INSERT INTO provider_channel_defaults (provider_id, account_id, endpoint_id, credential_scope) VALUES (?, ?, ?, ?)',
+      [providerId, accountId, endpointId, scoped]);
+  }
+  if (previous && credentialsChanged) {
+    db.run('UPDATE provider_channel_defaults SET credential_scope = ? WHERE provider_id = ?', [scoped, providerId]);
   }
   if (changed) {
     db.run(`INSERT INTO provider_endpoint_revisions (endpoint_id, endpoint_revision, protocol, base_url, fault_domain_id, auth_adapter, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)`, [endpointId, revision, provider.protocol, provider.base_url, URL.parse(provider.base_url)?.hostname ?? null, auth, now]);
   }
   if (previous) db.run('UPDATE provider_endpoints SET status = ?, current_revision = ? WHERE endpoint_id = ?', [provider.status, revision, endpointId]);
-  return { account_id: accountId, endpoint_id: endpointId, current_revision: revision, protocol: provider.protocol, base_url: provider.base_url, auth_adapter: auth };
+  return { account_id: accountId, endpoint_id: endpointId, current_revision: revision, protocol: provider.protocol, base_url: provider.base_url,
+    auth_adapter: auth, credential_scope: scoped };
 }
 
 function jobView(row: Job) {
@@ -114,16 +128,17 @@ function audit(db: Transaction, actor: string, action: string, target: string, d
     [`aud_${ulid()}`, actor, action, target, JSON.stringify(detail), at]);
 }
 
-async function observe(provider: Provider, kind: Job['kind'], masterKey: Uint8Array | undefined, send?: ProviderChannelFetch): Promise<CatalogResult> {
+async function observe(provider: Provider, channel: Channel, kind: Job['kind'], masterKey: Uint8Array | undefined, send?: ProviderChannelFetch): Promise<CatalogResult> {
   const unavailable = (reason: string): CatalogResult => ({ status: 'failed', reason, items: [] });
   if (provider.proxy && provider.proxy !== 'none') return unavailable('unsupported_proxy');
+  if (channel.credential_scope !== credentialScope(provider)) return unavailable('credential_scope_changed');
   if (!masterKey) return unavailable('missing_credential');
   let secret: Buffer;
   try { secret = decryptProviderSecret(masterKey, provider.id, provider.secret_ciphertext); }
   catch { return unavailable('missing_credential'); }
   try {
     return await discoverProviderCatalog({ protocol: provider.protocol, base_url: provider.base_url,
-      auth: provider.auth ?? (provider.protocol === 'anthropic' ? 'x_api_key' : 'bearer'), secret: secret.toString() }, kind, send);
+      auth: authFor(provider), secret: secret.toString() }, kind, send);
   } finally { secret.fill(0); }
 }
 
@@ -255,7 +270,7 @@ export function providerChannelRoutes(app: Hono, store: Store, opts: ManagementO
         if (provider.status !== 'active') throw conflict('provider_inactive');
         return { provider, channel: syncProviderChannel(db, id, at) };
       });
-      const observation = await observe(provider, kind, opts.masterKey, opts.providerChannelFetch);
+      const observation = await observe(provider, channel, kind, opts.masterKey, opts.providerChannelFetch);
       const observed = iso(opts.now());
       return store.system.write((db) => {
         requirePlatformAdmin(db, actor);

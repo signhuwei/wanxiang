@@ -28,7 +28,7 @@
 
 ### 渠道连接与拉取、型号身份和审核
 
-- `GET /providers/:provider_id/channel` 返回 `provider_id,revision,accounts,latest_probe,latest_discovery,latest_catalog,actions`。Provider 配置为其默认渠道提供稳定账号和端点，切换地址、协议、认证或密钥时新增端点修订。账号可用 `account_id,funding_id` 查阅独立的渠道账本。
+- `GET /providers/:provider_id/channel` 返回 `provider_id,revision,accounts,latest_probe,latest_discovery,latest_catalog,actions`。Provider 配置为其默认渠道提供稳定账号和端点，切换地址、协议、认证或密钥时新增端点修订。跨源或切换认证协议需要显式保存适用的密钥，连接和目录作业会在凭据作用域不匹配时返回 `credential_scope_changed`。账号可用 `account_id,funding_id` 查阅独立的渠道账本。
 - `POST /providers/:provider_id/probes` 接受 `{kind:"connectivity",revision}`，`POST /providers/:provider_id/discoveries` 接受 `{revision}`。两个操作均需幂等键，使用已登记的端点执行只读模型目录请求。返回 `202` 及已记录的 `succeeded`、`partial` 或 `failed` 结果。`GET /probe-jobs/:job_id` 回读结果，`GET /probe-jobs/:job_id/results` 按 `q,limit,cursor` 读取原始型号及目录声明。拉取处理上游分页，异常或截断显示原因，失败和部分结果保留此前的完整目录。请求和结果均保持推理密钥私密，连通测试不生成模型输出。
 - `GET/POST /models/:model_id/identity` 读取或创建初始逻辑身份，提交 `revision,maker_id,model_family,model_variant,identity_mode,model_snapshot?,capability_floor`。`POST /models/:model_id/pool/candidates/review` 接受 `{expected_identity_revision,reason,decisions:[{discovery_id,catalog_item_id,decision,capabilities}]}`，按平台管理员显式确认记录 `manual_review` 证据。固定快照的目录声明必须相符，渠道声明本身不会使候选合格。有效候选进入现有预览和池发布。
 

@@ -82,6 +82,7 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
           ? field(body.secret, 'secret', 4096) : undefined;
         if (secret !== undefined && !opts.masterKey) throw new ApiError('internal', { trace_id: `trc_${ulid()}` });
         const stored = secret === undefined ? row : { ...row, secret_ciphertext: encryptProviderSecret(opts.masterKey!, id, secret) };
+        if (previous && entry.table === 'providers') syncProviderChannel(sql, id, at);
         if (previous) change(sql, entry.table, stored, 'id = ?', [id]);
         else add(sql, entry.table, stored);
         if (entry.table === 'providers') syncProviderChannel(sql, id, at, secret !== undefined);
