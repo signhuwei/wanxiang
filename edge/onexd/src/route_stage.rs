@@ -86,6 +86,11 @@ impl Staged {
         self.keys.get(credential).map(|k| k.as_str())
     }
 
+    /// 交出配置和内存密钥，供应用视图持有。
+    pub fn into_parts(self) -> (PoolConfig, HashMap<CredentialRef, Zeroizing<String>>) {
+        (self.config, self.keys)
+    }
+
     pub fn credentials(&self) -> BTreeSet<&CredentialRef> {
         self.keys.keys().collect()
     }
@@ -236,6 +241,39 @@ fn check_rate(rate: &PoolRate) -> Result<Window, StageError> {
         (Some(from), Some(Some(until))) if from < until => Ok(Window { from, until: Some(until) }),
         _ => Err(at(StageError::invalid("rate_window_invalid"))),
     }
+}
+
+fn label_of(rate: &PoolRate) -> ModelLabel {
+    ModelLabel {
+        model_id: rate.base.model_id.clone(),
+        rate_version_id: rate.rate_version_id.clone(),
+        display_name: rate.model_display_name.clone(),
+        input_multiplier_ppm: rate.input_multiplier_ppm,
+        label: format!("{} · {}×", rate.model_display_name, format_multiplier(rate.input_multiplier_ppm)),
+    }
+}
+
+/// 已暂存配置在可信时点 `now_ms` 的型号标签：每个可执行型号取覆盖该时点的费率。
+/// 标签与费率出自同一条记录；没有当前费率的型号不出现。
+pub fn labels_at(config: &PoolConfig, now_ms: i64) -> Vec<ModelLabel> {
+    let executable: BTreeSet<&str> = config
+        .route_pool
+        .bindings
+        .iter()
+        .filter(|b| !b.deployment_ids.is_empty())
+        .map(|b| b.model_id.as_str())
+        .collect();
+    executable
+        .into_iter()
+        .filter_map(|model| {
+            config
+                .rates
+                .iter()
+                .filter(|r| r.base.model_id == model)
+                .find(|r| check_rate(r).is_ok_and(|w| w.covers(now_ms)))
+                .map(label_of)
+        })
+        .collect()
 }
 
 /// 校验一份完整 `route_pool.v1` config 并解封信封。不读写运行态。
@@ -468,13 +506,7 @@ pub fn stage(frame: &Value, input: &Input<'_>) -> Result<Staged, StageError> {
         let Some((_, rate)) = current else {
             return Err(StageError::invalid("rate_missing").at("model_id", *model));
         };
-        labels.push(ModelLabel {
-            model_id: rate.base.model_id.clone(),
-            rate_version_id: rate.rate_version_id.clone(),
-            display_name: rate.model_display_name.clone(),
-            input_multiplier_ppm: rate.input_multiplier_ppm,
-            label: format!("{} · {}×", rate.model_display_name, format_multiplier(rate.input_multiplier_ppm)),
-        });
+        labels.push(label_of(rate));
     }
 
     // 6. 信封：每个精确凭据引用恰好一个信封，不多不少，全部能解开。
@@ -944,7 +976,18 @@ mod tests {
         let overlap = edit(&|v| v["rates"].as_array_mut().unwrap().push(next("2026-11-30T00:00:00Z", 5_000_000)));
         assert_eq!(rejects(&overlap, &input(&key)), (apply_error::INVALID_CONFIG, "rate_overlap"));
         let adjacent = edit(&|v| v["rates"].as_array_mut().unwrap().push(next("2026-12-01T00:00:00Z", 5_000_000)));
-        assert_eq!(stage(&adjacent, &input(&key)).unwrap().labels[0].label, "DeepSeek V4.1 Flash · 4×");
+        let staged = stage(&adjacent, &input(&key)).unwrap();
+        assert_eq!(staged.labels[0].label, "DeepSeek V4.1 Flash · 4×");
+        // 应用后的标签按可信时点选费率：与暂存时一致，跨过边界即换成下一窗口，窗口外为空。
+        assert_eq!(labels_at(&staged.config, now()), staged.labels);
+        let boundary = parse_ms("2026-12-01T00:00:00Z").unwrap();
+        let after = labels_at(&staged.config, boundary);
+        assert_eq!(
+            (after[0].label.as_str(), after[0].rate_version_id.as_str()),
+            ("DeepSeek V4.1 Flash · 5×", "rate_m_5000000")
+        );
+        assert_eq!(labels_at(&staged.config, boundary - 1)[0].input_multiplier_ppm, 4_000_000);
+        assert!(labels_at(&staged.config, parse_ms("2027-01-01T00:00:00Z").unwrap()).is_empty());
         let later = Input { now_ms: parse_ms("2026-12-01T00:00:00Z").unwrap(), ..input(&key) };
         // 路由快照已过期时整份拒绝，不会借预发费率放行。
         assert_eq!(rejects(&adjacent, &later), (apply_error::INVALID_CONFIG, "expired"));

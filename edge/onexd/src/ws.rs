@@ -25,8 +25,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::outbox::{AckOutcome, Kind, Outbox};
-use crate::state::{ConfigSnapshot, Phase, State};
-use crate::{diagnostics, id};
+use crate::route_apply::{AckMatch, AppliedRecord, Scope, Store as RouteStore};
+use crate::state::{ConfigSnapshot, Phase, RouteApply, RouteView, SessionClock, State};
+use crate::{diagnostics, id, route_apply, route_stage};
+use onex_core::route_pool::{ApplyResult, ROUTE_POOL_V1};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Tx = SplitSink<Ws, Message>;
@@ -38,10 +40,12 @@ const CLOSE_REPLACED: u16 = 4001;
 const DECLARED_CAPABILITIES: [&str; 0] = [];
 const MISSED_PONGS: u32 = 3;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WsOptions {
     /// 完整地址，例如 `wss://onex.example.com/v1/edge/ws`。
     pub url: String,
+    /// 只在隔离测试入口设置：声明 `route_pool.v1` 并把应用结果写入这个本地库。生产 `main.rs` 不设。
+    route_pool: Option<Arc<RouteStore>>,
     pub edge_version: String,
     pub backoff_min: Duration,
     pub backoff_max: Duration,
@@ -58,6 +62,7 @@ impl WsOptions {
         Self {
             url: url.into(),
             edge_version: env!("CARGO_PKG_VERSION").into(),
+            route_pool: None,
             backoff_min: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
@@ -70,6 +75,31 @@ impl WsOptions {
     pub fn with_diagnostic_logs(mut self, directory: PathBuf, started_at: time::OffsetDateTime) -> Self {
         self.logs = Some(diagnostics::LogSource { directory, started_at });
         self
+    }
+
+    /// 隔离测试入口：本连接声明 `route_pool.v1`，按 `contracts/routing-projection.md` 应用投影并回执。
+    /// 生产握手、租约和扣费不经过这里。
+    #[doc(hidden)]
+    pub fn with_route_pool_for_isolated_test(mut self, store: Arc<RouteStore>) -> Self {
+        self.route_pool = Some(store);
+        self
+    }
+
+    fn declared_capabilities(&self) -> Vec<String> {
+        let mut declared: Vec<String> = DECLARED_CAPABILITIES.map(String::from).to_vec();
+        if self.route_pool.is_some() {
+            declared.push(ROUTE_POOL_V1.into());
+        }
+        declared
+    }
+}
+
+impl std::fmt::Debug for WsOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsOptions")
+            .field("url", &self.url)
+            .field("route_pool", &self.route_pool.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -112,6 +142,7 @@ pub async fn run(opts: WsOptions, state: Arc<State>, outbox: Arc<Outbox>, cancel
             End::Cancelled => return,
             End::Unauthenticated => {
                 warn!("server rejected device token; waiting for a new login");
+                state.end_authentication();
                 *state.config.write().unwrap() = ConfigSnapshot::default();
                 state.lease.set_commercial_plan(None);
                 state.secrets.write().unwrap().clear();
@@ -243,7 +274,7 @@ async fn handshake(opts: &WsOptions, state: &State, outbox: &Outbox, tx: &mut Tx
             config_revision: state.config_revision(),
             lease_id: state.lease.lease_id(),
             outbox_last_seq: outbox.last_seq(),
-            capabilities: DECLARED_CAPABILITIES.map(String::from).to_vec(),
+            capabilities: opts.declared_capabilities(),
         }),
     )
     .await?;
@@ -283,8 +314,14 @@ async fn connected(
     if state.expected_device_id.read().unwrap().as_ref().is_some_and(|id| id != &welcome.device_id) {
         return Err(Special::Unauthenticated.into());
     }
+    // 读 token 之后再读代次：换号时代次先推进，任一不符都视为旧登录。
+    let generation = state.generation();
     // 先于任何状态变更：welcome 选中未声明的能力时整条连接作废。
-    let capabilities = negotiated(&DECLARED_CAPABILITIES.map(String::from), welcome)?;
+    let capabilities = negotiated(&opts.declared_capabilities(), welcome)?;
+    let pool = match (&opts.route_pool, capabilities.iter().any(|c| c == ROUTE_POOL_V1)) {
+        (Some(store), true) => Some(PoolSession::start(opts, state, store, welcome, token, generation)?),
+        _ => None,
+    };
     {
         let mut config = state.config.write().unwrap();
         if config.policy.as_ref().is_some_and(|policy| !crate::policy::matches_identity(&policy.summary, welcome)) {
@@ -322,14 +359,27 @@ async fn connected(
     let mut renew_rx = state.lease.subscribe_renew();
     let mut lease_request_rx = state.lease.subscribe_lease_request();
     let mut diagnostic_tasks = JoinSet::new();
-    state.lease.on_connected();
-    send_renew(state, tx).await?;
-    send_lease_request(state, tx).await?;
+    // 模型池测试连接本批不领、不续租约（Server 侧对 lease_request/lease_renew 回 forbidden）。
+    let leases = pool.is_none();
+    if leases {
+        state.lease.on_connected();
+        send_renew(state, tx).await?;
+        send_lease_request(state, tx).await?;
+    }
 
     flush(opts, outbox, tx, &mut sent, acked).await?;
+    let mut token_rx = state.token.subscribe();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
+            // 模型池连接：登录变化立即结束本连接，旧投影已由 replace_token 封闭。
+            r = token_rx.changed(), if pool.is_some() => {
+                r.context("token closed")?;
+                if !pool.as_ref().is_some_and(|p| p.current(state)) {
+                    // 不是取消：断开后 run 按新 token 重连。
+                    bail!("authentication changed");
+                }
+            }
             _ = ticker.tick() => {
                 if missed >= MISSED_PONGS {
                     bail!("heartbeat timeout");
@@ -341,11 +391,11 @@ async fn connected(
                 r.context("outbox closed")?;
                 flush(opts, outbox, tx, &mut sent, acked).await?;
             }
-            r = renew_rx.changed() => {
+            r = renew_rx.changed(), if leases => {
                 r.context("lease closed")?;
                 send_renew(state, tx).await?;
             }
-            r = lease_request_rx.changed() => {
+            r = lease_request_rx.changed(), if leases => {
                 r.context("lease closed")?;
                 send_lease_request(state, tx).await?;
             }
@@ -357,7 +407,20 @@ async fn connected(
             m = recv_frame(rx, &capabilities) => {
                 missed = 0;
                 let m = match m? {
-                    Frame::Msg(m) => m,
+                    Frame::Msg(m) => *m,
+                    Frame::PoolConfig(value) => {
+                        let Some(pool) = &pool else { continue };
+                        if !pool.handle_config(state, tx, value).await? {
+                            bail!("authentication changed");
+                        }
+                        continue;
+                    }
+                    Frame::PoolRefused { id, code, message, reason } => {
+                        let detail = json!({"reason": reason});
+                        send(tx, &Msg::Ack(Ack { re: id, ok: false, error: Some(ErrorBody {
+                            code: code.into(), message: message.into(), detail: Some(detail) }) })).await?;
+                        continue;
+                    }
                     // 不应用配置、不发放租约、不停任何租约，只回拒绝。
                     Frame::Unnegotiated(u) => {
                         let message = match u.extension {
@@ -447,6 +510,7 @@ async fn connected(
                         let reply = DiagResult { id: id::new("msg"), diag_id: job.diag_id, ok: false, detail: json!({"reason": "busy"}) };
                         send(tx, &Msg::DiagResult(reply)).await?;
                     }
+                    Msg::Ack(a) if pool.as_ref().is_some_and(|p| p.handle_ack(&a)) => {}
                     Msg::Ack(Ack { re, ok: false, error }) => warn!(%re, ?error, "server rejected message"),
                     other => debug!(?other, "ignored"),
                 }
@@ -563,6 +627,269 @@ fn apply_config(state: &State, welcome: &Welcome, mut c: Config) -> Result<Optio
     Ok(proof)
 }
 
+/// 一条已协商 `route_pool.v1` 的连接上的设备应用（`contracts/routing-projection.md` 设备协议）。
+struct PoolSession {
+    store: Arc<RouteStore>,
+    scope: Scope,
+    tenant_id: String,
+    user_id: String,
+    device_id: String,
+    token: String,
+    generation: u64,
+    clock: SessionClock,
+}
+
+/// `config` 帧里的投影身份。拿不到时只能对原消息回普通失败 ACK。
+struct FrameIdentity {
+    revision: u64,
+    projection_id: String,
+    policy_revision: u64,
+}
+
+impl FrameIdentity {
+    fn of(value: &Value) -> Option<Self> {
+        let revision = value.get("revision")?.as_u64().filter(|r| *r > 0)?;
+        let projection_id = value.get("route_pool")?.get("projection_id")?.as_str().filter(|s| !s.is_empty())?;
+        let policy_revision = value.get("policy")?.get("policy_revision")?.as_u64()?;
+        value.get("id")?.as_str()?;
+        Some(Self { revision, projection_id: projection_id.to_owned(), policy_revision })
+    }
+}
+
+impl PoolSession {
+    /// 新会话：作用域来自本次认证，可信时间来自本次 welcome。已持久的应用索引进入待同步，
+    /// 等同投影的合法重封才恢复执行和重发成功回执。
+    fn start(
+        opts: &WsOptions,
+        state: &State,
+        store: &Arc<RouteStore>,
+        welcome: &Welcome,
+        token: &str,
+        generation: u64,
+    ) -> Result<Self> {
+        let scope = Scope::new(&opts.url, &welcome.tenant_id, &welcome.user_id, &welcome.device_id)
+            .context("server url has no origin")?;
+        let clock =
+            SessionClock::from_welcome(&welcome.server_time).context("welcome.server_time is not a valid time")?;
+        let route = match store.load(&scope) {
+            Ok(record) => {
+                let applied = record.map(|r| r.identity);
+                RouteApply::PendingSync { scope: scope.clone(), applied }
+            }
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "route apply store unreadable; staying pending sync");
+                RouteApply::PendingSync { scope: scope.clone(), applied: None }
+            }
+        };
+        if state.generation() != generation {
+            bail!(Special::Unauthenticated);
+        }
+        *state.route.write().unwrap() = route;
+        Ok(Self {
+            store: store.clone(),
+            scope,
+            tenant_id: welcome.tenant_id.clone(),
+            user_id: welcome.user_id.clone(),
+            device_id: welcome.device_id.clone(),
+            token: token.to_owned(),
+            generation,
+            clock,
+        })
+    }
+
+    /// 本连接的登录仍是当前登录。
+    fn current(&self, state: &State) -> bool {
+        state.token.borrow().as_deref() == Some(self.token.as_str()) && state.generation() == self.generation
+    }
+
+    /// 处理一帧 `config`。返回 false 表示登录已变化，连接应结束。
+    async fn handle_config(&self, state: &State, tx: &mut Tx, value: Value) -> Result<bool> {
+        if !self.current(state) {
+            return Ok(false);
+        }
+        let Some(frame) = FrameIdentity::of(&value) else {
+            let id = value.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let detail = json!({"reason": "projection_identity_unavailable"});
+            let error =
+                ErrorBody { code: "invalid_config".into(), message: "新配置无效".into(), detail: Some(detail) };
+            send(tx, &Msg::Ack(Ack { re: id, ok: false, error: Some(error) })).await?;
+            return Ok(true);
+        };
+        let record = match self.store.load(&self.scope) {
+            Ok(record) => record,
+            Err(e) => {
+                self.store_failed(state, "load", &e);
+                return Ok(true);
+            }
+        };
+        let session =
+            route_stage::Session { tenant_id: &self.tenant_id, user_id: &self.user_id, device_id: &self.device_id };
+        let input = route_stage::Input {
+            session,
+            now_ms: self.clock.now_ms(),
+            device_key: &state.device_key,
+            applied: record.as_ref().map(|r| &r.identity),
+            revocation_revision: record.as_ref().map_or(0, |r| r.revocation_revision),
+            adapters: &route_stage::SUPPORTED_ADAPTERS,
+        };
+        let staged = match route_stage::stage(&value, &input) {
+            Ok(staged) => staged,
+            Err(e) => {
+                let error = e.to_error_body();
+                let receipt = ConfigApplied {
+                    id: route_apply::rejection_id(
+                        &self.scope,
+                        frame.revision,
+                        &frame.projection_id,
+                        frame.policy_revision,
+                        &error,
+                    ),
+                    config_revision: frame.revision as i64,
+                    policy_revision: frame.policy_revision,
+                    projection_id: Some(frame.projection_id),
+                    result: Some(ApplyResult::Rejected),
+                    error: Some(error),
+                };
+                info!(
+                    revision = receipt.config_revision,
+                    code = e.code,
+                    reason = e.reason,
+                    "route_pool config rejected"
+                );
+                if let Err(err) = self.store.record_rejection(&self.scope, &receipt, self.clock.now_ms()) {
+                    warn!(error = %format!("{err:#}"), "could not record route_pool rejection");
+                }
+                if !self.current(state) {
+                    return Ok(false);
+                }
+                send(tx, &Msg::ConfigApplied(receipt)).await?;
+                return Ok(true);
+            }
+        };
+        let identity = staged.identity.clone();
+        let (policy_revision, expires_at_ms) = (staged.policy_revision, staged.expires_at_ms);
+        let (signature_id, revocation_revision, resealed) =
+            (staged.signature_id.clone(), staged.revocation_revision, staged.resealed);
+
+        if resealed {
+            // 同身份合法重封：换内存密钥并恢复执行；成功回执只在尚未得到成功 ACK 时用原 ID 重发。
+            let pending = match self.store.pending_receipt(&self.scope, identity.revision, &identity.projection_id) {
+                Ok(pending) => pending,
+                Err(e) => {
+                    self.store_failed(state, "pending_receipt", &e);
+                    return Ok(true);
+                }
+            };
+            let (config, keys) = staged.into_parts();
+            let view = RouteView {
+                scope: self.scope.clone(),
+                identity,
+                policy_revision,
+                expires_at_ms,
+                clock: self.clock,
+                config,
+                new_notice_ids: Vec::new(),
+                keys,
+            };
+            if !self.switch(state, view) {
+                return Ok(false);
+            }
+            if let Some(pending) = pending {
+                send(tx, &Msg::ConfigApplied(pending.to_message())).await?;
+            }
+            return Ok(true);
+        }
+
+        let receipt = ConfigApplied {
+            id: id::new("msg"),
+            config_revision: identity.revision as i64,
+            policy_revision,
+            projection_id: Some(identity.projection_id.clone()),
+            result: Some(ApplyResult::Applied),
+            error: None,
+        };
+        let record = AppliedRecord {
+            identity: identity.clone(),
+            policy_revision,
+            signature_id,
+            revocation_revision,
+            expires_at_ms,
+            applied_at_ms: self.clock.now_ms(),
+        };
+        let notice_ids: Vec<&str> = staged.config.policy.notices.iter().map(|n| n.id.as_str()).collect();
+        if !self.current(state) {
+            return Ok(false);
+        }
+        let fresh = match self.store.commit_applied(&self.scope, &record, &notice_ids, &receipt) {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                self.store_failed(state, "commit", &e);
+                return Ok(true);
+            }
+        };
+        let (config, keys) = staged.into_parts();
+        let view = RouteView {
+            scope: self.scope.clone(),
+            identity,
+            policy_revision,
+            expires_at_ms,
+            clock: self.clock,
+            config,
+            new_notice_ids: fresh,
+            keys,
+        };
+        if !self.switch(state, view) {
+            return Ok(false);
+        }
+        info!(revision = receipt.config_revision, projection_id = ?receipt.projection_id, "route_pool config applied");
+        send(tx, &Msg::ConfigApplied(receipt)).await?;
+        Ok(true)
+    }
+
+    /// 切换单份可执行视图。登录已变化时不切换。
+    fn switch(&self, state: &State, view: RouteView) -> bool {
+        let mut route = state.route.write().unwrap();
+        if !self.current(state) {
+            return false;
+        }
+        *route = RouteApply::Ready(Arc::new(view));
+        true
+    }
+
+    /// 本地存储失败：关闭执行门禁、保持待同步，只记脱敏故障，不发成功或拒绝。
+    fn store_failed(&self, state: &State, step: &'static str, e: &anyhow::Error) {
+        warn!(step, error = %format!("{e:#}"), "route apply store failed; staying pending sync");
+        let mut route = state.route.write().unwrap();
+        if self.current(state) {
+            *route = RouteApply::PendingSync { scope: self.scope.clone(), applied: None };
+        }
+        state.conn.lock().unwrap().last_error = Some((format!("route_apply_store:{step}"), crate::outbox::now_ms()));
+    }
+
+    /// 回执的 ACK。返回 true 表示这是本作用域的回执 ID（已处理）。
+    fn handle_ack(&self, ack: &Ack) -> bool {
+        let outcome = if ack.ok {
+            self.store.ack_ok(&self.scope, &ack.re, self.clock.now_ms())
+        } else {
+            let code = ack.error.as_ref().map_or("unknown", |e| e.code.as_str());
+            self.store.ack_failed(&self.scope, &ack.re, code)
+        };
+        match outcome {
+            Ok(AckMatch::Recorded) => {
+                if !ack.ok {
+                    warn!(re = %ack.re, error = ?ack.error, "server refused route_pool receipt; keeping it for replay");
+                }
+                true
+            }
+            Ok(AckMatch::Unknown) => false,
+            Err(e) => {
+                warn!(re = %ack.re, error = %format!("{e:#}"), "could not record route_pool receipt ack");
+                true
+            }
+        }
+    }
+}
+
 fn note_ack(outbox: &Outbox, ack_seq: u64) -> Result<()> {
     if outbox.ack(ack_seq)? == AckOutcome::Clamped {
         warn!(ack_seq, last_seq = outbox.last_seq(), "server acked seq that was never sent");
@@ -612,14 +939,23 @@ struct Unnegotiated {
 }
 
 enum Frame {
-    Msg(Msg),
+    Msg(Box<Msg>),
     Unnegotiated(Unnegotiated),
+    /// 已协商 `route_pool.v1` 的连接上的 `config`，保留原始 JSON 交给投影应用。
+    PoolConfig(Value),
+    /// 已协商连接上本批不处理的帧：回失败 ACK，不改任何状态。
+    PoolRefused {
+        id: String,
+        code: &'static str,
+        message: &'static str,
+        reason: &'static str,
+    },
 }
 
 async fn recv(rx: &mut Rx) -> Result<Msg> {
     loop {
         if let Frame::Msg(m) = recv_frame(rx, &[]).await? {
-            return Ok(m);
+            return Ok(*m);
         }
     }
 }
@@ -643,8 +979,31 @@ async fn recv_frame(rx: &mut Rx, capabilities: &[String]) -> Result<Frame> {
                     warn!(%id, extension, "server sent a route_pool extension on an unnegotiated connection");
                     return Ok(Frame::Unnegotiated(Unnegotiated { id, extension }));
                 }
+                if pool {
+                    let id = || value.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                    match value.get("type").and_then(Value::as_str) {
+                        Some("config") => return Ok(Frame::PoolConfig(value)),
+                        Some("lease") => {
+                            return Ok(Frame::PoolRefused {
+                                id: id(),
+                                code: "forbidden",
+                                message: "模型池测试连接暂不发放租约",
+                                reason: "route_pool_lease_pending",
+                            });
+                        }
+                        Some("cutoff") if onex_core::route_pool::extension_of(&value).is_some() => {
+                            return Ok(Frame::PoolRefused {
+                                id: id(),
+                                code: "unsupported_capability",
+                                message: "本批未启用目标撤销",
+                                reason: "targeted_cutoff_pending",
+                            });
+                        }
+                        _ => {}
+                    }
+                }
                 match serde_json::from_value::<Msg>(value) {
-                    Ok(m) => return Ok(Frame::Msg(m)),
+                    Ok(m) => return Ok(Frame::Msg(Box::new(m))),
                     Err(e) => warn!(error = %e, "bad frame from server"),
                 }
             }
