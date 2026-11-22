@@ -58,6 +58,10 @@ test('the joint-check server serves sealed v91, records the receipt, and resends
   expect(opened(config)).toEqual([info.inference_plaintext['cred_a@1'], info.inference_plaintext['cred_b@2']]);
   device.send({ type: 'config_applied', id: 'ca91', config_revision: 91, policy_revision: config.policy.policy_revision, projection_id: 'prj_91', result: 'applied' });
   expect(await device.nextOf('ack')).toEqual({ type: 'ack', re: 'ca91', ok: true });
+  // Without --lease-gate the isolated session keeps route_pool_lease_pending.
+  expect(info.lease_gate).toBe(false);
+  device.send({ type: 'lease_request', id: 'lr0', op_id: 'lr0' });
+  expect(await device.nextOf('ack')).toMatchObject({ re: 'lr0', ok: false, error: { code: 'forbidden', detail: { reason: 'route_pool_lease_pending' } } });
   const ledger = await (await fetch(info.ledger[0], { headers: { authorization: `Bearer ${info.platform_session}` } })).json() as any;
   expect(ledger.items).toMatchObject([{ device_id: 'dev_lin', target_config_revision: 91, applied_config_revision: 91, state: 'applied' }]);
 
@@ -86,4 +90,40 @@ test('the joint-check server serves sealed v91, records the receipt, and resends
     { device_id: 'dev_fix', state: 'offline', reason: 'target_expired', target_config_revision: 92 },
     { device_id: 'dev_lin', state: 'superseded', reason: 'pool_superseded' }]);
   expect(await rows(info.ledger[0])).toMatchObject([{ device_id: 'dev_lin', state: 'applied', applied_config_revision: 91 }]);
+}, 30_000);
+
+test('--lease-gate: no lease before the applied receipt, a bound lease after it, settlement on renew, reaffirmed after restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'onex-projection-joint-gate-'));
+  clean.push(() => rmSync(dir, { recursive: true, force: true }));
+  let { child, info } = await start(dir, ['--lease-gate']);
+  expect(info.lease_gate).toBe(true);
+  let device = edge(info, 'dev_lin');
+  await device.opened;
+  device.send({ type: 'hello', id: 'h1', edge_version: '0.1.0', os: 'darwin', arch: 'arm64', config_revision: 90, outbox_last_seq: 0, lease_id: null, ...info.hello });
+  const config = await device.nextOf('config');
+  device.send({ type: 'lease_request', id: 'lr1', op_id: 'lr1' });
+  expect(await device.nextOf('ack')).toMatchObject({ re: 'lr1', ok: false, error: { code: 'forbidden', detail: { reason: 'projection_not_applied' } } });
+  device.send({ type: 'config_applied', id: 'ca91', config_revision: 91, policy_revision: config.policy.policy_revision, projection_id: 'prj_91', result: 'applied' });
+  expect(await device.nextOf('ack')).toEqual({ type: 'ack', re: 'ca91', ok: true });
+  device.send({ type: 'lease_request', id: 'lr2', op_id: 'lr2' });
+  const lease = await device.nextOf('lease');
+  expect(lease).toMatchObject({ re: 'lr2', signature_id: 'sig_1', config_revision: 91, projection_id: 'prj_91' });
+  const used = (n: number) => lease.model_budgets ? Object.fromEntries(Object.keys(lease.model_budgets).map((m, i) => [m, i ? 0 : n])) : undefined;
+  device.send({ type: 'lease_renew', id: 'rn1', op_id: 'rn1', lease_id: lease.lease_id, used_milli: 3, model_used_milli: used(3) });
+  const successor = await device.nextOf('lease');
+  expect(successor).toMatchObject({ re: 'rn1', settled_lease_id: lease.lease_id, config_revision: 91, projection_id: 'prj_91' });
+
+  device.close();
+  child.kill('SIGTERM');
+  expect(await child.exited).toBe(0);
+  ({ child, info } = await start(dir, ['--lease-gate']));
+  device = edge(info, 'dev_lin');
+  await device.opened;
+  device.send({ type: 'hello', id: 'h2', edge_version: '0.1.0', os: 'darwin', arch: 'arm64', config_revision: 91, outbox_last_seq: 0, lease_id: successor.lease_id, ...info.hello });
+  await device.nextOf('config');
+  device.send({ type: 'lease_request', id: 'lr3', op_id: 'lr3' });
+  expect(await device.nextOf('lease')).toMatchObject({ re: 'lr3', lease_id: successor.lease_id, config_revision: 91 });
+  // The lost renew reply replays the same successor without a second settlement.
+  device.send({ type: 'lease_renew', id: 'rn1b', op_id: 'rn1', lease_id: lease.lease_id, used_milli: 3, model_used_milli: used(3) });
+  expect(await device.nextOf('lease')).toMatchObject({ re: 'rn1b', lease_id: successor.lease_id, settled_lease_id: lease.lease_id });
 }, 30_000);

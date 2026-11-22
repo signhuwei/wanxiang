@@ -33,8 +33,26 @@ HTTP 和 WS 共用。HTTP 返回 `{"error": {"code": "...", "message": "...", "d
 | `config_applied` 的 ack | `conflict` | `projection_mismatch` | 修订存在，但投影 ID 不是持久目标的投影 |
 | `config_applied` 的 ack | `conflict` | `policy_revision_mismatch` | 策略修订与持久目标不一致 |
 | `config_applied` 的 ack | `forbidden` | `device_unavailable` | 设备、成员或租户已停用，回执不入库 |
-| `lease_request`/`lease_renew` 的 ack | `forbidden` | `route_pool_lease_pending` | 隔离测试会话不发放也不续租旧租约 |
+| `lease_request`/`lease_renew` 的 ack | `forbidden` | `route_pool_lease_pending` | 隔离测试会话未打开租约门禁（默认），不发放也不续租 |
 | hello、`lease_*`、`config_applied` 的 ack | `unsupported_capability` | `route_pool_required` | 设备已登记隔离投影但 hello 缺能力；同时下发 `cutoff{reason:"contract"}`，不走旧发租和旧配置 |
+
+### 已应用投影与租约
+
+租约门禁（[已应用投影与租约](routing-lease-gate.md)）只在测试注入 `leaseGate` 的隔离会话中生效。`lease_request` 被拒时回 `ack{ok:false,error:{code:"forbidden",detail:{reason}}}`，不写预留；`lease_renew` 结清后没有可用后继时回 `cutoff{reason:"contract",settled_lease_id,detail:{reason,lease_id?}}`，门禁原因与 `lease_request` 相同。
+
+| `detail.reason` | 含义 |
+| --- | --- |
+| `projection_not_applied` | 本设备没有已应用头，或头缺本设备的持久快照、已确认的 `applied` 回执 |
+| `projection_signature_stale` | 已应用投影的签发不是当前签发 |
+| `projection_plan_changed` | 已应用投影的收费方案不是当前有效方案 |
+| `projection_revoked` | 已应用投影的撤销修订低于当前撤销修订 |
+| `projection_expired` | 已应用投影已过 `valid_until` |
+| `projection_authorization_changed` | 当前有效授权不再覆盖投影：模型、Agent 绑定及精确发行（含发行停用、OS/arch）、渠道收紧、凭据版本，或投影时池版本中的部署已不合格 |
+| `lease_settlement_required` | 仅 `lease_request`：活跃租约过期、无投影关联、签发或方案变化或失去授权，须先续租结清；`detail.lease_id` 给出该租约 |
+| `successor_lease_unavailable` | 仅续租重放：旧租约已结清，缓存的后继已失效；后继仍待结清时附 `detail.lease_id` |
+| `lease_released` | 仅 `release_only:true`：拒用租约按零用量结清、释放预留，不发后继 |
+
+`lease_renew` 另有：同 `op_id` 的 `lease_id`、`used_milli`、规范化 `model_used_milli` 或模式不同回 `conflict`；`release_only` 用于无投影关联的租约、非零 `used_milli` 或分模型明细不为逐型号零时回 `invalid` 并在 `detail.fields` 列出字段；旧协议会话带 `release_only` 一律回 `invalid`（`fields:["release_only"]`），生产入口不启用。
 
 目标台账 `reason` 另含：`awaiting_receipt`（已发送、等待回执）、`not_projected`（名册已登记、目标尚未生成）、`device_offline`、`pool_superseded`（跟随目标已被更新池取代）、`unsupported_capability`，以及投影先决条件或重发复核的失败原因 `missing_route_credential`、`missing_sales_rate`、`sales_rate_outside_window`、`signature_changed`、`agent_release_unavailable`、`no_eligible_deployment`、`no_active_pool`、`pool_revision_missing`、`device_unavailable`、`target_expired`、`revocation_changed`、`authorization_changed`。设备拒绝时为脱敏的 `error.detail.reason`。先决条件失败和重发复核失败不算设备拒绝。
 
