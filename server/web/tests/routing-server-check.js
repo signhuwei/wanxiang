@@ -164,6 +164,21 @@ async function verifySignatureKeepsItsRate(token, tenantId, priced) {
   assert.notEqual(nextPublished.source_rate_key, frozen.source_rate_key)
   const prior = await call(contract + '/signatures/2')
   assert.deepEqual(prior.sales_rate_snapshots, [frozen])
+
+  const tenantSession = await fetch(new URL('/v1/auth/select-tenant', app.server.url), {
+    method:'POST', headers:{ Authorization:'Bearer ' + token,'Content-Type':'application/json' },
+    body:JSON.stringify({ tenant_id:tenantId,kind:'web' }),
+  })
+  assert.equal(tenantSession.status, 200)
+  const selected = await tenantSession.json()
+  const tenantResponse = await fetch(new URL('/v1/policy/signatures/2', app.server.url), {
+    headers:{ Authorization:'Bearer ' + selected.token },
+  })
+  assert.equal(tenantResponse.status, 200)
+  const [tenantRate] = (await tenantResponse.json()).sales_rate_snapshots
+  assert.equal(tenantRate.rate_version_id, frozen.rate_version_id)
+  assert.equal(tenantRate.input_multiplier_ppm, 4000000)
+  assert.equal(Object.hasOwn(tenantRate,'source_rate_key'),false)
 }
 
 try {
