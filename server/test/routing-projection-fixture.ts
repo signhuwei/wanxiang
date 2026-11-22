@@ -73,9 +73,10 @@ export async function seedProjection(store: Store, dir: string, now: () => numbe
     terms: { model_prices: [{ model_id: 'mdl_m', source_rate_key: 'prate_m_12' }], monthly_grant_milli: 500 } });
   ok(plan.status === 201, `commerce plan failed: ${plan.status}`);
   const planId = (await plan.json() as { id: string }).id;
+  const entries = [['access.models', ['mdl_m']], ['access.agents', ['codex']], ['billing.plan', [planId]], ['lease.budget', 100000]]
+    .map(([id, adjustment]) => ({ template_ref: null, clause_ref: { id, version: 1 }, adjustment }));
   const signed = await call(`/platform/policy/contracts/${tenantId}/signatures`, { expected_platform_revision: 0, expected_policy_revision: 0,
-    base_revision: null, reason: 'routing projection', entries: [['access.models', ['mdl_m']], ['access.agents', ['codex']], ['billing.plan', [planId]], ['lease.budget', 100000]]
-      .map(([id, adjustment]) => ({ template_ref: null, clause_ref: { id, version: 1 }, adjustment })) });
+    base_revision: null, reason: 'routing projection', entries });
   ok(signed.status === 201, `signature failed: ${signed.status}`);
   const signature = await signed.json() as { sales_rate_snapshots: Record<string, any>[] };
 
@@ -96,8 +97,23 @@ export async function seedProjection(store: Store, dir: string, now: () => numbe
     selectRoutePool: (tenant, device) => selected(tenant, device),
     projectionId: () => `prj_${++projectionSeq}`,
   };
-  return { db, tenantId, userId, pinnedUser, platform, tokens, signature, inputs, publicKey,
+  return { db, tenantId, userId, pinnedUser, platform, tokens, signature, inputs, publicKey, planId,
     setGrants: (next: RouteGrant[]) => { grants = next; },
     setRevocation: (next: number) => { revocation = next; },
-    setSelection: (next: (tenant: string, device: string) => boolean) => { selected = next; } };
+    setSelection: (next: (tenant: string, device: string) => boolean) => { selected = next; },
+    /** Test-only: rewrites a member's effective hot policy (group/member narrowing, plan assignment) in place. */
+    patchHot: (user: string, patch: Record<string, unknown>) => db.write(sql => {
+      const row = sql.get<{ document_json: string }>("SELECT document_json FROM policy_effective WHERE scope = 'member' AND subject_id = ?", [user])!;
+      const document = JSON.parse(row.document_json);
+      document.hot = { ...document.hot, ...patch };
+      sql.run("UPDATE policy_effective SET document_json = ? WHERE scope = 'member' AND subject_id = ?", [JSON.stringify(document), user]);
+    }),
+    /** Signs the next platform revision with the same clauses through the real signature API. */
+    resign: async () => {
+      const head = db.get<{ platform_revision: number; policy_revision: number }>('SELECT platform_revision, policy_revision FROM policy_head WHERE id = 1')!;
+      const response = await call(`/platform/policy/contracts/${tenantId}/signatures`, { expected_platform_revision: head.platform_revision,
+        expected_policy_revision: head.policy_revision, base_revision: head.platform_revision, reason: 'routing projection resign', entries });
+      ok(response.status === 201, `resign failed: ${response.status} ${await response.text()}`);
+      return head.platform_revision + 1;
+    } };
 }

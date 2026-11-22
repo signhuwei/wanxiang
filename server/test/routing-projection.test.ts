@@ -197,7 +197,7 @@ test('tenants without grants keep their current configuration and the roster ign
   await expect(f.projector.project(f.tenantId, 'dev_lin', clock)).rejects.toMatchObject({ reason: 'signature_changed' });
 });
 
-test('existing tenant 20 and system 17 databases upgrade to 21 and 19 with the legacy application head intact', () => {
+test('existing tenant 20 and system 17 databases upgrade with the legacy application head intact', () => {
   const dir = mkdtempSync(join(tmpdir(), 'onex-projection-upgrade-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   const tenantId = 'ten_00000000000000000000000001';
@@ -219,8 +219,8 @@ test('existing tenant 20 and system 17 databases upgrade to 21 and 19 with the l
   const tenant = new QueuedDatabase(join(dir, `tenant-${tenantId}.sqlite`), 'tenant');
   const system = new QueuedDatabase(join(dir, 'system.sqlite'), 'system');
   try {
-    expect(tenant.get('PRAGMA user_version')).toEqual({ user_version: 21 });
-    expect(system.get('PRAGMA user_version')).toEqual({ user_version: 19 });
+    expect(tenant.get('PRAGMA user_version')).toEqual({ user_version: 23 });
+    expect(system.get('PRAGMA user_version')).toEqual({ user_version: 21 });
     expect(tenant.get('SELECT device_id, config_revision, policy_revision, projection_id FROM policy_device_applications'))
       .toEqual({ device_id: 'dev_old', config_revision: 40, policy_revision: 3, projection_id: null });
     for (const db of [tenant, system]) {

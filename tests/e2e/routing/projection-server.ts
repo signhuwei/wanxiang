@@ -2,7 +2,7 @@
 // Synthetic data only: A/B supply, a real 4× signature, device key 0x07 × 32 and fixture inference material.
 // Never point it at production data, keys or hosts.
 //
-//   bun --no-env-file tests/e2e/routing/projection-server.ts [--port 18790] [--data-dir DIR] [--unregistered dev_fix] [--now ISO]
+//   bun --no-env-file tests/e2e/routing/projection-server.ts [--port 18790] [--data-dir DIR] [--unregistered dev_fix] [--now ISO] [--lease-gate]
 //
 // Prints one JSON line with URLs, device tokens and keys, then serves until SIGINT/SIGTERM.
 // Restart check: stop it and start again with the same --data-dir; persisted targets are resealed and resent.
@@ -24,6 +24,7 @@ const unregistered = new Set((arg('--unregistered') ?? '').split(',').filter(Boo
 // --now ISO moves the fixed Server clock; use it only when restarting an already seeded --data-dir
 // (for example 2026-11-22T02:11:00Z shows lapsed unapplied targets as target_expired).
 const nowArg = arg('--now');
+const leaseGate = argv.includes('--lease-gate');
 const serverNow = nowArg ? Date.parse(nowArg) : clock;
 if (!Number.isFinite(serverNow)) throw new Error('--now must be an ISO timestamp');
 const statePath = join(dir, 'projection-fixture.json');
@@ -43,6 +44,8 @@ const inputs: RoutingProjectionInputs = {
   selectRoutePool: (_tenant, device) => !unregistered.has(device),
   // First run reproduces prj_91 / prj_92; restarts use generated ids so a regenerated target never collides.
   projectionId: () => seededInputs?.projectionId?.() ?? `prj_${crypto.randomUUID().replaceAll('-', '')}`,
+  // --lease-gate opens the isolated lease gate (contracts/routing-lease-gate.md); without it lease frames get route_pool_lease_pending.
+  leaseGate,
 };
 
 const service = await createServer({ dataDir: dir, hostname: '127.0.0.1', port: Number(arg('--port') ?? 0), tenantCacheSize: 4,
@@ -63,6 +66,7 @@ if (!state) {
 const http = service.server.url.toString().replace(/\/$/, '');
 console.log(JSON.stringify({
   http_url: http, ws_url: http.replace(/^http/, 'ws') + '/v1/edge/ws', data_dir: dir, server_time: new Date(serverNow).toISOString(),
+  lease_gate: leaseGate,
   tenant_id: state.tenant_id,
   devices: {
     dev_lin: { token: state.tokens.dev_lin, user_id: state.user_id, registered: !unregistered.has('dev_lin'), grant: 'follow v7 (dep_a, dep_b)', config_revision: 91 },
