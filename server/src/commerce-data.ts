@@ -6,11 +6,12 @@ import type { Store, Transaction } from './store';
 
 export const rateKeys = ['input_milli_per_mtok', 'output_milli_per_mtok', 'cache_read_milli_per_mtok', 'cache_write_milli_per_mtok'] as const;
 export const tiers = ['floor', 'standard', 'pro', 'advanced', 'top'] as const;
-type Rate = Record<(typeof rateKeys)[number], number>;
+export type ModelRate = Record<(typeof rateKeys)[number], number>;
+type ModelPrice = ModelRate & { model_id: string; source_rate_key?: string };
 export type Terms = {
   monthly_grant_milli: number; monthly_fee_fen: number;
   tiers: { from_milli: number; ratio_ppm: number }[]; commitment: { up_to_milli: number; ratio_ppm: number } | null;
-  model_prices: ({ model_id: string } & Rate)[]; model_budgets: { model_id: string; monthly_milli: number }[];
+  model_prices: ModelPrice[]; model_budgets: { model_id: string; monthly_milli: number }[];
   tool_prices: { release_id: string; per_call_milli: number }[];
 };
 export type Plan = { id: string; plan_id: string; version: number; name: string; terms: Terms; created_at: string; created_by: string };
@@ -31,6 +32,33 @@ export function modelId(sql: Get, id: unknown) {
   if (typeof id !== 'string' || !sql.get('SELECT 1 FROM models WHERE id=?', [id])) invalid('model_id');
   return id;
 }
+function fourRates(value: Record<string, unknown>): ModelRate {
+  return Object.fromEntries(rateKeys.map(key => [key, int(value[key], key)])) as ModelRate;
+}
+
+export function inputMultiplierPpm(inputMilliPerMtok: number) {
+  return int(inputMilliPerMtok * 1000, 'input_multiplier_ppm');
+}
+
+function parseModelPrice(sql: Get, row: Record<string, unknown>): ModelPrice {
+  const model_id = modelId(sql, row.model_id);
+  const key = row.source_rate_key;
+  if (key === undefined) {
+    const rates = fourRates(row);
+    inputMultiplierPpm(rates.input_milli_per_mtok);
+    return { model_id, ...rates };
+  }
+  if (typeof key !== 'string' || !key.length || key.length > 128) invalid('source_rate_key');
+  const source = sql.get<ModelRate>(`SELECT ${rateKeys.join(', ')} FROM platform_rate_versions
+    WHERE model_id = ? AND source_rate_key = ? AND status = 'available_to_sign'`, [model_id, key]);
+  if (!source) invalid('source_rate_key');
+  const supplied = rateKeys.filter(field => Object.hasOwn(row, field)).length;
+  if (supplied !== 0 && supplied !== rateKeys.length) invalid('model_prices');
+  const rates = fourRates(supplied ? row : source);
+  inputMultiplierPpm(rates.input_milli_per_mtok);
+  return { model_id, source_rate_key: key, ...rates };
+}
+
 export function parseTerms(sql: Get, value: unknown): Terms {
   const t = record(value, 'terms');
   const allowed = ['monthly_grant_milli', 'monthly_fee_fen', 'tiers', 'commitment', 'model_prices', 'model_budgets', 'tool_prices'];
@@ -42,10 +70,7 @@ export function parseTerms(sql: Get, value: unknown): Terms {
   return {
     monthly_grant_milli: int(t.monthly_grant_milli ?? 0, 'monthly_grant_milli'), monthly_fee_fen: int(t.monthly_fee_fen ?? 0, 'monthly_fee_fen'), tiers: levels,
     commitment: commitment && { up_to_milli: int(commitment.up_to_milli, 'up_to_milli', 1), ratio_ppm: int(commitment.ratio_ppm, 'ratio_ppm', 0, 1_000_000) },
-    model_prices: rows(t.model_prices ?? [], 'model_prices', r => ({
-      model_id: modelId(sql, r.model_id),
-      ...Object.fromEntries(rateKeys.map(k => [k, int(r[k], k)])) as Rate
-    }), r => r.model_id),
+    model_prices: rows(t.model_prices ?? [], 'model_prices', row => parseModelPrice(sql, row), row => row.model_id),
     model_budgets: rows(t.model_budgets ?? [], 'model_budgets', r => ({ model_id: modelId(sql, r.model_id), monthly_milli: int(r.monthly_milli, 'monthly_milli') }), r => r.model_id),
     tool_prices: rows(t.tool_prices ?? [], 'tool_prices', r => {
       if (typeof r.release_id !== 'string' || !sql.get("SELECT 1 FROM tool_releases WHERE id=? AND status='published' AND kind IN ('mcp','http_search')", [r.release_id])) invalid('release_id');
@@ -64,7 +89,11 @@ export function commerceCatalog(sql: PolicyReader) {
 }
 export function commerceRates<T extends { model_id: string }>(store: Store, policy: CommercialPolicy | null, rates: T[]): T[] {
   const prices = readPlan(store, policy)?.terms.model_prices;
-  return prices?.length ? rates.map(r => ({ ...r, ...prices.find(p => p.model_id === r.model_id) })) : rates;
+  if (!prices?.length) return rates;
+  return rates.map(rate => {
+    const negotiated = prices.find(price => price.model_id === rate.model_id);
+    return negotiated ? { ...rate, ...fourRates(negotiated) } : rate;
+  });
 }
 type Tier = { model_id: string; tier: typeof tiers[number] };
 export function parseTiers(sql: Get, body: Record<string, unknown>) {

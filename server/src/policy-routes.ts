@@ -1,4 +1,5 @@
 import { refreshCommerce } from './commerce';
+import { insertSalesRateSnapshots, readSalesRateSnapshots, signatureSalesRates } from './sales-rate-snapshots';
 import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
 import { ApiError, invalid, json, operation } from './api';
@@ -107,7 +108,8 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
   }
   function signatureView(sql:PolicyReader,tenantId:string,row:Signature) {
     const head=readHead(sql)??noPolicy;
-    return {...head,...row,tenant_id:tenantId,current:row.revision===head.platform_revision,actions:['read','sign']};
+    return {...head,...row,tenant_id:tenantId,current:row.revision===head.platform_revision,
+      sales_rate_snapshots:readSalesRateSnapshots(sql,row.revision),actions:['read','sign']};
   }
   function signingDraft(sql:PolicyReader, body:Record<string,unknown>) {
     object(body,'body',['expected_policy_revision','expected_platform_revision','base_revision','entries','reason']);
@@ -323,6 +325,7 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
     const current=db.get<{n:number}>("SELECT count(*) AS n FROM members WHERE status='active'")!.n;
     const affected=calculatePolicy(db,id,prospective);
     return c.json({...head,tenant_id:id,previous_entries:readSignature(db,head.platform_revision)?.entries??[],entries,
+      sales_rate_snapshots:signatureSalesRates(store,entries),
       impact:signatureImpact(store,db,affected,opts.dataDir,at,{devices:pagination(c),members:pagination(c,'member_cursor')}),
       seats:{limit:affected.tenant.hot.seat_limit,active:current,over_limit:Math.max(0,current-affected.tenant.hot.seat_limit)},
       revoked:affected.revised.map(({scope,subject_id,revoked})=>({scope,subject_id,revoked})),actions:['sign']});
@@ -338,6 +341,7 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
       const projection=calculatePolicy(sql,id,signature);
       sql.run('INSERT INTO policy_signatures (revision,reason,issued_by,issued_at,entries_json) VALUES (?, ?, ?, ?, ?)',
         [signature.revision,reason,actor,signature.issued_at,JSON.stringify(entries)]);
+      insertSalesRateSnapshots(sql,signature.revision,signature.issued_at,signatureSalesRates(store,entries));
       const next={platform_revision:signature.revision,policy_revision:head.policy_revision+1};
       publishProjection(sql,projection,next,actor,at);
       refreshCommerce(store,id,sql,at);

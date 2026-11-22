@@ -227,10 +227,19 @@ const impactRow=object({device_id:text,user_id:text,os:text,arch:text,applied_po
   changed_clauses:listItems(text),unavailable:listItems(object({resource_id:text,reason:text}))});
 const impactMember = object({user_id:text,name:text,changed_clauses:listItems(text),device_count:sequence});
 const priceFields={input_milli_per_mtok:sequence,output_milli_per_mtok:sequence,cache_read_milli_per_mtok:sequence,cache_write_milli_per_mtok:sequence};
-const commerceTerms=object({monthly_grant_milli:sequence,monthly_fee_fen:sequence,
+const modelPrice = object({model_id:text,source_rate_key:text,...priceFields}, ['model_id',...Object.keys(priceFields)]);
+const salesRateFields = {model_id:text,commerce_plan_id:text,source_rate_key:nullableText,terms_digest:text,...priceFields,
+  input_multiplier_basis:{const:'cny_1_per_mtok_input'},input_multiplier_ppm:sequence};
+const signedSalesRates = listItems(object({...salesRateFields,rate_version_id:text,platform_revision:revision,
+  valid_from:timestamp,valid_until:nullable(timestamp)}));
+const commerceFields={monthly_grant_milli:sequence,monthly_fee_fen:sequence,
   tiers:listItems(object({from_milli:sequence,ratio_ppm:sequence})),commitment:nullable(object({up_to_milli:sequence,ratio_ppm:sequence})),
-  model_prices:listItems(object({model_id:text,...priceFields})),model_budgets:listItems(object({model_id:text,monthly_milli:sequence})),
-  tool_prices:listItems(object({release_id:text,per_call_milli:sequence}))});
+  model_prices:listItems(modelPrice),model_budgets:listItems(object({model_id:text,monthly_milli:sequence})),
+  tool_prices:listItems(object({release_id:text,per_call_milli:sequence}))};
+const commerceTerms=object(commerceFields);
+const commerceTermsInput=object({...commerceFields,model_prices:listItems({oneOf:[
+  {...object({model_id:text,source_rate_key:text}),additionalProperties:false},modelPrice,
+]})}, []);
 const commercePlan=object({id:text,plan_id:text,version:revision,name:text,terms:commerceTerms,created_by:text,created_at:timestamp});
 const tierInput={floor_model_id:text,models:listItems(object({model_id:text,tier:{enum:['floor','standard','pro','advanced','top']}}))};
 const commerceAccount=object({tenant_id:text,month:text,plan:nullable(commercePlan),balance_milli:{type:'integer'},reserved_milli:sequence,
@@ -245,7 +254,7 @@ const policyPaths = {
   [policyTenant+'/targets/{user_id}']:{get:policyDetail(targetView,targetParameters)},
   [policyContractPath+'/targets/{user_id}']:{get:policyDetail(targetView,[contractTenantPath,...targetParameters])},
   [policyContractPath+'/targets']:{get:listOf(object({user_id:text,name:text,actions}),[contractTenantPath])},
-  '/v1/platform/commerce/plans':{get:listOf(commercePlan),post:policyWrite(object({name:text,expected_version:sequence,plan_id:text,terms:commerceTerms},['name','expected_version','terms']),commercePlan,'create')},
+  '/v1/platform/commerce/plans':{get:listOf(commercePlan),post:policyWrite(object({name:text,expected_version:sequence,plan_id:text,terms:commerceTermsInput},['name','expected_version','terms']),commercePlan,'create')},
   '/v1/platform/commerce/model-tiers':{get:detailOf(object({...tierInput,revision:sequence}),false),
     put:policyWrite(object({...tierInput,expected_revision:sequence}),object({...tierInput,revision}),'update')},
   '/v1/platform/commerce/tenants/{tenant_id}':{get:policyDetail(commerceAccount,[contractTenantPath])},
@@ -269,11 +278,11 @@ const policyPaths = {
   [policyPlatform + '/contracts']: { get: listOf(object(policyContractRow)) },
   [policyContractPath]: { get: policyDetail(object({ ...policyContractRow, balance: policyBalance }), [contractTenantPath]) },
   [policyContractPath + '/signatures']: { get: listOf(object(policySignature), [contractTenantPath]),
-    post: policyWrite(policySign, object({ ...policySignature, entries: listItems(policySignedEntry) }), 'create', [contractTenantPath]) },
-  [policyContractPath + '/signatures/{revision}']: { get: policyDetail(object({ ...policySignature, entries: listItems(policySignedEntry) }),
+    post: policyWrite(policySign, object({ ...policySignature, entries: listItems(policySignedEntry), sales_rate_snapshots:signedSalesRates }), 'create', [contractTenantPath]) },
+  [policyContractPath + '/signatures/{revision}']: { get: policyDetail(object({ ...policySignature, entries: listItems(policySignedEntry), sales_rate_snapshots:signedSalesRates }),
     [contractTenantPath, namedPath('revision', revision)]) },
   [policyContractPath + '/preview']: { post: policyPreview(policySign, object({ tenant_id: tenantId, ...policyHead,
-    entries: listItems(policySignedEntry), previous_entries: listItems(policySignedEntry), actions,
+    entries: listItems(policySignedEntry), previous_entries: listItems(policySignedEntry), sales_rate_snapshots:listItems(object(salesRateFields)), actions,
     seats:object({limit:sequence,active:sequence,over_limit:sequence}),impact:object({member_count:sequence,device_count:sequence,
       members:object({items:listItems(impactMember),total:sequence,next_cursor:nullableText,actions}),
       devices:object({items:listItems(impactRow),total:sequence,next_cursor:nullableText,actions})}) }),
