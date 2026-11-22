@@ -3,12 +3,14 @@ import { createPager } from './pager.js'
 import { formatDateTime } from './format.js'
 import { hasAction, inputField, optionSelect } from './policy-controls.js'
 import { formatMicro, parseMicro } from './routing-format.js'
+import { balanceOverview, channelBalance } from './provider-balance.js'
 
 const recordTypes = {
   recharge: { path: 'recharges', action: 'recharge', label: '渠道充值', entryLabel: '登记渠道充值' },
   balance_observation: { path: 'observations', action: 'record_balance', label: '余额核对', entryLabel: '核对渠道余额' },
   expense: { path: 'expenses', action: 'record_expense', label: '采购扣费', entryLabel: '登记渠道扣费' }
 }
+const recordSources = { manual: '人工登记', upstream: '上游核验', routing: '路由结算' }
 
 function amount(input, field, allowZero) {
   const parsed = parseMicro(input, field)
@@ -102,18 +104,29 @@ export function channelFunding(pane, api, provider, signal, back, initial = {}) 
   notice.setAttribute('role', 'status')
   const accountsHost = el('div')
   const summary = el('dl', 'policy-facts')
+  const balanceHost = el('section', 'deployment-section')
   const rowsHost = el('div')
   const navigation = el('div', 'card-pager')
   const prev = button('上一页流水', () => { if (pager.prev()) load() })
   const next = button('下一页流水', () => { if (pager.next()) load() })
   navigation.append(prev, next)
-  pane.body.replaceChildren(notice, accountsHost, summary, el('h3', null, '渠道资金流水'), rowsHost, navigation)
+  pane.body.replaceChildren(notice, accountsHost, summary, balanceHost, el('h3', null, '渠道资金流水'), rowsHost, navigation)
   let pager = createPager(), accountId = initial.accountId, controller
+  let balanceAccount, balanceController
+
+  function pause() {
+    controller?.abort()
+    balanceController?.abort()
+  }
 
   function select(id) {
     if (id === accountId) return
     accountId = id
     pager = createPager()
+    balanceController?.abort()
+    balanceAccount = undefined
+    balanceHost.replaceChildren()
+    pane.foot.replaceChildren()
     load()
   }
 
@@ -131,8 +144,8 @@ export function channelFunding(pane, api, provider, signal, back, initial = {}) 
     summary.replaceChildren()
     if (account) {
       const money = key => formatMicro(account[key], account.currency)
-      for (const [label, value] of [['账面余额', money('balance_micro')], ['最近核对余额', money('observed_balance_micro')],
-        ['余额核对时间', account.observed_at ? formatDateTime(account.observed_at) : '—'],
+      for (const [label, value] of [['账面余额', money('balance_micro')], ['最近台账核对余额', money('observed_balance_micro')],
+        ['台账核对时间', account.observed_at ? formatDateTime(account.observed_at) : '—'],
         ['累计渠道充值', money('credited_micro')], ['累计采购扣费', money('spent_micro')]]) {
         const row = el('div')
         row.append(el('dt', null, label), el('dd', null, value))
@@ -141,12 +154,28 @@ export function channelFunding(pane, api, provider, signal, back, initial = {}) 
       for (const [kind, spec] of Object.entries(recordTypes)) {
         if (!hasAction(data, spec.action) || (account.actions && !hasAction(account, spec.action))) continue
         const resume = message => channelFunding(pane, api, provider, signal, back, { accountId, message })
-        pane.foot.append(button(spec.entryLabel, () => editMovement(pane, api, base, account, kind, signal, () => resume(), resume), 'primary'))
+        pane.foot.append(button(spec.entryLabel, () => {
+          pause()
+          editMovement(pane, api, base, account, kind, signal, () => resume(), resume)
+        }, 'primary'))
+      }
+    }
+    if (account?.account_id !== balanceAccount) {
+      balanceController?.abort()
+      balanceHost.replaceChildren()
+      balanceAccount = account?.account_id
+      if (account) {
+        balanceController = new AbortController()
+        const selected = AbortSignal.any([signal, balanceController.signal])
+        balanceOverview(balanceHost, api, provider, account, selected, () => {
+          pause()
+          channelBalance(pane, api, provider, account, signal, () => channelFunding(pane, api, provider, signal, back, { accountId }))
+        })
       }
     }
     const items = data.items ?? []
-    rowsHost.replaceChildren(items.length ? table(['登记时间', '类型', '原币金额', '账户资金范围', '凭证', '备注'], items.map(row => [
-      formatDateTime(row.recorded_at), recordTypes[row.kind]?.label ?? row.kind, formatMicro(row.amount_micro, row.currency),
+    rowsHost.replaceChildren(items.length ? table(['登记时间', '类型', '来源', '原币金额', '账户资金范围', '凭证', '备注'], items.map(row => [
+      formatDateTime(row.recorded_at), recordTypes[row.kind]?.label ?? row.kind, recordSources[row.source] ?? '—', formatMicro(row.amount_micro, row.currency),
       row.funding_id, row.reference || '—', row.note || '—'
     ])) : el('p', 'muted', accounts.length ? '暂无渠道资金记录' : '该 Provider 暂无渠道账户'))
   }

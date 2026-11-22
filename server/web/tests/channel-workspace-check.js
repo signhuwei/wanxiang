@@ -12,11 +12,21 @@ import { openCodeLogin } from './login-flow.js'
 const scratch = await mkdtemp(join(tmpdir(), 'onex-channel-browser-'))
 const now = Date.now()
 const settings = [
-  { label: '渠道 A', model: 'vendor-a/m', key: 'local-fixture-key-a', price: '2' },
-  { label: '渠道 B', model: 'vendor-b/m', key: 'local-fixture-key-b', price: '3' }
+  { label: '渠道 A', origin: 'https://channel-a.example.test', model: 'vendor-a/m', key: 'local-fixture-key-a', balanceKey: 'local-management-a', price: '2' },
+  { label: '渠道 B', origin: 'https://channel-b.example.test', model: 'vendor-b/m', key: 'local-fixture-key-b', balanceKey: 'local-management-b', price: '3' }
 ]
+let balanceDenied = false
 const upstreams = settings.map((setting, index) => Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
   const url = new URL(request.url)
+  if (index === 0 && url.pathname === '/api/user/self' && request.method === 'GET') {
+    if (request.headers.get('Authorization') !== setting.balanceKey || request.headers.get('New-Api-User') !== '42') return new Response(null, { status: 401 })
+    if (balanceDenied) return new Response(null, { status: 403 })
+    return Response.json({ success: true, data: { id: 42, quota: 5250000 } })
+  }
+  if (index === 1 && url.pathname === '/api/v1/user/profile' && request.method === 'GET') {
+    if (request.headers.get('Authorization') !== 'Bearer ' + setting.balanceKey) return new Response(null, { status: 401 })
+    return Response.json({ code: 0, data: { id: 84, balance: '16.1254329' } })
+  }
   if (url.pathname !== '/v1/models' || request.method !== 'GET') return new Response(null, { status: 404 })
   if (request.headers.get('Authorization') !== 'Bearer ' + setting.key) return new Response(null, { status: 401 })
   if (index === 0 && url.searchParams.get('after') === 'first-page-end') return Response.json({ data: [{ id: 'z-full-directory-last' }], has_more: false })
@@ -24,7 +34,7 @@ const upstreams = settings.map((setting, index) => Bun.serve({ hostname: '127.0.
   const filler = index === 0 ? Array.from({ length: 25 }, (_, i) => ({ id: 'w-filler-' + String(i).padStart(2, '0') })) : []
   return Response.json({ data: [main, ...filler], has_more: index === 0, last_id: 'first-page-end' })
 } }))
-const allowed = new Set(upstreams.map(upstream => upstream.url.origin))
+const allowed = new Map(settings.map((setting, index) => [setting.origin, upstreams[index].url.origin]))
 let app, browser, otp
 const target = 'channel-qa@example.test'
 const errors = []
@@ -34,8 +44,9 @@ try {
     presence: new MemoryPresence(), commit: 'channel-browser-check', codeSecret: crypto.randomUUID(),
     masterKey: crypto.getRandomValues(new Uint8Array(32)), now: () => now, deliverCode: (_, value) => { otp = value },
     providerChannelFetch: (url, headers, signal) => {
-      assert(allowed.has(url.origin), 'browser fixture may reach only local fixture providers')
-      return fetch(url, { headers, signal, redirect: 'error', proxy: '' })
+      const fixture = allowed.get(url.origin)
+      assert(fixture, 'browser fixture may reach only local fixture providers')
+      return fetch(new URL(url.pathname + url.search, fixture), { headers, signal, redirect: 'error', proxy: '' })
     } })
   const tenant = await seedTenant(app.store, { target, name: '单链路联验租户', platformAdmin: true, now })
   browser = await chromium.launch({ channel: 'chrome', args: ['--disable-gpu', '--no-proxy-server'] })
@@ -86,7 +97,7 @@ try {
     await button('新建 Provider').click()
     await label('名称').fill(setting.label)
     await label('协议').selectOption('openai_chat')
-    await label('服务地址').fill(upstreams[index].url.href)
+    await label('服务地址').fill(setting.origin)
     await label('上游密钥').fill(setting.key)
     const provider = await submit('保存', '/platform/providers', 201)
     if (index === 0) providerToRotate = provider
@@ -120,8 +131,8 @@ try {
     reviewed.push(decision.items[0])
     await text('已归并到 ' + signedName + '，可在签约型号中选入模型池。').waitFor()
     await button('返回渠道').click()
+    await button('渠道资金').click()
     if (index === 0) {
-      await button('渠道资金').click()
       for (const [entry, field, value, ref, suffix] of [
         ['核对渠道余额', '核对余额', '10', 'opening-1', 'observations'],
         ['登记渠道充值', '充值金额', '1.25', 'recharge-1', 'recharges'],
@@ -137,8 +148,53 @@ try {
       const after = await call('/providers/' + provider.id + '/channel-ledger')
       assert.equal(after.accounts[0].balance_micro, 11150000)
       await text('¥11.15').waitFor()
-      await button('返回渠道').click()
     }
+    await button('查看上游账户查询').click()
+    await button('编辑余额查询配置').click()
+    await label('余额接口').selectOption(index === 0 ? 'new_api' : 'sub2api')
+    await label('上游账户 ID').fill(index === 0 ? '42' : '84')
+    if (index === 0) await label('每币种单位对应额度').fill('500000')
+    else {
+      assert.equal(await label('币种').inputValue(), 'USD')
+      await label('同步到账面余额').selectOption('on')
+    }
+    const password = label('余额查询凭据')
+    assert.equal(await password.getAttribute('type'), 'password')
+    await password.fill(setting.balanceKey)
+    const saved = await submit('保存查询配置', '/balance-profile', 200)
+    assert.equal(saved.profile.credential_usable, true)
+    assert(!JSON.stringify(saved).includes(setting.balanceKey))
+    const sample = await submit('查询上游余额', '/balance-probes', 202)
+    assert.equal(sample.status, 'ok')
+    assert.equal(sample.amount_micro, index === 0 ? 10500000 : 16125432)
+    assert.equal(sample.scope, index === 0 ? 'account_quota' : 'account_balance')
+    assert.equal(sample.wallet_synced, index === 1)
+    const upstreamBalance = page.getByRole('region', { name: '上游余额状态' })
+    const readout = index === 0 ? '5,250,000 额度单位 · 配置折算 ¥10.50' : 'US$16.125432'
+    await upstreamBalance.getByText(readout, { exact: true }).waitFor()
+    assert.equal((await page.content()).includes(setting.balanceKey), false)
+    if (index === 0) {
+      await button('编辑余额查询配置').click()
+      assert.equal(await label('余额查询凭据').inputValue(), '')
+      await button('取消编辑').click()
+      balanceDenied = true
+      const failed = await submit('查询上游余额', '/balance-probes', 202)
+      assert.equal(failed.reason_code, 'permission_denied')
+      await upstreamBalance.getByText('未取得读数 · 查询凭据缺少账户查看权限', { exact: true }).waitFor()
+      await upstreamBalance.getByText(readout, { exact: true }).waitFor()
+      await button('清除余额查询配置').click()
+      assert.equal((await submit('确认清除配置', '/balance-profile/clear', 200)).profile, null)
+      await upstreamBalance.getByText('历史配置 v' + saved.profile.profile_revision, { exact: true }).waitFor()
+      assert.equal(await button('查询上游余额').count(), 0)
+    }
+    await button('返回渠道资金').click()
+    if (index === 0) await text('¥11.15').waitFor()
+    else {
+      const synced = page.getByRole('table', { name: '渠道资金流水' }).getByRole('row').filter({ hasText: sample.id })
+      await synced.getByRole('cell', { name: '上游核验', exact: true }).waitFor()
+      await synced.getByRole('cell', { name: readout, exact: true }).waitFor()
+    }
+    await button('返回渠道').click()
     await button('采购报价 ' + reviewed.at(-1).deployment_id).click()
     await button('发布新报价').click()
     await label('币种').fill('CNY')
@@ -232,7 +288,8 @@ try {
   await refreshed.getByRole('button', { name: '归并 ' + source.model }).waitFor()
   assert.equal(await history.count(), 0)
   assert.deepEqual(errors, [])
-  console.log('channel-workspace-check ok', JSON.stringify({ discovered: 28, one_to_many: 2, signed_pool: 1, multiplier: 4, balance_micro: 11150000, historical_catalog_read_only: true }))
+  console.log('channel-workspace-check ok', JSON.stringify({ discovered: 28, one_to_many: 2, signed_pool: 1, multiplier: 4, balance_micro: 11150000,
+    historical_catalog_read_only: true, balance_adapters: ['new_api', 'sub2api'] }))
 } finally {
   await browser?.close()
   await app?.close()
