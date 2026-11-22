@@ -16,7 +16,7 @@ import { startFakeUpstream } from '../fake-upstream';
 const deviceKey = Buffer.alloc(32, 7);
 type Json = Record<string, any>;
 
-async function channel(letter: string) {
+async function channel(letter: string, streamDelayMs: number) {
   const upstream = await startFakeUpstream({ port: 0, usage: { input: 10_000, output: 2_000 } });
   const secret = `fixture-channel-${letter}`;
   const raw = `vendor-${letter}/flash-20261121`;
@@ -33,7 +33,9 @@ async function channel(letter: string) {
     const call = await request.json() as Json;
     if (call.model !== raw) return Response.json({}, {status:422});
     hits.inference++;
-    return fetch(new URL(path, upstream.url), { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(call) });
+    const headers = new Headers({'content-type':'application/json'});
+    if (call.stream && streamDelayMs) headers.set('x-fake-delay-ms', String(streamDelayMs));
+    return fetch(new URL(path, upstream.url), { method:'POST', headers, body:JSON.stringify(call) });
   }});
   const url = server.url.origin + '/v1';
   let stopped = false;
@@ -45,12 +47,13 @@ async function channel(letter: string) {
   return { secret, raw, hits, url, stopListening, async close() { await stopListening(); await upstream.stop(); } };
 }
 
-type ChainOptions = { directory?: string; primaryOffline?: boolean; production?: boolean; backupWalletCurrency?: string };
+type ChainOptions = { directory?: string; primaryOffline?: boolean; production?: boolean; backupWalletCurrency?: string; slowStream?: boolean };
 
-export async function startOneChain({ directory, primaryOffline = false, production = false, backupWalletCurrency = 'USD' }: ChainOptions = {}) {
+export async function startOneChain({ directory, primaryOffline = false, production = false, backupWalletCurrency = 'USD', slowStream = false }: ChainOptions = {}) {
   const clock = Date.now();
   const dataDir = directory ?? mkdtempSync(join(tmpdir(), 'onex-one-chain-'));
-  const [a,b] = await Promise.all([channel('a'),channel('b')]);
+  const streamDelay = slowStream ? 350 : 0;
+  const [a,b] = await Promise.all([channel('a', streamDelay),channel('b', streamDelay)]);
   const masterKey = randomBytes(32);
   let service: Awaited<ReturnType<typeof createServer>>;
   let fixtureTenant = '', fixtureDevice = '', release = '';
@@ -141,7 +144,8 @@ export async function startOneChain({ directory, primaryOffline = false, product
       return {deployment_id:row.deployment_id,deployment_revision:row.deployment_revision,approved_match_id:row.approved_match_id,
         evidence_ids:row.evidence_ids,priority:(index+1)*10};
     });
-    const draft={expected_pool_revision:0,members,routing:{strategy:'ordered',max_attempts:2,attempt_timeout_ms:5000,total_timeout_ms:10000},reason:'同一签约型号配置 A 和 B'};
+    const routing = {strategy:'ordered',max_attempts:2,attempt_timeout_ms:slowStream ? 1200 : 5000,total_timeout_ms:slowStream ? 1600 : 10000};
+    const draft={expected_pool_revision:0,members,routing,reason:'同一签约型号配置 A 和 B'};
     const checked=await api(modelPath+'/pool/preview',draft);
     if(!checked.publishable) throw new Error(`Pool review blocked ${JSON.stringify(checked.blocking)}`);
     const released=await api(modelPath+'/pool/revisions',{...draft,preview_basis:checked.preview_basis});
@@ -211,14 +215,14 @@ export async function startOneChain({ directory, primaryOffline = false, product
       config_revision:projected.config_revision,projection_id:projected.projection_id,signed_pool:signed.route_pools[0],
       signed_rate:signed.sales_rate_snapshots[0],origin_channel:supplies[0]!.wallet,backup_channel:supplies[1]!.wallet,
       primary_deployment_id:members[0]!.deployment_id,backup_deployment_id:members[1]!.deployment_id,
-      platform_session:platform,owner_session:owner},hits:[a.hits,b.hits]};
+      platform_session:platform,owner_session:owner,routing},hits:[a.hits,b.hits]};
   } catch(error) { await close(); throw error; }
 }
 
 if(import.meta.main) {
   const index=process.argv.indexOf('--data-dir');
   const fixture=await startOneChain({ directory: index===-1 ? undefined : process.argv[index+1],
-    primaryOffline: process.argv.includes('--primary-offline') });
+    primaryOffline: process.argv.includes('--primary-offline'), slowStream: process.argv.includes('--slow-stream') });
   console.log(JSON.stringify(fixture.info));
   for(const signal of ['SIGTERM','SIGINT'] as const) process.once(signal,async()=>{await fixture.close();process.exit(0);});
 }
