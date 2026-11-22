@@ -1,8 +1,9 @@
 import { realpathSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { prepareAttachments } from './onex-attachments.mjs'
 
 export const name = 'onex-managed-session'
-export const inject = ['llm', 'sessionPersistence', 'workspaceRegistry', 'credentials']
+export const inject = ['llm', 'sessionPersistence', 'workspaceRegistry', 'credentials', 'attachments']
 
 function path(value) {
   try { return realpathSync(value.startsWith('file:') ? fileURLToPath(value) : value) }
@@ -13,6 +14,16 @@ function publicText(blocks) {
   return Array.isArray(blocks)
     ? blocks.filter(block => block.type === 'text' && typeof block.text === 'string').map(block => block.text).join('\n')
     : ''
+}
+
+function userText(blocks) {
+  if (!Array.isArray(blocks)) return ''
+  return blocks.flatMap(block => {
+    if (block.type === 'text' && typeof block.text === 'string') return [block.text]
+    if (block.type === 'image') return ['[图片附件]']
+    if (block.type === 'file' && typeof block.attachment?.name === 'string') return [`[文件附件 ${block.attachment.name}]`]
+    return []
+  }).join('\n')
 }
 
 function bounded(text) {
@@ -36,7 +47,7 @@ function visibleMessage(event, offset) {
   }
   const kind = event.type === 'user/message' && data.source?.kind === 'user' ? 'user'
     : event.type === 'assistant/message' ? 'assistant' : null
-  const text = kind && publicText(kind === 'user' ? data.content : data.message?.content)
+  const text = kind === 'user' ? userText(data.content) : kind === 'assistant' ? publicText(data.message?.content) : ''
   return text ? { ...source, kind, ...bounded(text) } : null
 }
 
@@ -54,8 +65,8 @@ export async function apply(ctx, config) {
   const offsets = new Map()
   const bound = new Set()
 
-  async function register(id, records, bindModel = false) {
-    const body = JSON.stringify({ native_id:id, records, bind_model:bindModel })
+  async function register(id, records, bindModel = false, documents = []) {
+    const body = JSON.stringify({ native_id:id, records, bind_model:bindModel, ...(documents.length && { documents }) })
     if (!bindModel && records.length > 1 && Buffer.byteLength(body) > 1536 * 1024) {
       const split = Math.floor(records.length / 2)
       if (!await register(id, records.slice(0, split))) return null
@@ -79,7 +90,8 @@ export async function apply(ctx, config) {
     }
     const stat = await ctx.sessionPersistence.stat(id)
     if (!stat || stat.header.id !== id || !belongs(stat.header)) throw new Error('This workspace is outside the OneX launch')
-    const token = await register(id, [], true)
+    const documents = await prepareAttachments(ctx, config, options.messages, options.signal)
+    const token = await register(id, [], true, documents)
     bound.add(id)
     if (offsets.get(id)?.unbound) offsets.delete(id)
     const source = ctx.credentials.withSession(token, () => next()[Symbol.asyncIterator]())

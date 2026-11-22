@@ -18,6 +18,7 @@ pub(crate) struct Request<'a> {
     pub(crate) model_bearer: Option<&'a str>,
     pub(crate) router: &'a str,
     pub(crate) model: &'a str,
+    pub(crate) image_input: bool,
 }
 
 pub(crate) struct Prepared {
@@ -150,6 +151,7 @@ pub(crate) fn prepare(
                 launch::private_dir(&desktop)?;
                 let plugin = run.join("onex-desktop.mjs");
                 launch::write_private(&plugin, include_bytes!("desktop_adapters/deepseek.mjs"))?;
+                launch::write_private(&run.join("onex-attachments.mjs"), include_bytes!("desktop_adapters/deepseek-attachments.mjs"))?;
                 let credentials = run.join("onex-credentials.mjs");
                 launch::write_private(&credentials, include_bytes!("desktop_adapters/deepseek-credentials.mjs"))?;
                 let credentials_url = reqwest::Url::from_file_path(&credentials)
@@ -173,11 +175,12 @@ pub(crate) fn prepare(
                         "displayName":"OneX", "api":"openai-completions", "baseURL":format!("{origin}/v1"),
                         "apiKeyEnv":"ONEX_NATIVE_SESSION", "retryPolicy": { "mode":"normal", "maxRetries":0 },
                         "models":[{"id":request.model, "name":request.model, "contextWindow":32768,
-                            "maxTokens":4096, "input":["text"], "reasoningEfforts":false}]
+                            "maxTokens":4096, "input":if request.image_input { vec!["text", "image"] } else { vec!["text"] }, "reasoningEfforts":false}]
                     } } } },
                     { "id":"agent-default-model", "config": { "provider":"onex", "model":request.model } },
                     { "insert": [{ "id":"onex-managed-session", "name":plugin_url.as_str(), "config": {
-                        "origin":origin, "workspace":workspace, "model":request.model, "credential":path_text(&credential)?
+                        "origin":origin, "workspace":workspace, "model":request.model, "credential":path_text(&credential)?,
+                        "imageInput":request.image_input,"extractor":path_text(&std::env::current_exe()?)?
                     }}] },
                 ]);
                 publish(&desktop, "cordis.yml", b"[]\n")?;
@@ -286,6 +289,7 @@ mod tests {
             model_bearer: Some("test-model-only"),
             router: "127.0.0.1:19876",
             model: "contract-model",
+            image_input: false,
         };
         let prepared = prepare(&request, None).unwrap();
         let launch = &prepared.launch;

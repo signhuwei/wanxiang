@@ -707,6 +707,9 @@ async fn launch(
             .or_else(|| ipc.state.expected_device_id.read().unwrap().clone());
         let Some(owner) = owner else { return err("unauthenticated", "请先连接 OneX Server") };
         let model_bearer = (agent == "workbuddy").then(crate::id::token);
+        let image_input = agent == "deepseek-desktop" && protocol
+            .select_agent_route(&ipc.state.config.read().unwrap(), &model, Some(agent))
+            .is_some_and(crate::desktop_sessions::accepts_images);
         return start_desktop(
             ipc,
             ctx,
@@ -720,6 +723,7 @@ async fn launch(
                 model_bearer: model_bearer.as_deref(),
                 router: router_addr,
                 model: &model,
+                image_input,
             },
             approved.as_ref().expect("desktop launch always has an approved release"),
             claude_engine.as_ref().map(|(path, engine)| (path.as_path(), *engine)),

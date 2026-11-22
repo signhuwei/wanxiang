@@ -55,7 +55,12 @@ pub async fn chat_completions(AxState(rt): AxState<Arc<Router>>, headers: Header
 
 async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: Wire) -> Response {
     let started = Instant::now();
-    let binding = if wire == Wire::Responses {
+    let prompt = if wire == Wire::Chat { rt.state.desktop_sessions.take_deepseek_prompt(&headers) } else { None };
+    let mut documents = Vec::new();
+    let binding = if let Some((binding, attached)) = prompt {
+        documents = attached;
+        Ok(Some(binding))
+    } else if wire == Wire::Responses {
         match rt.state.desktop_sessions.codex_response(&headers).await {
             Ok(Some(binding)) => Ok(Some(binding)),
             Ok(None) => rt.session_for(&headers),
@@ -102,6 +107,10 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
         }
     };
     let managed_codex = agent_protocol == Some(AgentProtocol::Responses);
+    let deepseek = binding.as_ref().is_some_and(|binding| binding.agent == "deepseek-desktop");
+    if let Err(message) = crate::desktop_sessions::project_prompt_documents(&mut req, &documents) {
+        return err_before_headers(StatusCode::UNPROCESSABLE_ENTITY, "invalid", message);
+    }
     let session_id = binding.as_ref().map(|binding| binding.session_id.clone());
     let Some(model) = req.get("model").and_then(Value::as_str) else {
         return err_before_headers(StatusCode::UNPROCESSABLE_ENTITY, "invalid", "请求缺少 model 字段。");
@@ -154,6 +163,12 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
                 return err_before_headers(StatusCode::FORBIDDEN, "model_not_allowed", &message);
             }
         };
+    if deepseek && crate::route_select::required_features("openai_chat", &req).contains(crate::route_select::feature::IMAGES) {
+        if !crate::desktop_sessions::accepts_images(&route) {
+            return err_before_headers(StatusCode::FORBIDDEN, "model_not_allowed", "当前签约模型的渠道没有核验图片输入能力。");
+        }
+        execution.require_verified_images();
+    }
     let first_native_session = binding.and_then(|binding| binding.first_native_session);
     let to_chat = wire == Wire::Responses && route.protocol == "openai_chat";
     let Some(rate) = rate else {

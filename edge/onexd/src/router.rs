@@ -151,6 +151,7 @@ pub(crate) struct Execution {
     owner: (String, String),
     revision: i64,
     backups: Vec<(Route, Zeroizing<String>)>,
+    images_required: bool,
 }
 
 fn endpoint(route: &Route, path: &str) -> String {
@@ -163,6 +164,19 @@ fn endpoint(route: &Route, path: &str) -> String {
 }
 
 impl Execution {
+    pub(crate) fn require_verified_images(&mut self) {
+        self.images_required = true;
+    }
+
+    fn next_backup(&mut self) -> Option<(Route, Zeroizing<String>)> {
+        while let Some((route, key)) = self.backups.pop() {
+            if !self.images_required || crate::desktop_sessions::accepts_images(&route) {
+                return Some((route, key));
+            }
+        }
+        None
+    }
+
     pub(crate) fn admit(
         &self,
         rt: &Router,
@@ -185,6 +199,9 @@ impl Execution {
             if rt.state.config.read().unwrap().revision != self.revision {
                 return Err((StatusCode::CONFLICT, "OneX 策略已更新，请重新请求。"));
             }
+            if self.images_required && !crate::desktop_sessions::accepts_images(route) {
+                return Err((StatusCode::FORBIDDEN, "当前渠道的图片输入核验已失效。"));
+            }
             let url = endpoint(route, path);
             if let Ok(client) = self.client(rt, &url, route.proxy.as_deref()).await {
                 if rt.state.config.read().unwrap().revision == self.revision {
@@ -192,7 +209,7 @@ impl Execution {
                 }
                 continue;
             }
-            if let Some((next, secret)) = self.backups.pop() {
+            if let Some((next, secret)) = self.next_backup() {
                 *route = next;
                 *key = secret;
                 continue;
@@ -242,7 +259,7 @@ impl Execution {
         path: &str,
         model: &str,
     ) -> Option<(String, String)> {
-        while let Some((route, key)) = self.backups.pop() {
+        while let Some((route, key)) = self.next_backup() {
             if rt.state.config.read().unwrap().revision != self.revision {
                 return None;
             }
@@ -559,7 +576,7 @@ impl Router {
                     .collect()
             })
             .unwrap_or_default();
-        let execution = Execution { revision: cfg.revision, rules, owner, backups };
+        let execution = Execution { revision: cfg.revision, rules, owner, backups, images_required: false };
         Ok(SelectedRoute { route: route.clone(), rate, key, execution })
     }
 
@@ -1616,6 +1633,7 @@ mod tests {
             upstream_model: None,
             auth: UpstreamAuth::XApiKey,
             proxy: None,
+            input_capabilities: None,
         }
     }
 

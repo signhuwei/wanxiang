@@ -35,6 +35,7 @@ struct Grant {
     owner: String,
     expires: std::time::Instant,
     binding: LaunchBinding,
+    documents: Vec<PromptDocument>,
 }
 
 pub(crate) struct Launch {
@@ -131,6 +132,16 @@ impl DesktopSessions {
             .map(|grant| grant.binding)
     }
 
+    pub(crate) fn take_deepseek_prompt(&self, headers: &HeaderMap) -> Option<(LaunchBinding, Vec<PromptDocument>)> {
+        if headers.contains_key("x-api-key") {
+            return None;
+        }
+        let token = bearer(headers)?;
+        let grant = self.0.lock().unwrap().models.remove(token)?;
+        (grant.binding.agent == "deepseek-desktop" && grant.expires > std::time::Instant::now())
+            .then_some((grant.binding, grant.documents))
+    }
+
     pub(crate) fn claude_native_id(&self, headers: &HeaderMap) -> Option<Uuid> {
         Some(self.0.lock().unwrap().claude_models.get(bearer(headers)?)?.0)
     }
@@ -196,7 +207,7 @@ impl DesktopSessions {
         .await
         .ok()??;
         let token = self
-            .receive(&control, Batch { bind_model: true, native_id: native.to_string(), records: vec![] })
+            .receive(&control, Batch { bind_model: true, native_id: native.to_string(), records: vec![], documents: vec![] })
             .ok()???;
         let mut registry = self.0.lock().unwrap();
         let binding = registry.claude_models.get(&token)?.1.clone();
@@ -240,6 +251,7 @@ impl DesktopSessions {
         let Some(launch) = registry.launches.get_mut(credential) else { return Ok(None) };
         if matches!(launch.agent.as_str(), "codex-desktop" | "workbuddy")
             || (batch.bind_model && !matches!(launch.agent.as_str(), "deepseek-desktop" | "claude-desktop"))
+            || (!batch.documents.is_empty() && launch.agent != "deepseek-desktop")
         {
             return Ok(None);
         }
@@ -361,7 +373,10 @@ impl DesktopSessions {
         }
         let token = crate::id::token();
         let now = std::time::Instant::now();
-        let grant = Grant { owner: credential.to_owned(), expires: now + std::time::Duration::from_secs(60), binding };
+        let grant = Grant {
+            owner: credential.to_owned(), expires: now + std::time::Duration::from_secs(60), binding,
+            documents: batch.documents,
+        };
         registry.models.retain(|_, grant| grant.expires > now);
         if registry.models.len() >= 512 {
             return Ok(None);
@@ -469,6 +484,67 @@ struct Batch {
     bind_model: bool,
     native_id: String,
     records: Vec<Record>,
+    #[serde(default)]
+    documents: Vec<PromptDocument>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PromptDocument {
+    name: String,
+    marker: String,
+    text: String,
+}
+
+/// Substitute only handles produced by the original prompt. A changed vendor
+/// serialization is surfaced before sending a request with missing contents.
+pub(crate) fn project_prompt_documents(body: &mut serde_json::Value, documents: &[PromptDocument]) -> Result<(), &'static str> {
+    if documents.is_empty() {
+        return Ok(());
+    }
+    let Some(messages) = body["messages"].as_array_mut() else { return Err("缺少包含附件的原生消息。") };
+    let mut seen = vec![false; documents.len()];
+    let mut inserted = 0;
+    let mut project = |value: &mut serde_json::Value| -> Result<(), &'static str> {
+        let Some(mut source) = value.as_str() else { return Ok(()) };
+        let mut result = String::new();
+        while let Some((start, index, document)) = documents.iter().enumerate()
+            .filter_map(|(index, document)| source.find(&document.marker).map(|at| (at, index, document)))
+            .min_by_key(|(at, _, _)| *at)
+        {
+            inserted += document.name.len() + document.text.len() + 48;
+            if inserted > 256 * 1024 { return Err("本次请求的附件展开内容超过大小限制。") }
+            result.push_str(&source[..start]);
+            result.push_str(&format!("[附件 {} 的文本]\n{}\n[附件结束]", document.name, document.text));
+            seen[index] = true;
+            source = &source[start + document.marker.len()..];
+        }
+        if !result.is_empty() {
+            result.push_str(source);
+            *value = result.into();
+        }
+        Ok(())
+    };
+    for message in messages.iter_mut().filter(|item| matches!(item["role"].as_str(), Some("user" | "tool"))) {
+        let Some(content) = message.get_mut("content") else { continue };
+        if let Some(blocks) = content.as_array_mut() {
+            for block in blocks.iter_mut().filter(|block| block["type"] == "text") {
+                project(&mut block["text"])?;
+            }
+        } else {
+            project(content)?;
+        }
+    }
+    if seen.into_iter().all(|item| item) { Ok(()) } else { Err("附件与原生消息不匹配，请重试。") }
+}
+
+pub(crate) fn accepts_images(route: &onex_core::ws::Route) -> bool {
+    route.protocol == "openai_chat" && route.input_capabilities.as_ref().is_some_and(|capability| {
+        capability.modalities.contains(&onex_core::ws::InputModality::Image)
+            && capability.valid_until.as_deref().is_none_or(|expiry| {
+                crate::pricing::parse_ms(expiry).is_some_and(|time| time > now_ms())
+            })
+    })
 }
 
 #[derive(Deserialize)]
@@ -503,6 +579,14 @@ impl Batch {
         !self.native_id.is_empty()
             && self.native_id.len() <= 128
             && self.native_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            && (self.bind_model || self.documents.is_empty())
+            && self.documents.len() <= 8
+            && self.documents.iter().map(|file| file.text.len()).sum::<usize>() <= 128 * 1024
+            && self.documents.iter().all(|file| {
+                !file.name.is_empty() && file.name.len() <= 255 && !file.name.chars().any(char::is_control)
+                    && !file.marker.is_empty() && file.marker.len() <= 4096
+                    && !file.text.trim().is_empty() && file.text.len() <= 64 * 1024 && !file.text.contains('\0')
+            })
             && self.records.len() <= 32
             && self.records.iter().all(|record| {
                 let name = |value: &Option<String>| value.as_ref().is_some_and(|s| !s.is_empty() && s.len() <= 256);
@@ -587,6 +671,7 @@ mod tests {
         Batch {
             bind_model: true,
             native_id: native_id.into(),
+            documents: vec![],
             records: vec![Record {
                 seq,
                 at_ms: Some(now_ms()),
@@ -675,6 +760,7 @@ mod tests {
         let make = |native_id: &str, bind_model, seq: Option<u64>, at_ms| Batch {
             native_id: native_id.to_owned(),
             bind_model,
+            documents: vec![],
             records: seq
                 .map(|seq| Record {
                     seq,
