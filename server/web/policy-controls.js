@@ -90,7 +90,8 @@ export function policyValue(definition, value, display) {
   }
 }
 
-function catalogField(api, prefix, definition, original, display, signal) {
+// detail（可选）：{ describe(ids, node) } 为已选与候选项附加只读说明，不改变提交值。
+function catalogField(api, prefix, definition, original, display, signal, detail) {
   const { catalog } = definition.schema
   const selected = new Set(original ?? [])
   const labels = new Map(Object.entries(display ?? {}))
@@ -124,9 +125,16 @@ function catalogField(api, prefix, definition, original, display, signal) {
         choose(row.id, checkbox.checked)
       })
       label.append(checkbox, el('span', null, row.label))
+      if (detail) {
+        const note = el('small', 'muted policy-catalog-detail')
+        detail.describe([row.id], note)
+        label.append(note)
+      }
       return label
     }))
+    if (detail) detail.describe([...selected], pickedDetail)
   }
+  const pickedDetail = el('p', 'muted policy-catalog-detail')
   function choose(id, enabled) {
     if (enabled && catalog==='commerce_plans') selected.clear()
     if (enabled) selected.add(id)
@@ -166,7 +174,7 @@ function catalogField(api, prefix, definition, original, display, signal) {
   }
   details.addEventListener('toggle', () => { if (details.open && !request) void load() })
   search.addEventListener('keydown', event => { if (event.key === 'Enter') query() })
-  details.append(saved, search, button('查询', query), status, choices, previous, next)
+  details.append(saved, ...(detail ? [pickedDetail] : []), search, button('查询', query), status, choices, previous, next)
   draw()
   const missing = [...selected].filter(id => !labels.has(id))
   if (missing.length) {
@@ -184,9 +192,9 @@ function catalogField(api, prefix, definition, original, display, signal) {
   return { node: details, collect: () => [...selected] }
 }
 
-export function valueField(api, prefix, definition, value, { display, signal } = {}) {
+export function valueField(api, prefix, definition, value, { display, signal, detail } = {}) {
   const { schema } = definition
-  if (schema.kind === 'resource_set') return catalogField(api, prefix, definition, value, display, signal)
+  if (schema.kind === 'resource_set') return catalogField(api, prefix, definition, value, display, signal, detail)
   const initial = value == null ? '' :
     schema.kind === 'money_milli' ? formatMilli(value) :
     schema.kind === 'ratio_ppm' ? formatRatio(value) : String(value)

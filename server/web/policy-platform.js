@@ -7,7 +7,7 @@ import { previewPublisher } from './contract-controls.js'
 import { policyVersionsPage, versionEntries } from './policy-authoring.js'
 import { encode, fetchPolicyPage, hasAction, inputField, platformPolicy, policyValue, previewEntries, refText } from './policy-controls.js'
 import { rechargePage } from './policy-recharge.js'
-import { salesRateTable } from './routing-rates.js'
+import { planDirectory, salesRateTable } from './routing-rates.js'
 
 const contracts = platformPolicy + '/contracts'
 
@@ -45,7 +45,9 @@ function signedForm(body, data) {
 function drafting(api, base, revisions, signal) {
   const node = el('div', 'policy-editor')
   const reason = el('textarea')
-  const entries = versionEntries(api, platformPolicy, base?.entries ?? [], { signal, allowTemplates: true, signed: true })
+  const plans = planDirectory(api, signal)
+  const entries = versionEntries(api, platformPolicy, base?.entries ?? [], { signal, allowTemplates: true, signed: true,
+    catalogDetail: definition => plans.detail(definition) })
   node.append(el('p', 'muted', base ? '从 v' + base.revision + ' 起草 · 当前生效 v' + revisions.platform_revision : '首次签发'),
     inputField('签发原因', reason, true), entries.node)
   return {
