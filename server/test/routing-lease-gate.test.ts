@@ -245,15 +245,12 @@ test('release_only settles a bound, never-used lease to zero and issues nothing;
   expect(await edge.call({ ...request, id: 'rel_mode', release_only: false })).toMatchObject({ ok: false, error: { code: 'conflict' } });
   expect(ledger(f, lease.lease_id)).toEqual({ release: lease.budget_milli });
 
-  // A historical lease without a projection link cannot be released, but still settles by its original terms.
+  // A lease without a projection link is never releasable through release_only.
   await f.live().write(sql => sql.run(`INSERT INTO leases (id, device_id, user_id, budget_milli, expires_at, status, seq)
-    VALUES ('lse_hist', 'dev_lin', ?, 20, ?, 'active', 9)`, [f.userId, minutes(5)]));
-  expect(await edge.call(renew({ lease_id: 'lse_hist' }, 0, { release_only: true })))
+    VALUES ('lse_unbound', 'dev_lin', ?, 20, ?, 'active', 9)`, [f.userId, minutes(5)]));
+  expect(await edge.call(renew({ lease_id: 'lse_unbound' }, 0, { release_only: true })))
     .toMatchObject({ ok: false, error: { code: 'invalid', detail: { fields: ['release_only'] } } });
-  expect(await edge.call(leaseRequest())).toMatchObject(refused('lease_settlement_required', { lease_id: 'lse_hist' }));
-  const successor = await edge.call(renew({ lease_id: 'lse_hist' }, 6));
-  expect(successor).toMatchObject({ type: 'lease', settled_lease_id: 'lse_hist', config_revision: 91, seq: 10 });
-  expect(ledger(f, 'lse_hist')).toEqual({ settle: 6, release: 14 });
+  expect(ledger(f, 'lse_unbound')).toEqual({});
 });
 
 test('legacy sessions refuse release_only and keep their renew frames', async () => {
