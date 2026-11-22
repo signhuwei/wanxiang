@@ -7,6 +7,7 @@ import type { platformCreateActions } from './actions';
 import { iso } from './credentials';
 import { enumField, expectRevision, int, pagination, platformActor, urlField, type ManagementOptions } from './management';
 import { encryptProviderSecret } from './provider-secret';
+import { modelPoolSummary } from './model-pool';
 import { indexMember, type Store, type Transaction } from './store';
 
 const statuses = ['active', 'disabled'] as const;
@@ -47,10 +48,11 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
 
   function register(entry: { path: string; table: string; columns: string; search: string; prefix: string; action: typeof platformCreateActions[number];
     project?: (row: RecordRow) => Record<string, SQLQueryBindings | string[] | boolean>;
+    listProject?: (row: RecordRow) => Record<string, SQLQueryBindings | string[] | boolean>;
     parse: (input: Input, row: RecordRow | null, sql: Transaction) => Record<string, SQLQueryBindings> }) {
     const path = `/v1/platform/${entry.path}`;
     const project = entry.project ?? view;
-    list(path, entry.table, entry.columns, entry.search, 'id', entry.action, entry.table === 'models' ? 'provider_id' : undefined, project);
+    list(path, entry.table, entry.columns, entry.search, 'id', entry.action, entry.table === 'models' ? 'provider_id' : undefined, entry.listProject ?? project);
     if (entry.project) app.get(`${path}/:id`, (c) => {
       platformActor(store, c, opts.now());
       const row = store.system.get<RecordRow>(`SELECT ${entry.columns} FROM ${entry.table} WHERE id = ?`, [c.req.param('id')]);
@@ -98,6 +100,8 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
         proxy: proxy == null || proxy === 'none' ? proxy ?? null : urlField(proxy, 'proxy') };
     } });
   register({ path: 'models', table: 'models', columns: '*', search: "display_name || ' ' || upstream_name", prefix: 'mod', action: 'create_model',
+    // Pool fields are read-only additions; legacy writes and responses keep their shape.
+    listProject: (row) => ({ ...view(row), ...modelPoolSummary(store.system, String(row.id)) }),
     parse: (body, row, sql) => {
       const provider_id = text(body, row, 'provider_id');
       if (!sql.get('SELECT 1 FROM providers WHERE id = ?', [provider_id])) invalid('provider_id');
