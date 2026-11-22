@@ -12,7 +12,7 @@
 
 投影消费现有租户签发与有效配置、具体设备、绑定及池的固定输入。固定池只解析所签版本；跟随池取活动版中满足同身份和授权边界的候选。设备和已签费率从当前认证成员、设备权限和签发定位。预览阶段的粗影响数与当前在线清单不能代替收件人名册。停发、受限制余额、撤销以及可核验的固定候选均按既有约束。对从未开启池的租户继续用现行生效配置。本批测试以明确授权的固定与跟随绑定及推理凭据版本输入；Agent 绑定目录和签发授权读写按已审接口接续。
 
-跨系统库与租户库重试时，先核对系统作业所依池版本，再用租户内事务复核成员、设备、签发和 `source_token` 后持久化快照与发送记录。名册和快照写入分步失败后用稳定键恢复。跟随目标已被更新池取代时记 `superseded`，不把更新池结果归给旧作业。离线重封前复核原授权、期限与撤销。缺失精确凭据版本返回失败。
+跨系统库与租户库重试时，先核对系统作业所依池版本，再用租户内事务复核成员、设备、签发和 `source_token` 后持久化快照与发送记录。名册和快照写入分步失败后用稳定键恢复。跟随目标已被更新池取代时记 `superseded`，不把更新池结果归给旧作业。离线重封前复核原授权、期限与撤销。同目标仍有效即可重封，过期时记录 `target_expired`，重新生成才分配更高修订。精确凭据由本批测试注入。投影先决条件不齐时保留状态和失败原因，无设备回执的目标不算设备拒绝。
 
 ## 设备协议
 
@@ -21,12 +21,12 @@
 3. `config_applied` 保持 `{type,id,config_revision,policy_revision,projection_id,result,error?}`。`result=applied` 或 `rejected`。错误有稳定 `code` 和 `detail.reason`，文字脱敏。未协商出现新版字段，或已协商收到不完整新版内容，都拒绝该报文，不能降级为旧协议确认。服务端以认证设备、配置修订、投影 ID 和策略修订核对持久目标，提交后回普通 `ack{re:id,ok:true}`。只有该回包清除对应的 Edge 待发回执。未知或异设备目标、同标识异内容报冲突。相同内容复用确认，旧拒绝不能覆盖成功。回执本身不发放新租约，隔离测试会话的旧自动发租路径也须关闭。
 4. 回执成功后，Edge 的模型、型号标签、变更通知读同一已应用视图；标签和费率按同一可信时点选择。待同步时保持执行门禁，避免回落至旧路由。相同通知按作用域和 `notice.id` 去重。本批先用原生 Responses 和已注册的兼容适配器校验。
 
-已明确投影身份时以 `config_applied` 表达结果，不使用对 `config.id` 的普通成功 ACK 代替。无法解析身份时可对原配置消息给出普通失败 ACK。重封恢复沿用已持久的成功回执 ID，收到该 ID 的成功 ACK 后无需再次发送成功。拒绝回执使用身份及脱敏错误决定的稳定 ID，后续成功回执有另一个 ID。合法迟到回执可保存到原目标历史，成功头不倒退，旧拒绝不覆盖已确认成功。如果本地存储失败，保持待同步并记录脱敏故障。连接返回失败 ACK 时保留本地记录和失败原因，等服务端重发或新目标恢复。
+已明确投影身份时以 `config_applied` 表达结果，不使用对 `config.id` 的普通成功 ACK 代替。无法解析身份时可对原配置消息给出普通失败 ACK。重封恢复沿用已持久的成功回执 ID，收到该 ID 的成功 ACK 后无需再次发送成功。拒绝回执使用身份及脱敏错误决定的稳定 ID，后续成功回执有另一个 ID。规范化摘要覆盖整个合法回执，持久层只留摘要与脱敏代码。合法迟到回执可保存到原目标历史并确认，成功头不倒退，旧拒绝不覆盖已确认成功。如果本地存储失败，保持待同步并记录脱敏故障。连接返回失败 ACK 时保留本地记录和失败原因，等服务端重发或新目标恢复。测试连接的 `lease_request` 和 `lease_renew` 返回 `forbidden`，`detail.reason="route_pool_lease_pending"`。本批不新增 hello 字段。
 
 ## 管理端
 
 - `GET /v1/platform/model-pool-rollouts/:rollout_id` 返回 `rollout_id,model_id,pool_revision,total,counts,actions`，`counts` 分别列 `pending,applied,rejected,offline,needs_upgrade,superseded`。精确目标有已持久成功回执时为 applied，否则按 superseded、rejected、已观测不支持、离线、等待的顺序折叠。发布任务记录自身状态另作为 `job_status` 返回。详细状态基于已登记的名册。
-- `GET /v1/platform/model-pool-rollouts/:rollout_id/targets` 接受 `state,limit,cursor`，回 `{items,total,next_cursor,actions}`。行含 `tenant_id,user_id,device_id,target_config_revision,applied_config_revision,state,reason,last_seen_at,last_receipt_at,actions`。缺值为 null，`reason` 为稳定码。回执时间仅指本目标。分页总数是过滤后总数，游标绑定 rollout、筛选与操作者。页面使用当前池版本右栏和原有台账收窄，不暴露凭据字段。
+- `GET /v1/platform/model-pool-rollouts/:rollout_id/targets` 接受 `state,limit,cursor`，回 `{items,total,next_cursor,actions}`。行含 `tenant_id,user_id,device_id,target_config_revision,applied_config_revision,state,reason,last_seen_at,last_receipt_at,actions`。缺值为 null，`reason` 为稳定码，设备拒绝时采用已脱敏的 `error.detail.reason`。回执时间仅指本目标。分页总数是过滤后总数，游标绑定 rollout、筛选与操作者。页面使用当前池版本右栏和原有台账收窄，目标行本批无写操作。
 - 既有商业方案表单用 `GET /v1/platform/models` 的 `current_source_rate_key` 选择当前可签版本，精确版本详情沿用倍率回读。手填完整四项仍可用。编辑或复制旧方案保留原费率引用和显式手调值。仅有显示倍率、无版本引用的型号不能作为来源选项。
 - 平台签发预览与固定签发显示 `sales_rate_snapshots` 的四项售价及签约输入倍率。租户侧增加 `GET /v1/policy/signatures/:revision` 读取同租户历史售价，沿用租户计费详情的户主权限。列表在户主行上返回 `read_rates`，详情返回 `{revision,issued_at,sales_rate_snapshots,actions:["read"]}`；已签售价项保存 `rate_version_id,model_id,input_multiplier_basis,input_multiplier_ppm,valid_from,valid_until` 及四项费率。平台费率来源和商业摘要只在平台侧。历史无价格快照时展示空态。当前目标、实际应用、在途旧租约分别显示和验证。
 
