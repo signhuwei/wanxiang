@@ -262,7 +262,7 @@ fn login(ipc: &Ipc, token: String, server: Option<String>, device_id: Option<Str
     }
     let Some(device_id) = device_id else {
         info!("device token updated via ipc (legacy, memory-only)");
-        ipc.state.token.send_replace(Some(token));
+        ipc.state.replace_token(Some(token));
         return json!({"ok": true});
     };
     let configured = ipc.server_url.as_deref().and_then(normalize_origin);
@@ -289,7 +289,7 @@ fn login(ipc: &Ipc, token: String, server: Option<String>, device_id: Option<Str
         info!(%device_id, "device credentials persisted to keychain");
     }
     *ipc.state.expected_device_id.write().unwrap() = Some(device_id.clone());
-    ipc.state.token.send_replace(Some(token));
+    ipc.state.replace_token(Some(token));
     json!({"ok": true})
 }
 
@@ -330,7 +330,7 @@ fn logout(ipc: &Ipc) -> (Value, bool) {
     ipc.state.desktop_sessions.clear();
     ipc.state.workbuddy_turns.clear();
     ipc.state.active_session.write().unwrap().take();
-    ipc.state.token.send_replace(None);
+    ipc.state.replace_token(None);
     (json!({"ok": true}), true)
 }
 
