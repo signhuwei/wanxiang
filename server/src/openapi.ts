@@ -301,16 +301,94 @@ const invite = object({ id: text, role, group_id: nullableText, max_uses: sequen
   created_by: text, revision, actions, code_returned: { type: 'boolean' }, invite_code: text },
 ['id', 'role', 'group_id', 'max_uses', 'used', 'expires_at', 'created_by', 'revision', 'actions', 'code_returned']);
 
-function platformPaths(path: string, fields: Record<string, unknown>, required: string[], additionalInput = {}, additionalOutput = {}) {
+function platformPaths(path: string, fields: Record<string, unknown>, required: string[], additionalInput = {}, additionalOutput = {}, listOutput = additionalOutput) {
   const result = managed({ ...fields, ...additionalOutput });
+  const listResult = managed({ ...fields, ...listOutput });
   const input = { ...fields, ...additionalInput, revision };
   const item = write(object(input, ['revision']), result, 'update', true);
   return {
-    [path]: { get: listOf(result, path.endsWith('/models') ? [{ name: 'provider_id', in: 'query', schema: text }] : []), post: { ...write({ oneOf: [{ ...object(input, required), not: { required: ['id'] } }, object(input, ['id', 'revision'])] }, result, 'upsert'),
+    [path]: { get: listOf(listResult, path.endsWith('/models') ? [{ name: 'provider_id', in: 'query', schema: text }] : []), post: { ...write({ oneOf: [{ ...object(input, required), not: { required: ['id'] } }, object(input, ['id', 'revision'])] }, result, 'upsert'),
       description: '新建时不传 id；更新已有对象时传 id 和 revision。' } },
     [`${path}/{id}`]: { post: item, patch: item },
   };
 }
+
+const routingId = { ...text, pattern: '^[A-Za-z0-9_.-]{1,128}$' };
+const routingModelId = namedPath('model_id', routingId);
+const routingPoolPath = '/v1/platform/models/{model_id}/pool';
+const routingPagination = listParams.slice(1);
+const routingSearch = { name: 'q', in: 'query', schema: { ...text, maxLength: 200 } };
+const readActions = { ...actions, const: ['read'] };
+
+function routingList(item: object, parameters: object[], pageActions: object, extras = {}) {
+  const list = listOf(item);
+  return { ...list, parameters, responses: { ...list.responses, 404: error('对象不存在'),
+    200: response('分页结果', object({ items: listItems(item), total: sequence, next_cursor: nullableText, actions: pageActions, ...extras })) } };
+}
+
+const providerDeployment = object({ id: routingId, revision, deployment_revision: revision, display_name: text, raw_model: text,
+  account_id: routingId, endpoint_id: routingId, capabilities: listItems(text),
+  status: { ...text, enum: ['active', 'disabled', 'archived'] }, actions: readActions,
+  archive_blockers: listItems(object({ kind: { const: 'active_pool' }, model_id: routingId, pool_revision: revision })) });
+const routingMatchStatus = { ...text, enum: ['suggested', 'needs_review', 'accepted', 'rejected'] };
+const routingCandidateFields = { candidate_id: routingId, discovery_id: nullableText, catalog_item_id: nullableText,
+  deployment_id: routingId, deployment_revision: revision, provider_id: routingId, account_id: routingId, endpoint_id: routingId, raw_model: text,
+  match: object({ match_rule_id: nullableText, rule_revision: nullable(revision),
+    kind: { ...text, enum: ['exact', 'catalog', 'manual', 'normalized'] }, confidence: { ...text, enum: ['high', 'medium', 'low'] },
+    reason: text, reasons: listItems(text), review_status: routingMatchStatus }),
+  capabilities: listItems(text), health: object({ state: { const: 'unknown' }, reason: { const: 'not_observed' } }),
+  quote_ref: { type: 'null' }, eligible: boolean, reason: nullableText, reasons: listItems(text),
+  actions: { ...actions, enum: [['read'], ['read', 'select']] } };
+const routingCandidate = { ...object({ ...routingCandidateFields, approved_match_id: routingId, evidence_ids: listItems(routingId) },
+  Object.keys(routingCandidateFields)),
+  if: { properties: { eligible: { const: true } } }, then: { required: ['approved_match_id', 'evidence_ids'] },
+  else: { properties: { actions: readActions, approved_match_id: false, evidence_ids: false } } };
+
+const routingMember = { deployment_id: routingId, deployment_revision: revision, priority: { ...sequence, maximum: 1_000_000 },
+  approved_match_id: routingId, evidence_ids: { ...listItems(routingId), minItems: 1, maxItems: 16 } };
+const routingRules = { ...object({ strategy: { const: 'ordered' }, max_attempts: { ...revision, maximum: 8 },
+  attempt_timeout_ms: { ...revision, maximum: 600_000 },
+  total_timeout_ms: { ...revision, maximum: 600_000, description: '不得小于单次尝试时限。' } }), additionalProperties: false };
+const routingDraftContents = { members: { ...listItems({ ...object(routingMember), additionalProperties: false }), minItems: 1, maxItems: 32,
+  description: '同一 deployment_id 只允许出现一次。' }, routing: routingRules,
+  reason: { ...text, maxLength: 500, pattern: '\\S' } };
+const routingDraft = { expected_pool_revision: sequence, ...routingDraftContents };
+const routingIssue = object({ code: text, message: text, deployment_id: routingId, field: text }, ['code', 'message']);
+const routingPreviewBasis = { ...text, maxLength: 256, pattern: '\\S', description: '预览返回的不透明校验依据。' };
+const routingPreview = { ...object({ model_id: routingId, expected_pool_revision: sequence, preview_basis: routingPreviewBasis,
+  publishable: boolean, blocking: listItems(routingIssue), warnings: listItems(routingIssue),
+  diff: object({ added: listItems(routingId), removed: listItems(routingId), updated: listItems(routingId) }),
+  impact: object({ tenant_count: sequence, device_count: sequence }), draft: object(routingDraftContents),
+  actions }), if: { properties: { publishable: { const: true } } },
+  then: { properties: { actions: { ...actions, const: ['read', 'publish_pool'] } } }, else: { properties: { actions: readActions } } };
+const routingRevision = { model_id: routingId, pool_revision: revision, based_on_revision: nullable(revision),
+  rollback_of: nullable(revision), reason: text, released_by: text, released_at: timestamp, current: boolean, actions: readActions };
+const routingRevisionDetail = object({ ...routingRevision, identity_revision: revision, digest: text, routing: routingRules,
+  members: listItems(object({ ...routingMember, provider_id: routingId, account_id: routingId, endpoint_id: routingId, raw_model: text })),
+  rollout: nullable(object({ rollout_id: routingId, status: { ...text, enum: ['pending', 'running', 'done', 'failed'] } })) });
+
+const routingPaths = {
+  '/v1/platform/providers/{provider_id}/deployments': {
+    get: routingList(providerDeployment, [namedPath('provider_id', routingId), routingSearch, ...routingPagination], { ...actions, const: [] }),
+  },
+  '/v1/platform/deployments': { get: routingList(routingCandidate, [routingSearch, ...routingPagination,
+    { name: 'target_model_id', in: 'query', required: true, schema: routingId },
+    { name: 'provider_id', in: 'query', schema: routingId }, { name: 'protocol', in: 'query', schema: providers.protocol },
+    { name: 'match', in: 'query', schema: routingMatchStatus }], { ...actions, const: [] }) },
+  [routingPoolPath + '/preview']: {
+    post: policyPreview({ ...object(routingDraft), additionalProperties: false }, routingPreview, [routingModelId]),
+  },
+  [routingPoolPath + '/revisions']: {
+    get: routingList(object({ ...routingRevision, member_count: sequence }), [routingModelId, ...routingPagination],
+      { ...actions, enum: [[], ['preview_pool']] }, { current_pool_revision: sequence }),
+    post: { ...policyWrite({ ...object({ ...routingDraft, preview_basis: routingPreviewBasis }), additionalProperties: false },
+      object({ model_id: routingId, pool_revision: revision, rollout_id: routingId, actions: readActions }), 'create', [routingModelId]),
+      description: '提交原预览草稿及预览依据。重复提交使用同一幂等键。冲突原因包含 revision_changed、preview_stale 和 idempotency_mismatch。' },
+  },
+  [routingPoolPath + '/revisions/{pool_revision}']: {
+    get: policyDetail(routingRevisionDetail, [routingModelId, namedPath('pool_revision', revision)]),
+  },
+};
 
 const ledgerFields = { id: text, kind: text, amount_milli: { type: 'integer' }, user_id: nullableText, lease_id: nullableText,
   request_ref: nullableText, by: nullableText, at: text, note: nullableText, actions };
@@ -328,6 +406,7 @@ export const openapi = {
   info: { title: 'OneX Server', version: pkg.version },
   paths: {
     ...policyPaths,
+    ...routingPaths,
     '/v1/healthz': { get: { summary: '健康检查', responses: { 200: response('正常', object({ status: { const: 'ok' }, version: text, commit: text })) } } },
     '/v1/openapi.json': { get: { summary: '接口文档', responses: { 200: response('OpenAPI 文档', { type: 'object' }) } } },
     '/v1/auth/code': { post: { summary: '请求验证码', parameters: headers, requestBody: requestBody(object({ target: text })),
@@ -453,7 +532,10 @@ export const openapi = {
     '/v1/platform/capability-contracts/{tenant_id}/preview': { post: contractPreview(platformContractInput, [contractTenantPath]) },
     ...platformPaths('/v1/platform/tenants', tenantFields, ['name', 'owner_user_id'], {}, { created_at: text }),
     ...platformPaths('/v1/platform/providers', providers, ['name', 'protocol', 'base_url', 'secret'], { secret: { ...text, writeOnly: true } }),
-    ...platformPaths('/v1/platform/models', models, ['provider_id', 'upstream_name', 'display_name', 'context_window']),
+    ...platformPaths('/v1/platform/models', models, ['provider_id', 'upstream_name', 'display_name', 'context_window'], {}, {}, {
+      current_identity_revision: nullable(revision), current_pool_revision: { ...sequence, description: '0 表示未发布模型池。' },
+      channel_count: sequence,
+    }),
     ...platformPaths('/v1/platform/agent-releases', releases, ['agent', 'version', 'os', 'arch', 'url', 'sha256', 'size'], {},
       releaseSupply),
     '/v1/platform/agent-releases/{id}': {
