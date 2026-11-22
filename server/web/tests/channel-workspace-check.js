@@ -51,9 +51,9 @@ try {
   const text = name => page.getByText(name, { exact: true })
   const cell = name => page.getByRole('cell', { name, exact: true })
   const right = () => page.locator('.inline-pane').last()
-  async function submit(name, suffix, status) {
+  async function submit(name, suffix, status, scope = page) {
     const pending = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname.endsWith(suffix))
-    await button(name).click()
+    await scope.getByRole('button', { name, exact: true }).click()
     const response = await pending
     assert.equal(response.status(), status, await response.text())
     return response.json()
@@ -174,17 +174,26 @@ try {
   await label('倍率理由').fill('确定合同价格')
   await submit('重新试算', '/input-multiplier/preview', 200)
   const rate = await submit('发布可签倍率', '/input-multiplier/revisions', 201)
-  const plan = await call('/commerce/plans', { name: '双渠道销售方案', expected_version: 0,
-    terms: { model_prices: [{ model_id: modelId, source_rate_key: rate.source_rate_key }] } }, 201)
-  const contract = '/policy/contracts/' + tenant.tenantId
   await link('能力合约').click()
+  await link('商业计费').click()
+  await button('发布方案').click()
+  await label('方案名称').fill('双渠道销售方案')
+  await button('添加模型协议价').click()
+  const price = right().locator('.commerce-price-row').last()
+  await price.getByLabel('模型', { exact: true }).selectOption(modelId)
+  assert.equal(await price.getByLabel('费率来源', { exact: true }).inputValue(), rate.source_rate_key)
+  const plan = await submit('发布方案', '/commerce/plans', 201, right())
+  assert.equal(plan.terms.model_prices[0].input_milli_per_mtok, 4000)
+  const contract = '/policy/contracts/' + tenant.tenantId
+  await link('平台合约').click()
   await button('单链路联验租户').click()
   await button('首次签发').click()
   await label('签发原因').fill('将双渠道签约型号授予租户')
   async function chooseClause(title, value) {
-    await text('从条目库添加').click()
-    await right().locator('.policy-picker[open] input[type=search]').fill(title)
-    await right().locator('.policy-picker[open] tr').getByText(title, { exact: true }).click()
+    const picker = right().locator('.policy-picker', { has: page.locator('summary').getByText('从条目库添加', { exact: true }) })
+    await picker.locator('summary').click()
+    await picker.locator('input[type=search]').fill(title)
+    await picker.locator('tr').getByText(title, { exact: true }).click()
     const row = right().locator('.policy-entry', { has: page.getByText(title, { exact: true }) })
     await row.getByLabel('调节方式', { exact: true }).selectOption('adjust')
     await row.getByText('选择' + title, { exact: true }).click()

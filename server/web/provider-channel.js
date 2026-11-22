@@ -13,7 +13,8 @@ const capabilities = [
 ]
 const jobStatus = { succeeded: '成功', partial: '部分完成', failed: '失败', queued: '排队中', running: '执行中' }
 const jobReasons = {
-  missing_credential: '缺少查询凭据', credential_rejected: '上游拒绝认证', permission_denied: '上游限制访问',
+  missing_credential: '缺少查询凭据', credential_scope_changed: '地址或认证已变更，请保存适用的上游密钥',
+  credential_rejected: '上游拒绝认证', permission_denied: '上游限制访问',
   unsupported_capability: '此接口不提供模型目录', probe_timeout: '请求上游超时', schema_mismatch: '上游目录格式无法读取',
   upstream_unavailable: '上游暂不可达', probe_unreachable: '上游暂不可达', redirect_denied: '上游返回重定向',
   destination_denied: '目标地址无法用于查询', upstream_error: '上游返回错误', malformed_items: '部分条目格式错误',
