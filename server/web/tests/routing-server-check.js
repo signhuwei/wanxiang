@@ -116,6 +116,56 @@ function seedExistingEntitlements(sql, tenantId, userId) {
     [userId,at,userId,leaseId,at])
 }
 
+async function verifySignatureKeepsItsRate(token, tenantId, priced) {
+  const call = async (path, body, status = 200) => {
+    const response = await fetch(new URL('/v1/platform' + path, app.server.url), {
+      method: body ? 'POST' : 'GET',
+      headers: { Authorization:'Bearer ' + token,
+        ...(body ? { 'Content-Type':'application/json', 'Idempotency-Key':crypto.randomUUID() } : {}) },
+      body: body && JSON.stringify(body),
+    })
+    const result = await response.json()
+    assert.equal(response.status, status, JSON.stringify({ path, result }))
+    return result
+  }
+  const plan = await call('/commerce/plans', {
+    name:'联验商业方案', expected_version:0, terms:{ model_prices:[
+      { model_id:modelId, source_rate_key:priced.source_rate_key },
+    ] },
+  }, 201)
+  const { input_milli_per_mtok, output_milli_per_mtok, cache_read_milli_per_mtok, cache_write_milli_per_mtok } = plan.terms.model_prices[0]
+  assert.deepEqual([input_milli_per_mtok,output_milli_per_mtok,cache_read_milli_per_mtok,cache_write_milli_per_mtok],
+    [4000,12000,1000,5000])
+
+  const contract = '/policy/contracts/' + tenantId
+  const signing = {
+    expected_platform_revision:1, expected_policy_revision:1, base_revision:1, reason:'引用实际发布的费率',
+    entries:[['access.models',[modelId]],['billing.plan',[plan.id]]].map(([id,adjustment]) => ({
+      template_ref:null, clause_ref:{ id, version:1 }, adjustment,
+    })),
+  }
+  const preview = await call(contract + '/preview', signing)
+  const [proposed] = preview.sales_rate_snapshots
+  assert.equal(proposed.rate_version_id, undefined)
+  assert.equal(proposed.input_multiplier_ppm, fixture.pricing.signed_input_multiplier_ppm)
+  const signed = await call(contract + '/signatures', signing, 201)
+  const [frozen] = signed.sales_rate_snapshots
+  assert.match(frozen.rate_version_id, /^rate_/)
+  assert.equal(frozen.source_rate_key, priced.source_rate_key)
+  assert.equal(frozen.input_multiplier_ppm, fixture.pricing.signed_input_multiplier_ppm)
+
+  const nextPrice = { expected_pool_revision:fixture.model.next_pool_revision, expected_source_rate_key:priced.source_rate_key,
+    manual_input_multiplier_ppm:5000000, reason:'试验下一签期价格' }
+  const endpoint = '/models/' + modelId + '/input-multiplier'
+  const nextPreview = await call(endpoint + '/preview', nextPrice)
+  const nextPublished = await call(endpoint + '/revisions', { ...nextPrice, pricing_at:nextPreview.pricing_at,
+    preview_basis:nextPreview.preview_basis }, 201)
+  assert.equal(nextPublished.input_multiplier_ppm, 5000000)
+  assert.notEqual(nextPublished.source_rate_key, frozen.source_rate_key)
+  const prior = await call(contract + '/signatures/2')
+  assert.deepEqual(prior.sales_rate_snapshots, [frozen])
+}
+
 try {
   app = await createServer({ dataDir: scratch, hostname: '127.0.0.1', port: 0, heartbeatMs: 15000, tenantCacheSize: 2,
     presence: new MemoryPresence(), commit: 'test', codeSecret: crypto.randomUUID(), masterKey: crypto.getRandomValues(new Uint8Array(32)),
@@ -130,6 +180,7 @@ try {
     policyHead: tenant.get('SELECT * FROM policy_head'),
     signatures: tenant.all('SELECT * FROM policy_signatures ORDER BY revision'),
     effective: tenant.all('SELECT * FROM policy_effective ORDER BY scope,subject_id'),
+    signedRates: tenant.all('SELECT * FROM sales_rate_snapshots ORDER BY platform_revision,model_id'),
     applications: tenant.all('SELECT * FROM policy_device_applications ORDER BY device_id'),
     leases: tenant.all('SELECT * FROM leases ORDER BY id'),
     ledger: tenant.all('SELECT * FROM ledger ORDER BY id'),
@@ -158,7 +209,10 @@ try {
   await button('发送验证码').click()
   await page.getByText('验证码已发送，请查收').waitFor()
   await page.getByPlaceholder('6 位验证码').fill(loginCode)
+  const login = page.waitForResponse(response => new URL(response.url()).pathname === '/v1/auth/login')
   await button('登录').click()
+  const { token } = await (await login).json()
+  assert.equal(typeof token, 'string')
   await page.waitForURL(/#\/platform$/)
   await link('能力管理').click()
   await link('签约型号').click()
@@ -197,8 +251,72 @@ try {
     [{ deployment_id:'dep_a' },{ deployment_id:'dep_b' }])
   assert.equal(app.store.system.get('SELECT COUNT(*) AS n FROM route_release_jobs WHERE model_id=? AND pool_revision=7',[modelId]).n, 1)
   assert.deepEqual(snapshot(),before)
+  // Open the same management panels a platform administrator uses.
+  const submit = async (action, endpoint) => {
+    const request = page.waitForResponse(response => response.request().method() === 'POST' &&
+      new URL(response.url()).pathname.endsWith(endpoint))
+    await button(action).click()
+    const resp = await request
+    assert.equal(resp.status(), 201, await resp.text())
+    return resp.json()
+  }
+  const time = seconds => new Date(now + seconds * 1000).toISOString()
+  await link('Provider').click()
+  for (const [index, tail] of [[0,'a'], [1,'b']]) {
+    const source = fixture.pricing.procurement_quotes.filter(item => item.deployment_id === 'dep_' + tail)
+    await page.getByRole('cell', {name:'供应渠道 ' + tail.toUpperCase(), exact:true}).click()
+    await button('采购报价 dep_' + tail).click()
+    await button('发布新报价').click()
+    await page.getByLabel('币种', {exact:true}).fill(source[0].currency)
+    await page.getByLabel('生效时间（UTC）', {exact:true}).fill(time(-60))
+    await page.getByLabel('失效时间（UTC，可空）', {exact:true}).fill(expires)
+    for (const item of source) {
+      const name = item.dimension === 'input' ? '普通输入' : '输出'
+      await page.getByLabel(name + '单价', {exact:true}).fill(String(Number(item.rate_micro) / 1_000_000))
+      await page.getByLabel(name + '数量基数', {exact:true}).fill(String(item.quantity_basis))
+    }
+    await page.getByLabel('报价原因', {exact:true}).fill('采购联验 ' + tail)
+    const quote = await submit('发布报价', '/deployments/dep_' + tail + '/quotes')
+    assert.equal(quote.deployment_revision, draft.members[index].deployment_revision)
+    await page.getByText(/已发布采购报价 v1/).waitFor()
+    if (tail === 'a') {
+      await link('签约型号').click()
+      await link('Provider').click()
+    }
+  }
+  await link('采购汇率').click()
+  await button('登记汇率').click()
+  await page.getByLabel('1 USD 兑人民币', {exact:true}).fill('7.50')
+  await page.getByLabel('观测时间（UTC）', {exact:true}).fill(time(-60))
+  await page.getByLabel('生效时间（UTC）', {exact:true}).fill(time(-60))
+  await page.getByLabel('失效时间（UTC）', {exact:true}).fill(expires)
+  await page.getByLabel('汇率原因', {exact:true}).fill('汇率联验')
+  const fx = await submit('发布汇率', '/procurement/fx-rates')
+  assert.equal(fx.rate_numerator, fixture.pricing.fx.rate_numerator)
+  assert.equal(fx.rate_denominator, fixture.pricing.fx.rate_denominator)
+  await page.getByText(/已发布汇率 v1/).waitFor()
+
+  await link('签约型号').click()
+  await row.click()
+  await page.getByText('输入倍率', {exact:true}).click()
+  await button('试算倍率').click()
+  await page.getByText('完整试算', {exact:true}).waitFor()
+  await page.getByRole('table', {name:'渠道输入价'}).getByText('dep_b v2', {exact:true}).waitFor()
+  await page.getByLabel('最终倍率（×）', {exact:true}).fill('4')
+  await page.getByLabel('倍率理由', {exact:true}).fill('标准签约价联验')
+  const recalculated = page.waitForResponse(resp => resp.request().method() === 'POST' &&
+    new URL(resp.url()).pathname.endsWith('/input-multiplier/preview'))
+  await button('重新试算').click()
+  const previewed = await (await recalculated).json()
+  assert.equal(previewed.recommended_input_multiplier_ppm, fixture.pricing.recommended_input_multiplier_ppm)
+  const priced = await submit('发布可签倍率', '/input-multiplier/revisions')
+  assert.equal(priced.input_multiplier_ppm, fixture.pricing.signed_input_multiplier_ppm)
+  await page.getByText(/已发布平台可签输入倍率 4×/).waitFor()
+  await page.getByRole('table', {name:'倍率依据'}).getByText('dep_b v2', {exact:true}).waitFor()
+  assert.deepEqual(snapshot(), before)
+  await verifySignatureKeepsItsRate(token, tenantId, priced)
   assert.deepEqual(errors,[])
-  console.log('routing-server-check ok: real Chrome, platform HTTP, SQLite pool v6→v7, readback, no tenant-side writes')
+  console.log('routing-server-check ok: real Chrome, pool v6→v7, quote/FX, 3× recommendation, 4× signature preserved after publishing 5×')
 } catch (error) {
   if (errors.length) console.error('WebUI failed to load:', errors)
   throw error
