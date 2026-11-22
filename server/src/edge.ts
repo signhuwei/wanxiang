@@ -5,6 +5,7 @@ import { ulid } from 'ulid';
 import { ApiError } from './api';
 import { deviceTtl } from './auth';
 import { initialLease, renewLease, requestLease } from './billing';
+import { requestRouteLease } from './route-lease';
 import type { DiagChannel } from './diag';
 import { ackCursor, eventItems, ingestEvents, ingestUsage, usageItems, type PublishSummary } from './ingest';
 import { int } from './management';
@@ -209,6 +210,13 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
           }
           if (msg.type === 'pong' || (msg.type === 'ack' && isText(msg.re) && typeof msg.ok === 'boolean')) return;
           if (routePoolGated && ['lease_renew', 'lease_request', 'config_applied'].includes(String(msg.type)) && isText(msg.id)) throw unsupportedRoutePool();
+          if (routePoolSelected && projector?.inputs.leaseGate && msg.type === 'lease_request' && isText(msg.id)) {
+            if (!isText(msg.op_id)) throw new ApiError('invalid', { fields: ['op_id'] });
+            const reply = await requestRouteLease(store, projector.inputs, tenantId, deviceId, userId, now(), live);
+            await config.balanceChanged(tenantId);
+            send({ ...reply, re: msg.id });
+            return;
+          }
           if (routePoolSelected && (msg.type === 'lease_renew' || msg.type === 'lease_request') && isText(msg.id)) throw routePoolLeasePending();
           if (msg.type === 'config_applied' && isText(msg.id)) {
             if (routePoolSelected) {

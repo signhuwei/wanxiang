@@ -34,6 +34,8 @@ export type RoutingProjectionInputs = {
   revocationRevision?(tenantId: string, deviceId: string): number;
   projectionId?(): string;
   ttlMs?: number;
+  /** Isolated lease gate (contracts/routing-lease-gate.md). Off by default: sessions keep route_pool_lease_pending. */
+  leaseGate?: boolean;
 };
 
 export class ProjectionFailure extends Error {
@@ -213,6 +215,46 @@ export function readSnapshot(sql: Reader, deviceId: string, revision: number) {
 /** Latest persisted target of a device. */
 export function latestSnapshot(sql: Reader, deviceId: string) {
   return sql.get<SnapshotRow>('SELECT * FROM routing_config_snapshots WHERE device_id = ? ORDER BY config_revision DESC LIMIT 1', [deviceId]);
+}
+
+/**
+ * Whether the member's current effective authorization still covers an applied projection: every binding is still
+ * granted under the current signature (model, Agent, exact release, and the pinned pool revision when pinned), its exact
+ * Agent release is still active for the device's OS/arch, and every route is still an eligible member of the exact
+ * historical pool revision it was projected from (never the current pool head), keeps a permitted provider and the same
+ * available credential version. A pure active-pool change of a follow grant does not void it; narrowing, a disabled or
+ * re-versioned deployment, or a withdrawn release does.
+ */
+export function projectionStillAuthorized(store: Store, db: Reader, inputs: RoutingProjectionInputs, tenantId: string, deviceId: string,
+  config: RoutePoolConfig, at: number) {
+  const now = iso(at);
+  const system = store.system;
+  const device = db.get<Recipient>(`${recipientQuery} AND d.id = ?`, [now, deviceId]);
+  if (!device || config.policy.user_id !== device.user_id) return false;
+  const policy = readPolicyDevice(db as Transaction, device.user_id);
+  if (!policy) return false;
+  const grants = inputs.grants(tenantId).filter(grant => covers(grant, device.user_id) && grant.platform_revision === policy.platform_revision
+    && authorized(store, policy, grant));
+  const providers: Set<string> | null = policy.provider_ids_json == null ? null : new Set(JSON.parse(policy.provider_ids_json));
+  for (const binding of config.route_pool.bindings as { binding_id: string; binding_revision: number; agent_release_id: string; model_id: string }[]) {
+    const grant = grants.find(row => row.binding_id === binding.binding_id && row.binding_revision === binding.binding_revision
+      && row.agent_release_id === binding.agent_release_id && row.model_id === binding.model_id);
+    if (!grant) return false;
+    const pool = (config.route_pool.pools as { model_id: string; pool_revision: number }[]).find(row => row.model_id === binding.model_id);
+    if (grant.pool.mode === 'pinned' && grant.pool.pool_revision !== pool?.pool_revision) return false;
+    if (!system.get(`SELECT 1 FROM agent_releases WHERE id = ? AND status = 'active' AND os = ? AND arch = ?`,
+      [binding.agent_release_id, device.os, device.arch])) return false;
+  }
+  for (const route of config.routes) {
+    if (providers && !providers.has(route.provider_id)) return false;
+    const member = poolMembers(system, route.model_id, route.pool_revision)
+      .find(row => row.deployment_id === route.deployment_id && row.deployment_revision === route.deployment_revision);
+    if (!member || assessMember(system, route.model_id, currentIdentity(system, route.model_id), member, now).codes.length) return false;
+    const ref = inputs.credentialRef(route.deployment_id, route.deployment_revision);
+    if (!ref || ref.credential_id !== route.credential_ref?.credential_id || ref.credential_version !== route.credential_ref?.credential_version
+      || !inputs.credentialMaterial(ref.credential_id, ref.credential_version)) return false;
+  }
+  return true;
 }
 
 export function routingProjector(store: Store, inputs: RoutingProjectionInputs, now: () => number) {

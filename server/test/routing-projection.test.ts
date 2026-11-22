@@ -197,7 +197,7 @@ test('tenants without grants keep their current configuration and the roster ign
   await expect(f.projector.project(f.tenantId, 'dev_lin', clock)).rejects.toMatchObject({ reason: 'signature_changed' });
 });
 
-test('existing tenant 20 and system 17 databases upgrade to 21 and 18 with the legacy application head intact', () => {
+test('existing tenant 20 and system 17 databases upgrade to 22 and 18 with the legacy application head, leases and operations intact', () => {
   const dir = mkdtempSync(join(tmpdir(), 'onex-projection-upgrade-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   const tenantId = 'ten_00000000000000000000000001';
@@ -213,16 +213,21 @@ test('existing tenant 20 and system 17 databases upgrade to 21 and 18 with the l
         INSERT INTO members (user_id, role, status) VALUES ('usr_old', 'owner', 'active');
         INSERT INTO devices (id, user_id, name, os, arch, public_key, token_hash, token_expires_at, status)
           VALUES ('dev_old', 'usr_old', 'Old', 'darwin', 'arm64', 'k', 'h', '2030-01-01T00:00:00Z', 'active');
-        INSERT INTO policy_device_applications (device_id, config_revision, policy_revision, applied_at) VALUES ('dev_old', 40, 3, '2026-11-01T00:00:00Z');`);
+        INSERT INTO policy_device_applications (device_id, config_revision, policy_revision, applied_at) VALUES ('dev_old', 40, 3, '2026-11-01T00:00:00Z');
+        INSERT INTO leases (id, device_id, user_id, budget_milli, expires_at, status, seq) VALUES ('lse_old', 'dev_old', 'usr_old', 25, '2026-11-01T00:10:00Z', 'settled', 1);
+        INSERT INTO lease_operations (device_id, op_id, lease_id, used_milli, result_json) VALUES ('dev_old', 'op_old', 'lse_old', 5, '{}');`);
     } finally { legacy.close(); }
   }
   const tenant = new QueuedDatabase(join(dir, `tenant-${tenantId}.sqlite`), 'tenant');
   const system = new QueuedDatabase(join(dir, 'system.sqlite'), 'system');
   try {
-    expect(tenant.get('PRAGMA user_version')).toEqual({ user_version: 21 });
+    expect(tenant.get('PRAGMA user_version')).toEqual({ user_version: 22 });
     expect(system.get('PRAGMA user_version')).toEqual({ user_version: 18 });
     expect(tenant.get('SELECT device_id, config_revision, policy_revision, projection_id FROM policy_device_applications'))
       .toEqual({ device_id: 'dev_old', config_revision: 40, policy_revision: 3, projection_id: null });
+    // Existing operations stay legacy; historical leases keep no projection link.
+    expect(tenant.get('SELECT op_id, lease_id, used_milli, mode FROM lease_operations')).toEqual({ op_id: 'op_old', lease_id: 'lse_old', used_milli: 5, mode: 'legacy' });
+    expect(tenant.get('SELECT count(*) AS n FROM routing_lease_projections')).toEqual({ n: 0 });
     for (const db of [tenant, system]) {
       expect(db.all('PRAGMA foreign_key_check')).toEqual([]);
       expect(db.get('PRAGMA integrity_check')).toEqual({ integrity_check: 'ok' });

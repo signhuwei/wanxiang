@@ -190,7 +190,7 @@ export function deviceAllowed(store: Store, sql: Reader, tenantId: string, devic
 
 // 断流优先级（v0.13 edge-ws.md「断流原因优先级」）：disabled（调用方在 issue() 之前判定）> contract > balance > quota。
 function issue(store:Store, sql: Transaction, deviceId: string, userId: string, at: number, supportsCapabilityContract: boolean, supportsCapabilityPolicy: boolean,
-  settledLeaseId?: string): LeaseReply {
+  settledLeaseId?: string, options: { notAfter?: string } = {}): LeaseReply {
   const policy=readPolicyHot(sql,userId);
   if (policy && (!supportsCapabilityPolicy || policy.allowed_models_json==='[]')) return cutoff('contract',settledLeaseId);
   const contract=policy??readContract(sql);
@@ -216,8 +216,11 @@ function issue(store:Store, sql: Transaction, deviceId: string, userId: string, 
     if (!balanceFallbackModels(policy).some(id => allowed.has(id))) return cutoff('contract', settledLeaseId);
   }
   const last = sql.get<{ seq: number }>('SELECT seq FROM leases WHERE device_id = ? ORDER BY seq DESC LIMIT 1', [deviceId]);
+  // An isolated route_pool lease never outlives the applied projection it is bound to.
+  const expiresAt = Math.min(at + contract.lease_minutes * 60_000, plan ? Date.parse(monthBounds(at)[1]) : Infinity,
+    options.notAfter ? Date.parse(options.notAfter) : Infinity);
   const row: LeaseRow = { id: `lse_${ulid()}`, device_id: deviceId, user_id: userId, budget_milli: budget, used_milli: 0,
-    expires_at: iso(Math.min(at + contract.lease_minutes * 60_000,plan?Date.parse(monthBounds(at)[1]):Infinity)), status: 'active', seq: (last?.seq ?? 0) + 1 };
+    expires_at: iso(expiresAt), status: 'active', seq: (last?.seq ?? 0) + 1 };
   sql.run('INSERT INTO leases (id, device_id, user_id, budget_milli, expires_at, status, seq) VALUES (?, ?, ?, ?, ?, ?, ?)',
     [row.id, deviceId, userId, budget, row.expires_at, row.status, row.seq]);
   if (policy && plan) {
@@ -235,6 +238,27 @@ function issue(store:Store, sql: Transaction, deviceId: string, userId: string, 
   }
   entry(sql, 'reserve', budget, at, { lease: row });
   return leaseView(row,sql);
+}
+
+/** Isolated route_pool path only: same decision as the legacy issue, inside the caller's tenant transaction. */
+export { issue as issueLeaseInTransaction, leaseView };
+export type { LeaseRow, LeaseReply };
+
+/**
+ * Settles a lease within its original terms: charges min(used, budget), releases the rest and records any overage as
+ * pending. Shared by the legacy renewal and the isolated route_pool renewal; callers record the operation.
+ */
+export function settleLease(sql: Transaction, deviceId: string, lease: LeaseRow, used: number, report: Record<string, number> | null,
+  opId: string, at: number) {
+  // Edge 诚实上报的实际用量可能略超这份额度（尾部花费在发出预留之后才计出）。租户只按这份额度实扣，
+  // 多出的部分单独记一笔 overage_pending 挂账待核对，不计入余额、消费或预留，也不转嫁到下一份租约。
+  const charged = Math.min(used, lease.budget_milli);
+  sql.run("UPDATE leases SET used_milli = ?, status = 'settled', revision = revision + 1 WHERE id = ?", [charged, lease.id]);
+  settleCommercial(sql, lease.id, charged, used, report, at);
+  if (charged) entry(sql, 'settle', charged, at, { lease, requestRef: opId });
+  if (charged < lease.budget_milli) entry(sql, 'release', lease.budget_milli - charged, at, { lease, requestRef: opId });
+  if (used > charged) entry(sql, 'overage_pending', used - charged, at, { lease, requestRef: opId, note: '超租约差额待核对' });
+  reconcileUsage(sql, deviceId);
 }
 
 export function initialLease(store: Store, tenantId: string, deviceId: string, userId: string, at: number, live: () => boolean,
@@ -267,10 +291,10 @@ export function renewLease(store: Store, tenantId: string, deviceId: string, use
     if (!live() || !deviceAllowed(store, sql, tenantId, deviceId, at)) return cutoff('disabled');
     const report=modelReport(modelUsed);
     const reportJson=report?JSON.stringify(report):null;
-    const cached = sql.get<{ lease_id: string; used_milli: number; result_json: string;model_used_json:string|null }>(
-      'SELECT lease_id, used_milli, result_json, model_used_json FROM lease_operations WHERE device_id = ? AND op_id = ?', [deviceId, opId]);
+    const cached = sql.get<{ lease_id: string; used_milli: number; result_json: string;model_used_json:string|null; mode: string }>(
+      'SELECT lease_id, used_milli, result_json, model_used_json, mode FROM lease_operations WHERE device_id = ? AND op_id = ?', [deviceId, opId]);
     if (cached) {
-      if (cached.lease_id !== leaseId || cached.used_milli !== used || cached.model_used_json!==reportJson) throw new ApiError('conflict');
+      if (cached.lease_id !== leaseId || cached.used_milli !== used || cached.model_used_json!==reportJson || cached.mode !== 'legacy') throw new ApiError('conflict');
       const result = JSON.parse(cached.result_json) as LeaseReply;
       const policy=readPolicyHot(sql,userId);
       if (result.type==='lease') {
@@ -284,15 +308,7 @@ export function renewLease(store: Store, tenantId: string, deviceId: string, use
     const lease = sql.get<LeaseRow>('SELECT * FROM leases WHERE id = ? AND device_id = ?', [leaseId, deviceId]);
     if (!lease) throw new ApiError('not_found');
     if (lease.status !== 'active') throw new ApiError('conflict');
-    // Edge 诚实上报的实际用量可能略超这份额度（尾部花费在发出预留之后才计出）。租户只按这份额度实扣，
-    // 多出的部分单独记一笔 overage_pending 挂账待核对，不计入余额、消费或预留，也不转嫁到下一份租约。
-    const charged = Math.min(used, lease.budget_milli);
-    sql.run("UPDATE leases SET used_milli = ?, status = 'settled', revision = revision + 1 WHERE id = ?", [charged, leaseId]);
-    settleCommercial(sql,leaseId,charged,used,report,at);
-    if (charged) entry(sql, 'settle', charged, at, { lease, requestRef: opId });
-    if (charged < lease.budget_milli) entry(sql, 'release', lease.budget_milli - charged, at, { lease, requestRef: opId });
-    if (used > charged) entry(sql, 'overage_pending', used - charged, at, { lease, requestRef: opId, note: '超租约差额待核对' });
-    reconcileUsage(sql, deviceId);
+    settleLease(sql, deviceId, lease, used, report, opId, at);
     // 旧租约已经在上面结清；如果这次裁决回 cutoff，带上 settled_lease_id 让 Edge 知道这份租约不用再保留或重放（v0.13）。
     const response = issue(store, sql, deviceId, userId, at, supportsCapabilityContract, supportsCapabilityPolicy, lease.id);
     sql.run('INSERT INTO lease_operations (device_id, op_id, lease_id, used_milli, result_json, model_used_json) VALUES (?, ?, ?, ?, ?, ?)',
