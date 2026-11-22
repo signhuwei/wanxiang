@@ -3,6 +3,7 @@ import { detailPanel, editForm, el, button } from './panel.js'
 import { formatMilli } from './format.js'
 import { eraserMilli } from './contract-controls.js'
 import { deploymentCards } from './routing-deployments.js'
+import { quotePanel } from './routing-pricing.js'
 
 const text = (key, label, extra = {}) => ({ key, label, ...extra })
 const number = (key, label) => text(key, label, { type: 'number' })
@@ -42,7 +43,7 @@ export function catalog(host, api, actions, kind = 'provider', parent = null) {
             return api.post(path+(row && kind !== 'rate' ? '/'+encodeURIComponent(row.id) : ''), v, opts)
           } })
         if (mode === 'view') {
-          if (kind === 'provider') deploymentCards(pane.body, api, row)
+          if (kind === 'provider') deploymentCards(pane.body, api, row, undefined, { onQuotes: card => quotePanel(pane, api, card) })
           if (row.actions.includes('update')) pane.foot.append(button('编辑', () => paint('edit'), 'primary'))
           if (cfg.child) pane.foot.append(button(cfg.drill, () => {
             pane.body.replaceChildren(); pane.foot.replaceChildren()

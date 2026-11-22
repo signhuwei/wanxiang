@@ -10,6 +10,7 @@ import { createServer } from '../../src/server.ts'
 import { seedTenant } from '../../src/seed.ts'
 import { MemoryPresence } from '../../src/presence.ts'
 import fixture from '../../../tests/fixtures/routing/p0-ab.json'
+import { pricingStub } from './routing-pricing-stub.js'
 
 const shots = process.argv[2]
 if (shots) await mkdir(shots, { recursive: true })
@@ -18,7 +19,7 @@ const draft = fixture.http.draft
 const [memberA, memberB] = draft.members
 
 // —— fixture 驱动的接口桩：只覆盖 contracts/routing-p0.md 首批路由接口 ——
-function routingStub() {
+function routingStub(extraModel = () => ({})) {
   const revisions = new Map([[6, { model_id: 'mdl_m', pool_revision: 6, members: [clone(memberA)], routing: clone(draft.routing),
     reason: 'M 首个平台渠道', released_at: '2026-11-21T08:00:00Z' }]])
   const state = { current: 6, keys: new Map(), previews: [], publishes: [], abortNextPublish: false, forceMismatchNext: false, epoch: 0, lastBasis: null }
@@ -42,12 +43,16 @@ function routingStub() {
   const cards = [
     { id: 'dep_b', revision: 2, display_name: 'DeepSeek V4.1 Flash', raw_model: 'vendor-b/m', account_id: 'acct_b', endpoint_id: 'ep_dep_b',
       capabilities: ['text', 'stream', 'function_tools'], status: 'active', archive_blockers: [{ code: 'deployment_in_use', message: '活动池 mdl_m v6 引用' }],
-      actions: ['read', 'update', 'probe', 'archive'] },
+      actions: ['read', 'update', 'probe', 'archive', 'read_quotes'] },
     { id: 'dep_b_mini', revision: 1, display_name: 'Mini', raw_model: 'vendor-b/Mini-Flash', account_id: 'acct_b', endpoint_id: 'ep_dep_b',
       capabilities: { text: true, images: false }, status: 'active', archive_blockers: [], actions: ['read', 'update', 'archive'] },
     { id: 'dep_b_old', revision: 3, display_name: '旧版 M', raw_model: 'vendor-b/m-2025', account_id: 'acct_b', endpoint_id: 'ep_dep_b',
       capabilities: [], status: 'archived', archive_blockers: [], actions: ['read'] }
   ]
+  // 第二个 Provider（渠道 A）只有 dep_a；卡片 revision 是可编辑资料修订，与部署修订 v4 不同
+  const cardsA = [{ id: 'dep_a', revision: 1, display_name: 'DeepSeek V4.1 Flash', raw_model: 'vendor-a/m-20261121', account_id: 'acct_a', endpoint_id: 'ep_dep_a',
+    capabilities: ['text', 'stream', 'function_tools'], status: 'active', archive_blockers: [], actions: ['read', 'update', 'read_quotes'] }]
+  const providers = []
   const conflict = (reason, extra = {}) => ({ status: 409, json: { error: { code: 'conflict', message: '数据已变化', detail: { reason, ...extra } } } })
   const view = rev => ({ ...clone(revisions.get(rev)), current: rev === state.current, actions: ['read'] })
   const norm = body => JSON.stringify({ expected_pool_revision: body.expected_pool_revision, members: body.members, routing: body.routing, reason: body.reason })
@@ -62,12 +67,17 @@ function routingStub() {
   function handle(method, url, body, headers) {
     const path = url.pathname
     const q = url.searchParams.get('q') ?? ''
+    const modelRow = () => ({ id: 'mdl_m', display_name: 'DeepSeek V4.1 Flash', status: 'active', revision: 1, current_pool_revision: state.current,
+      channel_count: revisions.get(state.current).members.length, ...extraModel(), actions: ['read', 'update', 'preview_input_multiplier'] })
     if (method === 'GET' && path === '/v1/platform/models' && !url.searchParams.has('provider_id')) {
-      return { json: { items: [{ id: 'mdl_m', display_name: 'DeepSeek V4.1 Flash', status: 'active', revision: 1, current_pool_revision: state.current,
-        channel_count: revisions.get(state.current).members.length, actions: ['read', 'update'] }], total: 1, next_cursor: null, actions: ['create_model'] } }
+      return { json: { items: [modelRow()], total: 1, next_cursor: null, actions: ['create_model'] } }
     }
+    if (method === 'GET' && path === '/v1/platform/models/mdl_m') return { json: modelRow() }
     if (method === 'GET' && /^\/v1\/platform\/providers\/[^/]+\/deployments$/.test(path)) {
-      const hits = cards.filter(c => c.display_name.includes(q) || c.raw_model.includes(q))
+      const providerId = path.split('/')[4]
+      if (!providers.includes(providerId)) providers.push(providerId)
+      const set = providers.indexOf(providerId) === 0 ? cards : cardsA
+      const hits = set.filter(c => c.display_name.includes(q) || c.raw_model.includes(q))
       const start = url.searchParams.get('cursor') === 'p2' ? 2 : 0
       return { json: { items: hits.slice(start, start + 2), total: hits.length, next_cursor: start === 0 && hits.length > 2 ? 'p2' : null, actions: ['create_deployment'] } }
     }
@@ -137,7 +147,8 @@ const app = await createServer({ dataDir: dir, hostname: '127.0.0.1', port: 0, h
 const browserUrl = new URL(app.server.url)
 browserUrl.hostname = 'onex-routing.test'
 const browser = await chromium.launch({ channel: 'chrome', args: ['--disable-gpu', '--no-proxy-server', '--host-resolver-rules=MAP onex-routing.test 127.0.0.1'] })
-const stub = routingStub()
+const stub = routingStub(() => pricing.modelFields())
+const pricing = pricingStub({ pool: () => stub.revisions.get(stub.state.current).members })
 try {
   await seedTenant(app.store, { target, name: '路由租户', platformAdmin: true })
   const page = await browser.newPage({ baseURL: browserUrl.href, viewport: { width: 1280, height: 720 } })
@@ -151,6 +162,7 @@ try {
     if (url.pathname.startsWith('/v1/')) {
       const body = request.postData() ? JSON.parse(request.postData()) : undefined
       const hit = stub.handle(request.method(), url, body, request.headers())
+        ?? pricing.handle(request.method(), url, body, request.headers(), () => stub.state.current)
       if (!hit) {
         // 其余 /v1 原样转发到真实临时 Server（在测试进程内取回，避免浏览器侧 continue 受主机映射影响）
         const res = await fetch(new URL(url.pathname + url.search, app.server.url), { method: request.method(),
@@ -166,6 +178,11 @@ try {
         const ms = stub.state.delayNextPreview
         stub.state.delayNextPreview = 0
         await Bun.sleep(ms) // 慢响应：期间操作者修改草稿
+      }
+      if (url.pathname.endsWith('/input-multiplier/preview') && pricing.state.delayNextRatePreview) {
+        const ms = pricing.state.delayNextRatePreview
+        pricing.state.delayNextRatePreview = 0
+        await Bun.sleep(ms)
       }
       return route.fulfill({ status: hit.status ?? 200, contentType: 'application/json', body: JSON.stringify(hit.json) })
     }
@@ -345,8 +362,195 @@ try {
   assert.deepEqual(stub.revisions.get(final).members.map(m => [m.deployment_id, m.deployment_revision, m.priority]), [['dep_a', 4, 10], ['dep_b', 2, 10]])
   assert.notEqual(stub.state.publishes.at(-1).key, staleTry.key)
   await page.getByRole('table', { name: '池成员' }).getByText('mt_a2').waitFor()
+
+  // 6. 采购报价、人工汇率、可签输入倍率（contracts/routing-pricing-and-staging.md）
+  const at = ms => new Date(Date.now() + ms).toISOString()
+  const ps = pricing.state
+  const innerBack = () => page.locator('.inline-pane .inline-pane .inline-head').getByRole('button', { name: '← 返回' }).click()
+  // 6.1 B 报价：入口受 read_quotes 控制；部署修订取自报价列表；冲突保留表单；双页游标沿用同一 as_of
+  await page.getByRole('link', { name: 'Provider', exact: true }).click()
+  await page.getByText('渠道 B', { exact: true }).click()
+  assert.equal(await page.getByRole('button', { name: '采购报价 dep_b_mini' }).count(), 0, '无 read_quotes 不显示入口')
+  await page.getByRole('button', { name: '采购报价 dep_b' }).click()
+  await page.locator('tr.clickable').getByText('v2', { exact: true }).waitFor()
+  await button('发布新报价').click()
+  await page.getByText('部署 dep_b · 部署修订 v2 · 基于报价修订 v2（0 表示首次）').waitFor()
+  await field('currency').fill('USD')
+  await field('price_input').fill('0.40')
+  await field('price_output').fill('4')
+  await field('basis_output').fill('3000000')
+  await page.getByLabel('报价原因').fill('B 渠道 2026 年 11 月合同价')
+  await capture('quote-form')
+  ps.deploymentRevision.dep_b = 3
+  await button('发布报价').click()
+  await page.getByText('部署修订已变化，表单已保留。请刷新报价头并核对部署修订后再发布。').waitFor()
+  assert.equal(await field('price_input').inputValue(), '0.40')
+  ps.deploymentRevision.dep_b = 2
+  await button('刷新报价头').click()
+  await page.getByText('已基于报价修订 v2、部署修订 v2 更新，请核对后再发布。').waitFor()
+  await button('发布报价').click()
+  await page.getByText(/^已发布采购报价 v3。/).waitFor()
+  await page.getByRole('table', { name: '报价条目' }).getByText('US$0.40 / 1,000,000 token').waitFor()
+  const [qConflict, qOk] = ps.quotePosts.slice(-2)
+  assert.notEqual(qConflict.key, qOk.key, '明确 409 后换键')
+  assert.deepEqual(qOk.body.items, [
+    { dimension: 'input', rate_micro: fixture.pricing.procurement_quotes[1].rate_micro, quantity_basis: 1000000, unit: 'token' },
+    { dimension: 'output', rate_micro: fixture.pricing.procurement_quotes[2].rate_micro, quantity_basis: 3000000, unit: 'token' }])
+  assert.equal(qOk.body.deployment_revision, 2)
+  assert.equal(qOk.body.expected_quote_revision, 2)
+  await innerBack()
+  await page.locator('tr.clickable').getByText('v3 · 当前适用').waitFor()
+  const quotePager = page.locator('.inline-pane .pager')
+  await quotePager.getByRole('button', { name: '下一页' }).click()
+  await page.locator('tr.clickable').getByText('v1', { exact: true }).waitFor()
+  assert(ps.secondPages >= 1, '第二页沿用同一 as_of，未返回 422')
+  // 6.2 A 报价：卡片 revision=1 是资料修订，报价写入列表给出的部署修订 v4
+  await button('← 返回').click()
+  await button('新建 Provider').click()
+  await field('name').fill('渠道 A')
+  await field('base_url').fill('http://127.0.0.1:9')
+  await field('secret').fill('fixture-only')
+  await button('保存').click()
+  await page.getByText('渠道 A', { exact: true }).click()
+  await page.getByRole('button', { name: '采购报价 dep_a' }).click()
+  await page.getByText('尚无已发布报价').waitFor()
+  await button('发布新报价').click()
+  await field('currency').fill('CNY')
+  await field('price_input').fill('2')
+  await page.getByLabel('报价原因').fill('A 渠道合同价')
+  await button('发布报价').click()
+  await page.getByText(/^已发布采购报价 v1。/).waitFor()
+  assert.equal(ps.quotePosts.at(-1).body.deployment_revision, 4)
+  await page.getByRole('table', { name: '报价条目' }).getByText('¥2.00 / 1,000,000 token').waitFor()
+  await innerBack()
+  await button('← 返回').click()
+
+  const openMultiplier = async () => {
+    await link('签约型号').click()
+    await page.locator('tr.clickable', { hasText: 'DeepSeek V4.1 Flash' }).click()
+    await button('输入倍率').click()
+  }
+  // 6.3 缺汇率：部分试算，首个试算省略 pricing_at，无理由不可发布
+  await openMultiplier()
+  await page.getByText('尚无可签版本').waitFor()
+  await page.getByText('平台可签：仅表示可选入签发。', { exact: false }).waitFor()
+  const previewsBefore = ps.ratePreviews.length
+  await button('试算倍率').click()
+  await page.getByText('部分试算（有缺项）').waitFor()
+  await page.getByRole('table', { name: '渠道输入价' }).getByText('缺汇率').waitFor()
+  assert.equal(Object.hasOwn(ps.ratePreviews[previewsBefore], 'pricing_at'), false, '首次试算省略 pricing_at')
+  assert.equal(ps.lastRatePreview.recommended_input_multiplier_ppm, 2000000)
+  assert.equal(await button('发布可签倍率').isVisible(), false)
+  // 6.4 人工汇率：先登记已过期的 v1，倍率显示“汇率已过期”
+  await link('采购汇率').click()
+  await page.getByText('该币种尚无已发布汇率').waitFor()
+  await button('登记汇率').click()
+  await field('rate').fill('7.20')
+  await page.getByText('= 36/5').waitFor()
+  await field('valid_from').fill(at(-2 * 3600000))
+  await field('valid_until').fill(at(-60000))
+  await page.getByLabel('汇率原因').fill('上月人工汇率')
+  await button('发布汇率').click()
+  await page.getByText(/^已发布汇率 v1。/).waitFor()
+  assert.deepEqual([ps.fxPosts.at(-1).body.rate_numerator, ps.fxPosts.at(-1).body.rate_denominator, ps.fxPosts.at(-1).body.expected_fx_revision], ['36', '5', 0])
+  await openMultiplier()
+  await button('试算倍率').click()
+  await page.getByRole('table', { name: '渠道输入价' }).getByText('汇率已过期').waitFor()
+  // 有效 15/2：他人先发布 v2 → 409 保留表单 → 刷新头 → 发布 v3；列表双页
+  await link('采购汇率').click()
+  await page.locator('tr.clickable').getByText('v1', { exact: true }).waitFor()
+  await button('登记汇率').click()
+  await field('rate').fill('7.50')
+  await page.getByText('= 15/2').waitFor()
+  await field('valid_from').fill(at(-3600000))
+  await field('valid_until').fill(at(24 * 3600000))
+  await page.getByLabel('汇率原因').fill('本月人工汇率')
+  pricing.concurrentFx({ rate_numerator: '15', rate_denominator: '2', observed_at: at(-5400000), valid_from: at(-5400000), valid_until: at(24 * 3600000) })
+  await button('发布汇率').click()
+  await page.getByText('已被他人更新到新的修订，表单已保留。').waitFor()
+  assert.equal(await field('rate').inputValue(), '7.50')
+  await button('刷新汇率头').click()
+  await page.getByText('已基于汇率修订 v2 更新，请核对后再发布。').waitFor()
+  await button('发布汇率').click()
+  await page.getByText(/^已发布汇率 v3。/).waitFor()
+  assert.equal(ps.fxPosts.at(-1).body.expected_fx_revision, 2)
+  assert.deepEqual([ps.fxPosts.at(-1).body.rate_numerator, ps.fxPosts.at(-1).body.rate_denominator], [fixture.pricing.fx.rate_numerator, fixture.pricing.fx.rate_denominator])
+  await page.locator('.inline-pane').first().getByRole('button', { name: '← 返回' }).click()
+  await page.locator('tr.clickable').getByText('v3 · 当前适用').waitFor()
+  const before = ps.secondPages
+  await page.locator('.pager').getByRole('button', { name: '下一页' }).click()
+  await page.locator('tr.clickable').getByText('v1', { exact: true }).waitFor()
+  assert.equal(ps.secondPages, before + 1)
+  await capture('fx-ledger')
+
+  // 6.5 完整试算 3× → 手调 4×；慢响应丢弃；409 保留手调与理由后二次发布；5xx 同体同键重放
+  await openMultiplier()
+  await button('试算倍率').click()
+  await page.getByText('完整试算').waitFor()
+  const channels = page.getByRole('table', { name: '渠道输入价' })
+  await channels.getByText('US$0.40 / 1,000,000').waitFor()
+  await channels.getByText('¥7.5/USD · v3').waitFor()
+  await channels.getByText('¥3.00').waitFor()
+  assert.equal(ps.lastRatePreview.recommended_input_multiplier_ppm, fixture.pricing.recommended_input_multiplier_ppm)
+  await button('发布可签倍率').waitFor()
+  await page.getByLabel('最终倍率（×）').fill('4')
+  await page.getByText('最终倍率或理由已修改，需重新试算后才能发布。').waitFor()
+  assert.equal(await button('发布可签倍率').isVisible(), false)
+  await page.getByLabel('倍率理由').fill('按签约标准报价')
+  ps.delayNextRatePreview = 800
+  await button('重新试算').click()
+  await page.getByLabel('倍率理由').fill('按签约标准报价（改）')
+  await page.getByText('试算期间表单已修改，旧结果已丢弃，请重新试算。').waitFor()
+  assert.equal(await button('发布可签倍率').isVisible(), false)
+  await page.getByLabel('倍率理由').fill('按签约标准报价')
+  await button('重新试算').click()
+  await page.getByText('4 块／百万输入 Token').waitFor()
+  await button('发布可签倍率').waitFor()
+  assert.equal(ps.lastRatePreview.input_multiplier_ppm, fixture.pricing.signed_input_multiplier_ppm)
+  await capture('multiplier-preview')
+  const otherRate = pricing.concurrentRate()
+  await button('发布可签倍率').click()
+  await page.getByText('已被他人更新到新的修订，表单已保留。').waitFor()
+  assert.equal(await page.getByLabel('最终倍率（×）').inputValue(), '4')
+  assert.equal(await page.getByLabel('倍率理由').inputValue(), '按签约标准报价')
+  const conflictKey = ps.ratePosts.at(-1).key
+  await button('按最新数据重新计算').click()
+  await button('发布可签倍率').waitFor()
+  assert.equal(ps.ratePreviews.at(-1).expected_source_rate_key, otherRate, '冲突详情刷新可签头')
+  assert.equal(Object.hasOwn(ps.ratePreviews.at(-1), 'pricing_at'), false, '冲突后去掉旧时点重算')
+  ps.fail5xxNextRate = true
+  await button('发布可签倍率').click()
+  await page.getByText(/结果不明，重试将使用同一提交键/).waitFor()
+  await button('发布可签倍率').click()
+  await page.getByText(/^已发布平台可签输入倍率 4×（prate_m_2）。/).waitFor()
+  const [gateway, published] = ps.ratePosts.slice(-2)
+  assert.equal(gateway.key, published.key, '网关 5xx 同体同键重放')
+  assert.deepEqual(gateway.body, published.body)
+  assert.notEqual(published.key, conflictKey)
+  assert.deepEqual(published.body, { expected_pool_revision: stub.state.current, expected_source_rate_key: otherRate,
+    pricing_at: ps.lastRatePreview.pricing_at, manual_input_multiplier_ppm: 4000000, reason: '按签约标准报价', preview_basis: ps.lastRatePreview.preview_basis })
+  await page.getByText('平台可签', { exact: true }).waitFor()
+  await page.getByText('平台可签：仅表示可选入签发。', { exact: false }).waitFor()
+  assert.equal(await page.getByText(/^(已应用|已签发|设备已应用)/).count(), 0, '可签与设备应用、租户签发严格区分')
+  await capture('multiplier-published')
+  // 切换表单保护：慢试算期间返回概览，旧结果不得渲染
+  await button('返回概览').click()
+  await page.getByText('prate_m_2', { exact: true }).waitFor()
+  ps.delayNextRatePreview = 800
+  await button('试算倍率').click()
+  await button('返回概览').click()
+  await page.waitForTimeout(1200)
+  assert.equal(await page.getByText('完整试算').count(), 0)
+  await button('试算倍率').waitFor()
+  await page.locator('.inline-head').first().getByRole('button', { name: '← 返回' }).click()
+  await page.locator('tr.clickable', { hasText: 'DeepSeek V4.1 Flash' }).getByText('4×').waitFor()
   assert.deepEqual(errors, [])
-  console.log('routing-check ok: cards, signed models, candidates, preview, idempotent publish v7, equal priority, 409 keep-draft, key rotation, stale reconcile, readback v' + final)
+  console.log('routing-check ok: cards, signed models, candidates, preview, idempotent publish v7, equal priority, 409 keep-draft, key rotation, stale reconcile, readback v' + final
+    + '; pricing: quotes, FX (expired/conflict/two pages), multiplier 3x→4x, 409 retain, 5xx replay, stale-view guard')
+} catch (e) {
+  for (const p of browser.contexts().flatMap(c => c.pages())) await p.screenshot({ path: join(dir, 'failure.png') }).then(() => Bun.write('.local/routing-failure.png', Bun.file(join(dir, 'failure.png')))).catch(() => {})
+  console.error('rate posts:', JSON.stringify(pricing.state.ratePosts.map(p => ({ key: p.key, body: p.body })), null, 1))
+  throw e
 } finally {
   await browser.close()
   await app.close()

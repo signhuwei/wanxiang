@@ -7,7 +7,7 @@ import { capabilityList, deploymentStatusLabel, reasonText } from './routing-for
 
 const PAGE = 50
 
-function card(row) {
+function card(row, onQuotes) {
   const node = el('article', 'deployment-card')
   node.dataset.key = row.id
   node.setAttribute('aria-label', '渠道模型 ' + (row.display_name || row.raw_model))
@@ -29,10 +29,16 @@ function card(row) {
     for (const text of blockers) list.append(el('li', null, text))
     node.append(el('small', 'blocker-title', '占用中，暂不可归档'), list)
   }
+  if (onQuotes && row.actions?.includes('read_quotes')) {
+    const open = el('button', 'link', '采购报价')
+    open.setAttribute('aria-label', '采购报价 ' + row.id)
+    open.onclick = () => onQuotes(row)
+    node.append(open)
+  }
   return node
 }
 
-export function deploymentCards(host, api, provider, signal) {
+export function deploymentCards(host, api, provider, signal, { onQuotes } = {}) {
   const section = el('section', 'deployment-section')
   const bar = el('div', 'deployment-toolbar')
   const title = el('h3', null, '渠道模型')
@@ -65,7 +71,7 @@ export function deploymentCards(host, api, provider, signal) {
       pager.applyResult(data.next_cursor ?? null)
       const items = data.items ?? []
       count.textContent = '共 ' + (data.total ?? items.length) + ' 个'
-      grid.replaceChildren(...(items.length ? items.map(card) : [el('p', 'muted', q ? '没有匹配的渠道模型' : '该 Provider 暂无渠道模型')]))
+      grid.replaceChildren(...(items.length ? items.map(row => card(row, onQuotes)) : [el('p', 'muted', q ? '没有匹配的渠道模型' : '该 Provider 暂无渠道模型')]))
     } catch (e) {
       if (ctrl.signal.aborted || e?.name === 'AbortError') return
       count.textContent = ''

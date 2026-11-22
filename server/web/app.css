@@ -390,6 +390,10 @@ details.section > summary .muted { font-weight: 400; margin-left: 8px; }
 .routing-table td { white-space: nowrap; }
 .routing-table td:last-child { white-space: normal; min-width: 180px; }
 .priority-input { width: 80px; }
+.routing-scroll { flex: 1; min-height: 0; overflow: auto; padding: 14px 16px; }
+.routing-scroll > h3 { margin: 14px 0 6px; }
+.routing-scroll > textarea { max-width: 960px; }
+.deployment-card > button.link { justify-self: start; padding: 0; }
 .review-cell { display: flex; gap: 4px 8px; align-items: center; flex-wrap: wrap; }
 .routing-table td:has(.review-cell, .ineligible) { white-space: normal; min-width: 220px; }
 .eligible { color: #1f7a3d; }

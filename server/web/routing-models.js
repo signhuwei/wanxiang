@@ -9,8 +9,10 @@ import { formatDateTime } from './format.js'
 import { idempotencyKey } from './idempotency.js'
 import {
   DEFAULT_ROUTING, buildDraft, candidateState, capabilityList, conflictMessage, isMemberOf, memberChanges, reasonText,
-  revisionText, shortValue, toggleMember
+  revisionText, shortValue, toggleMember, formatMultiplier
 } from './routing-format.js'
+import { mountTabs } from './policy-controls.js'
+import { multiplierTab } from './routing-pricing.js'
 
 const enc = encodeURIComponent
 const hasAction = (data, action) => data?.actions?.includes(action) === true
@@ -383,12 +385,13 @@ function draftPool(pane, api, model, base, signal, done) {
       done(res)
     } catch (e) {
       if (e?.name === 'AbortError') return
-      // 只有网络失败（服务端未应答）才用原参数原键重试；服务端已应答的失败一律作废旧键，
+      // 只有网络失败或网关 5xx（结果不明）才用原参数原键重放；明确应答的 4xx 一律作废旧键，
       // 即使重新预览得到相同的 preview_basis，下一次提交也换新键。
-      if (e.status !== 0) { publishKey = null; publishFingerprint = null }
+      const unclear = e.status === 0 || e.status >= 500
+      if (!unclear) { publishKey = null; publishFingerprint = null }
       if (e.code === 'conflict') conflict(e)
       else {
-        const box = el('p', 'notice error', '发布未完成：' + errorText(e) + (e.status === 0 ? '。重试将使用同一提交键，不会重复发布。' : ''))
+        const box = el('p', 'notice error', '发布未完成：' + errorText(e) + (unclear ? '。结果不明，重试将使用同一提交键，不会重复发布。' : ''))
         result.append(box)
         box.scrollIntoView({ block: 'nearest' })
       }
@@ -403,12 +406,9 @@ function draftPool(pane, api, model, base, signal, done) {
   loadCandidates()
 }
 
-function poolPanel(pane, api, model, signal, onChanged) {
-  pane.body.replaceChildren()
-  pane.foot.replaceChildren()
-  pane.body.classList.add('child-ledger')
+function poolPanel(host, api, model, signal, onChanged) {
   let ledger, active = Number.isSafeInteger(model.current_pool_revision) ? model.current_pool_revision : 0
-  const open = detailPanel(pane.body, () => ledger)
+  const open = detailPanel(host, () => ledger)
 
   function readback(sub, revision, published) {
     sub.setTitle('模型池 v' + revision)
@@ -443,7 +443,7 @@ function poolPanel(pane, api, model, signal, onChanged) {
     })
   }
 
-  ledger = createLedger(pane.body, {
+  ledger = createLedger(host, {
     title: '模型池版本', searchable: false, signal, rowKey: 'pool_revision', createAction: 'preview_pool', createLabel: '起草新版本',
     columns: [
       { title: '版本', render: item => 'v' + item.pool_revision },
@@ -471,9 +471,18 @@ export function signedModelsPage(host, api, signal) {
       { key: 'id', title: '型号 ID' },
       { title: '活动池', render: item => Number.isSafeInteger(item.current_pool_revision) ? revisionText(item.current_pool_revision) : '—' },
       { title: '平台渠道', render: item => Number.isSafeInteger(item.channel_count) ? String(item.channel_count) : '—' },
+      { title: '平台可签输入倍率', render: item => formatMultiplier(item.input_multiplier_ppm ?? item.input_pricing?.input_multiplier_ppm ?? null) },
       { title: '状态', render: item => item.status === 'disabled' ? '停用' : item.status === 'active' ? '启用' : (item.status ?? '—') }
     ],
     fetchPage: ({ q, cursor, limit, signal: s }) => api.get('/platform/models', { params: { q, cursor, limit }, signal: s }),
-    onOpen: row => open(row.display_name || row.id, pane => poolPanel(pane, api, row, signal, () => pane.changed()))
+    onOpen: row => open(row.display_name || row.id, pane => {
+      pane.body.replaceChildren()
+      pane.foot.replaceChildren()
+      pane.body.classList.add('policy-contract-workspace')
+      mountTabs(pane.body, [
+        ['pool', '模型池版本', (area, s) => poolPanel(area, api, row, s, () => pane.changed())],
+        ['multiplier', '输入倍率', (area, s) => multiplierTab(area, api, row, s, () => pane.changed())]
+      ], signal)
+    })
   })
 }
