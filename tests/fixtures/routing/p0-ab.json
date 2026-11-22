@@ -1,0 +1,541 @@
+{
+  "fixture_version": 1,
+  "clock_utc": "2026-11-22T02:00:12Z",
+  "test_only": [
+    "Example IDs used in WS are remapped to seeded account IDs when auth enforces UUID/ULID.",
+    "In config.route_pool.secrets the placeholder values are replaced by encrypted envelopes from the fixture device key.",
+    "preview_basis and rollout_id are opaque values returned by the real implementation."
+  ],
+  "model": {
+    "id": "mdl_m",
+    "identity_revision": 1,
+    "initial_pool_revision": 6,
+    "next_pool_revision": 7,
+    "initial_deployment_ids": [
+      "dep_a"
+    ],
+    "follow_deployment_ids": [
+      "dep_a",
+      "dep_b"
+    ],
+    "pinned_v6_deployment_ids": [
+      "dep_a"
+    ]
+  },
+  "http": {
+    "draft": {
+      "expected_pool_revision": 6,
+      "members": [
+        {
+          "deployment_id": "dep_a",
+          "deployment_revision": 3,
+          "priority": 10,
+          "approved_match_id": "mt_a",
+          "evidence_ids": [
+            "ev_a"
+          ]
+        },
+        {
+          "deployment_id": "dep_b",
+          "deployment_revision": 2,
+          "priority": 20,
+          "approved_match_id": "mt_b",
+          "evidence_ids": [
+            "ev_b"
+          ]
+        }
+      ],
+      "routing": {
+        "strategy": "ordered",
+        "max_attempts": 2,
+        "attempt_timeout_ms": 5000,
+        "total_timeout_ms": 12000
+      },
+      "reason": "M 同型号新增第二个独立平台渠道"
+    },
+    "expected_preview": {
+      "model_id": "mdl_m",
+      "expected_pool_revision": 6,
+      "publishable": true,
+      "blocking": [],
+      "warnings": [],
+      "diff": {
+        "added": [
+          "dep_b"
+        ],
+        "removed": [],
+        "updated": []
+      },
+      "actions": [
+        "read",
+        "publish_pool"
+      ]
+    },
+    "required_publish_status": 201,
+    "ineligible_candidate": {
+      "deployment_id": "dep_quant",
+      "reason": "model_identity_unverified"
+    },
+    "conflicts": [
+      "revision_changed",
+      "preview_stale",
+      "idempotency_mismatch"
+    ]
+  },
+  "pricing": {
+    "procurement_quotes": [
+      {
+        "deployment_id": "dep_a",
+        "currency": "CNY",
+        "dimension": "input",
+        "rate_micro": "2000000",
+        "quantity_basis": 1000000
+      },
+      {
+        "deployment_id": "dep_b",
+        "currency": "USD",
+        "dimension": "input",
+        "rate_micro": "400000",
+        "quantity_basis": 1000000
+      },
+      {
+        "deployment_id": "dep_b",
+        "currency": "USD",
+        "dimension": "output",
+        "rate_micro": "4000000",
+        "quantity_basis": 3000000
+      }
+    ],
+    "fx": {
+      "base_currency": "USD",
+      "quote_currency": "CNY",
+      "rate_numerator": "15",
+      "rate_denominator": "2"
+    },
+    "recommended_input_multiplier_ppm": 3000000,
+    "signed_input_multiplier_ppm": 4000000,
+    "sales_cost_milli": 64,
+    "procurement_currency": "CNY",
+    "procurement_amount_micro": "50000"
+  },
+  "wire": {
+    "hello": {
+      "type": "hello",
+      "id": "h1",
+      "edge_version": "0.1.0",
+      "os": "darwin",
+      "arch": "arm64",
+      "config_revision": 90,
+      "lease_id": null,
+      "outbox_last_seq": 700,
+      "capability_policy_v2": true,
+      "policy_runtime_v1": true,
+      "agent_cache": true,
+      "capabilities": [
+        "route_pool.v1"
+      ]
+    },
+    "welcome": {
+      "type": "welcome",
+      "re": "h1",
+      "device_id": "dev_lin",
+      "user_id": "usr_lin",
+      "tenant_id": "ten_demo",
+      "server_time": "2026-11-22T02:00:00Z",
+      "ack_seq": 700,
+      "heartbeat_ms": 15000,
+      "capabilities": [
+        "route_pool.v1"
+      ]
+    },
+    "config": {
+      "type": "config",
+      "id": "cfg91",
+      "revision": 91,
+      "agent_cache": true,
+      "policy": {
+        "abi": 2,
+        "tenant_id": "ten_demo",
+        "user_id": "usr_lin",
+        "device_id": "dev_lin",
+        "policy_revision": 21,
+        "platform_revision": 12,
+        "tenant_revision": 2,
+        "groups": [
+          {
+            "id": "grp_rd",
+            "revision": 4
+          }
+        ],
+        "member": {
+          "id": "usr_lin",
+          "revision": 2
+        },
+        "display": [],
+        "notices": [
+          {
+            "id": "ntc_91",
+            "kind": "policy_changed",
+            "title": "可用模型已更新",
+            "at": "2026-11-22T02:00:00Z",
+            "policy_revision": 21
+          }
+        ],
+        "secrets": [],
+        "runtime": {
+          "route.failover": true
+        },
+        "commerce_plan_id": "plan_demo",
+        "balance": {
+          "mode": "normal",
+          "aliases": []
+        }
+      },
+      "agents": [
+        {
+          "id": "rel_codex",
+          "agent": "codex",
+          "version": "1.0.0",
+          "os": "darwin",
+          "arch": "arm64",
+          "url": "/v1/edge/agent-artifacts/rel_codex",
+          "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "size": 1024
+        }
+      ],
+      "tools": [],
+      "routes": [
+        {
+          "model": "model-m",
+          "model_id": "mdl_m",
+          "deployment_id": "dep_a",
+          "deployment_revision": 3,
+          "pool_revision": 7,
+          "provider_id": "prv_a",
+          "protocol": "openai_responses",
+          "base_url": "https://a.example.test/v1",
+          "upstream_model": "vendor-a/m-20261121",
+          "auth": "bearer",
+          "priority": 10,
+          "features": [
+            "text",
+            "stream",
+            "function_tools"
+          ],
+          "max_context_tokens": 128000,
+          "max_output_tokens": 16000,
+          "valid_until": "2026-11-22T02:08:00Z",
+          "availability": {
+            "state": "eligible",
+            "observed_at": "2026-11-22T01:59:00Z",
+            "valid_until": "2026-11-22T02:08:00Z"
+          },
+          "credential_ref": {
+            "credential_id": "cred_a",
+            "credential_version": 1
+          }
+        },
+        {
+          "model": "model-m",
+          "model_id": "mdl_m",
+          "deployment_id": "dep_b",
+          "deployment_revision": 2,
+          "pool_revision": 7,
+          "provider_id": "prv_b",
+          "protocol": "openai_responses",
+          "base_url": "https://b.example.test/v1",
+          "upstream_model": "vendor-b/m",
+          "auth": "bearer",
+          "priority": 20,
+          "features": [
+            "text",
+            "stream",
+            "function_tools"
+          ],
+          "max_context_tokens": 128000,
+          "max_output_tokens": 16000,
+          "valid_until": "2026-11-22T02:08:00Z",
+          "availability": {
+            "state": "eligible",
+            "observed_at": "2026-11-22T01:59:00Z",
+            "valid_until": "2026-11-22T02:08:00Z"
+          },
+          "credential_ref": {
+            "credential_id": "cred_b",
+            "credential_version": 2
+          }
+        }
+      ],
+      "rates": [
+        {
+          "model_id": "mdl_m",
+          "rate_version_id": "rate_m_12",
+          "model_display_name": "DeepSeek V4.1 Flash",
+          "input_multiplier_basis": "cny_1_per_mtok_input",
+          "input_multiplier_ppm": 4000000,
+          "input_milli_per_mtok": 4000,
+          "output_milli_per_mtok": 12000,
+          "cache_read_milli_per_mtok": 1000,
+          "cache_write_milli_per_mtok": 5000,
+          "effective_from": "2026-11-22T00:00:00Z",
+          "effective_until": "2026-12-01T00:00:00Z"
+        }
+      ],
+      "route_pool": {
+        "abi": 1,
+        "projection_id": "prj_91",
+        "signature_id": "sig_12",
+        "expires_at": "2026-11-22T02:10:00Z",
+        "revocation_revision": 3,
+        "pools": [
+          {
+            "model_id": "mdl_m",
+            "pool_revision": 7,
+            "strategy": "ordered",
+            "max_attempts": 2,
+            "attempt_timeout_ms": 5000,
+            "total_timeout_ms": 12000,
+            "cost_bands": []
+          }
+        ],
+        "bindings": [
+          {
+            "binding_id": "bnd_codex_m",
+            "binding_revision": 1,
+            "agent_release_id": "rel_codex",
+            "ingress_protocol": "openai_responses",
+            "model_id": "mdl_m",
+            "aliases": [
+              "model-m"
+            ],
+            "deployment_ids": [
+              "dep_a",
+              "dep_b"
+            ]
+          }
+        ],
+        "secrets": [
+          {
+            "credential_id": "cred_a",
+            "credential_version": 1,
+            "key_id": "<base64>",
+            "nonce": "<base64>",
+            "ciphertext": "<base64>"
+          },
+          {
+            "credential_id": "cred_b",
+            "credential_version": 2,
+            "key_id": "<base64>",
+            "nonce": "<base64>",
+            "ciphertext": "<base64>"
+          }
+        ]
+      }
+    },
+    "cutoff": {
+      "type": "cutoff",
+      "id": "co_4",
+      "reason": "contract",
+      "revocation_revision": 4,
+      "targets": [
+        {
+          "deployment_id": "dep_a",
+          "credential_id": "cred_a",
+          "credential_version": 1
+        }
+      ],
+      "terminate_inflight": true
+    },
+    "lease": {
+      "type": "lease",
+      "id": "ls_01",
+      "lease_id": "lse_01",
+      "expires_at": "2026-11-22T02:08:00Z",
+      "budget_milli": 800,
+      "model_budgets": {
+        "mdl_m": 800
+      },
+      "commerce_plan_id": "plan_demo",
+      "signature_id": "sig_12",
+      "seq": 1
+    },
+    "events": {
+      "type": "events",
+      "id": "e701",
+      "batch": [
+        {
+          "seq": 701,
+          "kind": "route_decision",
+          "session_id": "ses_01",
+          "at": "2026-11-22T02:00:13Z",
+          "payload": {
+            "request_id": "req_01",
+            "decision_revision": 1,
+            "state": "planned",
+            "agent_release_id": "rel_codex",
+            "binding_id": "bnd_codex_m",
+            "binding_revision": 1,
+            "ingress_protocol": "openai_responses",
+            "requested_model_alias": "model-m",
+            "model_id": "mdl_m",
+            "pool_revision": 7,
+            "signature_id": "sig_12",
+            "config_revision": 91,
+            "lease_id": "lse_01",
+            "rate_version_id": "rate_m_12",
+            "reason": "ordered",
+            "candidate_order": [
+              "dep_a",
+              "dep_b"
+            ],
+            "skipped": []
+          }
+        },
+        {
+          "seq": 702,
+          "kind": "route_attempt",
+          "session_id": "ses_01",
+          "at": "2026-11-22T02:00:13Z",
+          "payload": {
+            "request_id": "req_01",
+            "attempt_id": "att_01",
+            "attempt_no": 1,
+            "attempt_revision": 1,
+            "deployment_id": "dep_a",
+            "deployment_revision": 3,
+            "outcome": "started"
+          }
+        },
+        {
+          "seq": 703,
+          "kind": "route_attempt",
+          "session_id": "ses_01",
+          "at": "2026-11-22T02:00:14Z",
+          "payload": {
+            "request_id": "req_01",
+            "attempt_id": "att_01",
+            "attempt_no": 1,
+            "attempt_revision": 2,
+            "deployment_id": "dep_a",
+            "deployment_revision": 3,
+            "outcome": "not_sent",
+            "reason": "connect_failed",
+            "duration_ms": 1000
+          }
+        },
+        {
+          "seq": 704,
+          "kind": "route_attempt",
+          "session_id": "ses_01",
+          "at": "2026-11-22T02:00:14Z",
+          "payload": {
+            "request_id": "req_01",
+            "attempt_id": "att_02",
+            "attempt_no": 2,
+            "attempt_revision": 1,
+            "deployment_id": "dep_b",
+            "deployment_revision": 2,
+            "outcome": "started",
+            "reason": "failover"
+          }
+        },
+        {
+          "seq": 705,
+          "kind": "route_attempt",
+          "session_id": "ses_01",
+          "at": "2026-11-22T02:00:16Z",
+          "payload": {
+            "request_id": "req_01",
+            "attempt_id": "att_02",
+            "attempt_no": 2,
+            "attempt_revision": 2,
+            "deployment_id": "dep_b",
+            "deployment_revision": 2,
+            "outcome": "completed",
+            "first_token_ms": 420,
+            "duration_ms": 2000
+          }
+        },
+        {
+          "seq": 706,
+          "kind": "route_decision",
+          "session_id": "ses_01",
+          "at": "2026-11-22T02:00:16Z",
+          "payload": {
+            "request_id": "req_01",
+            "decision_revision": 2,
+            "state": "completed",
+            "final_attempt_id": "att_02"
+          }
+        }
+      ]
+    },
+    "usage": {
+      "type": "usage",
+      "id": "u707",
+      "batch": [
+        {
+          "seq": 707,
+          "request_id": "req_01",
+          "session_id": "ses_01",
+          "lease_id": "lse_01",
+          "provider_id": "prv_b",
+          "model": "model-m",
+          "model_id": "mdl_m",
+          "deployment_id": "dep_b",
+          "deployment_revision": 2,
+          "attempt_id": "att_02",
+          "rate_version_id": "rate_m_12",
+          "config_revision": 91,
+          "input_tokens": 10000,
+          "output_tokens": 2000,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "cost_milli": 64,
+          "at": "2026-11-22T02:00:16Z",
+          "status": "ok",
+          "complete": true,
+          "measurement_basis": "upstream_usage"
+        }
+      ]
+    },
+    "lease_renew": {
+      "type": "lease_renew",
+      "id": "lr_01",
+      "op_id": "op_lse_01",
+      "lease_id": "lse_01",
+      "used_milli": 64,
+      "model_used_milli": {
+        "mdl_m": 64
+      }
+    },
+    "events_ack": {
+      "type": "events_ack",
+      "re": "u707",
+      "ack_seq": 707
+    },
+    "config_applied_ok": {
+      "type": "config_applied",
+      "id": "ca91",
+      "config_revision": 91,
+      "policy_revision": 21,
+      "projection_id": "prj_91",
+      "result": "applied"
+    },
+    "config_applied_rejected": {
+      "type": "config_applied",
+      "id": "ca91_reject",
+      "config_revision": 91,
+      "policy_revision": 21,
+      "projection_id": "prj_91",
+      "result": "rejected",
+      "error": {
+        "code": "missing_route_credential",
+        "message": "新配置缺少可用的渠道凭据",
+        "detail": {
+          "deployment_id": "dep_b"
+        }
+      }
+    }
+  }
+}
