@@ -5,6 +5,7 @@ import { el, button, detailPanel } from './panel.js'
 import { formatDateTime, formatMilli } from './format.js'
 import { previewPublisher } from './contract-controls.js'
 import { policyVersionsPage, versionPicker } from './policy-authoring.js'
+import { salesRateTable } from './routing-rates.js'
 import { encode, fetchPolicyPage, hasAction, inputField, mountTabs, optionSelect, policyValue, previewEntries, refKey, refText, scopeLabel, tenantPolicy, valueField } from './policy-controls.js'
 
 export const policyConfigurationPath = (scope, id) => tenantPolicy + '/configurations/' + encode(scope) + '/' + encode(id)
@@ -191,15 +192,28 @@ export function tenantPolicyPage(host, api, session, signal) {
       loadDefinitions: async () => (await api.get(policyConfigurationPath('tenant', session.tenant.id), { signal: local })).entries
     })])
   if (tenantScope) tabs.push(['signatures', '签发记录', (area, local) => {
-    createLedger(area, {
-      title: '签发记录', signal: local, searchable: false,
+    let ledger
+    const open = detailPanel(area, () => ledger)
+    // 户主行带 read_rates 才可打开；详情只读同租户冻结售价，字段按白名单渲染。
+    ledger = createLedger(area, {
+      title: '签发记录', signal: local, searchable: false, openAction: 'read_rates', rowKey: 'key',
+      onOpen: row => open('签发售价 · v' + row.revision, async pane => {
+        pane.body.append(el('p', 'muted', '正在读取签发售价…'))
+        const data = await api.get(tenantPolicy + '/signatures/' + encode(row.revision), { signal: local })
+        if (local.aborted) return
+        pane.body.replaceChildren(el('p', 'muted', '签发 v' + data.revision + ' · ' + formatDateTime(data.issued_at)),
+          salesRateTable(data.sales_rate_snapshots, { title: '已签售价', label: '已签售价', tenant: true, empty: '该版本没有价格快照' }))
+      }),
       columns: [
         { title: '版本', render: item => 'v' + item.revision },
         { title: '签发时间', render: item => formatDateTime(item.issued_at) },
         { key: 'issued_by', title: '签发人' }, { key: 'reason', title: '签发原因' },
         { title: '状态', render: item => item.current ? '当前生效' : '已归档' }
       ],
-      fetchPage: fetchPolicyPage(api, tenantPolicy + '/signatures')
+      fetchPage: async args => {
+        const page = await fetchPolicyPage(api, tenantPolicy + '/signatures')(args)
+        return { ...page, items: page.items.map(item => ({ ...item, key: String(item.revision) })) }
+      }
     })
   }])
   mountTabs(host, tabs, signal)

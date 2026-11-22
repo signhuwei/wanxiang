@@ -4,6 +4,8 @@ import { renderForm } from './form.js'
 import { eraserMilli, readPages } from './contract-controls.js'
 import { formatDateTime, formatMilli } from './format.js'
 import { idempotencyKey } from './idempotency.js'
+import { inputField } from './policy-controls.js'
+import { formatMultiplier, modelPriceBody, priceRowFromSaved, rateAmountsText, rateBlocks, rateSourceOptions } from './routing-format.js'
 
 const base = '/platform/commerce'
 const prices = ['input', 'output', 'cache_read', 'cache_write']
@@ -43,6 +45,89 @@ function repeated(host, title, fields, initial) {
   host.append(outer)
   return () => [...forms.values()].map(f => f.collect())
 }
+// 模型协议价：每行选模型和费率来源。引用来源只来自 current_source_rate_key（编辑时另含原引用），
+// 版本四项用倍率回读展示；四项留空只发引用，填齐则作为显式价随引用保存。
+function priceRows(host, api, signal, models, initial) {
+  const outer = el('fieldset', 'contract-choices'), list = el('div')
+  outer.append(el('legend', null, '模型协议价'), list)
+  const byId = new Map(models.map(r => [r.id, r]))
+  const versions = new Map()
+  const readVersion = (modelId, key) => {
+    const id = modelId + '\n' + key
+    if (!versions.has(id)) versions.set(id, api.get('/platform/models/' + encodeURIComponent(modelId) + '/input-multiplier/revisions/' + encodeURIComponent(key), { signal })
+      .catch(e => { versions.delete(id); throw e }))
+    return versions.get(id)
+  }
+  const rows = new Set()
+  function add(value = { model_id: '', source_rate_key: '', amounts: {} }) {
+    const row = el('div', 'section commerce-price-row')
+    const original = value.source_rate_key || null
+    const model = el('select'), source = el('select'), note = el('p', 'muted')
+    note.setAttribute('role', 'status')
+    model.append(Object.assign(el('option', null, '请选择'), { value: '' }))
+    for (const r of models) model.append(Object.assign(el('option', null, r.display_name + ' · ' + r.id), { value: r.id }))
+    model.value = value.model_id ?? ''
+    const inputs = Object.fromEntries(prices.map(key => {
+      const input = el('input')
+      input.value = value.amounts?.[key] ?? ''
+      input.placeholder = '0.000'
+      return [key, input]
+    }))
+    let version = null, seq = 0
+    function fillSources(preferred) {
+      source.replaceChildren()
+      for (const o of rateSourceOptions(byId.get(model.value), model.value === value.model_id ? original : null)) {
+        source.append(Object.assign(el('option', null, o.label), { value: o.value }))
+      }
+      // preferred 为 null：新选模型，默认当前可签版本；没有时只能手填。
+      source.value = preferred !== null && [...source.options].some(o => o.value === preferred) ? preferred : (source.options[1]?.value ?? '')
+    }
+    const restore = () => { for (const k of prices) inputs[k].value = value.amounts?.[k] ?? '' }
+    function explain() {
+      const key = source.value
+      const filled = prices.filter(k => inputs[k].value.trim() !== '')
+      if (!key) { note.textContent = '手填完整四项，不引用平台费率版本。'; return }
+      if (!version) { note.textContent = '正在回读费率版本 ' + key + '…'; return }
+      if (version.error) { note.textContent = '费率版本 ' + key + ' 回读失败：' + version.error; return }
+      const head = '引用 ' + key + ' · 输入倍率 ' + formatMultiplier(version.data.input_multiplier_ppm) + ' · ' + rateAmountsText(version.data)
+      if (!filled.length) { note.textContent = head + '。四项留空，按该版本展开。'; return }
+      const same = prices.every(k => inputs[k].value.trim() === rateBlocks(version.data[k + '_milli_per_mtok']))
+      note.textContent = head + (same ? '。显式价与版本一致。' : '。显式价与版本不同，按显式价保存（手调）。')
+    }
+    async function readback() {
+      const key = source.value, mine = ++seq
+      version = null
+      explain()
+      if (!key || !model.value) return
+      try { const data = await readVersion(model.value, key); if (mine === seq) version = { data } }
+      catch (e) { if (mine === seq && !signal?.aborted) version = { error: e.message } }
+      if (mine === seq) explain()
+    }
+    // 切到其他引用清空显式价；切回原引用或原手填恢复原值，原样保存不改价。
+    model.onchange = () => { fillSources(null); for (const k of prices) inputs[k].value = ''; readback() }
+    source.onchange = () => {
+      const back = model.value === value.model_id && source.value === (original ?? '')
+      if (back) restore()
+      else if (source.value) for (const k of prices) inputs[k].value = ''
+      readback()
+    }
+    for (const k of prices) inputs[k].addEventListener('input', explain)
+    fillSources(value.model_id ? (original ?? '') : null)
+    const grid = el('div', 'form-grid')
+    grid.append(inputField('模型', model), inputField('费率来源', source, true),
+      ...prices.map((k, i) => inputField(labels[i] + '（块 / 百万 Token）', inputs[k])))
+    const entry = { collect: () => ({ model_id: model.value, source_rate_key: source.value || null,
+      amounts: Object.fromEntries(prices.map(k => [k, inputs[k].value])) }) }
+    row.append(grid, note, button('移除', () => { rows.delete(entry); row.remove() }, 'link'))
+    list.append(row)
+    rows.add(entry)
+    readback()
+  }
+  initial.forEach(add)
+  outer.append(button('添加模型协议价', () => add(), 'link'))
+  host.append(outer)
+  return () => [...rows].map(r => r.collect())
+}
 function saver(pane, label, submit) {
   let key = idempotencyKey(), previous
   const notice = el('p', 'notice')
@@ -77,8 +162,7 @@ async function planEditor(pane, api, signal, plan) {
     commitment: t.commitment ? formatMilli(t.commitment.up_to_milli) : '', commit_ratio: t.commitment ? t.commitment.ratio_ppm / 1000000 : '' } })
   const levels = repeated(pane.body, '阶梯', [amount('from', '起始用量（块）'), ratio],
     (t.tiers ?? []).map(r => ({ from: formatMilli(r.from_milli), ratio: r.ratio_ppm / 1000000 })))
-  const rates = repeated(pane.body, '模型协议价', [m, ...prices.map((key, i) => amount(key, labels[i] + '（块 / 百万 Token）'))],
-    (t.model_prices ?? []).map(r => ({ model_id: r.model_id, ...Object.fromEntries(prices.map(k => [k, formatMilli(r[k + '_milli_per_mtok'])])) })))
+  const rates = priceRows(pane.body, api, signal, models, (t.model_prices ?? []).map(priceRowFromSaved))
   const budgets = repeated(pane.body, '单模型月预算', [m, amount('monthly', '每月额度（块）')],
     (t.model_budgets ?? []).map(r => ({ model_id: r.model_id, monthly: formatMilli(r.monthly_milli) })))
   const fees = repeated(pane.body, '工具调用费', [
@@ -92,7 +176,7 @@ async function planEditor(pane, api, signal, plan) {
     const terms = { monthly_grant_milli: eraserMilli(f.grant, '月包'), monthly_fee_fen: decimal(f.fee, 2, '月费'),
       commitment: f.commitment == null ? null : { up_to_milli: eraserMilli(f.commitment, '承诺额度'), ratio_ppm: coefficient(f.commit_ratio) },
       tiers: levels().map(r => ({ from_milli: eraserMilli(r.from, '阶梯起点'), ratio_ppm: coefficient(r.ratio) })),
-      model_prices: rates().map(r => ({ model_id: r.model_id, ...Object.fromEntries(prices.map(k => [k + '_milli_per_mtok', eraserMilli(r[k], '模型费率')])) })),
+      model_prices: rates().map(r => modelPriceBody(r, eraserMilli)),
       model_budgets: budgets().map(r => ({ model_id: r.model_id, monthly_milli: eraserMilli(r.monthly, '模型预算') })),
       tool_prices: fees().map(r => ({ release_id: r.release_id, per_call_milli: eraserMilli(r.price, '调用费') })) }
     const update = plan && f.publication === 'version'

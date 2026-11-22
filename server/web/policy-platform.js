@@ -7,6 +7,7 @@ import { previewPublisher } from './contract-controls.js'
 import { policyVersionsPage, versionEntries } from './policy-authoring.js'
 import { encode, fetchPolicyPage, hasAction, inputField, platformPolicy, policyValue, previewEntries, refText } from './policy-controls.js'
 import { rechargePage } from './policy-recharge.js'
+import { salesRateTable } from './routing-rates.js'
 
 const contracts = platformPolicy + '/contracts'
 
@@ -36,7 +37,9 @@ function signedForm(body, data) {
     row.append(name, value)
     rows.append(row)
   }
-  body.append(el('h3', null, '签发信息'), info, el('h3', null, '合约条目'), rows)
+  body.append(el('h3', null, '签发信息'), info, el('h3', null, '合约条目'), rows,
+    salesRateTable(data.sales_rate_snapshots, { title: '已签售价（冻结）', label: '已签售价', empty: '该版本未冻结售价' }),
+    el('p', 'muted', '已签售价是该签发版本冻结的值；设备是否已应用以设备回执为准，在途旧租约按原授权结清。'))
 }
 
 function drafting(api, base, revisions, signal) {
@@ -84,6 +87,9 @@ function appendImpactList(body, title, moreLabel, page, load, label) {
 
 function signaturePreview(value, nextPage) {
   const body = previewEntries(value, 'signed_value')
+  // 拟签售价来自所选商业方案（含其引用的可签费率版本），签发时按此冻结。
+  body.append(salesRateTable(value.sales_rate_snapshots, { title: '拟签售价', label: '拟签售价', frozen: false,
+    empty: '所选条目不冻结售价（未选商业方案或方案不含所签型号）' }))
   if (!value.impact) return body
   const { impact, seats } = value
   body.append(el('h3', null, '签发影响'), el('p', null, `影响 ${impact.member_count} 位成员、${impact.device_count} 台设备；现有 ${seats.active} 席，拟签 ${seats.limit} 席，超出 ${seats.over_limit} 席。`))
