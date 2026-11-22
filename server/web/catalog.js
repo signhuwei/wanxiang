@@ -5,7 +5,7 @@ import { eraserMilli } from './contract-controls.js'
 import { deploymentCards } from './routing-deployments.js'
 import { quotePanel } from './routing-pricing.js'
 import { channelOperations, reviewDiscoveredModel } from './provider-channel.js'
-import { channelFunding } from './provider-funding.js'
+import { channelFunding, fundingOverview } from './provider-funding.js'
 
 const text = (key, label, extra = {}) => ({ key, label, ...extra })
 const number = (key, label) => text(key, label, { type: 'number' })
@@ -62,6 +62,7 @@ export function catalog(host, api, actions, kind = 'provider', parent = null, si
           } })
         if (mode === 'view') {
           if (kind === 'provider') {
+            const openFunding = () => switchView(next => channelFunding(pane, api, row, next, back))
             channelOperations(pane.body, api, row, signal, discovered => {
               switchView(next => reviewDiscoveredModel(pane, api, row, discovered, next, back))
             })
@@ -69,7 +70,8 @@ export function catalog(host, api, actions, kind = 'provider', parent = null, si
               pane.headActions.append(button('返回渠道', back))
               quotePanel(pane, api, card, next)
             }) })
-            pane.headActions.append(button('渠道资金', () => switchView(next => channelFunding(pane, api, row, next, back))))
+            fundingOverview(pane.body, api, row, signal, openFunding)
+            pane.headActions.append(button('渠道资金', openFunding))
           }
           if (row.actions.includes('update')) pane.foot.append(button('编辑', () => paint('edit'), 'primary'))
           if (cfg.child) pane.foot.append(button(cfg.drill, () => {

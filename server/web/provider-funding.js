@@ -54,9 +54,11 @@ function editMovement(pane, api, path, account, kind, signal, back, done) {
     submit(values, options) {
       const currency = String(values.currency ?? '').trim().toUpperCase()
       const reference = String(values.reference ?? '').trim()
+      const note = String(values.note ?? '').trim()
       if (!/^[A-Z]{3}$/.test(currency)) throw new Error('请填写三位币种代码')
       if (!reference) throw new Error('请填写账单或交易凭证')
-      const payload = { account_id: account.account_id, currency, reference, note: String(values.note ?? '').trim() }
+      if (!note) throw new Error('请填写备注')
+      const payload = { account_id: account.account_id, currency, reference, note }
       payload[observation ? 'balance_micro' : 'amount_micro'] = amount(values.amount, field, observation)
       return api.post(path + '/' + spec.path, payload, { ...options, signal })
     }, done: () => { if (!signal.aborted) done('已保存' + spec.label) }
@@ -64,8 +66,35 @@ function editMovement(pane, api, path, account, kind, signal, back, done) {
   pane.foot.prepend(button('取消登记', back))
 }
 
+const fundingPath = provider => '/platform/providers/' + encodeURIComponent(provider.id) + '/channel-ledger'
+
+export async function fundingOverview(host, api, provider, signal, open) {
+  const section = el('section', 'deployment-section')
+  const facts = el('dl', 'policy-facts')
+  host.append(section)
+  section.append(el('h3', null, '渠道资金'), facts)
+  try {
+    const data = await api.get(fundingPath(provider), { params: { limit: 1 }, signal })
+    if (signal.aborted || !section.isConnected) return
+    if (!data.accounts?.length) facts.append(el('p', 'muted', '暂无渠道账户'))
+    const wallets = new Set()
+    for (const account of data.accounts ?? []) {
+      if (wallets.has(account.funding_id)) continue
+      wallets.add(account.funding_id)
+      const row = el('div')
+      const value = key => formatMicro(account[key], account.currency)
+      row.append(el('dt', null, account.label), el('dd', null,
+        '账面余额 ' + value('balance_micro') + ' · 累计充值 ' + value('credited_micro') + ' · 累计采购扣费 ' + value('spent_micro')))
+      facts.append(row)
+    }
+    if (hasAction(data, 'read')) section.append(button('查看资金流水', open, 'link'))
+  } catch (error) {
+    if (!signal.aborted && section.isConnected) facts.append(el('p', 'muted', '资金摘要读取失败。' + error.message))
+  }
+}
+
 export function channelFunding(pane, api, provider, signal, back, initial = {}) {
-  const base = '/platform/providers/' + encodeURIComponent(provider.id) + '/channel-ledger'
+  const base = fundingPath(provider)
   pane.setTitle(provider.name + ' / 渠道资金')
   pane.headActions.replaceChildren(button('返回渠道', back))
   pane.foot.replaceChildren()
