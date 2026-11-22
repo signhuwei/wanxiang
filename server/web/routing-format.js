@@ -204,6 +204,77 @@ export function isoInput(text, label, required = true) {
   return new Date(t).toISOString()
 }
 
+// —— 签约售价与设备目标（contracts/routing-projection.md） ——
+
+export const RATE_FIELDS = [['input', '输入'], ['output', '输出'], ['cache_read', '缓存读'], ['cache_write', '缓存写']]
+const milliKey = key => key + '_milli_per_mtok'
+const blocks = milli => {
+  if (!Number.isSafeInteger(milli)) return '—'
+  const digits = String(Math.abs(milli)).padStart(4, '0'), frac = digits.slice(-3).replace(/0+$/, '')
+  return (milli < 0 ? '-' : '') + digits.slice(0, -3) + (frac ? '.' + frac : '')
+}
+export const rateBlocks = blocks
+
+// 商业方案的一行协议价。source_rate_key 为空：手填完整四项。
+// 有引用且四项全空：只发引用，由 Server 展开该版本。有引用且四项填齐：引用加显式价（编辑旧方案时保留）。
+export function modelPriceBody({ model_id, source_rate_key, amounts }, toMilli) {
+  if (!model_id) throw new Error('请选择协议价模型')
+  const filled = RATE_FIELDS.filter(([key]) => String(amounts?.[key] ?? '').trim() !== '')
+  if (source_rate_key && !filled.length) return { model_id, source_rate_key }
+  if (source_rate_key && filled.length !== RATE_FIELDS.length) throw new Error(model_id + ' 引用费率版本时四项须全部留空或全部填写')
+  const rates = Object.fromEntries(RATE_FIELDS.map(([key, label]) => [milliKey(key), toMilli(amounts?.[key], label + '费率')]))
+  return { model_id, ...(source_rate_key && { source_rate_key }), ...rates }
+}
+
+// 已保存的方案行 → 表单行：保留原引用和展开后的四项，原样再发即不改价。
+export function priceRowFromSaved(price) {
+  return { model_id: price.model_id, source_rate_key: price.source_rate_key ?? '',
+    amounts: Object.fromEntries(RATE_FIELDS.map(([key]) => [key, blocks(price[milliKey(key)])])) }
+}
+
+// 引用选项：只有带 current_source_rate_key 的型号；编辑时另加该行的原引用。仅有展示倍率的型号不可引用。
+export function rateSourceOptions(model, originalKey) {
+  const options = [{ value: '', label: '手填完整四项' }]
+  const current = model?.current_source_rate_key ?? null
+  if (current) options.push({ value: current, label: '当前可签版本 ' + current + (Number.isSafeInteger(model.input_multiplier_ppm) ? ' · ' + formatMultiplier(model.input_multiplier_ppm) : '') })
+  if (originalKey && originalKey !== current) options.push({ value: originalKey, label: '保留原引用 ' + originalKey })
+  return options
+}
+
+export const rateAmountsText = rate => RATE_FIELDS.map(([key, label]) => label + ' ' + blocks(rate?.[milliKey(key)])).join(' · ') + ' 块／百万 Token'
+
+// 售价表行。tenant=true 时只取户主可见字段，忽略多余字段。
+export function salesRateRow(rate, { tenant = false, frozen = true } = {}) {
+  const cells = [rate.model_id, formatMultiplier(rate.input_multiplier_ppm), ...RATE_FIELDS.map(([key]) => blocks(rate[milliKey(key)]))]
+  if (!tenant) cells.push(rate.source_rate_key ?? '方案手填', rate.commerce_plan_id ?? '—')
+  if (frozen) cells.push(validRange(rate.valid_from, rate.valid_until), rate.rate_version_id ?? '—')
+  return cells
+}
+export function salesRateHead({ tenant = false, frozen = true } = {}) {
+  return ['型号', '输入倍率', ...RATE_FIELDS.map(([, label]) => label), ...(tenant ? [] : ['费率来源', '商业方案']), ...(frozen ? ['生效区间', '费率版本'] : [])]
+}
+function validRange(from, until) {
+  const t = value => value ? String(value).replace('T', ' ').replace(/(\.\d+)?Z$/, ' UTC') : null
+  return (t(from) ?? '—') + ' 起' + (until ? ' 至 ' + t(until) : ' · 长期')
+}
+
+// 契约 counts 的折叠顺序：applied → superseded → rejected → needs_upgrade → offline → pending。
+export const TARGET_STATES = [['applied', '已应用'], ['superseded', '已被新池取代'], ['rejected', '已拒绝'],
+  ['needs_upgrade', '需升级 Edge'], ['offline', '离线'], ['pending', '等待应用']]
+export const targetStateLabel = state => TARGET_STATES.find(([key]) => key === state)?.[1] ?? (state || '—')
+const JOB_STATUS = { pending: '排队中', running: '执行中', done: '已完成', failed: '失败' }
+export const jobStatusLabel = status => JOB_STATUS[status] ?? (status || '—')
+const TARGET_REASONS = {
+  missing_envelope: '缺推理密钥信封', missing_route_credential: '缺渠道凭据', target_expired: '目标已过期',
+  stale_revision: '配置修订过旧', revocation_regressed: '撤销修订倒退', projection_conflict: '投影冲突',
+  unsupported_capability: '设备未协商路由池能力', invalid_config: '配置无效'
+}
+// 设备拒绝时 reason 取自已脱敏的 error.detail.reason；未知码原样显示。
+export const targetReasonLabel = code => code ? (TARGET_REASONS[code] ? TARGET_REASONS[code] + '（' + code + '）' : code) : '—'
+export function rolloutCounts(summary) {
+  return TARGET_STATES.map(([key, label]) => [key, label, Number.isSafeInteger(summary?.counts?.[key]) ? summary.counts[key] : 0])
+}
+
 // 写入键：同一请求体在网络失败后重试复用原键；体变化或服务端已应答的失败后换新键。
 export function submissionKeys(make) {
   let key = null, print = null
