@@ -40,7 +40,7 @@ const KNOWN_CODES: &[&str] = &[
     "internal",
 ];
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Op {
     State,
@@ -52,6 +52,11 @@ pub enum Op {
         code: String,
         #[serde(default)]
         invite_code: Option<String>,
+    },
+    PasswordLogin {
+        tenant: String,
+        username: String,
+        password: String,
     },
     SelectTenant {
         tenant_id: String,
@@ -255,6 +260,7 @@ impl Bridge {
             Op::State => self.state().await,
             Op::SendCode { target } => self.send_code(target).await,
             Op::Login { target, code, invite_code } => self.login(target, code, invite_code).await,
+            Op::PasswordLogin { tenant, username, password } => self.password_login(tenant, username, password).await,
             Op::SelectTenant { tenant_id } => self.select_tenant(tenant_id).await,
             Op::Launch { agent_id } => self.launch(agent_id).await,
             Op::Download { agent_id } => self.download(agent_id).await,
@@ -325,7 +331,7 @@ impl Bridge {
     }
 
     async fn select_tenant(&self, tenant_id: String) -> Reply {
-        let (global_token, tenant_name) = {
+        let (global_token, tenant_name, user_name) = {
             let inner = self.inner.lock().unwrap();
             if inner.phase != Phase::ChooseTenant {
                 return Err(forbidden());
@@ -334,7 +340,7 @@ impl Bridge {
             let Some((_, name)) = pending.tenants.iter().find(|(id, _)| id == &tenant_id) else {
                 return Err(forbidden());
             };
-            (pending.global_token.clone(), name.clone())
+            (pending.global_token.clone(), name.clone(), inner.user_name.clone().unwrap_or_default())
         };
         let server = self.server_origin().await?;
         let resp = self
@@ -347,7 +353,50 @@ impl Bridge {
             .map_err(|_| unavailable())?;
         let v = map_http_error(resp).await?;
         let scoped_token = str_field(&v, "token")?;
+        let result =
+            self.register_device(&server, &scoped_token, Tenant { id: tenant_id, name: tenant_name }, user_name).await;
+        self.end_login_session(&server, &scoped_token).await;
+        if result.is_ok() {
+            self.end_login_session(&server, &global_token).await;
+        }
+        result
+    }
 
+    async fn password_login(&self, tenant: String, username: String, password: String) -> Reply {
+        let tenant = tenant.trim();
+        let username = username.trim();
+        if tenant.is_empty() || username.is_empty() || password.is_empty() {
+            return Err(invalid("请输入租户、用户名和密码"));
+        }
+        if self.inner.lock().unwrap().phase != Phase::SignedOut {
+            return Err(forbidden());
+        }
+        let server = self.server_origin().await?;
+        let resp = self
+            .http
+            .post(format!("{server}/v1/auth/password-login"))
+            .json(&json!({"tenant": tenant, "username": username, "password": password, "kind": "desktop"}))
+            .send()
+            .await
+            .map_err(|_| unavailable())?;
+        let reply = map_http_error(resp).await?;
+        let scoped_token = str_field(&reply, "token")?;
+        let result = async {
+            let tenants: Vec<Tenant> = serde_json::from_value(reply["tenants"].clone()).map_err(|_| unavailable())?;
+            let [tenant] = tenants.as_slice() else { return Err(unavailable()) };
+            let user_name = reply.pointer("/user/name").and_then(Value::as_str).unwrap_or(username).to_owned();
+            self.register_device(&server, &scoped_token, tenant.clone(), user_name).await
+        }
+        .await;
+        self.end_login_session(&server, &scoped_token).await;
+        result
+    }
+
+    async fn end_login_session(&self, server: &str, token: &str) {
+        let _ = self.http.post(format!("{server}/v1/auth/logout")).bearer_auth(token).send().await;
+    }
+
+    async fn register_device(&self, server: &str, scoped_token: &str, tenant: Tenant, user_name: String) -> Reply {
         let info = self.ipc_call(&Request::DeviceInfo).await.map_err(|_| unavailable())?;
         let public_key = str_field(&info, "public_key")?;
         if public_key.len() != 44 {
@@ -357,7 +406,7 @@ impl Bridge {
         let resp = self
             .http
             .post(format!("{server}/v1/devices"))
-            .bearer_auth(&scoped_token)
+            .bearer_auth(scoped_token)
             .json(&json!({"name": device_name(), "os": onex_core::ipc::os_name(),
                 "arch": onex_core::ipc::arch_name(), "public_key": public_key}))
             .send()
@@ -366,35 +415,32 @@ impl Bridge {
         let dev = map_http_error(resp).await?;
         let device_token = str_field(&dev, "device_token")?;
         let device_id = str_field(&dev, "device_id")?;
-        let accepted = self
-            .ipc_call(&Request::Login {
-                token: device_token,
-                server: Some(server.clone()),
-                device_id: Some(device_id.clone()),
-            })
-            .await;
-        let _ = self.http.post(format!("{server}/v1/auth/logout")).bearer_auth(&scoped_token).send().await;
-        accepted.map_err(|_| unavailable())?;
+        self.ipc_call(&Request::Login {
+            token: device_token,
+            server: Some(server.to_owned()),
+            device_id: Some(device_id.clone()),
+        })
+        .await
+        .map_err(|_| unavailable())?;
         // device_token 不落盘；只存核对用的非敏感字段，供窗口重开时识别“同一台已登录设备”。
-        let user_name = self.inner.lock().unwrap().user_name.clone().unwrap_or_default();
         let stored = profile::StoredProfile {
             device_id: device_id.clone(),
-            tenant_id: tenant_id.clone(),
-            tenant_name: tenant_name.clone(),
-            user_name,
+            tenant_id: tenant.id.clone(),
+            tenant_name: tenant.name.clone(),
+            user_name: user_name.clone(),
         };
         if profile::store(&self.socket_path, &stored).is_err() {
             let _ = self.ipc_call(&Request::Logout).await;
             return Err(unavailable());
         }
-        let _ = self.http.post(format!("{server}/v1/auth/logout")).bearer_auth(&global_token).send().await;
-
         {
             let mut inner = self.inner.lock().unwrap();
-            inner.tenant = Some(Tenant { id: tenant_id, name: tenant_name });
+            inner.tenant = Some(tenant);
+            inner.user_name = Some(user_name);
             inner.device_id = Some(device_id);
             inner.pending = None;
             inner.phase = Phase::Ready;
+            inner.send_code_target = None;
         }
         self.state().await
     }

@@ -1,7 +1,7 @@
 //! onex：onexd 的命令行。
 //!
 //! ```text
-//! onex login <邮箱或手机号> [--invite <邀请码>] [--tenant <租户名或 id>] [--server <https://...>] [--name <设备名>]
+//! onex login --tenant <租户 ID 或简称> --username <用户名> [--server <https://...>] [--name <设备名>]
 //! onex run <claude-code|codex|kimi-code|deepseek-desktop|workbuddy|codex-desktop|claude-desktop> [--model <模型>] [--managed]   在当前目录启动指定 Agent
 //!   不带 --managed：用 PATH 里已安装的可执行文件（claude-code → claude，codex → codex，kimi-code → kimi）
 //!   带 --managed：由 onexd 按 Server 下发的发行目录自己选型、下载、校验、缓存后启动
@@ -34,6 +34,7 @@ const AGENTS: &[(&str, &str)] = &[
 ];
 
 const USAGE: &str = "usage:
+  onex login --tenant <租户 ID 或简称> --username <用户名> [--server <地址>] [--name <设备名>]
   onex login <邮箱或手机号> [--invite <邀请码>] [--tenant <租户>] [--server <地址>] [--name <设备名>]
   onex run <claude-code|codex|kimi-code|deepseek-desktop|workbuddy|codex-desktop|claude-desktop> [--model <模型>] [--managed]
   onex status
@@ -59,6 +60,7 @@ async fn main() -> Result<()> {
 
 async fn cmd_login(args: &[String]) -> Result<()> {
     let mut target = None;
+    let mut username = None;
     let (mut invite, mut tenant, mut server, mut name) = (None, None, None, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -66,13 +68,22 @@ async fn cmd_login(args: &[String]) -> Result<()> {
         match a.as_str() {
             "--invite" => invite = Some(val()?),
             "--tenant" => tenant = Some(val()?),
+            "--username" => username = Some(val()?),
             "--server" => server = Some(val()?),
             "--name" => name = Some(val()?),
             s if !s.starts_with("--") && target.is_none() => target = Some(s.to_string()),
             _ => bail!("{USAGE}"),
         }
     }
-    let target = target.context(USAGE)?;
+    if username.is_some() && (target.is_some() || invite.is_some()) {
+        bail!("{USAGE}");
+    }
+    if target.is_none()
+        && (username.as_ref().is_none_or(|s| s.trim().is_empty())
+            || tenant.as_ref().is_none_or(|s| s.trim().is_empty()))
+    {
+        bail!("{USAGE}");
+    }
 
     let info = call(&Request::DeviceInfo).await?;
     let public_key = info["public_key"].as_str().context("onexd did not return a public key")?.to_string();
@@ -83,8 +94,29 @@ async fn cmd_login(args: &[String]) -> Result<()> {
         }
     };
     let device_name = name.unwrap_or_else(default_device_name);
-    let a = login::LoginArgs { server: server.clone(), target, invite, tenant, device_name, public_key };
-    let r = login::login(&a, &mut prompt).await?;
+    let r = if let Some(username) = username {
+        let tenant = tenant.as_deref().context(USAGE)?.trim();
+        let password = rpassword::prompt_password("密码：").context("无法从终端读取密码")?;
+        let a = login::PasswordLoginArgs {
+            server: &server,
+            tenant,
+            username: username.trim(),
+            password: &password,
+            device_name: &device_name,
+            public_key: &public_key,
+        };
+        login::login_password(&a).await?
+    } else {
+        let a = login::LoginArgs {
+            server: server.clone(),
+            target: target.context(USAGE)?,
+            invite,
+            tenant,
+            device_name,
+            public_key,
+        };
+        login::login(&a, &mut prompt).await?
+    };
 
     let reply =
         call(&Request::Login { token: r.device_token, server: Some(server), device_id: Some(r.device_id.clone()) })

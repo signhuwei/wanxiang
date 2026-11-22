@@ -20,6 +20,36 @@ async function act(request,message=''){
   try{const r=await call(request);if(!r.ok){$('notice').textContent=errorText(r.error?.code);return}state=r.state;last=JSON.stringify(state);if(request.op==='logout'){activeTab='workbench';seenNotices.clear()};paint();$('notice').textContent=message}
   catch{$('notice').textContent='本机服务暂不可用，请稍后重试'}finally{pane.inert=false;busy=false}
 }
+
+function paintLogin(content) {
+  $('title').textContent = '登录 OneX'
+  const form = node('form')
+  content.append(form)
+  if (demo) form.append(node('p', '演示账号 · 租户 demo · 用户名 employee · 密码 Demo-Only-246810'))
+
+  const tenant = field(form, '租户 ID 或简称', 'text')
+  const username = field(form, '用户名', 'text')
+  const password = field(form, '密码', 'password')
+  tenant.required = username.required = password.required = true
+  tenant.autocomplete = 'organization'
+  username.autocomplete = 'username'
+  password.autocomplete = 'current-password'
+  tenant.spellcheck = username.spellcheck = false
+
+  const submit = node('button', '登录')
+  submit.type = 'submit'
+  submit.className = 'primary'
+  form.append(submit)
+  form.onsubmit = event => {
+    event.preventDefault()
+    if (busy) return
+    const request = { op: 'password_login', tenant: tenant.value.trim(), username: username.value.trim(),
+      password: password.value }
+    password.value = ''
+    void act(request)
+  }
+}
+
 function paint(){
   const c=$('content');c.replaceChildren();$('notice').textContent='';$('scope').textContent=state.tenant ? `${state.tenant.name} · ${state.user?.name||''} · `+({connected:'已连接',connecting:'连接中',backoff:'断线重连中',idle:'未连接'}[state.connection]||state.connection) : '员工工作区'
   $('messages').hidden=state.phase!=='ready'
@@ -30,14 +60,8 @@ function paint(){
   }
   if(activeTab==='settings'){$('title').textContent='设置';c.append(node('p','Desktop 版本：'+(state.version || '未知')),node('p','服务地址：'+state.settings.server_origin));const l=node('label'),i=node('input');i.type='checkbox';i.checked=state.settings.hide_on_close;l.append(i,' 关闭窗口时隐藏到托盘');c.append(l,button('保存设置',()=>act({op:'settings',hide_on_close:i.checked},'设置已保存'),true));if(state.phase!=='signed_out')c.append(button('退出登录',()=>act({op:'logout'})));return}
   if(state.phase==='signed_out'){
-    $('title').textContent='登录 OneX';const form=node('form');c.append(form)
-    if(demo)form.append(node('p','仅供演示：demo@example.test · 验证码 246810 · 可选邀请码 DEMO。不要输入真实凭据。'))
-    const target=field(form,'邮箱或手机号','text'), code=field(form,'验证码','text'), invite=field(form,'邀请码（选填）','text');code.autocomplete='one-time-code';target.autocomplete='username';target.required=code.required=true
-    const send=button('发送验证码',async()=>{
-      const account=target.value,inv=invite.value
-      await act({op:'send_code',target:account.trim()},demo?'演示验证码：246810':'请查收验证码')
-      const inputs=c.querySelectorAll('input');if(inputs.length===3){inputs[0].value=account;inputs[2].value=inv;inputs[1].focus()}
-    });form.append(send);const submit=node('button','登录');submit.className='primary';form.append(submit);form.onsubmit=e=>{e.preventDefault();act({op:'login',target:target.value.trim(),code:code.value.trim(),...(invite.value.trim()?{invite_code:invite.value.trim()}:{})})};return
+    paintLogin(c)
+    return
   }
   if(state.phase==='choose_tenant'){$('title').textContent='选择租户';for(const t of state.tenants)c.append(button(t.name,()=>act({op:'select_tenant',tenant_id:t.id})));if(!state.tenants.length)c.append(node('p','没有可用的租户，请联系管理员。'));return}
   if (activeTab==='messages') {

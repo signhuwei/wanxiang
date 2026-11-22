@@ -3,6 +3,12 @@ const fail=(code,message)=>({ok:false,error:{code,message}})
 export function makeMock(){
   let issued=false,start=0
   const state={version:'0.1.0-demo',phase:'signed_out',user:null,tenant:null,tenants:[],connection:'idle',agents:[],settings:{server_origin:'https://onex.example.invalid',hide_on_close:true}}
+  function enterTenant(tenant) {
+    Object.assign(state, { phase: 'ready', tenant, tenants: [], connection: 'connected', agents: [
+      { id: 'claude-code', name: 'Claude Code', version: '演示版', status: 'available', actions: ['launch'] },
+      { id: 'demo-preview', name: '示例预览 Agent', version: '演示版', status: 'update_available', actions: [] },
+    ] })
+  }
   return async r=>{
     switch(r.op){
       case 'state':
@@ -13,10 +19,17 @@ export function makeMock(){
         if(!issued||r.target!=='demo@example.test'||r.code!=='246810')return fail('unauthenticated','请发送并输入演示验证码 246810')
         if(r.invite_code && r.invite_code!=='DEMO')return fail('invalid','演示邀请码为 DEMO')
         issued=false;state.user={name:'示例员工'};state.phase='choose_tenant';state.tenants=[tenant,...(r.invite_code?[{id:'ten_lab',name:'示例实验室'}]:[])];break
+      case 'password_login':
+        if (!['demo', tenant.id].includes(r.tenant) || r.username !== 'employee' || r.password !== 'Demo-Only-246810') {
+          return fail('unauthenticated', '演示凭据无效')
+        }
+        state.user = { name: '示例员工' }
+        enterTenant(tenant)
+        break
       case 'select_tenant':{
         const t=state.tenants.find(t=>t.id===r.tenant_id)
         if(state.phase!=='choose_tenant'||!t)return fail('forbidden','无权进入此租户')
-        Object.assign(state,{phase:'ready',tenant:t,tenants:[],connection:'connected',agents:[{id:'claude-code',name:'Claude Code',version:'演示版',status:'available',actions:['launch']},{id:'demo-preview',name:'示例预览 Agent',version:'演示版',status:'update_available',actions:[]} ]});break
+        enterTenant(t);break
       }
       case 'launch':{
         const a=state.agents.find(a=>a.id===r.agent_id)
