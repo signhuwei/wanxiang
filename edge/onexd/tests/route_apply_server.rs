@@ -87,7 +87,17 @@ impl Server {
     async fn ledger(&self, index: usize) -> Value {
         let url = self.info["ledger"][index].as_str().unwrap();
         let session = self.info["platform_session"].as_str().unwrap();
-        reqwest::Client::new().get(url).bearer_auth(session).send().await.unwrap().json().await.unwrap()
+        loopback_client()
+            .get(url)
+            .bearer_auth(session)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
     }
 }
 
@@ -170,6 +180,10 @@ async fn wait_ledger(server: &Server, index: usize, device: &str, state: &str) -
     }
 }
 
+fn loopback_client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().timeout(T).build().unwrap()
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
@@ -241,7 +255,7 @@ async fn joint_projection_receipt_ledger_and_reconnect() {
         (applied["target_config_revision"].as_u64(), applied["applied_config_revision"].as_u64()),
         (Some(91), Some(91))
     );
-    let summary = reqwest::Client::new()
+    let summary = loopback_client()
         .get(info["ledger"][0].as_str().unwrap().trim_end_matches("/targets"))
         .bearer_auth(info["platform_session"].as_str().unwrap())
         .send()
@@ -428,7 +442,7 @@ async fn signed_pool_native_responses_settles_both_ledgers() {
             first_native_session: None,
         },
     );
-    let http = reqwest::Client::builder().no_proxy().timeout(T).build().unwrap();
+    let http = loopback_client();
     let (usage, _legacy_usage) = tokio::sync::mpsc::unbounded_channel();
     let router = Router::new(edge.state.clone(), "separate-local-token".into(), http.clone(), usage)
         .with_isolated_pool_execution(edge.store.clone());
