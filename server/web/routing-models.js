@@ -438,9 +438,9 @@ function poolPanel(host, api, model, signal, onChanged) {
       sub.body.append(el('p', 'muted', '正在读取活动池…'))
       const base = active > 0 ? await api.get(modelPath(model.id) + '/pool/revisions/' + active, { signal }) : null
       draftPool(sub, api, model, base, signal, res => {
+        active = model.current_pool_revision = res.pool_revision
         sub.changed()
         onChanged()
-        active = res.pool_revision
         readback(sub, res.pool_revision, res).catch(e => sub.body.replaceChildren(el('p', 'error-row', e.message)))
       })
     })
@@ -457,7 +457,7 @@ function poolPanel(host, api, model, signal, onChanged) {
     fetchPage: async ({ cursor, limit, signal: s }) => {
       const page = await api.get(modelPath(model.id) + '/pool/revisions', { params: { cursor, limit }, signal: s })
       const cur = (page.items ?? []).find(item => item.current)
-      if (cur) active = cur.pool_revision
+      if (cur) active = model.current_pool_revision = Math.max(active, cur.pool_revision)
       return page
     },
     onOpen: showRevision, onCreate: draft
@@ -486,7 +486,7 @@ export function signedModelsPage(host, api, signal) {
         ['pool', '模型池版本', (area, s) => poolPanel(area, api, row, s, () => pane.changed())],
         ['multiplier', '输入倍率', (area, s) => multiplierTab(area, api, row, s, () => pane.changed())],
         ['sales', '基础销售费率', (area, s) => catalog(area, api, null, 'rate', row, s)]
-      ], signal)
+      ], AbortSignal.any([signal, pane.signal].filter(Boolean)))
     })
   })
 }
