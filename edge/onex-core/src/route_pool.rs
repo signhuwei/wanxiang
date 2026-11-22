@@ -21,6 +21,21 @@ pub const INPUT_MULTIPLIER_BASIS: &str = "cny_1_per_mtok_input";
 /// 首批能力词（`contracts/routing-p0.md` 连接与回执口径第 3 条）。
 pub const FEATURES: [&str; 6] = ["text", "stream", "function_tools", "images", "reasoning", "json_schema"];
 
+/// Server → Edge 帧是否带 `route_pool.v1` 扩展；带时返回扩展名。
+///
+/// 旧 [`Msg`](crate::ws::Msg) 解析会忽略这些字段，把池配置当成可运行的旧配置、把目标撤销
+/// 当成整租约 cutoff、把带签发的租约当成旧租约。未协商的连接必须先用本函数在原始 JSON 上
+/// 拦下这些帧。
+pub fn extension_of(frame: &serde_json::Value) -> Option<&'static str> {
+    let has = |k: &str| frame.get(k).is_some();
+    match frame.get("type")?.as_str()? {
+        "config" if has("route_pool") => Some("config.route_pool"),
+        "lease" if has("signature_id") => Some("lease.signature_id"),
+        "cutoff" if has("targets") || has("revocation_revision") || has("terminate_inflight") => Some("cutoff.targets"),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // config
 // ---------------------------------------------------------------------------
@@ -514,6 +529,28 @@ mod tests {
         assert_eq!(c.reason, "contract");
         let Msg::Lease(l) = serde_json::from_value(wire("lease")).unwrap() else { panic!() };
         assert_eq!(l.lease_id, "lse_01");
+    }
+
+    #[test]
+    fn extensions_are_detected_on_raw_frames() {
+        assert_eq!(extension_of(&wire("config")), Some("config.route_pool"));
+        assert_eq!(extension_of(&wire("lease")), Some("lease.signature_id"));
+        assert_eq!(extension_of(&wire("cutoff")), Some("cutoff.targets"));
+        for only in [json!({"revocation_revision":4}), json!({"terminate_inflight":false}), json!({"targets":[]})] {
+            let mut c = json!({"type":"cutoff","id":"c","reason":"contract"});
+            c.as_object_mut().unwrap().extend(only.as_object().unwrap().clone());
+            assert_eq!(extension_of(&c), Some("cutoff.targets"), "{c}");
+        }
+
+        let mut legacy_config = wire("config");
+        legacy_config.as_object_mut().unwrap().remove("route_pool");
+        assert_eq!(extension_of(&legacy_config), None);
+        let mut legacy_lease = wire("lease");
+        legacy_lease.as_object_mut().unwrap().remove("signature_id");
+        assert_eq!(extension_of(&legacy_lease), None);
+        assert_eq!(extension_of(&json!({"type":"cutoff","id":"c","reason":"balance","settled_lease_id":"l"})), None);
+        assert_eq!(extension_of(&wire("events_ack")), None);
+        assert_eq!(extension_of(&json!({"route_pool":{}})), None);
     }
 
     #[test]

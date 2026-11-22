@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, HashSet};
 use onex_core::route_pool::{
     AvailabilityState, Binding, Pool, PoolConfig, PoolRate, PoolRoute, RevocationTarget, SkippedCandidate, Strategy,
 };
+use onex_core::ws::BalanceMode;
 use serde_json::Value;
 
 use crate::pricing::parse_ms;
@@ -51,9 +52,11 @@ pub struct Request<'a> {
     pub requested_output_tokens: Option<u64>,
 }
 
-/// 选路环境：可信时间、已落盘撤销、本 Edge 支持的转换器。
+/// 选路环境：余额档、可信时间、已落盘撤销、本 Edge 支持的转换器。
 #[derive(Debug, Clone, Copy)]
 pub struct Context<'a> {
+    /// 同一快照 `policy.balance.mode`；缺省按 `normal`。
+    pub balance: BalanceMode,
     pub now_ms: i64,
     pub revocations: &'a [RevocationTarget],
     /// 已验证可用的 `(adapter_id, adapter_revision)`；非原生路由只有命中才参加排序。
@@ -81,6 +84,8 @@ impl Plan<'_> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectError {
+    /// 余额档 `stopped`：不发任何新请求。
+    BalanceExhausted,
     /// 本发行在快照中没有任何绑定。
     AgentNotAllowed,
     /// 发行有绑定，但入口或别名不匹配；或命中的绑定为空且没有可用替代目标。
@@ -109,6 +114,7 @@ impl SelectError {
     /// `unsupported_strategy` 是 Edge 提议，见进度报告。
     pub fn code(&self) -> &'static str {
         match self {
+            SelectError::BalanceExhausted => "balance_exhausted",
             SelectError::AgentNotAllowed => "agent_not_allowed",
             SelectError::ModelNotAllowed | SelectError::AmbiguousBinding => "model_not_allowed",
             SelectError::SnapshotExpired => "snapshot_expired",
@@ -158,9 +164,13 @@ fn match_binding<'a>(cfg: &'a PoolConfig, req: &Request<'_>) -> Result<&'a Bindi
     }
 }
 
-/// 降档绑定只能转到同一发行、同一入口下已签且有部署的替代型号。
+/// 降档绑定只能转到同一发行、同一入口下已签且有部署的**另一**型号。
 fn resolve_restricted<'a>(cfg: &'a PoolConfig, source: &'a Binding) -> Result<&'a Binding, SelectError> {
-    let target = source.restricted_target_model_id.as_deref().ok_or(SelectError::ModelNotAllowed)?;
+    let target = source
+        .restricted_target_model_id
+        .as_deref()
+        .filter(|target| *target != source.model_id)
+        .ok_or(SelectError::ModelNotAllowed)?;
     let mut found = cfg.route_pool.bindings.iter().filter(|b| {
         b.agent_release_id == source.agent_release_id
             && b.ingress_protocol == source.ingress_protocol
@@ -215,11 +225,17 @@ fn judge(route: &PoolRoute, binding: &Binding, pool: &Pool, req: &Request<'_>, c
     if !req.required_features.iter().all(|f| route.features.iter().any(|g| g == f)) {
         return Verdict::Incompatible(skip::UNSUPPORTED_FEATURE);
     }
-    if route.max_context_tokens.is_some_and(|max| req.estimated_input_tokens > max) {
-        return Verdict::Incompatible(skip::CONTEXT_TOO_LONG);
-    }
     if req.requested_output_tokens.zip(route.max_output_tokens).is_some_and(|(want, max)| want > max) {
         return Verdict::Incompatible(skip::OUTPUT_TOO_LONG);
+    }
+    // 窗口要容纳输入加本次允许的输出。未指定输出上限时按部署允许的最大输出估算；
+    // 加法溢出按超窗处理。
+    let allowed_output = req.requested_output_tokens.or(route.max_output_tokens).unwrap_or(0);
+    if route
+        .max_context_tokens
+        .is_some_and(|max| req.estimated_input_tokens.checked_add(allowed_output).is_none_or(|needed| needed > max))
+    {
+        return Verdict::Incompatible(skip::CONTEXT_TOO_LONG);
     }
     if let Some(hit) = ctx.revocations.iter().find(|t| t.matches(&route.deployment_id, &route.credential_ref)) {
         return Verdict::Unavailable(if hit.deployment_id.is_some() {
@@ -245,11 +261,15 @@ pub fn select<'a>(cfg: &'a PoolConfig, req: &Request<'_>, ctx: &Context<'_>) -> 
     if !still_valid(&cfg.route_pool.expires_at, ctx.now_ms) {
         return Err(SelectError::SnapshotExpired);
     }
+    if ctx.balance == BalanceMode::Stopped {
+        return Err(SelectError::BalanceExhausted);
+    }
     let matched = match_binding(cfg, req)?;
-    let (binding, restricted_from) = if matched.deployment_ids.is_empty() {
-        (resolve_restricted(cfg, matched)?, Some(matched.binding_id.as_str()))
-    } else {
-        (matched, None)
+    // 只有 restricted 档下的空绑定才转到已签替代型号；其余档位的空绑定没有运行权限。
+    let (binding, restricted_from) = match (matched.deployment_ids.is_empty(), ctx.balance) {
+        (false, _) => (matched, None),
+        (true, BalanceMode::Restricted) => (resolve_restricted(cfg, matched)?, Some(matched.binding_id.as_str())),
+        (true, _) => return Err(SelectError::ModelNotAllowed),
     };
     let mut pools = cfg.route_pool.pools.iter().filter(|p| p.model_id == binding.model_id);
     let pool = match (pools.next(), pools.next()) {
@@ -319,13 +339,30 @@ fn contains_block(v: &Value, types: &[&str]) -> bool {
     }
 }
 
+/// 请求历史里是否有原生工具调用或工具结果。
+fn carries_tool_turn(ingress_protocol: &str, body: &Value) -> bool {
+    match ingress_protocol {
+        "openai_responses" => body.get("input").is_some_and(|i| {
+            contains_block(i, &["function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"])
+        }),
+        "openai_chat" => body.get("messages").and_then(Value::as_array).is_some_and(|messages| {
+            messages.iter().any(|m| {
+                m.get("role").and_then(Value::as_str) == Some("tool") || m.get("tool_calls").is_some_and(has_items)
+            })
+        }),
+        "anthropic" => body.get("messages").is_some_and(|m| contains_block(m, &["tool_use", "tool_result"])),
+        _ => false,
+    }
+}
+
 /// 从入口实际请求推出所需能力。`text` 恒需要。
 pub fn required_features(ingress_protocol: &str, body: &Value) -> BTreeSet<&'static str> {
     let mut need = BTreeSet::from([feature::TEXT]);
     if body.get("stream").and_then(Value::as_bool) == Some(true) {
         need.insert(feature::STREAM);
     }
-    if body.get("tools").is_some_and(has_items) {
+    // 连续工具轮次可能不再带 `tools`，但历史里的原生工具调用或结果同样要求上游支持工具。
+    if body.get("tools").is_some_and(has_items) || carries_tool_turn(ingress_protocol, body) {
         need.insert(feature::FUNCTION_TOOLS);
     }
     match ingress_protocol {
@@ -406,7 +443,62 @@ mod tests {
     }
 
     fn ctx() -> Context<'static> {
-        Context { now_ms: clock(), revocations: &[], adapters: &[] }
+        Context { balance: BalanceMode::Normal, now_ms: clock(), revocations: &[], adapters: &[] }
+    }
+
+    #[test]
+    fn context_window_counts_input_plus_allowed_output() {
+        let cfg = config();
+        // 125,000 输入 + 10,000 输出 > 128,000。
+        let over = Request { estimated_input_tokens: 125_000, requested_output_tokens: Some(10_000), ..req(&["text"]) };
+        let SelectError::NoCompatibleRoute { skipped } = select(&cfg, &over, &ctx()).unwrap_err() else { panic!() };
+        assert_eq!(skips(&skipped), [("dep_a", skip::CONTEXT_TOO_LONG), ("dep_b", skip::CONTEXT_TOO_LONG)]);
+        // 恰好填满窗口可以通过。
+        let exact = Request { estimated_input_tokens: 118_000, ..over.clone() };
+        assert_eq!(order(&select(&cfg, &exact, &ctx()).unwrap()), ["dep_a", "dep_b"]);
+        // 未给输出上限时按部署允许的最大输出（16,000）计。
+        let implicit = Request { estimated_input_tokens: 112_001, requested_output_tokens: None, ..req(&["text"]) };
+        assert!(matches!(select(&cfg, &implicit, &ctx()), Err(SelectError::NoCompatibleRoute { .. })));
+        let fits = Request { estimated_input_tokens: 112_000, ..implicit };
+        assert!(select(&cfg, &fits, &ctx()).is_ok());
+        // 溢出不回绕成小数。
+        let huge = Request { estimated_input_tokens: u64::MAX, requested_output_tokens: Some(1), ..req(&["text"]) };
+        assert!(matches!(select(&cfg, &huge, &ctx()), Err(SelectError::NoCompatibleRoute { .. })));
+    }
+
+    #[test]
+    fn tool_continuation_without_tools_still_requires_tools() {
+        let cfg = config_with(|v| v["routes"][1]["features"] = json!(["text", "stream"]));
+        let body = json!({"model":"model-m","input":[
+            {"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
+            {"type":"function_call_output","call_id":"c1","output":"ok"}
+        ]});
+        let need = required_features("openai_responses", &body);
+        assert!(need.contains(feature::FUNCTION_TOOLS));
+        let plan = select(&cfg, &Request { required_features: need, ..req(&[]) }, &ctx()).unwrap();
+        assert_eq!(order(&plan), ["dep_a"]);
+        assert_eq!(skips(&plan.skipped), [("dep_b", skip::UNSUPPORTED_FEATURE)]);
+
+        let only_output = json!({"input":[{"type":"function_call_output","call_id":"c1","output":"ok"}]});
+        assert!(required_features("openai_responses", &only_output).contains(feature::FUNCTION_TOOLS));
+        let chat = json!({"messages":[{"role":"assistant","tool_calls":[{"id":"c1"}]},{"role":"tool","tool_call_id":"c1","content":"ok"}]});
+        assert!(required_features("openai_chat", &chat).contains(feature::FUNCTION_TOOLS));
+        let messages = json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1"}]}]});
+        assert!(required_features("anthropic", &messages).contains(feature::FUNCTION_TOOLS));
+        // 普通文本历史不需要工具。
+        let text = json!({"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]});
+        assert!(!required_features("openai_responses", &text).contains(feature::FUNCTION_TOOLS));
+    }
+
+    #[test]
+    fn balance_modes_gate_selection() {
+        let cfg = config();
+        for mode in [BalanceMode::Normal, BalanceMode::Warn, BalanceMode::Restricted] {
+            let plan = select(&cfg, &req(&["text"]), &Context { balance: mode, ..ctx() }).unwrap();
+            assert_eq!((order(&plan), plan.restricted_from), (vec!["dep_a".to_string(), "dep_b".to_string()], None));
+        }
+        let stopped = select(&cfg, &req(&["text"]), &Context { balance: BalanceMode::Stopped, ..ctx() }).unwrap_err();
+        assert_eq!((stopped.clone(), stopped.code()), (SelectError::BalanceExhausted, "balance_exhausted"));
     }
 
     fn order(plan: &Plan<'_>) -> Vec<String> {
@@ -691,11 +783,26 @@ mod tests {
             rate["input_milli_per_mtok"] = json!(1000);
             v["rates"] = json!([rate]);
         });
-        let plan = select(&cfg, &req(&["text"]), &ctx()).unwrap();
+        let restricted = Context { balance: BalanceMode::Restricted, ..ctx() };
+        let plan = select(&cfg, &req(&["text"]), &restricted).unwrap();
         assert_eq!(plan.restricted_from, Some("bnd_codex_m"));
         assert_eq!(plan.binding.binding_id, "bnd_codex_lite");
         assert_eq!(plan.rate.rate_version_id, "rate_lite_1");
         assert_eq!(order(&plan), ["dep_lite"]);
+
+        // normal、warn 档不经过替代目标；stopped 一律拒绝。
+        for mode in [BalanceMode::Normal, BalanceMode::Warn] {
+            let err = select(&cfg, &req(&["text"]), &Context { balance: mode, ..ctx() }).unwrap_err();
+            assert_eq!(err, SelectError::ModelNotAllowed, "{mode:?}");
+        }
+        let stopped = Context { balance: BalanceMode::Stopped, ..ctx() };
+        assert_eq!(select(&cfg, &req(&["text"]), &stopped).unwrap_err(), SelectError::BalanceExhausted);
+
+        // 非空绑定在 restricted 档仍按原型号执行，不跳到替代目标。
+        let normal_binding =
+            config_with(|v| v["route_pool"]["bindings"][0]["restricted_target_model_id"] = json!("mdl_lite"));
+        let plan = select(&normal_binding, &req(&["text"]), &restricted).unwrap();
+        assert_eq!((plan.binding.model_id.as_str(), plan.restricted_from), ("mdl_m", None));
 
         // 替代目标没有本发行同入口的已签绑定时拒绝。
         let cfg = config_with(|v| {
@@ -703,7 +810,19 @@ mod tests {
             src["deployment_ids"] = json!([]);
             src["restricted_target_model_id"] = json!("mdl_lite");
         });
-        assert_eq!(select(&cfg, &req(&["text"]), &ctx()).unwrap_err(), SelectError::ModelNotAllowed);
+        assert_eq!(select(&cfg, &req(&["text"]), &restricted).unwrap_err(), SelectError::ModelNotAllowed);
+
+        // 替代目标指回同一型号时拒绝（降档只允许转到另一已签型号）。
+        let cfg = config_with(|v| {
+            let mut twin = v["route_pool"]["bindings"][0].clone();
+            twin["binding_id"] = json!("bnd_twin");
+            twin["aliases"] = json!(["model-twin"]);
+            let src = &mut v["route_pool"]["bindings"][0];
+            src["deployment_ids"] = json!([]);
+            src["restricted_target_model_id"] = json!("mdl_m");
+            v["route_pool"]["bindings"].as_array_mut().unwrap().push(twin);
+        });
+        assert_eq!(select(&cfg, &req(&["text"]), &restricted).unwrap_err(), SelectError::ModelNotAllowed);
     }
 
     #[test]
