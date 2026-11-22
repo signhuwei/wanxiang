@@ -1,4 +1,4 @@
-//! `onex login`：验证码登录 → 选租户 → 注册设备 → 把 device_token 交给 onexd。
+//! `onex login`：验证租户账号，注册设备，再把 device_token 交给 onexd。
 //!
 //! 只有设备公钥离开本机；私钥一直在 onexd 内存里。登录和租户会话令牌只用于注册设备，用完即注销。
 
@@ -13,6 +13,15 @@ pub struct LoginArgs {
     pub tenant: Option<String>,
     pub device_name: String,
     pub public_key: String,
+}
+
+pub struct PasswordLoginArgs<'a> {
+    pub server: &'a str,
+    pub tenant: &'a str,
+    pub username: &'a str,
+    pub password: &'a str,
+    pub device_name: &'a str,
+    pub public_key: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,13 +40,7 @@ pub struct Registered {
 /// `ask(prompt)` 从用户读一行（验证码、租户编号）。
 pub async fn login(a: &LoginArgs, ask: &mut dyn FnMut(&str) -> Result<String>) -> Result<Registered> {
     let base = a.server.trim_end_matches('/');
-    let mut b = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-    // 契约：127.0.0.1 和 localhost 一律不走代理，其余遵从环境变量代理
-    let host = reqwest::Url::parse(base).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default();
-    if matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]") {
-        b = b.no_proxy();
-    }
-    let http = b.build()?;
+    let http = client(base)?;
     let api = Api { http: &http, base };
 
     api.post("/v1/auth/code", None, json!({"target": a.target})).await.context("发送验证码失败")?;
@@ -56,6 +59,39 @@ pub async fn login(a: &LoginArgs, ask: &mut dyn FnMut(&str) -> Result<String>) -
     r
 }
 
+pub async fn login_password(a: &PasswordLoginArgs<'_>) -> Result<Registered> {
+    let base = a.server.trim_end_matches('/');
+    let http = client(base)?;
+    let api = Api { http: &http, base };
+    let reply = api
+        .post(
+            "/v1/auth/password-login",
+            None,
+            json!({"tenant": a.tenant, "username": a.username, "password": a.password, "kind": "desktop"}),
+        )
+        .await
+        .context("登录失败")?;
+    let scoped = str_field(&reply, "token")?;
+    let result = async {
+        let tenants: Vec<Tenant> = serde_json::from_value(reply["tenants"].clone()).context("无法读取登录租户")?;
+        let [tenant] = tenants.as_slice() else { bail!("登录响应缺少唯一的租户") };
+        register_device(&api, &scoped, tenant, a.device_name, a.public_key).await
+    }
+    .await;
+    let _ = api.post("/v1/auth/logout", Some(&scoped), json!({})).await;
+    result
+}
+
+fn client(base: &str) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    // 本机测试地址直连，其余地址使用环境配置。
+    let url = reqwest::Url::parse(base).context("服务地址无效")?;
+    if matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")) {
+        builder = builder.no_proxy();
+    }
+    Ok(builder.build()?)
+}
+
 async fn register(
     api: &Api<'_>,
     a: &LoginArgs,
@@ -69,17 +105,27 @@ async fn register(
         .await
         .context("选择租户失败")?;
     let scoped = str_field(&v, "token")?;
+    let result = register_device(api, &scoped, tenant, &a.device_name, &a.public_key).await;
+    let _ = api.post("/v1/auth/logout", Some(&scoped), json!({})).await;
+    result
+}
+
+async fn register_device(
+    api: &Api<'_>,
+    scoped: &str,
+    tenant: &Tenant,
+    device_name: &str,
+    public_key: &str,
+) -> Result<Registered> {
     let dev = api
         .post(
             "/v1/devices",
-            Some(&scoped),
-            json!({"name": a.device_name, "os": onex_core::ipc::os_name(), "arch": onex_core::ipc::arch_name(),
-                "public_key": a.public_key}),
+            Some(scoped),
+            json!({"name": device_name, "os": onex_core::ipc::os_name(), "arch": onex_core::ipc::arch_name(),
+                "public_key": public_key}),
         )
         .await
-        .context("注册设备失败");
-    let _ = api.post("/v1/auth/logout", Some(&scoped), json!({})).await;
-    let dev = dev?;
+        .context("注册设备失败")?;
     Ok(Registered {
         device_id: str_field(&dev, "device_id")?,
         device_token: str_field(&dev, "device_token")?,
@@ -129,6 +175,15 @@ impl Api<'_> {
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         if !status.is_success() {
             let code = v.pointer("/error/code").and_then(Value::as_str).unwrap_or("");
+            if path == "/v1/auth/password-login" {
+                if status.as_u16() == 429 {
+                    bail!("尝试太频繁，请稍后再试");
+                }
+                if status.as_u16() == 401 {
+                    bail!("租户、用户名或密码无效。使用简称无法登录时，可以输入租户 ID");
+                }
+                bail!("登录服务返回 HTTP {}", status.as_u16());
+            }
             let hint = match code {
                 "unauthenticated" if path == "/v1/auth/login" => {
                     "验证码错误或已过期，或这个账号还没有加入租户（需要 --invite）"
@@ -181,6 +236,14 @@ mod tests {
                             }
                             Json(json!({"token":"global","user":{},"tenants":tenants})).into_response()
                         }
+                        "/v1/auth/password-login" if b["password"] != "form-password" => (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({"error":{"code":"unauthenticated","message":"raw test exception"}})),
+                        )
+                            .into_response(),
+                        "/v1/auth/password-login" => Json(json!({"token":"scoped_password",
+                            "tenants":[{"id":"ten_a","name":"甲公司"}]}))
+                        .into_response(),
                         "/v1/auth/select-tenant" => {
                             Json(json!({"token": format!("scoped_{}", b["tenant_id"].as_str().unwrap())}))
                                 .into_response()
@@ -195,7 +258,14 @@ mod tests {
             }
         };
         let mut app = axum::Router::new();
-        for p in ["/v1/auth/code", "/v1/auth/login", "/v1/auth/select-tenant", "/v1/devices", "/v1/auth/logout"] {
+        for p in [
+            "/v1/auth/code",
+            "/v1/auth/login",
+            "/v1/auth/password-login",
+            "/v1/auth/select-tenant",
+            "/v1/devices",
+            "/v1/auth/logout",
+        ] {
             app = app.route(p, post(rec(p, seen.clone())));
         }
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -213,6 +283,45 @@ mod tests {
             device_name: "Mac".into(),
             public_key: "PUB".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn password_login_registers_with_the_scoped_token_and_revokes_it() {
+        let (url, seen) = fake_server(false).await;
+        let mut args = PasswordLoginArgs {
+            server: &url,
+            tenant: "OneC",
+            username: "zhangwei",
+            password: "form-password",
+            device_name: "Mac",
+            public_key: "PUB",
+        };
+        let registered = login_password(&args).await.unwrap();
+        assert_eq!(registered.tenant_name, "甲公司");
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.calls.len(), 3);
+            assert_eq!(
+                seen.calls[0],
+                (
+                    "/v1/auth/password-login".into(),
+                    None,
+                    json!({"tenant":"OneC","username":"zhangwei","password":"form-password","kind":"desktop"})
+                )
+            );
+            assert_eq!(seen.calls[1].0, "/v1/devices");
+            assert_eq!(seen.calls[1].1.as_deref(), Some("Bearer scoped_password"));
+            assert_eq!(seen.calls[1].2["public_key"], "PUB");
+            assert_eq!(seen.calls[2].0, "/v1/auth/logout");
+            assert_eq!(seen.calls[2].1.as_deref(), Some("Bearer scoped_password"));
+        }
+
+        args.password = "bad-password";
+        let error = format!("{:#}", login_password(&args).await.unwrap_err());
+        assert!(error.contains("租户、用户名或密码无效"));
+        assert!(!error.contains("bad-password"));
+        assert!(!error.contains("raw test exception"));
+        assert_eq!(seen.lock().unwrap().calls.len(), 4);
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use onex_desktop::bridge::{Bridge, Op};
@@ -39,13 +39,14 @@ async fn test_daemon(server_url: Option<String>) -> (Bridge, tempfile::TempDir, 
 #[derive(Default)]
 struct Seen {
     calls: Vec<(String, Value)>,
+    device_auth: Option<String>,
 }
 
 /// 假 Server：固定验证码 123456，支持单租户/多租户两种开关。
 async fn fake_server(two_tenants: bool) -> (String, Arc<Mutex<Seen>>) {
     let seen = Arc::new(Mutex::new(Seen::default()));
     let rec = |path: &'static str, s: Arc<Mutex<Seen>>| {
-        move |Json(b): Json<Value>| {
+        move |headers: HeaderMap, Json(b): Json<Value>| {
             let s = s.clone();
             async move {
                 s.lock().unwrap().calls.push((path.into(), b.clone()));
@@ -62,10 +63,15 @@ async fn fake_server(two_tenants: bool) -> (String, Arc<Mutex<Seen>>) {
                         }
                         Json(json!({"token":"global","user":{"name":"示例员工"},"tenants":tenants})).into_response()
                     }
+                    "/v1/auth/password-login" => Json(json!({"token":"scoped_password","user":{"name":"示例员工"},
+                        "tenants":[{"id":"ten_a","name":"甲公司"}]}))
+                    .into_response(),
                     "/v1/auth/select-tenant" => {
                         Json(json!({"token": format!("scoped_{}", b["tenant_id"].as_str().unwrap())})).into_response()
                     }
                     "/v1/devices" => {
+                        s.lock().unwrap().device_auth =
+                            headers.get("authorization").and_then(|value| value.to_str().ok()).map(str::to_owned);
                         (StatusCode::CREATED, Json(json!({"device_id":"dev_1","device_token":"dtok"}))).into_response()
                     }
                     _ => StatusCode::NO_CONTENT.into_response(),
@@ -74,9 +80,10 @@ async fn fake_server(two_tenants: bool) -> (String, Arc<Mutex<Seen>>) {
         }
     };
     let mut app = axum::Router::new();
-    for p in ["/v1/auth/code", "/v1/auth/login", "/v1/auth/select-tenant", "/v1/devices", "/v1/auth/logout"] {
+    for p in ["/v1/auth/code", "/v1/auth/login", "/v1/auth/password-login", "/v1/auth/select-tenant", "/v1/devices"] {
         app = app.route(p, post(rec(p, seen.clone())));
     }
+    app = app.route("/v1/auth/logout", post(|| async { StatusCode::NO_CONTENT }));
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
@@ -136,6 +143,39 @@ async fn full_login_select_tenant_and_logout() {
     assert_eq!(s.phase, "signed_out");
     assert!(s.tenant.is_none());
     assert!(s.agents.is_empty());
+}
+
+#[tokio::test]
+async fn password_login_registers_directly_and_returns_only_display_fields() {
+    let (url, seen) = fake_server(false).await;
+    let (bridge, dir, _task) = test_daemon(Some(url)).await;
+    let login =
+        Op::PasswordLogin { tenant: "OneC".into(), username: "zhangwei".into(), password: "form-password".into() };
+    let ready = bridge.call(login.clone()).await.unwrap();
+    assert_eq!(ready.phase, "ready");
+    assert_eq!(ready.tenant.as_ref().unwrap().id, "ten_a");
+    assert_eq!(ready.user.as_ref().unwrap().name, "示例员工");
+    assert!(ready.tenants.is_empty());
+    let serialized = serde_json::to_string(&ready).unwrap();
+    for private in ["form-password", "scoped_password", "dtok"] {
+        assert!(!serialized.contains(private));
+    }
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.calls.len(), 2);
+        assert_eq!(
+            seen.calls[0],
+            (
+                "/v1/auth/password-login".into(),
+                json!({"tenant":"OneC","username":"zhangwei","password":"form-password","kind":"desktop"})
+            )
+        );
+        assert_eq!(seen.calls[1].0, "/v1/devices");
+        assert_eq!(seen.device_auth.as_deref(), Some("Bearer scoped_password"));
+    }
+    let stored = std::fs::read_to_string(dir.path().join("desktop-profile.json")).unwrap();
+    assert!(!stored.contains("form-password") && !stored.contains("scoped_password"));
+    assert_eq!(bridge.call(login).await.unwrap_err().code, "forbidden");
 }
 
 #[tokio::test]

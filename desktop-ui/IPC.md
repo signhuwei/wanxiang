@@ -11,6 +11,7 @@ UI 是本地静态 HTML/ESM，不直连 Server、daemon socket 或上游。edge 
 | `state` | 无 | 返回当前安全快照，不触发网络写操作 |
 | `send_code` | `target` | 向配置好的 Server 请求验证码；限流错误原样分类 |
 | `login` | `target,code,invite_code?` | `kind:desktop`；邀请码仅用于入租。返回选租户快照，不返回令牌 |
+| `password_login` | `tenant,username,password` | 接受租户 ID 或简称。以 `kind:desktop` 登录并用租户会话直接注册设备，完成后注销该会话。快照只含公开显示信息 |
 | `select_tenant` | `tenant_id` | 只能选择返回的稳定 ID。原生层换租户令牌并注册设备、连接 onexd |
 | `download` | `agent_id` | 后台下载及校验当前获准的发行。onexd 自行确定版本、来源和摘要，接受后通过快照报告实际进度 |
 | `launch` | `agent_id` | 仅启动当前目录授权的 `claude-code`、`codex` 或 `kimi-code`。原生层验证设备与授权，将所选 Agent 交给随包 CLI，下载及校验由 onexd 完成。重复点击不另启进程 |
