@@ -94,6 +94,13 @@ test('real HTTP channel actions retain all pages and publish a one-to-many pool 
     expect(real.members.map((entry: Record<string, any>) => entry.raw_model)).toEqual(['Supplier-A/M', 'Supplier-B/M']);
     expect(requestLog.filter(({ path }) => path === '/a/v1/models').map(({ cursor }) => cursor)).toEqual([null, null, 'next-1']);
     expect(requestLog.every(({ method }) => method === 'GET')).toBe(true);
+    const changed = new URL('/a/v1', upstream.url);
+    changed.hostname = '127.0.0.2';
+    const edited = await api(`/providers/${a.id}`, { revision: a.revision, base_url: changed.href });
+    const count = requestLog.length;
+    expect(await api(`/providers/${a.id}/probes`, { revision: edited.revision, kind: 'connectivity' }, 202))
+      .toMatchObject({ status: 'failed', summary: { reason: 'credential_scope_changed' } });
+    expect(requestLog.length).toBe(count);
   } finally {
     await svc?.close();
     await upstream.stop(true);
