@@ -161,7 +161,7 @@ export async function startOneChain(directory?: string) {
     const device=await api('/devices',{name:'one-chain-fixture',os:'darwin',arch:'arm64',public_key:x25519PublicKey(deviceKey)},undefined,owner);
     fixtureDevice=device.device_id;
     const projected=await service.projection!.project(fixtureTenant,fixtureDevice,Date.now());
-    return {close,service,api,info:{http_url:url,ws_url:url.replace(/^http/,'ws')+'/v1/edge/ws',tenant_id:fixtureTenant,user_id:tenant.userId,
+    return {close,service,api,info:{data_dir:dataDir,http_url:url,ws_url:url.replace(/^http/,'ws')+'/v1/edge/ws',tenant_id:fixtureTenant,user_id:tenant.userId,
       device_id:fixtureDevice,device_token:device.device_token,device_private_key_hex:deviceKey.toString('hex'),model_id:logical.id,
       config_revision:projected.config_revision,projection_id:projected.projection_id,signed_pool:signed.route_pools[0],
       signed_rate:signed.sales_rate_snapshots[0],origin_channel:supplies[0]!.wallet,platform_session:platform,owner_session:owner},hits:[a.hits,b.hits]};
@@ -169,7 +169,8 @@ export async function startOneChain(directory?: string) {
 }
 
 if(import.meta.main) {
-  const fixture=await startOneChain();
+  const index=process.argv.indexOf('--data-dir');
+  const fixture=await startOneChain(index===-1 ? undefined : process.argv[index+1]);
   console.log(JSON.stringify(fixture.info));
   for(const signal of ['SIGTERM','SIGINT'] as const) process.once(signal,async()=>{await fixture.close();process.exit(0);});
 }
