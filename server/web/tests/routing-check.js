@@ -83,6 +83,7 @@ function routingStub() {
     if (method === 'GET' && one) return revisions.has(Number(one[1])) ? { json: view(Number(one[1])) } : { status: 404, json: { error: { code: 'not_found', message: '不存在' } } }
     if (method === 'POST' && path === '/v1/platform/models/mdl_m/pool/preview') {
       state.previews.push(body)
+      if (state.failNextPreview) { state.failNextPreview = false; return conflict('preview_stale', { changed: ['evidence'] }) }
       if (body.expected_pool_revision !== state.current) return conflict('revision_changed', { current_revision: state.current, changed: ['pool_revision'] })
       if (staleMember(body)) return conflict('preview_stale', { changed: ['evidence'] })
       const before = new Set(revisions.get(state.current).members.map(m => m.deployment_id))
@@ -160,6 +161,11 @@ try {
       if (request.method() === 'POST' && url.pathname.endsWith('/pool/revisions') && stub.state.abortNextPublish) {
         stub.state.abortNextPublish = false
         return route.abort('connectionreset') // 服务端已提交、响应丢失：重试须复用同一提交键
+      }
+      if (url.pathname.endsWith('/pool/preview') && stub.state.delayNextPreview) {
+        const ms = stub.state.delayNextPreview
+        stub.state.delayNextPreview = 0
+        await Bun.sleep(ms) // 慢响应：期间操作者修改草稿
       }
       return route.fulfill({ status: hit.status ?? 200, contentType: 'application/json', body: JSON.stringify(hit.json) })
     }
@@ -247,6 +253,19 @@ try {
   await page.getByText('草稿已修改，需重新预览后才能发布。').waitFor()
   assert.equal(await button('发布').isVisible(), false)
   await page.getByLabel('发布原因').fill(draft.reason)
+  // 竞态：预览在途时修改草稿，成功或失败的旧响应都必须丢弃，不出现发布按钮
+  stub.state.delayNextPreview = 800
+  await button('预览').click()
+  await page.getByLabel('发布原因').fill(draft.reason + '（在途修改）')
+  await page.getByText('草稿在预览期间已修改，旧结果已丢弃，请重新预览。').waitFor()
+  assert.equal(await button('发布').isVisible(), false)
+  stub.state.delayNextPreview = 800
+  stub.state.failNextPreview = true
+  await button('预览').click()
+  await page.getByLabel('发布原因').fill(draft.reason)
+  await page.getByText('草稿在预览期间已修改，旧结果已丢弃，请重新预览。').waitFor()
+  assert.equal(await page.getByText('预览依据已过期', { exact: false }).count(), 0, '失败的旧响应也不渲染')
+  assert.equal(await button('发布').isVisible(), false)
   await button('预览').click()
   await button('发布').waitFor()
 

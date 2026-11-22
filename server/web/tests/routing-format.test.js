@@ -31,6 +31,8 @@ test('candidates without select or match evidence are not selectable and always 
   expect(candidateState({ deployment_id: null, actions: ['read'] }).reasons).toEqual(['尚未登记为部署'])
   expect(candidateState({ deployment_id: 'd', deployment_revision: 1, actions: ['read'] }).reasons).toEqual(['服务端未返回原因'])
   expect(candidateState({ deployment_id: 'd', deployment_revision: 1, actions: ['select'] }).reasons).toEqual(['缺少已确认的归纳审核'])
+  expect(candidateState({ deployment_id: 'd', deployment_revision: 1, match: { reason: 'capability_unverified' }, actions: ['read'] }).reasons)
+    .toEqual(['能力未核验'])
   expect(candidateState(row(b)).selectable).toBe(true)
 })
 

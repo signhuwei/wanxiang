@@ -79,7 +79,7 @@ function draftPool(pane, api, model, base, signal, done) {
   let expected = base?.pool_revision ?? 0
   let members = (base?.members ?? []).map(m => ({ ...m, evidence_ids: [...(m.evidence_ids ?? [])] }))
   const routing = { ...DEFAULT_ROUTING, ...(base?.routing ?? {}) }
-  let preview = null, previewFingerprint = null, publishKey = null, publishFingerprint = null, busy = false
+  let preview = null, previewFingerprint = null, publishKey = null, publishFingerprint = null, busy = false, generation = 0
   const review = new Map() // deployment_id → memberChanges()：预览过期后需用户显式处理的成员
   const sync = () => { previewBtn.disabled = busy || review.size > 0 }
 
@@ -128,6 +128,7 @@ function draftPool(pane, api, model, base, signal, done) {
     try { return JSON.stringify(buildDraft(current())) } catch { return null }
   }
   function invalidate() {
+    generation += 1 // 任何草稿变化都让在途预览作废
     if (preview && fingerprint() !== previewFingerprint) {
       preview = null
       publishBtn.hidden = true
@@ -292,6 +293,7 @@ function draftPool(pane, api, model, base, signal, done) {
         cursor = page.next_cursor ?? null
       } while (cursor && ++pages < 25)
       review.clear()
+      generation += 1
       for (const m of members) {
         const change = memberChanges(m, found.get(m.deployment_id))
         if (change) review.set(m.deployment_id, change)
@@ -331,10 +333,19 @@ function draftPool(pane, api, model, base, signal, done) {
     previewBtn.disabled = true
     publishBtn.hidden = true
     result.replaceChildren(el('p', 'muted', '正在预览…'))
+    const gen = generation, sent = JSON.stringify(draft)
+    // 响应返回时草稿已变化（generation 或规范形不同），丢弃旧结果，不显示发布按钮
+    const outdated = () => gen !== generation || fingerprint() !== sent
+    const discard = () => {
+      preview = null
+      publishBtn.hidden = true
+      result.replaceChildren(el('p', 'notice warn', '草稿在预览期间已修改，旧结果已丢弃，请重新预览。'))
+    }
     try {
       const data = await api.post(modelPath(model.id) + '/pool/preview', draft, { signal })
+      if (outdated()) return discard()
       preview = data
-      previewFingerprint = JSON.stringify(draft)
+      previewFingerprint = sent
       result.replaceChildren()
       facts(result, [['可发布', data.publishable ? '是' : '否'], ['基于', revisionText(data.expected_pool_revision)],
         ['新增', (data.diff?.added ?? []).join('、') || '无'], ['移除', (data.diff?.removed ?? []).join('、') || '无'],
@@ -348,6 +359,7 @@ function draftPool(pane, api, model, base, signal, done) {
       result.scrollIntoView({ block: 'nearest' })
     } catch (e) {
       if (e?.name === 'AbortError') return
+      if (outdated()) return discard()
       if (e.code === 'conflict') conflict(e)
       else result.replaceChildren(el('p', 'notice error', errorText(e)))
     } finally {
