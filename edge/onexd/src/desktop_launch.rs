@@ -47,7 +47,11 @@ pub(crate) fn prepare(
     }
     let workspace = path_text(&cwd)?;
     let hash = crate::capture::hex(&Sha256::digest(workspace.as_bytes()));
-    let profile = request.home.join("agents").join(request.agent).join("profiles").join(owner).join(&hash);
+    let profile_root = request.home.join("agents").join(request.agent).join("profiles");
+    #[cfg(not(windows))]
+    let profile = profile_root.join(owner).join(&hash);
+    #[cfg(windows)]
+    let profile = profile_root.join(crate::capture::hex(&Sha256::digest(format!("{owner}:{hash}"))));
     let home = profile.join("home");
     let data = profile.join("electron");
     // WorkBuddy discovers its own sidecar under TMPDIR. A fresh namespace per

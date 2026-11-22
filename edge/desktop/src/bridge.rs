@@ -205,12 +205,16 @@ const AGENT_LAUNCHERS: &[AgentLauncher] = &[
         #[cfg(target_os = "macos")]
         script: "onex-run-kimi.command",
     },
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(windows, target_arch = "x86_64", debug_assertions)
+    ))]
     AgentLauncher {
         gui: true,
         id: "deepseek-desktop",
         name: "DeepSeek Harness Desktop",
         vendor: "DeepSeek",
+        #[cfg(target_os = "macos")]
         script: "",
     },
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

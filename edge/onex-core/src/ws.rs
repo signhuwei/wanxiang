@@ -64,6 +64,8 @@ pub struct Hello {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mac_desktop_v1: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub windows_deepseek_desktop_v1: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub codex_desktop_v1: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub claude_desktop_v1: bool,
@@ -510,8 +512,15 @@ mod tests {
             Msg::Hello(Hello { outbox_last_seq: 4810, codex_desktop_v1: false, claude_desktop_v1: false, .. })
         ));
         let mut wire = serde_json::to_value(hello).unwrap();
+        assert!(wire.get("windows_deepseek_desktop_v1").is_none());
         assert!(wire.get("codex_desktop_v1").is_none());
         assert!(wire.get("claude_desktop_v1").is_none());
+
+        let mut windows_wire = wire.clone();
+        windows_wire["windows_deepseek_desktop_v1"] = json!(true);
+        let windows_hello: Msg = serde_json::from_value(windows_wire).unwrap();
+        assert!(matches!(windows_hello, Msg::Hello(Hello { windows_deepseek_desktop_v1: true, .. })));
+        assert_eq!(serde_json::to_value(windows_hello).unwrap()["windows_deepseek_desktop_v1"], true);
 
         wire["claude_desktop_v1"] = json!(true);
         let claude_hello: Msg = serde_json::from_value(wire).unwrap();

@@ -255,7 +255,10 @@ async fn original_windows_gui_restores_native_session_and_settles_each_turn() ->
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
-    anyhow::ensure!(!association.success(), "Windows GUI QA needs a clean user without a dsh protocol handler");
+    anyhow::ensure!(
+        !association.success() || std::env::var("ONEX_DEEPSEEK_QA_PROTOCOL_BACKED_UP").as_deref() == Ok("1"),
+        "back up the existing dsh protocol handler before running Windows GUI QA"
+    );
     run_original_deepseek(false, false).await
 }
 
@@ -418,9 +421,10 @@ async fn run_original_deepseek(attachments: bool, host_only: bool) -> anyhow::Re
                     if let Some(id) = &original {
                         assert_eq!(id, session)
                     }
-                    if host_only {
+                    if cfg!(windows) {
+                        let runtime = if host_only { "Host" } else { "GUI" };
                         eprintln!(
-                            "verified Windows Host turn {turn}: session={session}, cost_milli={}",
+                            "verified Windows {runtime} turn {turn}: session={session}, cost_milli={}",
                             request.cost_milli
                         );
                     }

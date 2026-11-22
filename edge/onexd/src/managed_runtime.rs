@@ -68,14 +68,15 @@ pub fn select<'a>(
 /// Server 下发记录本身的合法性：不是「能不能下载成功」，是「这条记录像不像是正常的发行记录」。
 /// 真正的内容完整性仍然只认重新算出来的 SHA-256（见 `verify`），这里只挡明显畸形的输入。
 fn validate(r: &AgentRelease) -> Result<(), ResolveError> {
-    let desktop = crate::desktop_bundle::Bundle::manages(&r.agent);
-    if !SUPPORTED_AGENTS.contains(&r.agent.as_str())
-        && !(desktop
-            && cfg!(all(target_os = "macos", target_arch = "aarch64"))
-            && crate::desktop_bundle::Bundle::for_release(r).is_some()
-            && is_server_artifact(r))
-    {
-        return Err(ResolveError::BadRelease("unsupported agent"));
+    let desktop = Bundle::manages(&r.agent);
+    if !SUPPORTED_AGENTS.contains(&r.agent.as_str()) {
+        let mac = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && r.os == "darwin"
+            && Bundle::for_release(r).is_some();
+        let windows_qa = crate::desktop_bundle::windows_qa_release(r);
+        if !(desktop && (mac || windows_qa) && is_server_artifact(r)) {
+            return Err(ResolveError::BadRelease("unsupported agent"));
+        }
     }
     if r.sha256.len() != 64 || !r.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ResolveError::BadRelease("sha256 is not 64 hex characters"));
@@ -138,10 +139,10 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 /// `<home>/agents/<agent>/releases/<sha256>/<binary name>`。按摘要分目录，换版本不覆盖旧缓存，
 /// 旧版本缓存留着也没关系（S1 不做清理）。
 fn cache_path(home: &Path, agent: &str, release: &AgentRelease) -> PathBuf {
-    let name = if crate::desktop_bundle::Bundle::manages(agent) {
-        format!("{agent}.dmg")
-    } else if release.os == "win32" {
+    let name = if release.os == "win32" {
         format!("{agent}.exe")
+    } else if Bundle::manages(agent) {
+        format!("{agent}.dmg")
     } else {
         agent.to_string()
     };
@@ -162,7 +163,7 @@ pub(crate) fn cache_ready(home: &Path, release: &AgentRelease) -> bool {
     if !has_size(&path, release.size) {
         return false;
     }
-    if !Bundle::manages(&release.agent) {
+    if !Bundle::manages(&release.agent) || crate::desktop_bundle::windows_qa_release(release) {
         return true;
     }
     Bundle::for_release(release).is_some_and(|bundle| {
@@ -195,6 +196,12 @@ pub(crate) async fn resolve_with_progress(
     progress: impl Fn(ArtifactProgress),
 ) -> Result<PathBuf> {
     let release = select(releases, agent, os, arch)?;
+    if crate::desktop_bundle::windows_qa_release(release) {
+        anyhow::ensure!(
+            access.is_some_and(|access| crate::desktop_bundle::windows_qa_for_server(access.origin)),
+            "Windows DeepSeek QA requires a loopback OneX Server"
+        );
+    }
     let path = cache_path(home, agent, release);
     let engine = Bundle::for_release(release).and_then(|bundle| bundle.runtime);
     let total_bytes = release.size + engine.map_or(0, |e| e.bytes);
@@ -885,6 +892,25 @@ mod tests {
         let mut r = valid_release();
         r.agent = "workbuddy".into();
         assert_eq!(select(&[r], "workbuddy", "darwin", "arm64"), Err(ResolveError::BadRelease("unsupported agent")));
+    }
+
+    #[test]
+    fn caches_native_windows_installer_as_exe_and_rejects_an_unqualified_tuple() {
+        let mut release = valid_release();
+        release.agent = "deepseek-desktop".into();
+        release.os = "win32".into();
+        release.arch = "x64".into();
+        release.url = "/v1/edge/agent-artifacts/rel_1".into();
+        let home = Path::new("cache");
+        assert_eq!(cache_path(home, &release.agent, &release).file_name().unwrap(), "deepseek-desktop.exe");
+        let mut mac = release.clone();
+        mac.os = "darwin".into();
+        mac.arch = "arm64".into();
+        assert_eq!(cache_path(home, &mac.agent, &mac).file_name().unwrap(), "deepseek-desktop.dmg");
+        assert_eq!(
+            select(&[release], "deepseek-desktop", "win32", "x64"),
+            Err(ResolveError::BadRelease("unsupported agent"))
+        );
     }
 
     #[test]

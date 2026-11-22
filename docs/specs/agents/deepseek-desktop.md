@@ -42,7 +42,9 @@ OneX 只发布自有 profile：同目录独占临时写、同步、原子替换�
 
 设置 `ONEX_DEEPSEEK_QA_INSTALLER` 为精确 NSIS 原包路径，`ONEX_DEEPSEEK_QA_BUNDLE` 为从该原包提取的完整应用目录。运行 `cargo test -p onexd --lib original_windows_host_restores_native_session_and_settles_each_turn -- --ignored --nocapture`。测试核对原包、主程序和 ASAR 的 SHA-256，使用原厂 Desktop Host、OneX 私有 profile 和回环上游，核对同一原生会话恢复、两轮对话、outbox 和本机测试租约。
 
-原厂打包 GUI 会注册当前 Windows 用户的 `dsh://` 处理程序。`original_windows_gui_restores_native_session_and_settles_each_turn` 应在干净的普通用户会话运行。Host 测试使用厂商的 Node 模式，Windows 发行资格以原厂 GUI 以及 OneX 工作台的完整链路验证为准。
+原厂打包 GUI 会注册当前 Windows 用户的 `dsh://` 处理程序。优先在干净的普通用户会话运行 `original_windows_gui_restores_native_session_and_settles_each_turn`。已有处理程序时，先备份完整注册项，再用同一个测试包装进程设置 `ONEX_DEEPSEEK_QA_PROTOCOL_BACKED_UP=1`、运行测试、清理测试进程和恢复注册项。恢复后复核原注册项。Host 测试使用厂商的 Node 模式，Windows 发行资格以原厂 GUI 以及 OneX 工作台的完整链路验证为准。
+
+Windows x64 调试版可以用独立的 `ONEX_HOME` 和回环 QA Server 验证 OneX 的工作台下载接口及受管启动。设置 `ONEX_WINDOWS_DEEPSEEK_QA_7ZIP` 为经校验的 7-Zip 26.06 x64 提取程序绝对路径，在上述注册项备份及清理包装内运行 `cargo test -p onex-desktop --test windows_deepseek_qa -- --ignored --nocapture`。测试环境使用 `ONEX_WINDOWS_DEEPSEEK_QA_CREDENTIALS` 指定本机临时员工凭据。该路径限精确的 Windows RC3 原包、签名的回环合约和调试构建。
 
 ## OneX 受管附件
 

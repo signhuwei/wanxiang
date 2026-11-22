@@ -1,4 +1,4 @@
-//! Install a pinned macOS Desktop bundle inside the OneX cache. The vendor
+//! Install a pinned Desktop bundle inside the OneX cache. The vendor
 //! bundle and its signature are kept intact; profiles live outside the app.
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -196,7 +196,12 @@ impl VendorBundle {
     }
 }
 
-pub(crate) async fn executable(release: &AgentRelease, image: PathBuf) -> Result<PathBuf> {
+pub(crate) async fn executable(release: &AgentRelease, image: PathBuf, server: Option<&str>) -> Result<PathBuf> {
+    #[cfg(all(windows, target_arch = "x86_64", debug_assertions))]
+    if windows_qa_release(release) && server.is_some_and(windows_qa_for_server) {
+        return tokio::task::spawn_blocking(move || windows_qa::install(&image)).await?;
+    }
+    let _ = server;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         let bundle = Bundle::for_release(release).ok_or_else(|| anyhow::anyhow!("desktop release not approved"))?;
@@ -208,6 +213,30 @@ pub(crate) async fn executable(release: &AgentRelease, image: PathBuf) -> Result
         bail!("native desktop bundles are currently available for Apple Silicon");
     }
 }
+
+pub(crate) fn windows_qa_release(release: &AgentRelease) -> bool {
+    #[cfg(all(windows, target_arch = "x86_64", debug_assertions))]
+    return windows_qa::matches(release) && windows_qa::extractor_path().is_some();
+    #[cfg(not(all(windows, target_arch = "x86_64", debug_assertions)))]
+    {
+        let _ = release;
+        false
+    }
+}
+
+pub(crate) fn windows_qa_for_server(server: &str) -> bool {
+    #[cfg(all(windows, target_arch = "x86_64", debug_assertions))]
+    return windows_qa::loopback(server) && windows_qa::extractor_path().is_some();
+    #[cfg(not(all(windows, target_arch = "x86_64", debug_assertions)))]
+    {
+        let _ = server;
+        false
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64", debug_assertions))]
+#[path = "desktop_bundle_windows_qa.rs"]
+mod windows_qa;
 
 #[cfg(test)]
 #[path = "desktop_qualification.rs"]

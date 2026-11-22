@@ -509,7 +509,10 @@ async fn launch(
     };
     let desktop = crate::desktop_bundle::Bundle::manages(agent);
     let Some(protocol) = AgentProtocol::for_agent(agent).filter(|_| {
-        LAUNCHABLE_AGENTS.contains(&agent) && (!desktop || cfg!(all(target_os = "macos", target_arch = "aarch64")))
+        let desktop_supported = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            || (agent == "deepseek-desktop"
+                && ipc.server_url.as_deref().is_some_and(crate::desktop_bundle::windows_qa_for_server));
+        LAUNCHABLE_AGENTS.contains(&agent) && (!desktop || desktop_supported)
     }) else {
         return err("agent_not_allowed", &format!("OneX 暂不支持启动 {agent}"));
     };
@@ -620,7 +623,7 @@ async fn launch(
         }
     };
     let resolved_program = if let Some(release) = approved.as_ref().filter(|_| desktop) {
-        match crate::desktop_bundle::executable(release, resolved_program).await {
+        match crate::desktop_bundle::executable(release, resolved_program, ipc.server_url.as_deref()).await {
             Ok(entry) => entry,
             Err(error) => {
                 warn!(agent, %error, "desktop bundle rejected");
