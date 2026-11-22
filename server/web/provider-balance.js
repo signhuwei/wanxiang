@@ -16,7 +16,8 @@ const reasons = {
   schema_mismatch: '无法识别上游余额格式', response_limit: '上游响应超出读取限制', probe_refused: '上游拒绝本次查询',
   wallet_changed: '渠道资金账户已变更', wallet_currency_mismatch: '上游余额与渠道台账币种不同',
   shared_wallet_requires_verification: '共享资金账户须先核对归属', not_prepaid_wallet: '该渠道账户采用人工台账',
-  observation_expired: '上游读数已过期', missing_credential: '尚未配置余额查询凭据', provider_inactive: '渠道已停用',
+  account_wallet_already_bound: '此上游账户已关联到其他自动同步台账', observation_expired: '上游读数已过期',
+  missing_credential: '尚未配置余额查询凭据', credential_unavailable: '已保存的查询凭据无法读取，请重新配置', provider_inactive: '渠道已停用',
   probe_in_progress: '已有查询正在进行', balance_endpoint_unavailable: '此渠道未配置支持的 HTTPS 账户接口',
   management_key_unavailable: '服务当前无法保存余额查询凭据', separate_management_credential_required: '请填写独立的余额查询凭据'
 }
