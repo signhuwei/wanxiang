@@ -11,8 +11,8 @@ UI 是本地静态 HTML/ESM，不直连 Server、daemon socket 或上游。edge 
 | `state` | 无 | 返回当前安全快照，不触发网络写操作 |
 | `send_code` | `target` | 向配置好的 Server 请求验证码；限流错误原样分类 |
 | `login` | `target,code,invite_code?` | `kind:desktop`；邀请码仅用于入租。返回选租户快照，不返回令牌 |
-| `password_login` | `tenant,username,password` | 接受租户 ID 或简称。以 `kind:desktop` 登录并用租户会话直接注册设备，完成后注销该会话。快照只含公开显示信息 |
-| `select_tenant` | `tenant_id` | 只能选择返回的稳定 ID。原生层换租户令牌并注册设备、连接 onexd |
+| `password_login` | `tenant,username,password` | 接受租户 ID 或简称。以 `kind:desktop` 登录并用租户会话验证已有设备或注册新设备，完成后注销该会话。快照只含公开显示信息 |
+| `select_tenant` | `tenant_id` | 只能选择返回的稳定 ID。原生层换取租户会话并验证已有设备或注册新设备 |
 | `download` | `agent_id` | 后台下载及校验当前获准的发行。onexd 自行确定版本、来源和摘要，接受后通过快照报告实际进度 |
 | `launch` | `agent_id` | 仅启动当前目录授权的 `claude-code`、`codex` 或 `kimi-code`。原生层验证设备与授权，将所选 Agent 交给随包 CLI，下载及校验由 onexd 完成。重复点击不另启进程 |
 | `settings` | `hide_on_close:boolean` | 设置关闭窗口时是否隐藏到托盘。只改此偏好；Server 地址在 S1 UI 中只读 |
@@ -30,6 +30,8 @@ macOS 桌面一键启动 Codex 的默认工作目录是 `~/OneX Workspace`。通
 
 能力策略状态仅在登录的设备与租户匹配时返回。`policy` 包含已应用的设备配置修订、策略修订、平台签发修订、租户配置修订与脱敏展示条目。`policy_pending` 表示设备未接受最近一次应执行的快照，等待同步时不提供受管启动。`notices` 是随已应用策略收到的最近消息，按消息 ID 去重。工作台按本机设备展示通知，消息列表不包含其他租户的数据。
 
+若 onexd 已由命令行登录，Desktop 在认证后用租户会话核对该设备的归属账号和有效状态。确认属于同一租户及账号后，保留设备 ID 和现有连接，只保存 Desktop 的显示资料。归属不同或设备不可验证时返回 `device_already_logged_in` 并保留当前会话。切换账号前可运行 `onex logout`。Windows 默认安装位置可在 PowerShell 中执行 `& "$env:LOCALAPPDATA\OneX Desktop\onex.exe" logout`，再从托盘退出并重新打开 Desktop。
+
 工作台的 `local_usage` 记录本次 onexd 运行期间的模型请求计量用量、模型请求累计时长、输入和输出 Token。它可能包含尚未结算的用量，重启后重新累计。`agents` 提供适配器的厂商、运行类别、实际已登记实例数，以及下载期间的已接收字节、目标大小和校验阶段。状态和按钮均由实际授权与本机准备结果驱动。
 
 ### UI 中文文案（只按枚举选取，不展示自由文本）
@@ -38,6 +40,7 @@ macOS 桌面一键启动 Codex 的默认工作目录是 `~/OneX Workspace`。通
 |---|---|---|---|
 | unauthenticated | 登录凭据无效或已过期 | forbidden | 没有权限执行此操作 |
 | not_found | 对象不存在 | conflict | 状态已变化，请刷新后重试 |
+| device_already_logged_in | 本机 OneX 已登录。请用同一租户和账号登录，或先用 OneX 命令行退出。 | | |
 | invalid | 请检查输入内容 | seat_limit | 租户人数已达合约上限 |
 | balance_exhausted | 橡皮余额不足 | lease_expired | 额度租约已过期 |
 | agent_not_allowed | 合约不允许该 Agent | model_not_allowed | 合约不允许该模型 |

@@ -807,7 +807,42 @@ test('capability pins select an exact verified artifact and recheck it on each d
   const path = '/edge/agent-artifacts/';
   expect((await f.request(path + first.id)).status).toBe(401);
   expect((await f.request(path + first.id, undefined, scoped)).status).toBe(401);
-  expect((await f.request(path + first.id, undefined, device.device_token)).status).toBe(200);
+  const full = await f.request(path + first.id, undefined, device.device_token);
+  const etag = '"' + createHash('sha256').update('2.1.30').digest('hex') + '"';
+  expect(full.status).toBe(200);
+  expect(full.headers.get('accept-ranges')).toBe('bytes');
+  expect(full.headers.get('etag')).toBe(etag);
+  expect(await full.text()).toBe('2.1.30');
+  const ranged = (range: string, token?: string, ifRange?: string, id = first.id) =>
+    fetch(new URL('/v1' + path + id, f.server.url), { headers: {
+      range, ...(token && { authorization: `Bearer ${token}` }), ...(ifRange && { 'if-range': ifRange }),
+    } });
+  for (const [request, contentRange, body] of [
+    ['bytes=2-', 'bytes 2-5/6', '1.30'],
+    ['bytes=0-2', 'bytes 0-2/6', '2.1'],
+    ['bytes=4-99', 'bytes 4-5/6', '30'],
+    ['bytes=-2', 'bytes 4-5/6', '30'],
+  ] as const) {
+    const part = await ranged(request, device.device_token, etag);
+    expect(part.status).toBe(206);
+    expect(part.headers.get('content-range')).toBe(contentRange);
+    expect(part.headers.get('content-length')).toBe(String(body.length));
+    expect(await part.text()).toBe(body);
+  }
+  const tooFar = await ranged('bytes=6-', device.device_token);
+  expect(tooFar.status).toBe(416);
+  expect(tooFar.headers.get('content-range')).toBe('bytes */6');
+  for (const whole of [
+    await ranged('bytes=2-', device.device_token, '"different"'),
+    await ranged('bytes=0-1,3-4', device.device_token),
+  ]) {
+    expect(whole.status).toBe(200);
+    expect(whole.headers.has('content-range')).toBe(false);
+    expect(await whole.text()).toBe('2.1.30');
+  }
+  expect((await ranged('bytes=0-1')).status).toBe(401);
+  expect((await ranged('bytes=0-1', scoped)).status).toBe(401);
+  expect((await ranged('bytes=0-1', device.device_token, undefined, other.id)).status).toBe(404);
   expect((await f.request(path + other.id, undefined, device.device_token)).status).toBe(404);
 
   const windows = await (await f.request('/devices', { ...f.device, name: 'Windows', os: 'win32', arch: 'x64',
@@ -1572,6 +1607,12 @@ test('signed release selections reach only compatible Apple Silicon Edges', asyn
   expect(authorized.status).toBe(200);
   expect(authorized.headers.get('content-length')).toBe(String(runtime.size));
   await authorized.body!.cancel();
+  const runtimeTail = await fetch(new URL('/v1' + edgeRuntimePath, f.server.url), {
+    headers: { authorization: 'Bearer ' + device.device_token, range: 'bytes=-7', 'if-range': '"' + runtime.sha256 + '"' },
+  });
+  expect(runtimeTail.status).toBe(206);
+  expect(runtimeTail.headers.get('content-range')).toBe(`bytes ${runtime.size - 7}-${runtime.size - 1}/${runtime.size}`);
+  expect((await runtimeTail.arrayBuffer()).byteLength).toBe(7);
   const effective = await f.request('/policy/targets/' + f.userId + '?os=darwin&arch=arm64', undefined, tenant);
   expect(effective.status).toBe(200);
   expect((await effective.json() as {releases: {id: string}[]}).releases.map(row => row.id).sort())

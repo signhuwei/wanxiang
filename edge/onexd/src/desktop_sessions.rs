@@ -1001,19 +1001,30 @@ mod tests {
         let frame = json!({"type":"user","sessionId":native,"cwd":cwd,"message":{"role":"user","content":"fixture"}});
         crate::launch::write_private(&project.join(format!("{native}.jsonl")), format!("{frame}\n").as_bytes())
             .unwrap();
-        assert_eq!(request(&helper, "/v1/messages", model, native).await.unwrap().status(), 200);
-        let first_usage = usage.recv().await.unwrap();
-        assert!(first_usage.usage_final);
-        assert_eq!(first_usage.cost_milli, 3);
+        // Native Claude Desktop binds only through a private transcript root, which non-Unix builds reject.
+        let transcript_status = request(&helper, "/v1/messages", model, native).await.unwrap().status();
+        #[cfg(unix)]
+        let first_usage = {
+            assert_eq!(transcript_status, 200);
+            let first_usage = usage.recv().await.unwrap();
+            assert!(first_usage.usage_final);
+            assert_eq!(first_usage.cost_milli, 3);
+            first_usage
+        };
+        #[cfg(not(unix))]
+        assert_eq!(transcript_status, 403);
         state.desktop_sessions.stop("before");
         assert_eq!(request(&first, "/v1/messages", model, native).await.unwrap().status(), 401);
         assert_eq!(request(&helper, "/v1/messages", model, native).await.unwrap().status(), 401);
         let second = bind("after", 2);
         assert_ne!(second, first);
-        assert_eq!(request(&second, "/v1/messages", model, native).await.unwrap().status(), 200);
-        let second_usage = usage.recv().await.unwrap();
-        assert_eq!(second_usage.session_id, first_usage.session_id);
-        assert_eq!(second_usage.cost_milli, 3);
+        #[cfg(unix)]
+        {
+            assert_eq!(request(&second, "/v1/messages", model, native).await.unwrap().status(), 200);
+            let second_usage = usage.recv().await.unwrap();
+            assert_eq!(second_usage.session_id, first_usage.session_id);
+            assert_eq!(second_usage.cost_milli, 3);
+        }
         state.config.write().unwrap().agents.clear();
         assert_eq!(request(&second, "/v1/messages", model, native).await.unwrap().status(), 403);
         assert!(usage.try_recv().is_err());

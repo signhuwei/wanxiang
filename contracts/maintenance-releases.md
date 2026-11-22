@@ -47,6 +47,8 @@ onex-server-release-v1
 | `GET /v1/platform/agent-releases/{id}/runtime` | 管理员下载已缓存的配套引擎 |
 | `GET /v1/edge/agent-artifacts/{id}/runtime` | 凭设备令牌下载成员当前合约允许的发行所需的引擎 |
 
+两个设备端下载接口支持单个 `bytes` 范围，含开放结束位置和后缀范围。完整文件返回 200，满足的范围返回 206、`Content-Range` 和对应 `Content-Length`，不相交的有效范围返回 416 和 `Content-Range: bytes */<完整大小>`。格式错误或包含多个范围的请求按完整文件处理。返回的强 `ETag` 是加双引号的制品 SHA-256。`If-Range` 与该 ETag 不一致时返回完整文件。每次续传请求仍校验设备凭据、有效合约和发行资格。
+
 上传和拉取均在私有暂存文件中校验原始字节数及 SHA-256，验证通过后原子发布，并记录审计。
 厂商地址受限时，平台管理员可上传手头的已批准制品。同一发行允许在启用前上传或拉取。
 支持缓存协议的 Edge 使用它当前连接的 OneX Server 作为下载服务器，跟随同一协议、主机和端口。厂商源地址供 Server 入库。旧 Edge 的兼容规则见 [Edge ↔ Server 协议](edge-ws.md)。

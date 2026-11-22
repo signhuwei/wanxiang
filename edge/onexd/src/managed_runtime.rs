@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use onex_core::ipc::ArtifactProgress;
 use onex_core::ws::AgentRelease;
+use reqwest::StatusCode;
+use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, IF_RANGE, RANGE};
 use sha2::{Digest, Sha256};
 
 use crate::desktop_bundle::{Bundle, RuntimeBundle};
@@ -198,9 +200,14 @@ pub(crate) async fn resolve_with_progress(
     let total_bytes = release.size + engine.map_or(0, |e| e.bytes);
     if verify(&path, release.size, &release.sha256).is_err() {
         let request = artifact_request(http, release, access)?;
-        download_and_verify(request, &path, release.size, &release.sha256, |downloaded_bytes, verifying| {
-            progress(ArtifactProgress { downloaded_bytes, total_bytes, verifying })
-        })
+        download_and_verify(
+            request,
+            &path,
+            release.size,
+            &release.sha256,
+            is_server_artifact(release),
+            |downloaded_bytes, verifying| progress(ArtifactProgress { downloaded_bytes, total_bytes, verifying }),
+        )
         .await?;
     }
     if let Some(engine) = engine {
@@ -241,7 +248,7 @@ async fn resolve_engine(
     let path = claude_engine_path(bundle, engine);
     if verify(&path, engine.bytes, engine.digest).is_err() {
         let request = server_request(&format!("{}/runtime", release.url), access)?;
-        download_and_verify(request, &path, engine.bytes, engine.digest, notify).await?;
+        download_and_verify(request, &path, engine.bytes, engine.digest, true, notify).await?;
     }
     Ok(path)
 }
@@ -290,87 +297,184 @@ fn server_request(path: &str, access: Option<ArtifactAccess<'_>>) -> Result<reqw
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(300));
+        .read_timeout(std::time::Duration::from_secs(30));
     if url.scheme() == "http" {
         // Use the direct route for the configured HTTP control plane.
         builder = builder.no_proxy();
     }
-    Ok(builder.build()?.get(url).bearer_auth(access.device_token))
+    Ok(builder.build()?.get(url).bearer_auth(access.device_token).header(ACCEPT_ENCODING, "identity"))
 }
 
-/// 下载到同目录的临时文件，边下边算摘要；大小或摘要不符就删临时文件并报错，绝不把未经校验的文件
-/// 暴露在最终路径上。校验通过后 `rename` 原子落地并加可执行权限。
+fn server_partial_path(dest: &Path, digest: &str) -> PathBuf {
+    if dest.parent().and_then(Path::file_name).is_some_and(|name| name == digest) {
+        // The containing release directory already identifies the full digest.
+        dest.with_extension("part")
+    } else {
+        // A paired runtime has its own digest within the release directory.
+        dest.with_file_name(format!(".runtime-{digest}.part"))
+    }
+}
+
+async fn download_response(
+    request: reqwest::RequestBuilder,
+    offset: u64,
+    bytes: u64,
+    digest: &str,
+) -> Result<(reqwest::Response, u64)> {
+    if offset > 0 {
+        let response = request
+            .try_clone()
+            .context("clone artifact request")?
+            .header(RANGE, format!("bytes={offset}-"))
+            .header(IF_RANGE, format!("\"{digest}\""))
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
+        let status = response.status();
+        if status == StatusCode::PARTIAL_CONTENT {
+            let expected = format!("bytes {offset}-{}/{bytes}", bytes - 1);
+            if response.headers().get(CONTENT_RANGE).is_some_and(|value| value == expected.as_str())
+                && response.content_length().is_none_or(|len| len == bytes - offset)
+            {
+                return Ok((response, offset));
+            }
+        } else if status != StatusCode::RANGE_NOT_SATISFIABLE {
+            // Older servers ignore Range and already sent a complete 200 response.
+            return Ok((response, 0));
+        }
+        // An incompatible range response never contributes bytes to the prefix.
+    }
+    Ok((request.send().await.map_err(reqwest::Error::without_url)?, 0))
+}
+
+/// A Server artifact keeps its incomplete prefix in a digest-specific path.
+/// The daemon serializes preparations, and only publishes a fully verified file.
 async fn download_and_verify(
     request: reqwest::RequestBuilder,
     dest: &Path,
     bytes: u64,
     digest: &str,
+    resumable: bool,
     notify: impl Fn(u64, bool),
 ) -> Result<()> {
-    notify(0, false);
     let dir = dest.parent().context("artifact cache path has no parent")?;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let resp = request.send().await.map_err(reqwest::Error::without_url)?;
+    let temp = if resumable { server_partial_path(dest, digest) } else { dir.join(format!(".tmp-{}", id::new("dl"))) };
+    let mut cleanup = DownloadTemp { path: temp, retain: true };
+    let mut offset = 0;
+    if resumable {
+        match std::fs::symlink_metadata(&cleanup.path) {
+            Ok(meta) => {
+                anyhow::ensure!(meta.is_file(), "artifact partial is not a regular file");
+                offset = meta.len();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspect artifact partial"),
+        }
+        if offset >= bytes {
+            if offset == bytes && verify(&cleanup.path, bytes, digest).is_ok() {
+                notify(bytes, true);
+                return publish_download(&cleanup.path, dest);
+            }
+            std::fs::remove_file(&cleanup.path).context("discard invalid artifact partial")?;
+            offset = 0;
+        }
+    }
+    notify(offset, false);
+    let (resp, start) = download_response(request, offset, bytes, digest).await?;
     let status = resp.status();
-    if !status.is_success() {
+    if !status.is_success() || (resumable && status != StatusCode::OK && start == 0) {
         bail!("download failed: HTTP {status}");
     }
-    if let Some(len) = resp.content_length()
-        && len != bytes
+    if resumable
+        && resp
+            .headers()
+            .get(CONTENT_ENCODING)
+            .is_some_and(|value| !value.to_str().is_ok_and(|encoding| encoding.eq_ignore_ascii_case("identity")))
     {
-        bail!("download size mismatch before transfer: manifest says {}, server says {len}", bytes);
+        bail!("unexpected content encoding for server artifact");
+    }
+    if let Some(len) = resp.content_length()
+        && len != bytes - start
+    {
+        bail!("download size mismatch before transfer: expected {}, server says {len}", bytes - start);
+    }
+    if start != offset {
+        notify(start, false);
     }
 
-    let tmp = dir.join(format!(".tmp-{}", id::new("dl")));
     let mut open = std::fs::OpenOptions::new();
-    open.write(true).create_new(true);
+    if resumable {
+        open.write(true).create(true).truncate(start == 0).append(start > 0);
+    } else {
+        open.write(true).create_new(true);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         open.mode(0o600);
     }
-    let mut file = open.open(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-    let cleanup = DownloadTemp(tmp);
     let mut hasher = Sha256::new();
-    let mut written: u64 = 0;
+    if start > 0 {
+        let copied = std::io::copy(&mut std::fs::File::open(&cleanup.path)?, &mut hasher)?;
+        anyhow::ensure!(copied == start, "artifact partial size changed during download");
+    }
+    let mut file = open.open(&cleanup.path).context("open artifact download file")?;
+    cleanup.retain = resumable;
+    let mut written = start;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(reqwest::Error::without_url).context("read download stream")?;
+        let chunk = chunk.map_err(|error| {
+            let message = if resumable && error.is_timeout() {
+                "server artifact download stalled"
+            } else {
+                "read download stream"
+            };
+            anyhow::Error::new(error.without_url()).context(message)
+        })?;
         written += chunk.len() as u64;
         if written > bytes {
+            cleanup.retain = false;
             bail!("download exceeded manifest size {}", bytes);
         }
         hasher.update(&chunk);
         file.write_all(&chunk).context("write downloaded artifact")?;
         notify(written, false);
     }
+    if written != bytes {
+        bail!("downloaded {written} bytes, manifest says {bytes}");
+    }
     notify(written, true);
     file.sync_all()?;
     drop(file);
-
-    if written != bytes {
-        bail!("downloaded {written} bytes, manifest says {}", bytes);
-    }
     let got = hex(&hasher.finalize());
     if !got.eq_ignore_ascii_case(digest) {
+        cleanup.retain = false;
         bail!("downloaded artifact sha256 mismatch: want {}, got {got}", digest);
     }
-    // Windows 的可执行权限不是文件属性而是文件扩展名（`.exe`）；`cache_path` 对 `win32` 已经
-    // 带了 `.exe` 后缀，这里不需要额外设置任何位。
+    publish_download(&cleanup.path, dest)
+}
+
+fn publish_download(temp: &Path, dest: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&cleanup.0, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(temp, std::fs::Permissions::from_mode(0o700))?;
     }
-    std::fs::rename(&cleanup.0, dest)?;
+    std::fs::rename(temp, dest)?;
     Ok(())
 }
 
-struct DownloadTemp(PathBuf);
+struct DownloadTemp {
+    path: PathBuf,
+    retain: bool,
+}
 
 impl Drop for DownloadTemp {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if !self.retain {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -439,6 +543,108 @@ mod tests {
         let result = resolve(home.path(), &http, &[rel], "claude-code", "darwin", "arm64", access()).await;
         assert!(result.unwrap_err().to_string().contains("307"));
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn interrupted_server_download_resumes_and_verifies_the_complete_file() {
+        use axum::body::Body;
+        use axum::http::{HeaderMap, Response, header::CONTENT_LENGTH};
+        use futures_util::stream;
+
+        let bytes = b"verified artifact";
+        let prefix = b"verified ";
+        let rel = release("/v1/edge/agent-artifacts/rel_1", bytes);
+        let etag = format!("\"{}\"", rel.sha256);
+        let app = axum::Router::new().route(
+            "/v1/edge/agent-artifacts/rel_1",
+            get(move |headers: HeaderMap| {
+                let etag = etag.clone();
+                async move {
+                    if headers.contains_key(RANGE) {
+                        assert_eq!(headers[RANGE], "bytes=9-");
+                        assert_eq!(headers[IF_RANGE], etag.as_str());
+                        return Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header(CONTENT_RANGE, "bytes 9-16/17")
+                            .body(Body::from(&bytes[prefix.len()..]))
+                            .unwrap();
+                    }
+                    let body = stream::iter([Ok(Bytes::from_static(prefix))]).chain(stream::once(async {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        Err(std::io::Error::other("interrupted test transfer"))
+                    }));
+                    Response::builder().header(CONTENT_LENGTH, bytes.len()).body(Body::from_stream(body)).unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let http = reqwest::Client::new();
+        let access = Some(ArtifactAccess { origin: &origin, device_token: "fake-device-token" });
+        let releases = std::slice::from_ref(&rel);
+        let dest = cache_path(home.path(), "claude-code", &rel);
+        let partial = server_partial_path(&dest, &rel.sha256);
+        assert!(resolve(home.path(), &http, releases, "claude-code", "darwin", "arm64", access).await.is_err());
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read(&partial).unwrap(), prefix);
+
+        let updates = Mutex::new(Vec::new());
+        let path =
+            resolve_with_progress(home.path(), &http, releases, "claude-code", "darwin", "arm64", access, |value| {
+                updates.lock().unwrap().push(value)
+            })
+            .await
+            .unwrap();
+        assert_eq!(path, dest);
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert!(!partial.exists());
+        assert_eq!(updates.into_inner().unwrap()[0].downloaded_bytes, prefix.len() as u64);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn server_resume_restarts_on_a_full_response_or_incompatible_range() {
+        use axum::body::Body;
+        use axum::http::{HeaderMap, Response};
+
+        for incompatible in [None, Some(StatusCode::PARTIAL_CONTENT), Some(StatusCode::RANGE_NOT_SATISFIABLE)] {
+            let bytes = b"verified artifact";
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let captured = requests.clone();
+            let app = axum::Router::new().route(
+                "/v1/edge/agent-artifacts/rel_1",
+                get(move |headers: HeaderMap| {
+                    let had_range = headers.get(RANGE).is_some_and(|range| range == "bytes=4-");
+                    captured.lock().unwrap().push(had_range);
+                    async move {
+                        if had_range && let Some(status) = incompatible {
+                            return Response::builder().status(status).body(Body::empty()).unwrap();
+                        }
+                        Response::new(Body::from(&bytes[..]))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let home = tempfile::tempdir().unwrap();
+            let http = reqwest::Client::new();
+            let rel = release("/v1/edge/agent-artifacts/rel_1", bytes);
+            let dest = cache_path(home.path(), "claude-code", &rel);
+            let partial = server_partial_path(&dest, &rel.sha256);
+            std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
+            std::fs::write(&partial, b"junk").unwrap();
+            let access = Some(ArtifactAccess { origin: &origin, device_token: "fake-device-token" });
+
+            let path = resolve(home.path(), &http, &[rel], "claude-code", "darwin", "arm64", access).await.unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert!(!partial.exists());
+            let expected = if incompatible.is_some() { &[true, false][..] } else { &[true][..] };
+            assert_eq!(requests.lock().unwrap().as_slice(), expected);
+            task.abort();
+        }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

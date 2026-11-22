@@ -105,6 +105,18 @@ const quotaUsage = object({ scope: { type: 'string', enum: ['member', 'group'] }
 const meQuota = object({ quota_milli: { type: ['integer', 'null'], minimum: 0 }, month_used_milli: sequence,
   remaining_milli: { type: ['integer', 'null'] }, limited_by: { type: ['string', 'null'] } });
 const agentBinary = { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } };
+const agentArtifactRangeParameters = [idPath,
+  { name: 'Range', in: 'header', schema: text, description: '单一字节区间，例如 bytes=1048576-。' },
+  { name: 'If-Range', in: 'header', schema: text, description: '使用发行 SHA-256 的带引号强 ETag。验证值不匹配时返回完整制品。' },
+];
+const agentArtifactRangeHeaders = { 'Accept-Ranges': { schema: { const: 'bytes' } }, ETag: { schema: text } };
+const agentArtifactContentRange = { 'Content-Range': { schema: text } };
+const agentArtifactDownloadResponses = {
+  200: { description: '完整制品原始字节', headers: agentArtifactRangeHeaders, content: agentBinary },
+  206: { description: '请求区间的制品原始字节', headers: { ...agentArtifactRangeHeaders, ...agentArtifactContentRange }, content: agentBinary },
+  416: { description: '有效的字节区间超出制品范围', headers: agentArtifactContentRange },
+  401: status[401],
+};
 const runtimeArtifact = object({ size: sequence, sha256: releaseDigest, artifact_cached: { type: 'boolean' } });
 const releaseSupply = { runtime: { anyOf: [runtimeArtifact, { type: 'null' }] }, artifact_cached: { type: 'boolean' }, qualification_required: { type: 'boolean' }, part_bytes: { type: ['integer', 'null'], minimum: 1 },
   format: { type: ['string', 'null'], enum: ['executable', 'dmg', 'nsis', null] } };
@@ -845,9 +857,8 @@ export const openapi = {
           404: error('引擎未缓存') } },
     },
     '/v1/edge/agent-artifacts/{id}/runtime': { get: { summary: '按设备和能力合约下载 Claude Desktop 配套引擎',
-      security: [{ DeviceToken: [] }], parameters: [idPath],
-      responses: { 200: { description: '配套引擎原始字节', content: agentBinary }, 401: status[401],
-        404: error('引擎不可用或合约未授权') } } },
+      security: [{ DeviceToken: [] }], parameters: agentArtifactRangeParameters,
+      responses: { ...agentArtifactDownloadResponses, 404: error('引擎不可用或合约未授权') } } },
     '/v1/platform/agent-releases/{id}/pull': { post: { summary: '从登记的官方源拉取受管 Agent 制品',
       security: bearer, parameters: [idPath], responses: { ...status,
         200: response('制品校验通过', object({ sha256: releaseDigest, size: sequence, artifact_cached: { const: true }, download_url: text })),
@@ -857,9 +868,8 @@ export const openapi = {
       responses: { 200: { description: '制品原始字节', content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
         401: status[401], 403: status[403], 404: error('制品未缓存或发行已撤销') } } },
     '/v1/edge/agent-artifacts/{id}': { get: { summary: '按当前设备和能力合约下载 Agent 制品', security: [{ DeviceToken: [] }],
-      parameters: [idPath],
-      responses: { 200: { description: '制品原始字节', content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
-        401: status[401], 404: error('制品不存在或当前合约不允许') } } },
+      parameters: agentArtifactRangeParameters,
+      responses: { ...agentArtifactDownloadResponses, 404: error('制品不存在或当前合约不允许') } } },
     '/v1/platform/tool-releases': { get: listOf(toolRelease),
       post: { ...write(object({ ...toolFields, os: { ...text, enum: ['macos', 'windows'] }, arch: desktopArch,
         entrypoint: text, endpoint: { ...text, format: 'uri' }, secret: { ...text, writeOnly: true } },

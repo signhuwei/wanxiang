@@ -101,6 +101,7 @@ v0.15 的 `config` 可携带平台合约和租户配置修订，字段和兼容�
 ## OpenAI Chat 路由（v0.10）
 
 - `protocol: "openai_chat"` 的路由由 Edge 把 Anthropic Messages 转成 OpenAI Chat。`base_url` 以 `/v1` 结尾时直接接 `/chat/completions`，否则先补 `/v1`。
+- Qwen3.5 及之后的 Qwen3.x OpenAI Chat 上游按实际发送的模型名识别。Edge 将非空 `system` 文本按原顺序合并为一条开头消息，并保留其他角色的相对顺序。其他 Chat 上游沿用各自已有的消息顺序兼容规则。
 - 用量按 OpenAI 口径：`prompt_tokens` 包含缓存，`input_tokens = prompt_tokens − cached_tokens − cache_write_tokens`；`reasoning_tokens` 是 `completion_tokens` 的子集，只作明细，不重复计费。
 - Provider 以后可以声明 `usage_semantics` 覆盖口径，S1 不实现。
 
@@ -183,6 +184,7 @@ S1 起存在的缺陷：续租回 `cutoff` 后，Edge 保留旧租约并重放�
 
 - 支持新缓存协议的 Edge 在 `hello` 加 `agent_cache: true`。Server 在对应 `config` 回传 `agent_cache: true`，且 `agents` 仅带当前设备平台、架构及能力合约允许的已缓存启用发行。
 - 缓存协议的 `agents[].url` 是 `/v1/edge/agent-artifacts/<release_id>`。Edge 使用当前连接的 OneX Server 作为下载服务器，沿用同一协议、主机和端口，携带设备 Bearer，拒绝重定向。落入本机缓存前核对原始字节数及 SHA-256。缓存协议启用时，IPC 拒绝调用方指定的非受管可执行文件。
+- 已接收的制品字节按固定摘要保存在设备私有目录。下载中断后，Edge 以已保存的字节数发送 `Range`，并以固定摘要的强 ETag 作为 `If-Range`。追加前校验 `206` 的 `Content-Range` 与固定大小。收到旧 Server 的完整 `200` 时，从该响应的首字节重写临时文件。只有完整大小和 SHA-256 均通过校验后才发布到可启动的缓存路径。
 - 合约固定发行时只下发该发行的原始身份。停用、缺失缓存或换摘要的固定条目失效，不能自动改用同 Agent 的其他版本。
 - 无固定发行的设备平台上，不带能力位的旧 Edge 继续收到登记的厂商地址。固定发行的平台要求新版 Edge，旧 Edge 收到空配置和 `cutoff{contract}`。旧 Server 可忽略新 `hello` 字段。
 

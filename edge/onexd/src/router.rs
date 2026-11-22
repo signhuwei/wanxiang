@@ -163,6 +163,23 @@ fn endpoint(route: &Route, path: &str) -> String {
     }
 }
 
+fn translate_messages_to_chat(req: &Value, route: &Route, upstream_model: &str) -> Result<Bytes, String> {
+    let model_name = upstream_model.rsplit('/').next().unwrap_or_default();
+    let qwen_template = model_name.split_once('.').is_some_and(|(family, version)| {
+        family.eq_ignore_ascii_case("qwen3")
+            && version.split(['-', '_', ':']).next().and_then(|minor| minor.parse::<u32>().ok()).is_some_and(|v| v >= 5)
+    });
+    // Qwen3.5+ templates require a leading system message. Older templates preserve inline system messages.
+    let system_messages = if qwen_template || route.provider_id == MVP_LOCAL_QWEN_PROVIDER_ID {
+        chat::SystemMessages::SingleLeading
+    } else {
+        chat::SystemMessages::InOrder
+    };
+    let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let translated = chat::build_request(req, upstream_model, stream, system_messages)?;
+    Ok(Bytes::from(serde_json::to_vec(&translated).unwrap()))
+}
+
 impl Execution {
     pub(crate) fn require_verified_images(&mut self) {
         self.images_required = true;
@@ -258,6 +275,7 @@ impl Execution {
         permit: &mut Option<crate::runtime_gate::Permit>,
         path: &str,
         model: &str,
+        messages_to_chat: Option<&Value>,
     ) -> Option<(String, String)> {
         while let Some((route, key)) = self.next_backup() {
             if rt.state.config.read().unwrap().revision != self.revision {
@@ -271,10 +289,14 @@ impl Execution {
             if permit.as_mut().is_some_and(|permit| !permit.move_to(&key)) {
                 continue;
             }
-            let upstream = route.upstream_model.unwrap_or_else(|| model.to_owned());
-            let mut body: Value = serde_json::from_slice(&out.body).ok()?;
-            body["model"] = Value::from(upstream.clone());
-            out.body = Bytes::from(serde_json::to_vec(&body).ok()?);
+            let upstream = route.upstream_model.as_deref().unwrap_or(model);
+            out.body = if let Some(req) = messages_to_chat {
+                translate_messages_to_chat(req, &route, upstream).ok()?
+            } else {
+                let mut body: Value = serde_json::from_slice(&out.body).ok()?;
+                body["model"] = Value::from(upstream);
+                Bytes::from(serde_json::to_vec(&body).ok()?)
+            };
             out.headers.remove(header::AUTHORIZATION);
             out.headers.remove("x-api-key");
             match route.auth {
@@ -285,7 +307,7 @@ impl Execution {
             };
             out.url = url;
             out.client = client;
-            return Some((route.provider_id, upstream));
+            return Some((route.provider_id, upstream.to_owned()));
         }
         None
     }
@@ -832,17 +854,10 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
     let upstream_model = route.upstream_model.clone().unwrap_or_else(|| model.clone());
     let body = if to_chat {
         // `?beta=true` 之类的查询参数属于 Anthropic，不带给 Chat 上游。
-        // MVP 本机 Qwen 的 chat template 只接受一条置于开头的 system 消息。
-        let system_messages = if route.provider_id == MVP_LOCAL_QWEN_PROVIDER_ID {
-            chat::SystemMessages::SingleLeading
-        } else {
-            chat::SystemMessages::InOrder
-        };
-        let chat_req = match chat::build_request(&req, &upstream_model, stream, system_messages) {
+        match translate_messages_to_chat(&req, &route, &upstream_model) {
             Ok(v) => v,
             Err(msg) => return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg),
-        };
-        Bytes::from(serde_json::to_vec(&chat_req).unwrap())
+        }
     } else {
         if upstream_model != model || execution.clamps_output() {
             req["model"] = Value::String(upstream_model.clone());
@@ -900,6 +915,7 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         duration_ms: 0,
         session_id,
     };
+    let messages_to_chat = to_chat.then_some(&req);
     let mut req = Req { rt: rt.clone(), rec, meter, ticket, started, first_native_session, permit };
 
     // A connect error proves the request did not reach the upstream.
@@ -923,8 +939,11 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         // 连不上时请求肯定没到上游，按零计；其余情况上游可能已经处理并收费，标待结算。
         let reached = !e.is_connect();
         warn!(request_id = %req.rec.request_id, provider_id = %req.rec.provider_id, attempt, reached, error = %e.without_url(), "upstream request failed");
-        let fallback =
-            if !reached { execution.next(&rt, &mut out, &mut req.permit, path, &req.rec.model).await } else { None };
+        let fallback = if !reached {
+            execution.next(&rt, &mut out, &mut req.permit, path, &req.rec.model, messages_to_chat).await
+        } else {
+            None
+        };
         if reached || (fallback.is_none() && attempt >= 2) {
             req.rec.usage_final = !reached;
             req.finish();
@@ -1021,7 +1040,7 @@ async fn forward_count_tokens(
             Err(error) => {
                 let connected = !error.is_connect();
                 warn!(attempt, error = %error.without_url(), "upstream token count failed");
-                if connected || (execution.next(rt, out, permit, path, model).await.is_none() && attempt >= 2) {
+                if connected || (execution.next(rt, out, permit, path, model, None).await.is_none() && attempt >= 2) {
                     break;
                 }
             }
@@ -1681,6 +1700,57 @@ mod tests {
         assert_eq!(select_route(&rs, "claude-sonnet-5-5").unwrap().provider_id, "c");
         assert_eq!(select_route(&rs, "kimi-k3").unwrap().provider_id, "any");
         assert!(select_route(&rs[1..], "kimi-k3").is_none());
+    }
+
+    #[tokio::test]
+    async fn claude_messages_use_the_selected_chat_models_system_layout() {
+        let request = json!({
+            "system": [{"type":"text","text":"initial instructions"}],
+            "messages": [
+                {"role":"user","content":"test prompt"},
+                {"role":"system","content":[{"type":"text","text":"# Environment"}]}
+            ]
+        });
+        let leading = json!([
+            {"role":"system","content":"initial instructions\n\n# Environment"},
+            {"role":"user","content":"test prompt"}
+        ]);
+        let mut primary = route("employee-model", "standard-provider");
+        primary.protocol = "openai_chat".into();
+        let client = client_builder().build().unwrap();
+        let app = Router::new(Arc::new(State::default()), "daemon".into(), client.clone(), mpsc::unbounded_channel().0);
+        let as_chat = |body: &Bytes| serde_json::from_slice::<Value>(body).unwrap();
+        let standard = translate_messages_to_chat(&request, &primary, "standard-chat").unwrap();
+        let in_order = json!([
+            {"role":"system","content":"initial instructions"},
+            {"role":"user","content":"test prompt"},
+            {"role":"system","content":"# Environment"}
+        ]);
+        assert_eq!(as_chat(&standard)["messages"], in_order);
+        for name in ["Qwen2.5-7B-Instruct", "Qwen3-32B"] {
+            assert_eq!(as_chat(&translate_messages_to_chat(&request, &primary, name).unwrap())["messages"], in_order);
+        }
+        let mut backup = primary.clone();
+        backup.provider_id = "registered-qwen-provider".into();
+        backup.base_url = "http://127.0.0.1:1234".into();
+        backup.upstream_model = Some("community/qwen3.8-27B".into());
+        assert_eq!(
+            as_chat(&translate_messages_to_chat(&request, &backup, "Qwen3.8-27B").unwrap())["messages"],
+            leading
+        );
+        let mut execution = Execution {
+            rules: Default::default(),
+            owner: Default::default(),
+            revision: 0,
+            backups: vec![(backup, Zeroizing::new("fixture".into()))],
+            images_required: false,
+        };
+        let mut out = Outbound { client, url: String::new(), headers: HeaderMap::new(), body: standard };
+        assert_eq!(
+            execution.next(&app, &mut out, &mut None, "/v1/messages", "employee-model", Some(&request)).await,
+            Some(("registered-qwen-provider".into(), "community/qwen3.8-27B".into()))
+        );
+        assert_eq!(as_chat(&out.body)["messages"], leading);
     }
 
     #[test]

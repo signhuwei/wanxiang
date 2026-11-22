@@ -342,7 +342,7 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
                 let reached = !e.is_connect();
                 if !reached {
                     if let Some((provider, model)) =
-                        execution.next(&rt, &mut outbound, &mut req_ctx.permit, "", &req_ctx.rec.model).await
+                        execution.next(&rt, &mut outbound, &mut req_ctx.permit, "", &req_ctx.rec.model, None).await
                     {
                         req_ctx.rec.provider_id = provider;
                         req_ctx.rec.upstream_model = model;

@@ -18,6 +18,20 @@ import { readPolicyHot } from './policy-data';
 export const AGENT_ARTIFACT_UPLOAD_PATH = /^\/v1\/platform\/agent-releases\/[^/]+\/(?:artifact|runtime)$/;
 export const AGENT_ARTIFACT_DOWNLOAD_PATH = /^\/v1\/(?:(?:edge\/)?agent-artifacts\/[^/]+(?:\/runtime)?|platform\/agent-releases\/[^/]+\/runtime)$/;
 
+// Ignore unsupported headers and serve the whole object. A syntactically valid
+// single range with no overlap is distinct from an unsupported header.
+function byteRange(header: string | null, size: number) {
+  const range = /^bytes=(\d*)-(\d*)$/i.exec(header ?? '');
+  if (!range || (!range[1] && !range[2])) return undefined;
+  if (!range[1]) {
+    const length = Number(range[2]);
+    return length ? { start: Math.max(0, size - length), end: size - 1 } : null;
+  }
+  const start = Number(range[1]);
+  const end = range[2] ? Math.min(size - 1, Number(range[2])) : size - 1;
+  return start <= end ? { start, end } : null;
+}
+
 export function agentArtifactRoutes(app: Hono, store: Store, opts: ManagementOptions) {
   const dir = join(opts.dataDir, 'agent-artifacts');
   const pulls = new Set<string>();
@@ -141,18 +155,35 @@ export function agentArtifactRoutes(app: Hono, store: Store, opts: ManagementOpt
     return storeArtifact(c, row, actor, c.req.raw, false, 'upload', { size, sha256 });
   });
 
-  const downloadArtifact = (row: Pick<AgentRelease, 'agent' | 'sha256' | 'size'>, filename: string) => {
+  const downloadArtifact = (row: Pick<AgentRelease, 'agent' | 'sha256' | 'size'>, filename: string, request?: Request) => {
     if (!hasArtifact(opts.dataDir, row)) throw new ApiError('not_found');
-    return new Response(Bun.file(artifactPath(opts.dataDir, row.sha256)), { headers: {
+    const file = Bun.file(artifactPath(opts.dataDir, row.sha256));
+    const headers = new Headers({
       'cache-control': 'no-store', 'content-type': 'application/octet-stream',
       'content-disposition': `attachment; filename="${filename}"`, 'content-length': String(row.size),
       'x-content-type-options': 'nosniff',
-    } });
+    });
+    if (!request) return new Response(file, { headers });
+    const etag = `"${row.sha256}"`;
+    headers.set('accept-ranges', 'bytes');
+    headers.set('etag', etag);
+    const validator = request.headers.get('if-range');
+    const range = validator === null || validator === etag ? byteRange(request.headers.get('range'), row.size) : undefined;
+    if (range === null) {
+      headers.set('content-range', `bytes */${row.size}`);
+      headers.set('content-length', '0');
+      return new Response(null, { status: 416, headers });
+    }
+    if (!range) return new Response(file, { headers });
+    const { start, end } = range;
+    headers.set('content-range', `bytes ${start}-${end}/${row.size}`);
+    headers.set('content-length', String(end - start + 1));
+    return new Response(file.slice(start, end + 1), { status: 206, headers });
   };
-  const download = (row: AgentRelease) => {
+  const download = (row: AgentRelease, request?: Request) => {
     const format = artifactFormat(row);
     const filename = format === 'dmg' ? 'onex-agent.dmg' : format === 'nsis' ? 'onex-agent.exe' : 'onex-agent';
-    return downloadArtifact(row, filename);
+    return downloadArtifact(row, filename, request);
   };
 
   app.get('/v1/agent-artifacts/:sha256', (c) => {
@@ -187,9 +218,9 @@ export function agentArtifactRoutes(app: Hono, store: Store, opts: ManagementOpt
     return row;
   }
 
-  app.get('/v1/edge/agent-artifacts/:id', async (c) => download(await deviceRelease(c)));
+  app.get('/v1/edge/agent-artifacts/:id', async (c) => download(await deviceRelease(c), c.req.raw));
   app.get('/v1/edge/agent-artifacts/:id/runtime', async (c) =>
-    downloadArtifact(getRuntime(await deviceRelease(c)), 'onex-agent-runtime.tar.zst'));
+    downloadArtifact(getRuntime(await deviceRelease(c)), 'onex-agent-runtime.tar.zst', c.req.raw));
 }
 
 async function receiveCompressed(request: Pick<Request, 'body' | 'headers'>, compressed: string, target: string, size: number, limit: number) {

@@ -144,9 +144,10 @@ impl Default for Settings {
     }
 }
 
-/// 登录过程中间态，不出现在快照里：全局令牌、候选租户、设备公钥。
+/// 登录过程中间态，不出现在快照里：全局令牌、账号 ID 和候选租户。
 struct PendingLogin {
     global_token: String,
+    user_id: Option<String>,
     tenants: Vec<(String, String)>,
 }
 
@@ -314,6 +315,7 @@ impl Bridge {
         let v = map_http_error(resp).await?;
         let global_token = str_field(&v, "token")?;
         let user_name = v.pointer("/user/name").and_then(Value::as_str).unwrap_or(&target).to_string();
+        let user_id = v.pointer("/user/id").and_then(Value::as_str).map(str::to_owned);
         let tenants: Vec<(String, String)> = v["tenants"]
             .as_array()
             .into_iter()
@@ -323,7 +325,7 @@ impl Bridge {
         {
             let mut inner = self.inner.lock().unwrap();
             inner.user_name = Some(user_name);
-            inner.pending = Some(PendingLogin { global_token, tenants });
+            inner.pending = Some(PendingLogin { global_token, user_id, tenants });
             inner.phase = Phase::ChooseTenant;
             inner.send_code_target = None;
         }
@@ -331,7 +333,7 @@ impl Bridge {
     }
 
     async fn select_tenant(&self, tenant_id: String) -> Reply {
-        let (global_token, tenant_name, user_name) = {
+        let (global_token, tenant_name, user_name, user_id) = {
             let inner = self.inner.lock().unwrap();
             if inner.phase != Phase::ChooseTenant {
                 return Err(forbidden());
@@ -340,7 +342,12 @@ impl Bridge {
             let Some((_, name)) = pending.tenants.iter().find(|(id, _)| id == &tenant_id) else {
                 return Err(forbidden());
             };
-            (pending.global_token.clone(), name.clone(), inner.user_name.clone().unwrap_or_default())
+            (
+                pending.global_token.clone(),
+                name.clone(),
+                inner.user_name.clone().unwrap_or_default(),
+                pending.user_id.clone(),
+            )
         };
         let server = self.server_origin().await?;
         let resp = self
@@ -353,8 +360,15 @@ impl Bridge {
             .map_err(|_| unavailable())?;
         let v = map_http_error(resp).await?;
         let scoped_token = str_field(&v, "token")?;
-        let result =
-            self.register_device(&server, &scoped_token, Tenant { id: tenant_id, name: tenant_name }, user_name).await;
+        let result = self
+            .complete_login(
+                &server,
+                &scoped_token,
+                Tenant { id: tenant_id, name: tenant_name },
+                user_name,
+                user_id.as_deref(),
+            )
+            .await;
         self.end_login_session(&server, &scoped_token).await;
         if result.is_ok() {
             self.end_login_session(&server, &global_token).await;
@@ -385,7 +399,8 @@ impl Bridge {
             let tenants: Vec<Tenant> = serde_json::from_value(reply["tenants"].clone()).map_err(|_| unavailable())?;
             let [tenant] = tenants.as_slice() else { return Err(unavailable()) };
             let user_name = reply.pointer("/user/name").and_then(Value::as_str).unwrap_or(username).to_owned();
-            self.register_device(&server, &scoped_token, tenant.clone(), user_name).await
+            let user_id = reply.pointer("/user/id").and_then(Value::as_str);
+            self.complete_login(&server, &scoped_token, tenant.clone(), user_name, user_id).await
         }
         .await;
         self.end_login_session(&server, &scoped_token).await;
@@ -394,6 +409,45 @@ impl Bridge {
 
     async fn end_login_session(&self, server: &str, token: &str) {
         let _ = self.http.post(format!("{server}/v1/auth/logout")).bearer_auth(token).send().await;
+    }
+
+    async fn complete_login(
+        &self,
+        server: &str,
+        scoped_token: &str,
+        tenant: Tenant,
+        user_name: String,
+        user_id: Option<&str>,
+    ) -> Reply {
+        let initial = self.ipc_status().await.map_err(|_| unavailable())?;
+        if !initial.logged_in {
+            return self.register_device(server, scoped_token, tenant, user_name).await;
+        }
+
+        let device_id =
+            initial.device_id.filter(|_| initial.ws != "unauthenticated").ok_or_else(device_session_conflict)?;
+        let user_id = user_id.filter(|id| !id.is_empty()).ok_or_else(device_session_conflict)?;
+        let mut url = reqwest::Url::parse(server).map_err(|_| unavailable())?;
+        url.path_segments_mut().map_err(|_| unavailable())?.pop_if_empty().extend(["v1", "devices", &device_id]);
+        // The scoped session can only look up devices in the selected tenant. The returned owner
+        // must also match the account just authenticated, before Desktop can attach to this daemon.
+        let response = self.http.get(url).bearer_auth(scoped_token).send().await.map_err(|_| unavailable())?;
+        if matches!(response.status(), reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::FORBIDDEN) {
+            return Err(device_session_conflict());
+        }
+        let device = map_http_error(response).await?;
+        if device["id"] != device_id.as_str() || device["user_id"] != user_id || device["status"] != "active" {
+            return Err(device_session_conflict());
+        }
+        let current = self.ipc_status().await.map_err(|_| unavailable())?;
+        if !current.logged_in
+            || current.ws == "unauthenticated"
+            || current.device_id.as_deref() != Some(device_id.as_str())
+        {
+            return Err(device_session_conflict());
+        }
+        self.persist_login(tenant, user_name, device_id)?;
+        self.state().await
     }
 
     async fn register_device(&self, server: &str, scoped_token: &str, tenant: Tenant, user_name: String) -> Reply {
@@ -415,13 +469,29 @@ impl Bridge {
         let dev = map_http_error(resp).await?;
         let device_token = str_field(&dev, "device_token")?;
         let device_id = str_field(&dev, "device_id")?;
-        self.ipc_call(&Request::Login {
-            token: device_token,
-            server: Some(server.to_owned()),
-            device_id: Some(device_id.clone()),
-        })
-        .await
-        .map_err(|_| unavailable())?;
+        let reply = self
+            .ipc_reply(&Request::Login {
+                token: device_token,
+                server: Some(server.to_owned()),
+                device_id: Some(device_id.clone()),
+            })
+            .await
+            .map_err(|_| unavailable())?;
+        if reply["ok"] != true {
+            return Err(if reply.pointer("/error/code").and_then(Value::as_str) == Some("conflict") {
+                device_session_conflict()
+            } else {
+                unavailable()
+            });
+        }
+        if let Err(error) = self.persist_login(tenant, user_name, device_id) {
+            let _ = self.ipc_call(&Request::Logout).await;
+            return Err(error);
+        }
+        self.state().await
+    }
+
+    fn persist_login(&self, tenant: Tenant, user_name: String, device_id: String) -> Result<(), ErrorBody> {
         // device_token 不落盘；只存核对用的非敏感字段，供窗口重开时识别“同一台已登录设备”。
         let stored = profile::StoredProfile {
             device_id: device_id.clone(),
@@ -429,20 +499,15 @@ impl Bridge {
             tenant_name: tenant.name.clone(),
             user_name: user_name.clone(),
         };
-        if profile::store(&self.socket_path, &stored).is_err() {
-            let _ = self.ipc_call(&Request::Logout).await;
-            return Err(unavailable());
-        }
-        {
-            let mut inner = self.inner.lock().unwrap();
-            inner.tenant = Some(tenant);
-            inner.user_name = Some(user_name);
-            inner.device_id = Some(device_id);
-            inner.pending = None;
-            inner.phase = Phase::Ready;
-            inner.send_code_target = None;
-        }
-        self.state().await
+        profile::store(&self.socket_path, &stored).map_err(|_| unavailable())?;
+        let mut inner = self.inner.lock().unwrap();
+        inner.tenant = Some(tenant);
+        inner.user_name = Some(user_name);
+        inner.device_id = Some(device_id);
+        inner.pending = None;
+        inner.phase = Phase::Ready;
+        inner.send_code_target = None;
+        Ok(())
     }
 
     /// Restore display data only for the identity confirmed by the daemon.
@@ -663,8 +728,12 @@ impl Bridge {
             .collect()
     }
 
+    async fn ipc_reply(&self, req: &Request) -> anyhow::Result<Value> {
+        tokio::time::timeout(Duration::from_secs(3), ipc_call_with(&self.socket_path, req)).await?
+    }
+
     async fn ipc_call(&self, req: &Request) -> anyhow::Result<Value> {
-        let reply = tokio::time::timeout(Duration::from_secs(3), ipc_call_with(&self.socket_path, req)).await??;
+        let reply = self.ipc_reply(req).await?;
         anyhow::ensure!(reply["ok"] == true, "daemon declined request");
         Ok(reply)
     }
@@ -860,6 +929,13 @@ fn invalid(message: &str) -> ErrorBody {
 
 fn forbidden() -> ErrorBody {
     ErrorBody { code: "forbidden".into(), message: "没有权限执行此操作".into() }
+}
+
+fn device_session_conflict() -> ErrorBody {
+    ErrorBody {
+        code: "device_already_logged_in".into(),
+        message: "本机 OneX 已登录。请用同一租户和账号登录，或先用 OneX 命令行退出。".into(),
+    }
 }
 
 fn unavailable() -> ErrorBody {
