@@ -12,7 +12,8 @@ const REASONS = {
 const CONFLICTS = {
   revision_changed: '模型池已被他人更新，草稿已保留。请基于最新版本重新预览。',
   preview_stale: '预览依据已过期（部署、审核或证据已变化），草稿已保留。请重新预览。',
-  idempotency_mismatch: '同一提交键对应的内容已变化，草稿已保留。请重新预览后再发布。'
+  idempotency_mismatch: '同一提交键对应的内容已变化，草稿已保留。请重新预览后再发布。',
+  quote_deployment_revision_changed: '部署修订已变化，草稿已保留。请刷新报价头并核对部署修订后再发布。'
 }
 const STATUS = { active: '启用', disabled: '停用', archived: '已归档', draft: '草稿' }
 
@@ -106,6 +107,111 @@ export function buildDraft({ expected_pool_revision, members, routing, reason })
 }
 
 export const DEFAULT_ROUTING = { strategy: 'ordered', max_attempts: 2, attempt_timeout_ms: 5000, total_timeout_ms: 12000 }
+
+// —— 采购报价、汇率、可签输入倍率（contracts/routing-pricing-and-staging.md） ——
+// 金额与汇率按十进制字符串和 BigInt 处理，不经浮点。
+
+export const DIMENSIONS = [['input', '普通输入', 'token'], ['output', '输出', 'token'], ['cache_read', '缓存读', 'token'],
+  ['cache_write', '缓存写', 'token'], ['request', '按次', 'request']]
+export const dimensionLabel = key => DIMENSIONS.find(([k]) => k === key)?.[1] ?? key
+const PRICING_REASONS = {
+  missing_input_quote: '缺输入报价', quote_expired: '报价已过期', invalid_input_unit: '报价单位无效',
+  missing_fx_rate: '缺汇率', missing_fx: '缺汇率', fx_expired: '汇率已过期',
+  deployment_revision_mismatch: '报价对应的部署修订与池成员不一致', quote_deployment_revision_changed: '报价对应的部署修订已变化'
+}
+export const pricingReason = code => PRICING_REASONS[code] ?? reasonLabel(code)
+
+// 游标绑定 as_of：无游标（第一页、刷新）开启新一轮并冻结时点，翻页沿用该轮时点。
+export function asOfRound(now = () => new Date().toISOString()) {
+  let at = null
+  return cursor => (cursor && at) ? at : (at = now())
+}
+export const calculationLabel = status => ({ complete: '完整试算', partial: '部分试算（有缺项）', unavailable: '无法试算' })[status] ?? (status || '—')
+const SYMBOL = { CNY: '¥', USD: 'US$' }
+
+// "0.40" → "400000"（百万分之一单位）；空串为缺项返回 null；"0" 为明确零价。
+export function parseMicro(text, label = '价格') {
+  const s = String(text ?? '').trim()
+  if (!s) return null
+  const m = s.match(/^(\d+)(?:\.(\d{1,6}))?$/)
+  if (!m) throw new Error(label + '须为非负数，最多 6 位小数')
+  const value = BigInt(m[1]) * 1000000n + BigInt((m[2] ?? '').padEnd(6, '0'))
+  if (value.toString().length > 38) throw new Error(label + '超出范围')
+  return value.toString()
+}
+
+function decimal(value, scale, minDigits) {
+  const neg = value < 0n
+  const abs = neg ? -value : value
+  const unit = 10n ** BigInt(scale)
+  let frac = (abs % unit).toString().padStart(scale, '0').replace(/0+$/, '')
+  if (frac.length < minDigits) frac = frac.padEnd(minDigits, '0')
+  return (neg ? '-' : '') + (abs / unit).toString() + (frac ? '.' + frac : '')
+}
+
+export function formatMicro(micro, currency, minDigits = 2) {
+  if (micro == null || micro === '') return '未知'
+  const text = decimal(BigInt(micro), 6, minDigits)
+  return SYMBOL[currency] ? SYMBOL[currency] + text : text + ' ' + (currency ?? '')
+}
+
+export function unitPriceText(item, currency) {
+  if (!item) return '缺项'
+  const basis = Number(item.quantity_basis).toLocaleString('en-US')
+  return formatMicro(item.rate_micro ?? item.amount_micro, currency) + ' / ' + basis + ' ' + (item.unit ?? 'token')
+}
+
+const gcd = (a, b) => { while (b) [a, b] = [b, a % b]; return a }
+
+// "7.50" → {rate_numerator:"15", rate_denominator:"2"}：1 单位原币可换的人民币，约成最简分数。
+export function parseRatio(text) {
+  const m = String(text ?? '').trim().match(/^(\d+)(?:\.(\d{1,12}))?$/)
+  if (!m) throw new Error('汇率须为正数，最多 12 位小数')
+  const scale = 10n ** BigInt((m[2] ?? '').length)
+  const num = BigInt(m[1] + (m[2] ?? ''))
+  if (num === 0n) throw new Error('汇率须大于 0')
+  const g = gcd(num, scale)
+  return { rate_numerator: (num / g).toString(), rate_denominator: (scale / g).toString() }
+}
+
+export function formatRatio(numerator, denominator) {
+  if (numerator == null || denominator == null) return '—'
+  const n = BigInt(numerator), d = BigInt(denominator)
+  const scaled = n * 1000000n
+  const exact = scaled % d === 0n
+  return (exact ? '' : '≈') + decimal(scaled / d, 6, 0)
+}
+
+export function formatMultiplier(ppm) {
+  if (!Number.isSafeInteger(ppm)) return '—'
+  return decimal(BigInt(ppm), 6, 0) + '×'
+}
+
+// "4" → 4000000；最多三位小数，存储值是 1000 的整数倍。
+export function parseMultiplier(text) {
+  const m = String(text ?? '').trim().match(/^(\d+)(?:\.(\d{1,3}))?$/)
+  if (!m) throw new Error('倍率须为非负数，最多 3 位小数')
+  const ppm = Number(BigInt(m[1]) * 1000000n + BigInt((m[2] ?? '').padEnd(3, '0')) * 1000n)
+  if (!Number.isSafeInteger(ppm)) throw new Error('倍率超出范围')
+  return ppm
+}
+
+export function isoInput(text, label, required = true) {
+  const s = String(text ?? '').trim()
+  if (!s) { if (required) throw new Error('请填写' + label); return null }
+  const t = Date.parse(s)
+  if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d(\.\d{1,3})?)?Z$/.test(s) || !Number.isFinite(t)) throw new Error(label + '须为 UTC 时间，如 2026-11-22T00:00:00Z')
+  return new Date(t).toISOString()
+}
+
+// 写入键：同一请求体在网络失败后重试复用原键；体变化或服务端已应答的失败后换新键。
+export function submissionKeys(make) {
+  let key = null, print = null
+  return {
+    for(body) { const p = JSON.stringify(body); if (p !== print) { key = make(); print = p } return key },
+    answered() { key = null; print = null }
+  }
+}
 
 // 预览过期后逐个核对已选成员与最新候选：返回 null 表示一致；
 // {kind:'gone'} 表示已不可入池；{kind:'changed'} 列出修订、审核、证据的新旧值，需用户显式采用。
