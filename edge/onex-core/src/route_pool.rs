@@ -29,11 +29,42 @@ pub const FEATURES: [&str; 6] = ["text", "stream", "function_tools", "images", "
 pub fn extension_of(frame: &serde_json::Value) -> Option<&'static str> {
     let has = |k: &str| frame.get(k).is_some();
     match frame.get("type")?.as_str()? {
-        "config" if has("route_pool") => Some("config.route_pool"),
+        "config" if has("route_pool") || has_pool_rows(frame) => Some("config.route_pool"),
         "lease" if has("signature_id") => Some("lease.signature_id"),
         "cutoff" if has("targets") || has("revocation_revision") || has("terminate_inflight") => Some("cutoff.targets"),
         _ => None,
     }
+}
+
+/// 不完整的池配置可能缺少顶层对象。只在相应行中检查 PoolRoute / PoolRate 增加的字段，
+/// 包括显式的 null；旧 Route / Rate 的字段和其它位置的同名键按旧协议处理。
+fn has_pool_rows(frame: &serde_json::Value) -> bool {
+    let has_field = |collection: &str, fields: &[&str]| {
+        frame
+            .get(collection)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|rows| rows.iter().any(|row| fields.iter().any(|field| row.get(*field).is_some())))
+    };
+    has_field(
+        "routes",
+        &[
+            "deployment_id",
+            "deployment_revision",
+            "pool_revision",
+            "priority",
+            "features",
+            "max_context_tokens",
+            "max_output_tokens",
+            "valid_until",
+            "availability",
+            "credential_ref",
+            "adapter_id",
+            "adapter_revision",
+        ],
+    ) || has_field(
+        "rates",
+        &["rate_version_id", "model_display_name", "input_multiplier_basis", "input_multiplier_ppm", "effective_until"],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -542,15 +573,35 @@ mod tests {
             assert_eq!(extension_of(&c), Some("cutoff.targets"), "{c}");
         }
 
-        let mut legacy_config = wire("config");
-        legacy_config.as_object_mut().unwrap().remove("route_pool");
-        assert_eq!(extension_of(&legacy_config), None);
         let mut legacy_lease = wire("lease");
         legacy_lease.as_object_mut().unwrap().remove("signature_id");
         assert_eq!(extension_of(&legacy_lease), None);
         assert_eq!(extension_of(&json!({"type":"cutoff","id":"c","reason":"balance","settled_lease_id":"l"})), None);
         assert_eq!(extension_of(&wire("events_ack")), None);
         assert_eq!(extension_of(&json!({"route_pool":{}})), None);
+    }
+
+    #[test]
+    fn config_detects_each_pool_only_field_in_route_and_rate_rows() {
+        let mut pool = wire("config");
+        pool.as_object_mut().unwrap().remove("route_pool");
+        pool["routes"][0]["proxy"] = json!("none");
+        pool["routes"][0]["adapter_id"] = json!("adapter_a");
+        pool["routes"][0]["adapter_revision"] = json!(1);
+        let legacy = serde_json::to_value(serde_json::from_value::<Msg>(pool.clone()).unwrap()).unwrap();
+        assert_eq!(extension_of(&legacy), None);
+        assert_eq!(extension_of(&pool), Some("config.route_pool"));
+
+        for collection in ["routes", "rates"] {
+            let base = &legacy[collection][0];
+            for field in pool[collection][0].as_object().unwrap().keys().filter(|key| base.get(key).is_none()) {
+                let mut mixed = legacy.clone();
+                let mut row = base.clone();
+                row[field] = Value::Null;
+                mixed[collection].as_array_mut().unwrap().push(row);
+                assert_eq!(extension_of(&mixed), Some("config.route_pool"), "{collection}[].{field}");
+            }
+        }
     }
 
     #[test]

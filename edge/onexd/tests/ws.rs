@@ -937,6 +937,20 @@ async fn unnegotiated_route_pool_frames_are_refused_without_side_effects() {
     let a = p.recv_skip_ping().await;
     assert_eq!((a["re"].as_str(), a["ok"].as_bool()), (Some("cfg91"), Some(false)), "{a}");
     assert_eq!(a["error"]["code"], "unsupported_capability");
+    // A valid legacy frame plus a single pool-only field still requires negotiation.
+    let fixture = routing_wire("config");
+    let mut legacy = serde_json::to_value(serde_json::from_value::<onex_core::ws::Msg>(fixture).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("policy");
+    legacy["id"] = json!("cfg-legacy");
+    for (id, rows, field) in [("cfg-route", "routes", "credential_ref"), ("cfg-rate", "rates", "effective_until")] {
+        let mut mixed = legacy.clone();
+        mixed["id"] = json!(id);
+        mixed[rows][0][field] = Value::Null;
+        p.send(mixed).await;
+        let a = p.recv_skip_ping().await;
+        assert_eq!((a["re"].as_str(), a["ok"].as_bool()), (Some(id), Some(false)), "{a}");
+        assert_eq!(a["error"]["code"], "unsupported_capability");
+    }
     // A targeted cutoff must not be treated as a whole-lease cutoff.
     p.send(routing_wire("cutoff")).await;
     let a = p.recv_skip_ping().await;
@@ -960,6 +974,9 @@ async fn unnegotiated_route_pool_frames_are_refused_without_side_effects() {
     assert!(edge.state.lease.admit(0).is_ok());
 
     // Legacy frames on the same connection keep working.
+    p.send(legacy).await;
+    assert_eq!(p.recv_skip_ping().await, json!({"type":"ack","re":"cfg-legacy","ok":true}));
+    assert_eq!(edge.state.config_revision(), 91);
     p.send(json!({"type":"cutoff","id":"c_legacy","reason":"balance"})).await;
     assert_eq!(p.recv_skip_ping().await, json!({"type":"ack","re":"c_legacy","ok":true}));
     assert_eq!(edge.state.lease.status()["state"], "cutoff");
