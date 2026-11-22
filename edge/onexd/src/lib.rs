@@ -26,6 +26,7 @@ pub mod outbox;
 mod policy;
 pub mod pricing;
 mod responses;
+pub mod route_apply;
 pub mod route_select;
 pub mod route_stage;
 pub mod router;
