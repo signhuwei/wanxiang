@@ -1329,6 +1329,11 @@ test('policy v2 ties generic signing, exact recharge, profile revisions and devi
   expect(db.all('SELECT * FROM policy_device_applications')).toEqual([]);
   edge.send({ type: 'config_applied', id: 'unsent', config_revision: configuration.revision + 1, policy_revision: 1 });
   expect(await edge.next()).toMatchObject({ type: 'ack', re: 'unsent', ok: false });
+  for (const fields of [{ projection_id: 'prj_fixture', result: 'rejected' }, { result: null }, { error: null }]) {
+    edge.send({ type: 'config_applied', id: 'unnegotiated', config_revision: configuration.revision, policy_revision: 1, ...fields });
+    expect(await edge.next()).toMatchObject({ type: 'ack', re: 'unnegotiated', ok: false, error: { code: 'unsupported_capability' } });
+    expect(db.all('SELECT * FROM policy_device_applications')).toEqual([]);
+  }
   edge.send({ type: 'config_applied', id: 'actual', config_revision: configuration.revision, policy_revision: 1 });
   expect(await edge.next()).toMatchObject({ type: 'ack', re: 'actual', ok: true });
   expect(await (await f.request('/devices/' + token.device_id, undefined, owner)).json()).toMatchObject({
