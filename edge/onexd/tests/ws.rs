@@ -911,3 +911,75 @@ async fn v2_policy_is_applied_atomically_and_proved_only_for_current_identity() 
     assert_eq!(proof["policy_revision"], 7);
     assert_eq!(peer.recv_skip_ping().await["type"], "lease_request");
 }
+
+const ROUTING_FIXTURE: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/routing/p0-ab.json"));
+
+fn routing_wire(name: &str) -> Value {
+    serde_json::from_str::<Value>(ROUTING_FIXTURE).unwrap()["wire"][name].clone()
+}
+
+/// route_pool.v1 is not declared yet, so every extension frame is refused without touching config or leases.
+#[tokio::test]
+async fn unnegotiated_route_pool_frames_are_refused_without_side_effects() {
+    let srv = FakeServer::start().await;
+    let edge = start_edge(&srv.url, Some("t"));
+    let mut p = srv.accept().await;
+    let hello = p.handshake(0, 15000).await;
+    assert!(hello.get("capabilities").is_none(), "route_pool.v1 must not be declared yet: {hello}");
+
+    p.send(lease_msg("s1", "lse_1", 1, 1000, 600_000)).await;
+    assert_eq!(p.recv_skip_ping().await, json!({"type":"ack","re":"s1","ok":true}));
+    let revision_before = edge.state.config_revision();
+
+    // config with route_pool must not become a runnable legacy config.
+    p.send(routing_wire("config")).await;
+    let a = p.recv_skip_ping().await;
+    assert_eq!((a["re"].as_str(), a["ok"].as_bool()), (Some("cfg91"), Some(false)), "{a}");
+    assert_eq!(a["error"]["code"], "unsupported_capability");
+    // A targeted cutoff must not be treated as a whole-lease cutoff.
+    p.send(routing_wire("cutoff")).await;
+    let a = p.recv_skip_ping().await;
+    assert_eq!((a["re"].as_str(), a["ok"].as_bool()), (Some("co_4"), Some(false)), "{a}");
+    assert_eq!(a["error"]["code"], "unsupported_capability");
+    // A lease with signature_id must not replace the current lease.
+    p.send(routing_wire("lease")).await;
+    let a = p.recv_skip_ping().await;
+    assert_eq!((a["re"].as_str(), a["ok"].as_bool()), (Some("ls_01"), Some(false)), "{a}");
+    assert_eq!(a["error"]["code"], "unsupported_capability");
+    p.expect_no_data(Duration::from_millis(100)).await;
+
+    assert_eq!(edge.state.config_revision(), revision_before);
+    {
+        let cfg = edge.state.config.read().unwrap();
+        assert!(cfg.routes.is_empty() && cfg.policy.is_none() && !cfg.policy_blocked);
+    }
+    assert_eq!(edge.state.lease.lease_id().as_deref(), Some("lse_1"));
+    let status = edge.state.lease.status();
+    assert_eq!((status["state"].as_str(), &status["cutoff_reason"]), (Some("active"), &Value::Null), "{status}");
+    assert!(edge.state.lease.admit(0).is_ok());
+
+    // Legacy frames on the same connection keep working.
+    p.send(json!({"type":"cutoff","id":"c_legacy","reason":"balance"})).await;
+    assert_eq!(p.recv_skip_ping().await, json!({"type":"ack","re":"c_legacy","ok":true}));
+    assert_eq!(edge.state.lease.status()["state"], "cutoff");
+}
+
+#[tokio::test]
+async fn welcome_selecting_undeclared_capability_drops_connection() {
+    let srv = FakeServer::start().await;
+    let edge = start_edge(&srv.url, Some("t"));
+    let mut p = srv.accept().await;
+    let hello = p.recv().await;
+    let mut welcome = routing_wire("welcome");
+    welcome["re"] = hello["id"].clone();
+    welcome["server_time"] = json!(format_ms(now_ms()));
+    p.send(welcome).await;
+    // Nothing is applied from this connection; the Edge reconnects instead.
+    let mut again = srv.accept().await;
+    assert_eq!(again.recv().await["type"], "hello");
+    let last_error = edge.state.conn.lock().unwrap().last_error.clone().unwrap().0;
+    assert!(last_error.contains("undeclared capability"), "{last_error}");
+    assert_eq!(edge.state.config_revision(), 0);
+    assert!(edge.state.lease.lease_id().is_none());
+}

@@ -74,6 +74,9 @@ pub struct Hello {
     pub config_revision: i64,
     pub lease_id: Option<String>,
     pub outbox_last_seq: u64,
+    /// 能力名集合（如 `route_pool.v1`）。空时不序列化，旧 Server 看到的帧不变。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -85,6 +88,9 @@ pub struct Welcome {
     pub server_time: String,
     pub ack_seq: u64,
     pub heartbeat_ms: u64,
+    /// Server 对本连接实际选中的能力；缺省等于空集，走旧协议。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -260,6 +266,13 @@ pub struct ConfigApplied {
     pub id: String,
     pub config_revision: i64,
     pub policy_revision: u64,
+    /// 以下三项只在选中 `route_pool.v1` 的连接上出现。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<crate::route_pool::ApplyResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorBody>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

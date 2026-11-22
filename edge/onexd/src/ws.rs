@@ -33,6 +33,9 @@ type Tx = SplitSink<Ws, Message>;
 type Rx = SplitStream<Ws>;
 
 const CLOSE_REPLACED: u16 = 4001;
+/// `hello.capabilities`。`route_pool.v1` 在原子应用、信封和连续回执完成前不声明
+/// （contracts/routing-p0.md）。
+const DECLARED_CAPABILITIES: [&str; 0] = [];
 const MISSED_PONGS: u32 = 3;
 
 #[derive(Debug, Clone)]
@@ -240,6 +243,7 @@ async fn handshake(opts: &WsOptions, state: &State, outbox: &Outbox, tx: &mut Tx
             config_revision: state.config_revision(),
             lease_id: state.lease.lease_id(),
             outbox_last_seq: outbox.last_seq(),
+            capabilities: DECLARED_CAPABILITIES.map(String::from).to_vec(),
         }),
     )
     .await?;
@@ -279,6 +283,8 @@ async fn connected(
     if state.expected_device_id.read().unwrap().as_ref().is_some_and(|id| id != &welcome.device_id) {
         return Err(Special::Unauthenticated.into());
     }
+    // 先于任何状态变更：welcome 选中未声明的能力时整条连接作废。
+    let capabilities = negotiated(&DECLARED_CAPABILITIES.map(String::from), welcome)?;
     {
         let mut config = state.config.write().unwrap();
         if config.policy.as_ref().is_some_and(|policy| !crate::policy::matches_identity(&policy.summary, welcome)) {
@@ -348,9 +354,22 @@ async fn connected(
                     send(tx, &Msg::DiagResult(result)).await?;
                 }
             }
-            m = recv(rx) => {
+            m = recv_frame(rx, &capabilities) => {
                 missed = 0;
-                match m? {
+                let m = match m? {
+                    Frame::Msg(m) => m,
+                    // 不应用配置、不发放租约、不停任何租约，只回拒绝。
+                    Frame::Unnegotiated(u) => {
+                        let message = match u.extension {
+                            "config.route_pool" => "本连接未协商模型池配置",
+                            "lease.signature_id" => "本连接未协商带签发的租约",
+                            _ => "本连接未协商目标撤销",
+                        };
+                        send(tx, &ack_err(u.id, "unsupported_capability", message)).await?;
+                        continue;
+                    }
+                };
+                match m {
                     Msg::Ping { id } => send(tx, &Msg::Pong { re: Some(id) }).await?,
                     Msg::Pong { .. } => {}
                     Msg::EventsAck(a) => {
@@ -507,6 +526,9 @@ fn apply_config(state: &State, welcome: &Welcome, mut c: Config) -> Result<Optio
         id: id::new("msg"),
         config_revision: c.revision,
         policy_revision: applied.summary.policy_revision,
+        projection_id: None,
+        result: None,
+        error: None,
     });
     if proof.is_some() {
         state.secrets.write().unwrap().clear();
@@ -574,15 +596,58 @@ async fn send(tx: &mut Tx, m: &Msg) -> Result<()> {
     Ok(())
 }
 
+/// 本连接 hello 声明且 welcome 选中的能力。只有两边都有的才生效。
+fn negotiated(declared: &[String], welcome: &Welcome) -> Result<Vec<String>> {
+    if let Some(extra) = welcome.capabilities.iter().find(|c| !declared.contains(c)) {
+        bail!("welcome selected undeclared capability {extra}");
+    }
+    Ok(welcome.capabilities.clone())
+}
+
+/// 未协商 `route_pool.v1` 时收到的扩展帧。旧 `Msg` 解析会丢掉扩展字段，所以这些帧
+/// 在原始 JSON 上拦截，不能当作旧配置、旧租约或整租约 cutoff 处理。
+struct Unnegotiated {
+    id: String,
+    extension: &'static str,
+}
+
+enum Frame {
+    Msg(Msg),
+    Unnegotiated(Unnegotiated),
+}
+
 async fn recv(rx: &mut Rx) -> Result<Msg> {
+    loop {
+        if let Frame::Msg(m) = recv_frame(rx, &[]).await? {
+            return Ok(m);
+        }
+    }
+}
+
+async fn recv_frame(rx: &mut Rx, capabilities: &[String]) -> Result<Frame> {
+    let pool = capabilities.iter().any(|c| c == onex_core::route_pool::ROUTE_POOL_V1);
     loop {
         match rx.next().await {
             None => bail!("connection closed"),
             Some(Err(e)) => return Err(e.into()),
-            Some(Ok(Message::Text(t))) => match serde_json::from_str::<Msg>(&t) {
-                Ok(m) => return Ok(m),
-                Err(e) => warn!(error = %e, "bad frame from server"),
-            },
+            Some(Ok(Message::Text(t))) => {
+                let value = match serde_json::from_str::<Value>(&t) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "bad frame from server");
+                        continue;
+                    }
+                };
+                if !pool && let Some(extension) = onex_core::route_pool::extension_of(&value) {
+                    let id = value.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                    warn!(%id, extension, "server sent a route_pool extension on an unnegotiated connection");
+                    return Ok(Frame::Unnegotiated(Unnegotiated { id, extension }));
+                }
+                match serde_json::from_value::<Msg>(value) {
+                    Ok(m) => return Ok(Frame::Msg(m)),
+                    Err(e) => warn!(error = %e, "bad frame from server"),
+                }
+            }
             Some(Ok(Message::Close(frame))) => {
                 if let Some(f) = &frame {
                     if u16::from(f.code) == CLOSE_REPLACED {

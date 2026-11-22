@@ -26,6 +26,7 @@ pub mod outbox;
 mod policy;
 pub mod pricing;
 mod responses;
+pub mod route_select;
 pub mod router;
 mod runtime_gate;
 pub mod secret;
