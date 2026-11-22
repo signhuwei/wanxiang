@@ -309,6 +309,22 @@ impl Store {
         .map_err(Into::into)
     }
 
+    /// 同身份最近一条成功回执的 ID，不论是否已确认。供诊断和联验记录。
+    pub fn applied_receipt_id(&self, scope: &Scope, revision: u64, projection_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        conn.query_row(
+            "SELECT receipt_id FROM receipts
+             WHERE server_origin = ?1 AND tenant_id = ?2 AND user_id = ?3 AND device_id = ?4
+               AND result = 'applied' AND config_revision = ?5 AND projection_id = ?6
+             ORDER BY created_at_ms DESC LIMIT 1",
+            params![origin, tenant, user, device, revision as i64, projection_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// 本作用域某回执是否已收到过成功 ACK。
     pub fn receipt_acked(&self, scope: &Scope, receipt_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
