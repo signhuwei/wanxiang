@@ -50,6 +50,7 @@ pub struct WsOptions {
     /// 只在隔离测试入口设置：模型池连接上领取、结清隔离租约（`contracts/routing-lease-gate.md`）。
     /// 关闭时隔离连接照旧对租约回 `forbidden/route_pool_lease_pending`。
     route_pool_leases: bool,
+    isolated_route_execution: bool,
     pub edge_version: String,
     pub backoff_min: Duration,
     pub backoff_max: Duration,
@@ -68,6 +69,7 @@ impl WsOptions {
             edge_version: env!("CARGO_PKG_VERSION").into(),
             route_pool: None,
             route_pool_leases: false,
+            isolated_route_execution: false,
             backoff_min: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
@@ -95,6 +97,13 @@ impl WsOptions {
     #[doc(hidden)]
     pub fn with_route_pool_leases_for_isolated_test(mut self) -> Self {
         self.route_pool_leases = true;
+        self
+    }
+
+    /// Dedicated loopback fixture. Production clients never select this execution path.
+    #[doc(hidden)]
+    pub fn with_route_pool_execution_for_isolated_test(mut self) -> Self {
+        self.isolated_route_execution = true;
         self
     }
 
@@ -141,6 +150,7 @@ pub async fn run(opts: WsOptions, state: Arc<State>, outbox: Arc<Outbox>, cancel
 
         state.set_phase(Phase::Connecting);
         let end = session(&opts, &state, &outbox, &token, &cancel).await;
+        state.isolated_route_execution.store(false, std::sync::atomic::Ordering::Release);
         // 控制连接断开不影响本机进行中的请求，只把等待中的续租记为不可达。
         state.lease.on_disconnected();
         let reason = match &end {
@@ -376,6 +386,16 @@ async fn connected(
     // 模型池测试连接不碰生产 Ledger：不领、不续旧租约。租约门禁打开时只用隔离租约存储。
     let leases = pool.is_none();
     let lease_gate = pool.is_some() && opts.route_pool_leases;
+    let execution = lease_gate && opts.isolated_route_execution && crate::pool_execution::loopback(&opts.url, "ws");
+    if execution && outbox.last_seq() != 0 {
+        bail!("isolated route execution needs a fresh dedicated outbox");
+    }
+    state.isolated_route_execution.store(execution, std::sync::atomic::Ordering::Release);
+    let mut runtime_poll = tokio::time::interval(Duration::from_millis(100));
+    let mut sent_usage = None;
+    if execution && let Some(p) = &pool {
+        p.store.ack_isolated_usage(&p.scope, welcome.ack_seq)?;
+    }
     let mut pool_leases = PoolLeases::new();
     if leases {
         state.lease.on_connected();
@@ -406,6 +426,16 @@ async fn connected(
                 }
                 missed += 1;
                 send(tx, &Msg::Ping { id: id::new("msg") }).await?;
+            }
+            _ = runtime_poll.tick(), if execution => {
+                if let Some(p) = &pool {
+                    if sent_usage.is_none() && let Some((seq, payload)) = p.store.pending_isolated_usage(&p.scope)? {
+                        let id = id::new("usage");
+                        send_value(tx, &json!({"type":"usage","id": id,"batch":[payload]})).await?;
+                        sent_usage = Some((id, seq));
+                    }
+                    p.drive_leases(state, tx, &mut pool_leases).await?;
+                }
             }
             r = outbox_rx.changed() => {
                 r.context("outbox closed")?;
@@ -477,6 +507,15 @@ async fn connected(
                     Msg::Ping { id } => send(tx, &Msg::Pong { re: Some(id) }).await?,
                     Msg::Pong { .. } => {}
                     Msg::EventsAck(a) => {
+                        if execution {
+                            if let (Some(p), Some((id, seq))) = (&pool, &sent_usage)
+                                && a.re.as_deref() == Some(id.as_str()) && a.ack_seq >= *seq
+                            {
+                                p.store.ack_isolated_usage(&p.scope, *seq)?;
+                                sent_usage = None;
+                            }
+                            continue;
+                        }
                         note_ack(outbox, a.ack_seq)?;
                         acked = acked.max(a.ack_seq.min(outbox.last_seq()));
                         // 重连时可能还有更早发出的确认，sent 不能落到 acked 之后。
@@ -556,6 +595,9 @@ async fn connected(
                         if lease_gate && a.ok && let Some(p) = &pool {
                             p.drive_leases(state, tx, &mut pool_leases).await?;
                         }
+                    }
+                    Msg::Ack(a) if execution && !a.ok && sent_usage.as_ref().is_some_and(|(id, _)| id == &a.re) => {
+                        bail!("isolated route usage rejected: {:?}", a.error);
                     }
                     Msg::Ack(a) if lease_gate && pool.is_some() => {
                         let p = pool.as_ref().unwrap();
@@ -944,7 +986,7 @@ impl PoolSession {
 
 // ---------------------------------------------------------------------------
 // 隔离租约（contracts/routing-lease-gate.md）。只记在 route_apply 库，不进生产 Ledger，
-// 不放行任何请求：真实模型入口在模型池流程中由 State::route_pool_engaged 一律拒绝。
+// 独立的回环联验启用实测用量；常规模型池入口继续由门禁保护。
 // ---------------------------------------------------------------------------
 
 /// 模型池连接上的隔离租约协调。
@@ -953,11 +995,12 @@ struct PoolLeases {
     request: Option<(String, String)>,
     /// 最近一次门禁拒绝原因；新目标应用、回执确认后清除再请求。
     gated: Option<String>,
+    sent_op: Option<String>,
 }
 
 impl PoolLeases {
     fn new() -> Self {
-        Self { request: None, gated: None }
+        Self { request: None, gated: None, sent_op: None }
     }
 }
 
@@ -1044,18 +1087,35 @@ impl PoolSession {
             }
         };
         if let Some(op) = ops.first() {
-            send_value(tx, &op.to_frame()).await?;
+            if leases.sent_op.as_deref() != Some(op.op_id.as_str()) {
+                self.send_pool_operation(tx, op).await?;
+                leases.sent_op = Some(op.op_id.clone());
+            }
             return Ok(());
         }
         let Some(view) = self.acked_view(state) else { return Ok(()) };
         // 2. 已接受但不再可用的租约：先结清。
         if let Ok(Some(held)) = self.store.accepted_pool_lease(&self.scope) {
+            if let Some((_, payload, acked)) = self.store.isolated_usage_for_lease(&self.scope, &held.lease_id)? {
+                if acked && let Some(payload) = payload {
+                    let op = self.store.begin_isolated_metered_settlement(
+                        &self.scope,
+                        &held,
+                        &payload,
+                        self.clock.now_ms(),
+                    )?;
+                    self.send_pool_operation(tx, &op).await?;
+                    leases.sent_op = Some(op.op_id);
+                }
+                return Ok(());
+            }
             if Self::still_usable(&held, &view) {
                 return Ok(());
             }
             let op = self.store.begin_settlement(&self.scope, &held, self.clock.now_ms())?;
             info!(lease_id = %held.lease_id, op_id = %op.op_id, "settling route_pool lease no longer valid for the applied view");
-            send_value(tx, &op.to_frame()).await?;
+            self.send_pool_operation(tx, &op).await?;
+            leases.sent_op = Some(op.op_id);
             return Ok(());
         }
         // 3. 首领。门禁拒绝后等新目标应用再请求。
@@ -1067,6 +1127,14 @@ impl PoolSession {
         send(tx, &Msg::LeaseRequest(LeaseRequest { id: request.0.clone(), op_id: request.1.clone() })).await?;
         leases.request = Some(request);
         Ok(())
+    }
+
+    async fn send_pool_operation(&self, tx: &mut Tx, op: &route_apply::PoolLeaseOp) -> Result<()> {
+        let mut frame = op.to_frame();
+        if let Some((Some(seq), _, true)) = self.store.isolated_usage_for_lease(&self.scope, &op.lease_id)? {
+            frame["usage_through_seq"] = seq.into();
+        }
+        send_value(tx, &frame).await
     }
 
     /// 处理租约门禁打开时的 `lease`。
@@ -1187,8 +1255,11 @@ impl PoolSession {
                 (Some("lease_settlement_required"), Some(lease_id)) => {
                     match self.store.pool_lease(&self.scope, lease_id)? {
                         Some(held) if held.state == route_apply::PoolLeaseState::Accepted => {
-                            let op = self.store.begin_settlement(&self.scope, &held, self.clock.now_ms())?;
-                            send_value(tx, &op.to_frame()).await?;
+                            if self.store.isolated_usage_for_lease(&self.scope, &held.lease_id)?.is_none() {
+                                let op = self.store.begin_settlement(&self.scope, &held, self.clock.now_ms())?;
+                                self.send_pool_operation(tx, &op).await?;
+                                leases.sent_op = Some(op.op_id);
+                            }
                         }
                         _ => self.settle_unknown(tx, lease_id).await?,
                     }

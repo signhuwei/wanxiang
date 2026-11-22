@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::route_stage::AppliedIdentity;
 
 /// 2：加隔离租约表（`contracts/routing-lease-gate.md`）。1 的库打开时就地升级。
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// 配置域：服务、租户、成员、设备。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -180,6 +180,12 @@ impl Store {
                  done_at_ms INTEGER,
                  last_failure TEXT,
                  PRIMARY KEY (server_origin, tenant_id, user_id, device_id, op_id)
+             );
+             CREATE TABLE IF NOT EXISTS pool_runtime_receipts (
+                 server_origin TEXT NOT NULL, tenant_id TEXT NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                 lease_id TEXT NOT NULL, request_id TEXT NOT NULL, seq INTEGER, payload TEXT, acked INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY(server_origin,tenant_id,user_id,device_id,lease_id),
+                 UNIQUE(server_origin,tenant_id,user_id,device_id,seq)
              );",
         )?;
         let version: Option<i64> =
@@ -188,8 +194,8 @@ impl Store {
             None => {
                 conn.execute("INSERT INTO meta (k, v) VALUES ('schema', ?1)", [SCHEMA_VERSION])?;
             }
-            // 1 → 2 只新增表，上面已建好。
-            Some(1) => {
+            // Previous versions only need the additive tables defined above.
+            Some(1 | 2) => {
                 conn.execute("UPDATE meta SET v = ?1 WHERE k = 'schema'", [SCHEMA_VERSION])?;
             }
             Some(SCHEMA_VERSION) => {}
@@ -471,6 +477,109 @@ pub struct PoolLeaseOp {
     pub used_milli: i64,
     pub model_used_milli: BTreeMap<String, i64>,
     pub last_failure: Option<String>,
+}
+
+impl Store {
+    /// One durable intent per isolated lease. An unconfirmed upstream result keeps the lease unavailable.
+    pub fn reserve_isolated_request(&self, scope: &Scope, lease_id: &str, request_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        Ok(conn.execute(
+            "INSERT OR IGNORE INTO pool_runtime_receipts(server_origin,tenant_id,user_id,device_id,lease_id,request_id)
+             SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS(SELECT 1 FROM pool_leases WHERE server_origin=?1 AND tenant_id=?2
+             AND user_id=?3 AND device_id=?4 AND lease_id=?5 AND state='accepted') AND NOT EXISTS(SELECT 1 FROM pool_lease_ops
+             WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3 AND device_id=?4 AND lease_id=?5 AND done_at_ms IS NULL)",
+            params![origin, tenant, user, device, lease_id, request_id],
+        )? == 1)
+    }
+
+    /// Write the metered response and its replay sequence atomically before returning it to the local client.
+    pub fn complete_isolated_request(
+        &self,
+        scope: &Scope,
+        lease_id: &str,
+        request_id: &str,
+        mut payload: Value,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let [origin, tenant, user, device] = scope_params(scope);
+        let seq: u64 = tx.query_row(
+            "SELECT coalesce(max(seq),0)+1 FROM pool_runtime_receipts WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3 AND device_id=?4",
+            params![origin, tenant, user, device], |r| r.get(0),
+        )?;
+        payload["seq"] = seq.into();
+        let updated = tx.execute(
+            "UPDATE pool_runtime_receipts SET seq=?7,payload=?8 WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3
+             AND device_id=?4 AND lease_id=?5 AND request_id=?6 AND payload IS NULL",
+            params![origin, tenant, user, device, lease_id, request_id, seq, payload.to_string()],
+        )?;
+        if updated != 1 {
+            bail!("isolated route receipt has no open intent");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_isolated_usage(&self, scope: &Scope) -> Result<Option<(u64, Value)>> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        let row: Option<(u64, String)> = conn
+            .query_row(
+                "SELECT seq,payload FROM pool_runtime_receipts WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3
+             AND device_id=?4 AND acked=0 AND payload IS NOT NULL ORDER BY seq LIMIT 1",
+                params![origin, tenant, user, device],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(seq, payload)| Ok((seq, serde_json::from_str(&payload)?))).transpose()
+    }
+
+    pub fn ack_isolated_usage(&self, scope: &Scope, through: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        conn.execute(
+            "UPDATE pool_runtime_receipts SET acked=1 WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3
+            AND device_id=?4 AND seq<=?5",
+            params![origin, tenant, user, device, through],
+        )?;
+        Ok(())
+    }
+
+    pub fn isolated_usage_for_lease(
+        &self,
+        scope: &Scope,
+        lease_id: &str,
+    ) -> Result<Option<(Option<u64>, Option<Value>, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        let row: Option<(Option<u64>, Option<String>, bool)> = conn.query_row(
+            "SELECT seq,payload,acked FROM pool_runtime_receipts WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3 AND device_id=?4 AND lease_id=?5",
+            params![origin, tenant, user, device, lease_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        row.map(|(seq, payload, acked)| Ok((seq, payload.map(|p| serde_json::from_str(&p)).transpose()?, acked)))
+            .transpose()
+    }
+
+    pub fn begin_isolated_metered_settlement(
+        &self,
+        scope: &Scope,
+        lease: &PoolLease,
+        payload: &Value,
+        now_ms: i64,
+    ) -> Result<PoolLeaseOp> {
+        let mut op = PoolLeaseOp::zero(lease, false);
+        op.used_milli = payload["cost_milli"].as_i64().context("invalid measured cost")?;
+        let model = payload["model_id"].as_str().context("invalid measured model")?;
+        if let Some(amount) = op.model_used_milli.get_mut(model) {
+            *amount = op.used_milli;
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_op(&tx, scope, &op, now_ms)?;
+        tx.commit()?;
+        Ok(op)
+    }
 }
 
 impl PoolLeaseOp {

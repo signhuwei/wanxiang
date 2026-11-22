@@ -1,7 +1,7 @@
 //! daemon 各部分共享的运行状态。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -217,6 +217,8 @@ pub struct State {
     /// 登录代次：token 每变一次加一。投影提交、切换和回执发送前比对。
     pub auth_generation: AtomicU64,
     pub route: RwLock<RouteApply>,
+    #[doc(hidden)]
+    pub isolated_route_execution: AtomicBool,
     /// 设备 X25519 私钥，解密下发的上游密钥。每次启动新生成、只在内存，所以重启后要重新登录注册设备。
     pub device_key: DeviceKey,
     /// When set, only this registered device can acknowledge or replay this outbox.
@@ -242,6 +244,7 @@ impl Default for State {
             token: Default::default(),
             auth_generation: AtomicU64::new(0),
             route: Default::default(),
+            isolated_route_execution: Default::default(),
             device_key: DeviceKey::generate(),
             expected_device_id: Default::default(),
             conn: Default::default(),

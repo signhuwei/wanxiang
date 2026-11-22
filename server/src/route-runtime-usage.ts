@@ -17,11 +17,12 @@ export type RouteProcurementCharge = {
 export type PostRouteProcurement = (charge: RouteProcurementCharge) => Promise<void>;
 
 type Usage = ReturnType<typeof usageItems>[number] & {
-  attemptId: string; deploymentId: string; deploymentRevision: number; configRevision: number; rateId: string;
+  attemptId: string; deploymentId: string; deploymentRevision: number; configRevision: number; projectionId: string; rateId: string;
 };
 type Snapshot = { projection_id: string; platform_revision: number; payload_json: string; valid_until: string; created_at: string };
 type Rate = RoutingSalesRates & { source_rate_key: string | null; valid_from: string; valid_until: string | null };
 type Plan = { routes: Array<{ model_id: string; provider_id: string; deployment_id: string; deployment_revision: number; pool_revision: number }>;
+  rates: Array<{ model_id: string; rate_version_id: string }>;
   route_pool: { bindings: Array<{ model_id: string; aliases: string[]; deployment_ids: string[] }> } };
 
 function parseBatch(value: unknown): Usage[] {
@@ -32,7 +33,8 @@ function parseBatch(value: unknown): Usage[] {
     if (!item.lease || !item.complete || item.status !== 'ok' || raw.measurement_basis !== 'upstream_usage') invalid('measurement_basis');
     return { ...item, attemptId: routeId(raw.attempt_id, 'attempt_id'), deploymentId: routeId(raw.deployment_id, 'deployment_id'),
       deploymentRevision: int(raw.deployment_revision, 'deployment_revision', 1),
-      configRevision: int(raw.config_revision, 'config_revision', 1), rateId: routeId(raw.rate_version_id, 'rate_version_id') };
+      configRevision: int(raw.config_revision, 'config_revision', 1), projectionId: routeId(raw.projection_id, 'projection_id'),
+      rateId: routeId(raw.rate_version_id, 'rate_version_id') };
   });
 }
 
@@ -90,13 +92,16 @@ function persistReceipt(store: Store, sql: Transaction, tenant: string, device: 
     FROM routing_config_snapshots s JOIN routing_lease_projections p ON p.device_id=s.device_id AND p.config_revision=s.config_revision
       AND p.projection_id=s.projection_id WHERE p.lease_id=? AND s.device_id=? AND s.config_revision=?`,
     [row.lease, device, row.configRevision]);
-  if (!snapshot || row.at < snapshot.created_at || row.at >= snapshot.valid_until) throw refused('route_usage_projection_mismatch');
+  if (!snapshot || snapshot.projection_id !== row.projectionId || row.at < snapshot.created_at || row.at >= snapshot.valid_until) throw refused('route_usage_projection_mismatch');
   const plan = JSON.parse(snapshot.payload_json) as Plan;
   const route = plan.routes.find(r => r.model_id === row.modelId && r.provider_id === row.provider &&
     r.deployment_id === row.deploymentId && r.deployment_revision === row.deploymentRevision);
   const grants = plan.route_pool.bindings.some(b => b.model_id === row.modelId && b.deployment_ids.includes(row.deploymentId)
     && b.aliases.some(alias => alias.endsWith('*') ? row.model.startsWith(alias.slice(0, -1)) : alias === row.model));
   if (!route || !grants) throw refused('route_usage_deployment_mismatch');
+  if (!plan.rates.some(rate => rate.model_id === row.modelId && rate.rate_version_id === row.rateId)) {
+    throw refused('route_usage_rate_mismatch');
+  }
   const rate = sql.get<Rate>(`SELECT source_rate_key,valid_from,valid_until,input_milli_per_mtok,output_milli_per_mtok,
     cache_read_milli_per_mtok,cache_write_milli_per_mtok FROM sales_rate_snapshots
     WHERE rate_version_id=? AND platform_revision=? AND model_id=?`, [row.rateId, snapshot.platform_revision, row.modelId]);

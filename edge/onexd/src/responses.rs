@@ -43,6 +43,9 @@ enum Wire {
 }
 
 pub async fn responses(AxState(rt): AxState<Arc<Router>>, headers: HeaderMap, body: Bytes) -> Response {
+    if rt.isolated_pool_store.is_some() && rt.state.route_pool_engaged() {
+        return crate::pool_execution::responses(rt, headers, body).await;
+    }
     openai_request(rt, headers, body, Wire::Responses).await
 }
 
@@ -446,7 +449,7 @@ fn output_reservation(rate: &onex_core::ws::Rate, input: u64, remaining: i64) ->
 /// Responses 的 `usage` → 计费 token。`input_tokens` 本身含缓存命中，扣掉
 /// `input_tokens_details.cached_tokens` 才是计费输入；`output_tokens_details.reasoning_tokens`
 /// 只是 `output_tokens` 的子集，不单独计入 `Tokens`（`cost_milli` 没有推理 token 的单独单价）。
-fn responses_usage_to_tokens(u: &Value) -> Tokens {
+pub(crate) fn responses_usage_to_tokens(u: &Value) -> Tokens {
     let n = |p: &str| u.pointer(p).and_then(Value::as_u64).unwrap_or(0);
     let input = n("/input_tokens");
     let cached = n("/input_tokens_details/cached_tokens").min(input);
@@ -476,7 +479,7 @@ fn chat_usage_to_responses(u: &Value) -> Value {
 }
 
 /// 未发响应头时的错误：`{"error":{"type","code","message"}}`（`contracts/edge-ws.md` 多 Agent 一节）。
-fn err_before_headers(status: StatusCode, code: &str, message: &str) -> Response {
+pub(crate) fn err_before_headers(status: StatusCode, code: &str, message: &str) -> Response {
     (status, axum::Json(err_body(error_kind(code), code, message))).into_response()
 }
 
