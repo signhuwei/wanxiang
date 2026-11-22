@@ -387,6 +387,13 @@ const routingRevisionDetail = object({ ...routingRevision, identity_revision: re
   members: listItems(object({ ...routingMember, provider_id: routingId, account_id: routingId, endpoint_id: routingId, raw_model: text })),
   rollout: nullable(object({ rollout_id: routingId, status: { ...text, enum: ['pending', 'running', 'done', 'failed'] } })) });
 
+const rolloutStateNames = ['pending', 'applied', 'rejected', 'offline', 'needs_upgrade', 'superseded'];
+const rolloutState = { ...text, enum: rolloutStateNames };
+const rolloutJobStatus = { ...text, enum: ['pending', 'running', 'done', 'failed'] };
+const rolloutTarget = object({ tenant_id: text, user_id: text, device_id: text, target_config_revision: nullable(revision),
+  applied_config_revision: nullable(revision), state: rolloutState, reason: { ...nullableText, description: '稳定原因码；设备拒绝时为脱敏的 error.detail.reason。' },
+  last_seen_at: nullable(timestamp), last_receipt_at: { ...nullable(timestamp), description: '仅指本目标的最近回执。' }, actions: { ...actions, const: [] } });
+
 const routingPaths = {
   '/v1/platform/providers/{provider_id}/deployments': {
     get: routingList(providerDeployment, [namedPath('provider_id', routingId), routingSearch, ...routingPagination], { ...actions, const: [] }),
@@ -408,7 +415,18 @@ const routingPaths = {
   [routingPoolPath + '/revisions/{pool_revision}']: {
     get: policyDetail(routingRevisionDetail, [routingModelId, namedPath('pool_revision', revision)]),
   },
+  '/v1/platform/model-pool-rollouts/{rollout_id}': {
+    get: { ...policyDetail(object({ rollout_id: routingId, model_id: routingId, pool_revision: revision, job_status: rolloutJobStatus,
+      total: sequence, counts: object(Object.fromEntries(rolloutStateNames.map(state => [state, sequence]))), actions: readActions }),
+      [namedPath('rollout_id', routingId)]),
+      description: '发布任务完成不等于设备已应用。精确目标有已持久成功回执时为 applied，否则依次按 superseded、rejected、needs_upgrade、offline、pending 折叠。' },
+  },
+  '/v1/platform/model-pool-rollouts/{rollout_id}/targets': {
+    get: routingList(rolloutTarget, [namedPath('rollout_id', routingId), ...routingPagination,
+      { name: 'state', in: 'query', schema: rolloutState }], readActions),
+  },
 };
+
 
 const procurementTime = { ...timestamp, pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,3})?Z$' };
 const procurementStart = { ...procurementTime, description: '起点包含在有效区间内。新版本的起点必须晚于当前发布头。' };

@@ -12,6 +12,7 @@ const errors = {
   seat_limit: [403, '租户人数已达合约上限'],
   rate_limited: [429, '请求过快，请稍后再试'],
   internal: [500, '服务内部错误'],
+  unsupported_capability: [409, '设备连接未协商所需能力，请升级设备'],
 } as const;
 
 export class ApiError extends Error {

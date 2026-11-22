@@ -31,6 +31,7 @@ import { tenantRoutes } from './tenant-management';
 import { TOOL_ARTIFACT_DOWNLOAD_PATH, TOOL_ARTIFACT_UPLOAD_PATH, toolReleaseRoutes } from './tool-releases';
 import type { Presence } from './presence';
 import { routingProjector, type RoutingProjectionInputs } from './route-projection';
+import { rolloutRoutes } from './route-rollouts';
 import { Store } from './store';
 import { statisticsRoutes } from './statistics';
 
@@ -113,6 +114,7 @@ export async function createServer(opts: Options) {
     modelPoolRoutes(app, store, management);
     procurementRoutes(app, store, management);
     inputMultiplierRoutes(app, store, management);
+    rolloutRoutes(app, store, management, opts.presence);
     capabilityRoutes(app, store, management);
     policyRoutes(app, store, management);
     upstreamRoutes(app,store,management);
@@ -127,7 +129,7 @@ export async function createServer(opts: Options) {
     deviceRoutes(app, store, management, diag);
     desktopReleaseRoutes(app, store, management);
     closeReleases = serverReleaseRoutes(app, store, management);
-    const closeSockets = edgeGateway(app, store, opts.presence, now, opts.heartbeatMs, config, pending, observation.publish, diag);
+    const closeSockets = edgeGateway(app, store, opts.presence, now, opts.heartbeatMs, config, pending, observation.publish, diag, projection);
     let shuttingDown = false;
     const server = Bun.serve({ hostname: opts.hostname, port: opts.port,
       fetch: (request, server) => shuttingDown ? new Response(null, { status: 503 }) : pending.track(Promise.resolve(app.fetch(request, server))),
