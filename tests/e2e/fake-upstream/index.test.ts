@@ -86,13 +86,12 @@ test('delay can be set via model name or request header and applied between fram
   const json = await call('openai', false, { model: 'fake-delay-70' });
   await json.text();
   expect(performance.now() - start).toBeGreaterThanOrEqual(60);
-  const stream = await call('anthropic', true, { delay: 30 });
-  const reader = stream.body!.getReader();
-  expect((await reader.read()).done).toBe(false);
+
   start = performance.now();
-  expect((await reader.read()).done).toBe(false);
-  expect(performance.now() - start).toBeGreaterThanOrEqual(20);
-  await reader.cancel();
+  const stream = await call('anthropic', true, { delay: 30 });
+  expect(await stream.text()).toContain('event: message_stop');
+  // HTTP may buffer multiple frames in one client read. Measure the complete seven-frame stream.
+  expect(performance.now() - start).toBeGreaterThanOrEqual(180);
 });
 
 test('rejects invalid controls and malformed request bodies', async () => {
