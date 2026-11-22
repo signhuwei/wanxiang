@@ -136,9 +136,9 @@ pub(crate) async fn responses(rt: Arc<Router>, headers: HeaderMap, body: Bytes) 
         return blocked();
     }
     let request_id = crate::id::new("req");
-    if !store.reserve_route_request(&view.scope, &lease.lease_id, &request_id).unwrap_or(false) {
+    let Ok(Some(_intent)) = RouteIntent::reserve(store, &view.scope, &lease.lease_id, &request_id) else {
         return blocked();
-    }
+    };
 
     let start = Instant::now();
     let total = Duration::from_millis(plan.pool.total_timeout_ms);
@@ -179,7 +179,14 @@ pub(crate) async fn responses(rt: Arc<Router>, headers: HeaderMap, body: Bytes) 
         };
         let attempt_id = crate::id::new("att");
         if store
-            .start_route_attempt(&view.scope, &request_id, &attempt_id, &route.deployment_id, route.deployment_revision)
+            .start_route_attempt(
+                &view.scope,
+                &lease.lease_id,
+                &request_id,
+                &attempt_id,
+                &route.deployment_id,
+                route.deployment_revision,
+            )
             .is_err()
         {
             return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "无法持久化渠道尝试。");
@@ -254,6 +261,29 @@ pub(crate) async fn responses(rt: Arc<Router>, headers: HeaderMap, body: Bytes) 
     let mut response = Response::new(body);
     *response.headers_mut() = headers;
     response
+}
+
+/// On preflight exit or exhausted connection refusals, release the request slot. Once an attempt may have
+/// sent bytes, the persistent `started` record prevents cleanup, including when the client cancels early.
+struct RouteIntent<'a> {
+    store: &'a Store,
+    scope: &'a Scope,
+    lease: &'a str,
+    request: &'a str,
+}
+
+impl<'a> RouteIntent<'a> {
+    fn reserve(store: &'a Store, scope: &'a Scope, lease: &'a str, request: &'a str) -> anyhow::Result<Option<Self>> {
+        Ok(store.reserve_route_request(scope, lease, request)?.then(|| Self { store, scope, lease, request }))
+    }
+}
+
+impl Drop for RouteIntent<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.store.release_unsent_route_request(self.scope, self.lease, self.request) {
+            tracing::warn!(lease_id = self.lease, request_id = self.request, %error, "could not release unsent route request");
+        }
+    }
 }
 
 struct Receipt {
@@ -342,4 +372,62 @@ async fn write_frame(send: &mpsc::Sender<Result<Bytes, std::io::Error>>, open: &
 
 async fn send_failure(send: &mpsc::Sender<Result<Bytes, std::io::Error>>, open: &mut bool) {
     write_frame(send, open, response_failed_event("upstream_error", "上游送达或终态用量待核对。")).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::route_apply::{PoolLease, PoolLeaseState};
+
+    #[test]
+    fn route_intent_releases_only_without_possible_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("route.sqlite");
+        let store = Store::open(&path).unwrap();
+        let scope = Scope::new("wss://test.example/v1/edge/ws", "tenant", "user", "device").unwrap();
+        let lease = PoolLease {
+            lease_id: "lease".into(),
+            state: PoolLeaseState::Accepted,
+            config_revision: 1,
+            projection_id: "projection".into(),
+            signature_id: "signature".into(),
+            commerce_plan_id: None,
+            expires_at_ms: 120_000,
+            budget_milli: 100,
+            model_budgets: Default::default(),
+        };
+        store.accept_pool_lease(&scope, &lease, None, 1000).unwrap();
+        let reserve = |request| RouteIntent::reserve(&store, &scope, &lease.lease_id, request).unwrap();
+
+        drop(reserve("blocked_before_send").unwrap());
+        let all_refused = reserve("all_refused").unwrap();
+        for (attempt, deployment) in [("attempt_a", "deployment_a"), ("attempt_b", "deployment_b")] {
+            store.start_route_attempt(&scope, &lease.lease_id, "all_refused", attempt, deployment, 1).unwrap();
+            store.record_connect_refusal(&scope, attempt).unwrap();
+        }
+        drop(all_refused);
+        assert!(store.route_usage_for_lease(&scope, &lease.lease_id).unwrap().is_none());
+        let db = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let refusals: u32 = db
+            .query_row(
+                "SELECT count(*) FROM pool_runtime_attempts
+          WHERE request_id='all_refused' AND outcome='connect_refused'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refusals, 2);
+        assert!(
+            store
+                .start_route_attempt(&scope, &lease.lease_id, "all_refused", "late_attempt", "deployment_a", 1)
+                .is_err()
+        );
+
+        let uncertain = reserve("possibly_sent").unwrap();
+        store.start_route_attempt(&scope, &lease.lease_id, "possibly_sent", "attempt_c", "deployment_a", 1).unwrap();
+        assert!(reserve("possibly_sent").is_none());
+        drop(uncertain);
+        assert!(reserve("another_request").is_none());
+        assert!(store.route_usage_for_lease(&scope, &lease.lease_id).unwrap().is_some());
+    }
 }

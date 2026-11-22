@@ -202,7 +202,9 @@ impl Store {
                  request_id TEXT NOT NULL, attempt_id TEXT NOT NULL, deployment_id TEXT NOT NULL, deployment_revision INTEGER NOT NULL,
                  outcome TEXT NOT NULL CHECK(outcome IN ('started', 'connect_refused', 'completed')),
                  PRIMARY KEY(server_origin,tenant_id,user_id,device_id,attempt_id)
-             );",
+             );
+             CREATE INDEX IF NOT EXISTS pool_runtime_attempts_request
+                 ON pool_runtime_attempts(server_origin,tenant_id,user_id,device_id,request_id);",
         )?;
         let version: Option<i64> =
             conn.query_row("SELECT v FROM meta WHERE k = 'schema'", [], |r| r.get(0)).optional()?;
@@ -513,9 +515,24 @@ impl Store {
         )? == 1)
     }
 
+    /// Release a request slot only when the durable history proves that no attempt reached an upstream.
+    /// Keep the separate attempt records for review. This conditional delete is atomic with attempt writes.
+    pub(crate) fn release_unsent_route_request(&self, scope: &Scope, lease_id: &str, request_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        Ok(conn.execute(
+            "DELETE FROM pool_runtime_receipts WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3
+             AND device_id=?4 AND lease_id=?5 AND request_id=?6 AND seq IS NULL AND payload IS NULL
+             AND NOT EXISTS(SELECT 1 FROM pool_runtime_attempts WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3
+                 AND device_id=?4 AND request_id=?6 AND outcome<>'connect_refused')",
+            params![origin, tenant, user, device, lease_id, request_id],
+        )? == 1)
+    }
+
     pub fn start_route_attempt(
         &self,
         scope: &Scope,
+        lease_id: &str,
         request_id: &str,
         attempt_id: &str,
         deployment_id: &str,
@@ -523,10 +540,15 @@ impl Store {
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let [origin, tenant, user, device] = scope_params(scope);
-        conn.execute(
-            "INSERT INTO pool_runtime_attempts VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'started')",
-            params![origin, tenant, user, device, request_id, attempt_id, deployment_id, deployment_revision],
+        let inserted = conn.execute(
+            "INSERT INTO pool_runtime_attempts(server_origin,tenant_id,user_id,device_id,request_id,attempt_id,
+                 deployment_id,deployment_revision,outcome)
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,'started' WHERE EXISTS(SELECT 1 FROM pool_runtime_receipts
+                 WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3 AND device_id=?4 AND request_id=?5
+                 AND lease_id=?9 AND seq IS NULL AND payload IS NULL)",
+            params![origin, tenant, user, device, request_id, attempt_id, deployment_id, deployment_revision, lease_id],
         )?;
+        anyhow::ensure!(inserted == 1, "route attempt needs an open request");
         Ok(())
     }
 
