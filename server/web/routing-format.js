@@ -58,6 +58,8 @@ export function candidateState(row) {
   for (const key of ['reason_code', 'reason', 'ineligible_reason']) if (row?.[key]) reasons.push(reasonText(row[key]))
   if (!row?.deployment_id) reasons.push('尚未登记为部署')
   if (row?.actions?.includes('select') && !row.approved_match_id) reasons.push('缺少已确认的归纳审核')
+  // 原因只出现在 match.reason 时也要显示，不能落到“未返回原因”
+  if (!reasons.length && row?.match?.reason) reasons.push(reasonText(row.match.reason))
   const unique = [...new Set(reasons.filter(Boolean))]
   return { selectable: false, reasons: unique.length ? unique : ['服务端未返回原因'] }
 }
