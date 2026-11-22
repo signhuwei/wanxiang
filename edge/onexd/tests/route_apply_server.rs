@@ -36,8 +36,9 @@ struct Server {
 }
 
 impl Server {
-    async fn start(checkout: &Path, data_dir: &Path, port: u16) -> Self {
-        let mut child = Command::new("bun")
+    async fn start(checkout: &Path, data_dir: &Path, port: u16, lease_gate: bool) -> Self {
+        let mut command = Command::new("bun");
+        command
             .args([
                 "--no-env-file",
                 "tests/e2e/routing/projection-server.ts",
@@ -45,7 +46,11 @@ impl Server {
                 &port.to_string(),
                 "--data-dir",
             ])
-            .arg(data_dir)
+            .arg(data_dir);
+        if lease_gate {
+            command.arg("--lease-gate");
+        }
+        let mut child = command
             .current_dir(checkout)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -84,7 +89,7 @@ struct Edge {
 }
 
 impl Edge {
-    fn start(url: &str, token: &str, key_hex: &str, store_path: &Path) -> Self {
+    fn start(url: &str, token: &str, key_hex: &str, store_path: &Path, lease_gate: bool) -> Self {
         let bytes: [u8; 32] = (0..32)
             .map(|i| u8::from_str_radix(&key_hex[i * 2..i * 2 + 2], 16).unwrap())
             .collect::<Vec<_>>()
@@ -96,6 +101,9 @@ impl Edge {
         let state = Arc::new(State { device_key: DeviceKey::from_bytes(bytes), ..Default::default() });
         state.replace_token(Some(token.into()));
         let mut o = WsOptions::new(url).with_route_pool_for_isolated_test(store.clone());
+        if lease_gate {
+            o = o.with_route_pool_leases_for_isolated_test();
+        }
         o.backoff_min = Duration::from_millis(50);
         o.backoff_max = Duration::from_millis(300);
         o.connect_timeout = Duration::from_secs(3);
@@ -165,7 +173,7 @@ async fn joint_projection_receipt_ledger_and_reconnect() {
     let port = free_port();
 
     // 1. Server 首次启动，投影 rol_v7（dev_lin 91）和 rol_v6（dev_fix 92）。
-    let server = Server::start(&checkout, server_dir.path(), port).await;
+    let server = Server::start(&checkout, server_dir.path(), port, false).await;
     let info = server.info.clone();
     let ws_url = info["ws_url"].as_str().unwrap().to_owned();
     let key_hex = info["device_private_key_hex"].as_str().unwrap().to_owned();
@@ -180,7 +188,7 @@ async fn joint_projection_receipt_ledger_and_reconnect() {
     assert!(row["state"] != "applied", "{row}");
 
     // 2. 真实 onexd WS：应用 v91，发 config_applied，等 Server 的成功 ACK。
-    let edge = Edge::start(&ws_url, &lin_token, &key_hex, &store_path);
+    let edge = Edge::start(&ws_url, &lin_token, &key_hex, &store_path, false);
     wait_until("edge applies v91", || edge.ready().is_some()).await;
     let scope = Scope::new(&ws_url, &tenant, &lin_user, "dev_lin").unwrap();
     let (revision, projection) = edge.ready().unwrap();
@@ -223,7 +231,7 @@ async fn joint_projection_receipt_ledger_and_reconnect() {
     // 3. Server 重启（同数据目录、同端口）：Edge 自动重连，收到重封；已确认的回执不再发送。
     server.stop().await;
     evidence("server_stopped", json!({}));
-    let server = Server::start(&checkout, server_dir.path(), port).await;
+    let server = Server::start(&checkout, server_dir.path(), port, false).await;
     evidence("server_restarted", json!({"ws_url": server.info["ws_url"]}));
     let connects = edge.state.conn.lock().unwrap().connects;
     wait_until("edge reconnects", || edge.state.conn.lock().unwrap().connects > connects).await;
@@ -235,7 +243,7 @@ async fn joint_projection_receipt_ledger_and_reconnect() {
 
     // 4. Edge 重启（新进程状态、同应用库）：先待同步，拿到本会话重封后恢复，无新回执。
     edge.stop().await;
-    let edge = Edge::start(&ws_url, &lin_token, &key_hex, &store_path);
+    let edge = Edge::start(&ws_url, &lin_token, &key_hex, &store_path, false);
     wait_until("edge ready after its own restart", || edge.ready() == Some((91, projection.clone()))).await;
     let notices_after = edge.state.route.read().unwrap().ready().unwrap().new_notice_ids.clone();
     let pending_after = edge.store.pending_receipt(&scope, 91, &projection).unwrap().map(|p| p.id);
@@ -255,7 +263,7 @@ async fn joint_projection_receipt_ledger_and_reconnect() {
     // 6. 固定 v6 设备（dev_fix，92）：只见 A，台账 applied。
     let fix_token = server.info["devices"]["dev_fix"]["token"].as_str().unwrap().to_owned();
     let fix_store = edge_dir.path().join("route_apply_fix.sqlite");
-    let fix = Edge::start(&ws_url, &fix_token, &key_hex, &fix_store);
+    let fix = Edge::start(&ws_url, &fix_token, &key_hex, &fix_store, false);
     wait_until("dev_fix applies v92", || fix.ready().is_some()).await;
     let deployments: Vec<String> = {
         let route = fix.state.route.read().unwrap();
@@ -267,6 +275,87 @@ async fn joint_projection_receipt_ledger_and_reconnect() {
     evidence("ledger_pinned_v6", fixed.clone());
     assert_eq!(fixed["applied_config_revision"], 92);
     assert!(matches!(*fix.state.route.read().unwrap(), RouteApply::Ready(_)));
+    fix.stop().await;
+    server.stop().await;
+}
+
+/// 租约门禁（`--lease-gate`）：applied ACK 之后首领，精确绑定 91/prj_91；Edge 重启后等同投影
+/// 重封才恢复，已接受租约沿用，不再首领；固定 v6 设备的首领绑定 92/prj_92；隔离租约不进生产
+/// Ledger，真实模型入口拒绝。
+#[tokio::test]
+async fn joint_lease_gate_first_lease_and_restart() {
+    let Some(checkout) = checkout() else {
+        eprintln!("skipped: set ONEX_PROJECTION_SERVER_CHECKOUT to run the joint check");
+        return;
+    };
+    let server_dir = tempfile::tempdir().unwrap();
+    let edge_dir = tempfile::tempdir().unwrap();
+    let store_path = edge_dir.path().join("route_apply.sqlite");
+    let server = Server::start(&checkout, server_dir.path(), free_port(), true).await;
+    let info = server.info.clone();
+    evidence("lease_gate_server_started", json!({"lease_gate": info["lease_gate"], "ws_url": info["ws_url"]}));
+    assert_eq!(info["lease_gate"], true, "projection-server.ts must report lease_gate:true");
+    let ws_url = info["ws_url"].as_str().unwrap().to_owned();
+    let key_hex = info["device_private_key_hex"].as_str().unwrap().to_owned();
+    let token = info["devices"]["dev_lin"]["token"].as_str().unwrap().to_owned();
+    let scope = Scope::new(
+        &ws_url,
+        info["tenant_id"].as_str().unwrap(),
+        info["devices"]["dev_lin"]["user_id"].as_str().unwrap(),
+        "dev_lin",
+    )
+    .unwrap();
+
+    let edge = Edge::start(&ws_url, &token, &key_hex, &store_path, true);
+    wait_until("dev_lin accepts the first isolated lease", || {
+        edge.store.accepted_pool_lease(&scope).unwrap().is_some()
+    })
+    .await;
+    let held = edge.store.accepted_pool_lease(&scope).unwrap().unwrap();
+    evidence(
+        "first_lease_accepted",
+        json!({"lease_id": held.lease_id, "config_revision": held.config_revision, "projection_id": held.projection_id,
+            "signature_id": held.signature_id, "commerce_plan_id": held.commerce_plan_id,
+            "budget_milli": held.budget_milli, "model_budgets": held.model_budgets,
+            "view": edge.ready(), "production_ledger_lease": edge.state.lease.lease_id()}),
+    );
+    assert_eq!(Some((held.config_revision, held.projection_id.clone())), edge.ready());
+    assert!(edge.state.lease.lease_id().is_none(), "isolated leases never enter the production Ledger");
+    assert!(edge.state.route_pool_engaged(), "the real model entry stays closed");
+
+    // Edge 重启：同一隔离存储；等同投影重封恢复，已接受租约沿用，不再首领。
+    edge.stop().await;
+    let edge = Edge::start(&ws_url, &token, &key_hex, &store_path, true);
+    wait_until("view restored after reseal", || edge.ready().is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = edge.store.accepted_pool_lease(&scope).unwrap().unwrap();
+    evidence(
+        "restart_keeps_lease",
+        json!({"lease_id": after.lease_id, "view": edge.ready(),
+            "pending_ops": edge.store.pending_pool_ops(&scope).unwrap().len()}),
+    );
+    assert_eq!(after.lease_id, held.lease_id);
+    assert!(edge.store.pending_pool_ops(&scope).unwrap().is_empty());
+    edge.stop().await;
+
+    // 固定 v6 设备：首领绑定 92/prj_92。
+    let fix_token = info["devices"]["dev_fix"]["token"].as_str().unwrap().to_owned();
+    let fix_scope = Scope::new(
+        &ws_url,
+        info["tenant_id"].as_str().unwrap(),
+        info["devices"]["dev_fix"]["user_id"].as_str().unwrap(),
+        "dev_fix",
+    )
+    .unwrap();
+    let fix = Edge::start(&ws_url, &fix_token, &key_hex, &edge_dir.path().join("fix.sqlite"), true);
+    wait_until("dev_fix accepts its lease", || fix.store.accepted_pool_lease(&fix_scope).unwrap().is_some()).await;
+    let fixed = fix.store.accepted_pool_lease(&fix_scope).unwrap().unwrap();
+    evidence(
+        "pinned_v6_lease",
+        json!({"lease_id": fixed.lease_id, "config_revision": fixed.config_revision, "projection_id": fixed.projection_id}),
+    );
+    assert_eq!((fixed.config_revision, fixed.projection_id.as_str()), (92, "prj_92"));
+    assert_ne!(fixed.lease_id, held.lease_id);
     fix.stop().await;
     server.stop().await;
 }
