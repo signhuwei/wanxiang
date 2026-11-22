@@ -266,6 +266,44 @@ test('reconnect resends only a still-authorized target: revocation, grant change
   expect(JSON.parse(delivery('dev_lin', 91).last_failure_json!)).toMatchObject({ code: 'target_expired' });
 });
 
+test('a disconnect before the receipt resends the same identity; an expired target is withheld and an expiry rejection never moves the head', async () => {
+  const f = await wsSetup();
+  await f.service().projection!.runRollout('rol_v7');
+  await f.service().projection!.runRollout('rol_v6');
+  const targetRow = async (rollout: string, device: string) =>
+    (await f.http(`/model-pool-rollouts/${rollout}/targets`)).body.items.find((row: any) => row.device_id === device);
+  // Disconnect after the config arrived but before any receipt: offline, then the same identity on reconnect.
+  let lin = f.connect('dev_lin');
+  await lin.hello();
+  const first = await lin.nextOf('config');
+  lin.close();
+  for (let i = 0; i < 100 && (await targetRow('rol_v7', 'dev_lin')).state !== 'offline'; i++) await Bun.sleep(10);
+  expect(await targetRow('rol_v7', 'dev_lin')).toMatchObject({ state: 'offline', reason: 'device_offline', applied_config_revision: null });
+  lin = f.connect('dev_lin');
+  await lin.hello({ capabilities: ['route_pool.v1'] }, 90);
+  const again = await lin.nextOf('config');
+  expect([again.revision, again.route_pool.projection_id, routeProjectionDigest(again)]).toEqual([91, 'prj_91', routeProjectionDigest(first)]);
+  await until(() => f.db.get<{ retry_count: number }>("SELECT retry_count FROM routing_config_deliveries WHERE device_id = 'dev_lin'")!.retry_count === 1);
+  expect(await lin.request(applied('ca91'))).toEqual({ type: 'ack', re: 'ca91', ok: true });
+  lin.close();
+
+  // dev_fix never connected; once its target lapses the ledger says so, and reconnecting does not resend it.
+  f.setClock(clock + 10 * 60_000);
+  expect(await targetRow('rol_v6', 'dev_fix')).toMatchObject({ state: 'offline', reason: 'target_expired', target_config_revision: 92 });
+  const fix = f.connect('dev_fix');
+  await fix.hello();
+  expect(await fix.quiet(150)).toEqual([]);
+  expect(await targetRow('rol_v6', 'dev_fix')).toMatchObject({ state: 'pending', reason: 'target_expired' });
+  expect(f.service().store.system.get('SELECT revision FROM edge_config_counter')).toEqual({ revision: 92 });
+  // The device's own expiry rejection is kept on the target: rejected, head untouched.
+  expect(await fix.request({ type: 'config_applied', id: 'exp92', config_revision: 92, policy_revision: 1, projection_id: 'prj_92', result: 'rejected',
+    error: { code: 'invalid_config', message: '配置已过期', detail: { reason: 'config_expired' } } })).toEqual({ type: 'ack', re: 'exp92', ok: true });
+  expect(await targetRow('rol_v6', 'dev_fix')).toMatchObject({ state: 'rejected', reason: 'config_expired', applied_config_revision: null });
+  expect(f.db.get("SELECT count(*) AS n FROM policy_device_applications WHERE device_id = 'dev_fix'")).toEqual({ n: 0 });
+  // The applied follow target stays applied after expiry; it is history, not a regression.
+  expect(await targetRow('rol_v7', 'dev_lin')).toMatchObject({ state: 'applied', applied_config_revision: 91 });
+});
+
 test('connect without a persisted target sends nothing; release jobs create targets and online sessions get them at once', async () => {
   const f = await wsSetup();
   const edge = f.connect('dev_lin');
