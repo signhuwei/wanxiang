@@ -21,6 +21,8 @@ import { SERVER_ARTIFACT_UPLOAD_PATH, serverReleaseRoutes, type ReleaseRuntime }
 import { personalLoginTokenRoutes } from './personal-login-tokens';
 import { platformRoutes } from './platform-management';
 import { modelPoolRoutes } from './model-pool';
+import { providerChannelRoutes } from './provider-channels';
+import type { ProviderChannelFetch } from './channel-catalog-upstream';
 import { procurementRoutes } from './procurement';
 import { inputMultiplierRoutes } from './input-multiplier';
 import { policyDiscountRoutes, settleUnclosedDiscountMonths } from './policy-discounts';
@@ -44,6 +46,7 @@ type Options = {
   commit: string;
   codeSecret: string;
   masterKey?: Uint8Array;
+  providerChannelFetch?: ProviderChannelFetch;
   deliverCode?: (target: string, code: string) => void;
   now?: () => number;
   presence: Presence;
@@ -112,6 +115,7 @@ export async function createServer(opts: Options) {
     tenantRoutes(app, store, management);
     platformRoutes(app, store, management);
     modelPoolRoutes(app, store, management);
+    providerChannelRoutes(app, store, management);
     procurementRoutes(app, store, management);
     inputMultiplierRoutes(app, store, management);
     rolloutRoutes(app, store, management, opts.presence);

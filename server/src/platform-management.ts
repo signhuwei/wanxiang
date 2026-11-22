@@ -11,6 +11,7 @@ import { modelPoolSummary } from './model-pool';
 import { modelPricingSummary } from './input-multiplier';
 import { indexMember, type Store, type Transaction } from './store';
 import { normalizeLoginName } from './tenant-passwords';
+import { syncProviderChannel } from './provider-channels';
 
 const statuses = ['active', 'disabled'] as const;
 const protocols = ['anthropic', 'openai_chat', 'openai_responses'] as const;
@@ -83,6 +84,7 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
         const stored = secret === undefined ? row : { ...row, secret_ciphertext: encryptProviderSecret(opts.masterKey!, id, secret) };
         if (previous) change(sql, entry.table, stored, 'id = ?', [id]);
         else add(sql, entry.table, stored);
+        if (entry.table === 'providers') syncProviderChannel(sql, id, at, secret !== undefined);
         return { response: op.complete(sql, { status: previous ? 200 : 201, payload: project(row) }), changed: true };
       });
       if (result.changed) opts.onConfigChange?.();
