@@ -1,4 +1,5 @@
 // 用同一 Server 验证管理端发布和员工下载。
+import { openCodeLogin } from './login-flow.js'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { deflateSync } from 'node:zlib'
@@ -60,6 +61,7 @@ try {
   await page.goto('/')
   assert.equal(await page.evaluate(() => window.isSecureContext), false)
   assert.equal(await link('下载 OneX Desktop').getAttribute('href'), '/download')
+  await openCodeLogin(page)
   await page.getByPlaceholder('邮箱或手机号').fill(target)
   await button('发送验证码').click()
   await page.getByText('验证码已发送，请查收').waitFor()

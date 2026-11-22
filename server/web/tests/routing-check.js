@@ -1,6 +1,7 @@
 // 路由首批 WebUI 验收：真实临时 Server（隔离 SQLite、非安全上下文源），
 // 首批路由接口在 Server 落地前由共享 fixture（tests/fixtures/routing/p0-ab.json）驱动的浏览器拦截应答。
 // 用法：bun --no-env-file server/web/tests/routing-check.js [截图目录]
+import { openCodeLogin } from './login-flow.js'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -205,6 +206,7 @@ try {
   }
 
   await page.goto('/')
+  await openCodeLogin(page)
   await page.getByPlaceholder('邮箱或手机号').fill(target)
   await button('发送验证码').click()
   await page.getByText('验证码已发送，请查收').waitFor()

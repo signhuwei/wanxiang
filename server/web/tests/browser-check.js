@@ -1,4 +1,5 @@
 // 从工作区根目录运行；使用本机 Chrome，不访问外部服务。
+import { openCodeLogin } from './login-flow.js'
 import { chromium } from 'playwright'
 import assert from 'node:assert/strict'
 import { mkdir } from 'node:fs/promises'
@@ -24,8 +25,9 @@ try {
       await page.screenshot({ path: join(dir, `${width}x${height}-${label}.png`) })
     }
     await page.goto('http://127.0.0.1:8123/?mock=1')
-    await button('验证码登录').waitFor()
+    await page.getByPlaceholder('租户 ID 或简称').waitFor()
     await check('login')
+    await openCodeLogin(page)
     await page.getByPlaceholder('邮箱或手机号').fill('admin@onex.dev')
     await button('发送验证码').click()
     await page.getByText('验证码已发送', { exact: false }).waitFor()
@@ -75,6 +77,7 @@ try {
     await page.getByRole('heading', { name: 'Provider' }).waitFor()
     await account.click()
     await button('退出').click()
+    await openCodeLogin(page)
     await button('邀请码登录').click()
     await page.getByPlaceholder('邮箱或手机号').fill('demo@onex.dev')
     await page.getByPlaceholder('邀请码', { exact: true }).fill('ONEX2026')
@@ -85,7 +88,7 @@ try {
     await page.locator('output[data-field=name]').waitFor()
     assert.equal(await button('编辑').count(), 0)
     await page.reload()
-    await button('验证码登录').waitFor() // mock 重置后，过期的租户令牌应跳转登录
+    await page.getByPlaceholder('租户 ID 或简称').waitFor() // mock 重置后，过期的租户令牌应跳转登录
     assert.deepEqual(errors, [])
     console.log(`${width}×${height}: 布局、登录、权限、分页与钻取通过`)
     await page.close()

@@ -1,4 +1,5 @@
 // 真实 API 测试：临时库、本地端口、一次性开发验证码。
+import { openCodeLogin } from './login-flow.js'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -50,6 +51,7 @@ try {
     await page.getByRole('button', { name: /^联调租户(?:\s|$)/ }).click()
   }
   await page.goto(app.server.url.href)
+  await openCodeLogin(page)
   await page.getByPlaceholder('邮箱或手机号').fill(target)
   await button('发送验证码').click()
   await page.getByText('验证码已发送，请查收').waitFor()
@@ -167,6 +169,7 @@ try {
   const adminInvite = await page.getByLabel('一次性邀请码').inputValue()
   await account.click()
   await button('退出').click()
+  await openCodeLogin(page)
   await button('邀请码登录').click()
   await page.getByPlaceholder('邮箱或手机号').fill(admin)
   await page.getByPlaceholder('邀请码',{exact:true}).fill(adminInvite)

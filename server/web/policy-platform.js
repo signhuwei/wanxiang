@@ -1,7 +1,7 @@
 import { reasonLabels,targetForm } from './policy-targets.js'
 import { commerceAccountPanel } from './commerce.js'
 import { createLedger } from './ledger.js'
-import { button, detailPanel, el } from './panel.js'
+import { button, detailPanel, editForm, el } from './panel.js'
 import { formatDateTime } from './format.js'
 import { previewPublisher } from './contract-controls.js'
 import { policyVersionsPage, versionEntries } from './policy-authoring.js'
@@ -10,6 +10,31 @@ import { rechargePage } from './policy-recharge.js'
 import { planDirectory, salesRateTable } from './routing-rates.js'
 
 const contracts = platformPolicy + '/contracts'
+
+async function tenantInformation(pane, api, id, signal, onChange) {
+  const path = '/platform/tenants/' + encode(id)
+  let data = await api.get(path, { signal })
+  if (signal?.aborted) return
+  function show(mode) {
+    const fields = [
+      { key: 'id', label: '租户 ID', readonly: true },
+      { key: 'name', label: '租户名称', readonly: true },
+      { key: 'short_name', label: '租户简称' }
+    ]
+    editForm(pane, { fields, values: data, mode,
+      submit: (values, options) => api.post(path, { revision: data.revision, short_name: values.short_name?.trim() || null }, { ...options, signal }),
+      done: next => {
+        if (signal?.aborted) return
+        data = next
+        onChange()
+        show('view')
+      }
+    })
+    if (mode === 'edit') pane.foot.prepend(button('取消', () => show('view')))
+    else if (hasAction(data, 'update')) pane.foot.append(button('编辑简称', () => show('edit'), 'primary'))
+  }
+  show('view')
+}
 
 function signedForm(body, data) {
   body.replaceChildren()
@@ -216,6 +241,10 @@ export function platformPolicyContracts(host, api, signal) {
         recordLedger = ledger
         drawRecord(title, draw)
       }
+      if (Object.hasOwn(row, 'short_name')) {
+        pane.headActions.append(button('租户资料', () => openRecord('租户资料', detail =>
+          tenantInformation(detail, api, row.tenant_id, signal, pane.changed))))
+      }
       const refreshRecharge = rechargePage(recharge, {
         api, endpoint: endpoint + '/recharges', tenantName: tenant.name, balance: tenant.balance, signal, openRecord,
         getBalance: async () => {
@@ -236,6 +265,7 @@ export function platformPolicyContracts(host, api, signal) {
     title: '租户台账', signal, rowKey: 'tenant_id', searchLabel: '查询租户',
     columns: [
       { title: '租户', render: item => hasAction(item, 'read') ? el('button', 'link policy-row-link', item.name) : item.name },
+      { title: '简称', render: item => item.short_name ?? '—' },
       { title: '合约版本', render: item => item.platform_revision ? 'v' + item.platform_revision : '未签发' },
       { title: '状态', render: item => item.platform_revision ? '当前生效' : '待签发' }
     ],

@@ -1,4 +1,5 @@
 // 真机浏览器联调：临时 OneX 实例、一次性登录验证码、隔离数据库。
+import { openCodeLogin } from './login-flow.js'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -53,6 +54,7 @@ try {
   const accountMenu = page.locator('.account-menu summary')
   async function login(browserPage, email) {
     await browserPage.goto(app.server.url.href)
+    await openCodeLogin(browserPage)
     await browserPage.getByPlaceholder('邮箱或手机号').fill(email)
     await browserPage.getByRole('button', { name: '发送验证码', exact: true }).click()
     await browserPage.getByText('验证码已发送，请查收').waitFor()

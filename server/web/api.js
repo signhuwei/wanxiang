@@ -36,7 +36,7 @@ export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthoriz
         headers,
         body: rawBody !== undefined ? rawBody : (body !== undefined ? JSON.stringify(body) : undefined),
         signal,
-        ...(binary && { redirect: 'error' })
+        ...((binary || path === '/auth/password-login' || path === '/auth/token-login') && { redirect: 'error' })
       })
     } catch (e) {
       if (e && e.name === 'AbortError') throw e
@@ -49,6 +49,9 @@ export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthoriz
       }
       if (path === '/auth/token-login') {
         throw new ApiError({ status: 401, code: 'unauthenticated', message: '令牌无效、已过期或已撤销' })
+      }
+      if (path === '/auth/password-login') {
+        throw new ApiError({ status: 401, code: 'unauthenticated', message: '租户、用户名或密码有误。若多个租户使用同一简称，请改用租户 ID。' })
       }
       onUnauthorized()
       throw new ApiError({ status: 401, code: 'unauthenticated', message: '登录已过期，请重新登录' })
