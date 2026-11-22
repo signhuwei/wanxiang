@@ -7,7 +7,7 @@ import { body, clock, minutes, setup, type Json } from './routing-fixture';
 test('routing migrations keep legacy tables readable and foreign keys consistent', async () => {
   const f = await setup();
   try {
-    expect(f.store.system.get<{ user_version: number }>('PRAGMA user_version')!.user_version).toBe(21);
+    expect(f.store.system.get<{ user_version: number }>('PRAGMA user_version')!.user_version).toBe(22);
     expect(f.store.system.all('PRAGMA foreign_key_check')).toEqual([]);
     expect(f.store.system.get('PRAGMA integrity_check')).toEqual({ integrity_check: 'ok' });
     const models = await body(await f.call(f.platform, '/models'));

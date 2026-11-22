@@ -23,7 +23,7 @@ function usableAddress(address: string) {
 }
 
 /** Keep credentials off argv and pin the DNS answer for the same request which sends the header. */
-const readOverHttp: ProviderChannelFetch = async (url, headers, signal) => {
+export const readOverHttp: ProviderChannelFetch = async (url, headers, signal) => {
   const host = url.hostname.replace(/^\[|\]$/g, '');
   const family = isIP(host);
   const addresses = family ? [{ address: host, family }] : await lookup(host, { all: true });
@@ -68,7 +68,7 @@ function asLabel(value: unknown, cap: number, secret: string): string | null {
   return value;
 }
 
-async function limitedJson(response: Response) {
+export async function limitedJson(response: Response, maxBytes = maxResponseBytes) {
   if (!response.body) throw new Error('schema_mismatch');
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -78,7 +78,7 @@ async function limitedJson(response: Response) {
       const part = await reader.read();
       if (part.done) break;
       length += part.value.length;
-      if (length > maxResponseBytes) throw new Error('response_limit');
+      if (length > maxBytes) throw new Error('response_limit');
       chunks.push(part.value);
     }
   } finally { await reader.cancel().catch(() => {}); }

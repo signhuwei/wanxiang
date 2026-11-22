@@ -409,11 +409,14 @@ const channelIdentityPath = '/v1/platform/models/{model_id}/identity';
 const channelProviderId = namedPath('provider_id', routingId);
 const channelJobId = namedPath('job_id', routingId);
 const channelLedgerPath = channelProvider + '/channel-ledger';
+const channelBalancePath = channelProvider + '/accounts/{account_id}';
+const channelBalanceParams = [channelProviderId, namedPath('account_id', routingId)];
 const channelCurrency = { ...text, pattern: '^[A-Z]{3}$' };
 const channelLedgerCommon = { account_id: routingId, currency: channelCurrency,
   reference: { ...text, minLength: 1, maxLength: 128 }, note: { ...text, minLength: 1, maxLength: 512 } };
 const channelLedgerEntry = object({ ...channelLedgerCommon, id: routingId, funding_id: routingId,
-  kind: { type: 'string', enum: ['recharge', 'balance_observation', 'expense'] }, amount_micro: sequence, recorded_at: timestamp });
+  kind: { type: 'string', enum: ['recharge', 'balance_observation', 'expense'] }, amount_micro: sequence, recorded_at: timestamp,
+  source: { ...text, enum: ['manual', 'upstream', 'routing'] } });
 const channelWallet = object({ account_id: routingId, funding_id: routingId, label: text, status: text, currency: nullable(channelCurrency),
   balance_micro: { ...nullable({ type: 'integer' }), description: '最近一次余额观测，加上后续充值，减去后续费用。' },
   observed_balance_micro: nullable(sequence), observed_at: nullableTimestamp, credited_micro: sequence, spent_micro: sequence, actions });
@@ -421,6 +424,18 @@ const channelLedgerWrite = (balance: boolean) => ({
   ...write(object({ ...channelLedgerCommon, ...(balance ? { balance_micro: sequence } : { amount_micro: revision }) }), channelLedgerEntry, 'upsert'),
   parameters: [channelProviderId, ...contractIdempotency],
 });
+const balanceAdapter = { ...text, enum: ['new_api', 'sub2api'] };
+const balanceProfileFields = { adapter: balanceAdapter, expected_user_id: { ...text, pattern: '^[1-9][0-9]{0,18}$' },
+  currency: channelCurrency, quota_per_unit: nullable(revision), sync_wallet: boolean };
+const balanceProfile = object({ profile: nullable(object({ ...balanceProfileFields, profile_revision: revision,
+  credential_configured: boolean, credential_usable: boolean, source_origin: text })), adapters: listItems(balanceAdapter), actions });
+const balanceProfileWrite = object({ ...balanceProfileFields, expected_profile_revision: sequence,
+  credential: { ...text, minLength: 1, maxLength: 4096, writeOnly: true } },
+['adapter', 'expected_user_id', 'currency', 'sync_wallet', 'expected_profile_revision']);
+const balanceObservation = object({ id: routingId, status: { ...text, enum: ['ok', 'exhausted', 'unknown', 'stale'] },
+  reason_code: nullableText, scope: { ...text, enum: ['account_quota', 'account_balance'] }, amount_micro: nullable(sequence),
+  currency: channelCurrency, quota_units: nullable(sequence), observed_at: timestamp, valid_until: nullableTimestamp,
+  profile_revision: revision, wallet_synced: boolean, source: object({ adapter: balanceAdapter, origin: text }) });
 const channelJob = object({ id: routingId, kind: { enum: ['connectivity', 'discovery'] }, status: { enum: ['succeeded', 'partial', 'failed'] },
   location: text, scope: object({ provider_id: routingId, provider_revision: revision, account_id: routingId, endpoint_id: routingId, endpoint_revision: revision }),
   observed_at: timestamp, summary: object({ model_count: sequence, reason: nullableText }), actions });
@@ -440,6 +455,15 @@ const routingPaths = {
   [channelLedgerPath + '/recharges']: { post: channelLedgerWrite(false) },
   [channelLedgerPath + '/observations']: { post: channelLedgerWrite(true) },
   [channelLedgerPath + '/expenses']: { post: channelLedgerWrite(false) },
+  [channelBalancePath + '/balance-profile']: { get: policyDetail(balanceProfile, channelBalanceParams),
+    post: policyWrite(balanceProfileWrite, balanceProfile, 'update', channelBalanceParams) },
+  [channelBalancePath + '/balance-profile/clear']: { post: policyWrite(object({ expected_profile_revision: revision }),
+    balanceProfile, 'update', channelBalanceParams) },
+  [channelBalancePath + '/balance-probes']: { post: { security: bearer, parameters: [...channelBalanceParams, ...contractIdempotency],
+    requestBody: requestBody(object({ profile_revision: revision })), responses: { 202: response('上游账户余额或额度观测', balanceObservation),
+      404: error('渠道账户不存在'), ...status } } },
+  [channelBalancePath + '/balance-observations']: { get: routingList(balanceObservation, [...channelBalanceParams, ...routingPagination],
+    actions, { latest: nullable(balanceObservation), last_success: nullable(balanceObservation) }) },
   [channelProvider + '/channel']: { get: policyDetail(object({ provider_id: routingId, revision, accounts: listItems(channelAccount),
     latest_probe: nullable(channelJob), latest_discovery: nullable(channelJob), latest_catalog: nullable(channelJob),
     historical_catalog: nullable(channelJob), actions }), [channelProviderId]) },

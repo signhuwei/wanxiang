@@ -10,10 +10,11 @@ type Reader = Pick<Transaction, 'get' | 'all'>;
 type Kind = 'recharge' | 'balance_observation' | 'expense';
 type Account = { account_id: string; label: string; funding_id: string; status: string };
 type Entry = { id: string; funding_id: string; account_id: string; currency: string; kind: Kind; amount_micro: number;
-  reference: string; note: string; recorded_at: string };
+  reference: string; note: string; recorded_at: string; source: 'manual' | 'upstream' | 'routing' };
 type Draft = Pick<Entry, 'currency' | 'kind' | 'amount_micro' | 'reference' | 'note'>;
 const actions = ['read', 'recharge', 'record_balance', 'record_expense'] as const;
-const entryColumns = `l.id, l.funding_id, l.account_id, w.currency, l.kind, l.amount_micro, l.reference, l.note, l.recorded_at`;
+const entryColumns = `l.id, l.funding_id, l.account_id, w.currency, l.kind, l.amount_micro, l.reference, l.note, l.recorded_at,
+  CASE l.recorded_by WHEN 'system:balance' THEN 'upstream' WHEN 'system:routing' THEN 'routing' ELSE 'manual' END AS source`;
 const accountColumns = 'account_id, name AS label, coalesce(funding_id,account_id) AS funding_id, status';
 
 function readAccount(sql: Reader, providerId: string, accountId: string) {
@@ -55,7 +56,8 @@ export function appendChannelEntry(sql: Transaction, providerId: string, account
   if (sql.get<{ currency: string }>('SELECT currency FROM channel_wallets WHERE funding_id=?', [account.funding_id])?.currency !== currency) {
     throw conflict('channel_currency_mismatch');
   }
-  const entry = { ...draft, id: `cle_${ulid()}`, funding_id: account.funding_id, account_id: accountId, recorded_at: now };
+  const source = actor === 'system:balance' ? 'upstream' : actor === 'system:routing' ? 'routing' : 'manual';
+  const entry: Entry = { ...draft, id: `cle_${ulid()}`, funding_id: account.funding_id, account_id: accountId, recorded_at: now, source };
   sql.run(`INSERT INTO channel_ledger (id,funding_id,account_id,kind,amount_micro,reference,note,recorded_by,recorded_at)
     VALUES (?,?,?,?,?,?,?,?,?)`, [entry.id, entry.funding_id, entry.account_id, entry.kind, entry.amount_micro, entry.reference, entry.note, actor, now]);
   wallet(sql, account.funding_id);
@@ -100,6 +102,7 @@ export function channelLedgerRoutes(app: Hono, store: Store, opts: ManagementOpt
     const account = routeId(body.account_id, 'account_id');
     const draft = { kind, currency: currencyCode(body.currency, 'currency'), amount_micro: int(body[amountField], amountField, kind === 'balance_observation' ? 0 : 1),
       reference: field(body.reference, 'reference', 128), note: field(body.note, 'note', 512) };
+    if (kind === 'balance_observation' && draft.reference.startsWith('bobs_')) throw new ApiError('invalid', { fields: ['reference'] });
     const op = operation(c, opts.codeSecret, at, actor, [account, draft]);
     return store.system.write((sql) => {
       requirePlatformAdmin(sql, actor);

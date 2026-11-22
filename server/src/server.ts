@@ -22,6 +22,7 @@ import { personalLoginTokenRoutes } from './personal-login-tokens';
 import { platformRoutes } from './platform-management';
 import { modelPoolRoutes } from './model-pool';
 import { providerChannelRoutes } from './provider-channels';
+import { channelBalanceRoutes } from './channel-balance';
 import type { ProviderChannelFetch } from './channel-catalog-upstream';
 import { procurementRoutes } from './procurement';
 import { inputMultiplierRoutes } from './input-multiplier';
@@ -127,6 +128,7 @@ export async function createServer(opts: Options) {
     platformRoutes(app, store, management);
     modelPoolRoutes(app, store, management);
     providerChannelRoutes(app, store, management);
+    channelBalanceRoutes(app, store, management);
     procurementRoutes(app, store, management);
     inputMultiplierRoutes(app, store, management);
     rolloutRoutes(app, store, management, opts.presence);
