@@ -1,3 +1,6 @@
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub mod attachment_pdf;
 pub mod capture;
 pub mod chat;
 mod claude_desktop;
