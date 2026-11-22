@@ -162,9 +162,15 @@ export async function startOneChain(directory?: string, primaryOffline = false) 
     const signPreview=await api(contract+'/preview',sign);
     if(signPreview.route_pools[0]?.member_count!==2) throw new Error('Signing does not show both channels');
     const signed=await api(contract+'/signatures',sign,'sign-1');
-    await api(contract+'/recharges',{amount_milli:20_000,note:'测试租户充值'},'tenant-pay-1');
+    const tenantSigned=await api(`/policy/signatures/${signed.revision}`,undefined,undefined,owner);
+    if(tenantSigned.route_pools[0]?.member_count!==2 || tenantSigned.sales_rate_snapshots[0]?.input_multiplier_ppm!==4_000_000) {
+      throw new Error('Tenant cannot read its signed two-channel model and frozen rate');
+    }
+    const topup=await api(contract+'/recharges',{amount_milli:20_375,note:'测试租户充值'},'tenant-pay-1');
     const ownerReceipt=await api('/policy/recharges',undefined,undefined,owner);
-    if(ownerReceipt.items[0]?.amount_milli!==20_000) throw new Error('Tenant cannot read the recharge receipt');
+    if(ownerReceipt.items[0]?.amount_milli!==20_375 || ownerReceipt.items[0]?.ledger_id!==topup.ledger_id) {
+      throw new Error('Tenant cannot read the same fractional recharge receipt');
+    }
     const device=await api('/devices',{name:'one-chain-fixture',os:'darwin',arch:'arm64',public_key:x25519PublicKey(deviceKey)},undefined,owner);
     fixtureDevice=device.device_id;
     const projected=await service.projection!.project(fixtureTenant,fixtureDevice,Date.now());
