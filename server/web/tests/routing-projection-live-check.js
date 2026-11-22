@@ -18,13 +18,26 @@ const shots = argv[0]
 if (shots) await mkdir(shots, { recursive: true })
 const script = join(serverTree, 'tests/e2e/routing/projection-server.ts')
 const webRoot = join(import.meta.dir, '..')
-const dir = await mkdtemp(join(tmpdir(), 'onex-projection-live-'))
+const dirs = []
+const freshDir = async () => { const d = await mkdtemp(join(tmpdir(), 'onex-projection-live-')); dirs.push(d); return d }
+let dir = await freshDir()
 const sockets = []
 let child, browser
+// 先取一个空闲端口并在每次启动时固定，重启后页面会话和 baseURL 不变。
+const probe = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response() })
+const port = probe.port
+probe.stop(true)
 
-async function startServer() {
+async function stopServer() {
+  if (!child) return
+  child.kill('SIGTERM')
+  const code = await child.exited
+  child = null
+  return code
+}
+async function startServer(extra = []) {
   // 保存子进程句柄，只经由句柄结束，不按名称查杀。
-  child = Bun.spawn(['bun', '--no-env-file', script, '--data-dir', dir], { cwd: serverTree, stdout: 'pipe', stderr: 'inherit' })
+  child = Bun.spawn(['bun', '--no-env-file', script, '--data-dir', dir, '--port', String(port), ...extra], { cwd: serverTree, stdout: 'pipe', stderr: 'inherit' })
   const reader = child.stdout.getReader()
   let text = ''
   while (!text.includes('\n')) {
@@ -63,15 +76,17 @@ function device(info, id) {
 try {
   const info = await startServer()
   const http = info.http_url
-  const me = await (await fetch(http + '/v1/me', { headers: { Authorization: 'Bearer ' + info.platform_session } })).json()
-  assert.equal(me.is_platform_admin, true, '隔离 Server 的平台会话必须是平台管理员')
-  // 与 login.js 平台管理员分支相同的会话形状，跳过验证码投递（隔离 Server 不投递验证码）。
-  const session = { ...me, globalActions: me.actions || [], token: info.platform_session, globalToken: info.platform_session, tenantChoices: [] }
-
   browser = await chromium.launch({ channel: 'chrome', args: ['--disable-gpu', '--no-proxy-server'] })
   const context = await browser.newContext({ baseURL: http, viewport: { width: 1280, height: 720 } })
-  await context.addInitScript(value => { localStorage.setItem('onex.session', value) }, JSON.stringify(session))
   const page = await context.newPage()
+  // 与 login.js 平台管理员分支相同的会话形状，跳过验证码投递（隔离 Server 不投递验证码）。每份新播种的目录换一次。
+  async function useSession(current) {
+    const me = await (await fetch(current.http_url + '/v1/me', { headers: { Authorization: 'Bearer ' + current.platform_session } })).json()
+    assert.equal(me.is_platform_admin, true, '隔离 Server 的平台会话必须是平台管理员')
+    const session = { ...me, globalActions: me.actions || [], token: current.platform_session, globalToken: current.platform_session, tenantChoices: [] }
+    await page.goto('/download.html').catch(() => {})
+    await page.evaluate(value => localStorage.setItem('onex.session', value), JSON.stringify(session))
+  }
   page.setDefaultTimeout(8000)
   const errors = [], apiCalls = []
   page.on('pageerror', e => errors.push(e.message))
@@ -103,6 +118,7 @@ try {
   const cells = async (section, id, from, to) => section.locator('tbody tr', { hasText: id }).locator('td').evaluateAll((t, [a, b]) => t.slice(a, b).map(n => n.textContent), [from, to])
   const refresh = async section => { await section.getByRole('button', { name: '刷新', exact: true }).click() }
 
+  await useSession(info)
   // 4. 收到合法 applied 之前：平台目标可见，已应用保持原值。设备未连接 → 离线。
   let v7 = await openPool('add B')
   await v7.getByText('池 v7 · 发布任务 rol_v7 · 任务状态').waitFor()
@@ -169,12 +185,67 @@ try {
   // 筛选“已应用”时 v6 没有行，总数为过滤后总数
   await v6.getByRole('button', { name: '已应用 0', exact: true }).click()
   await v6.getByText('没有符合条件的目标设备').waitFor()
+  // superseded：脚本先跑 v7 再跑 v6，dev_lin 的跟随目标在 rol_v6 中被 v7 取代
+  await v6.getByRole('button', { name: '已被新池取代 1', exact: true }).click()
+  await v6.locator('tbody tr', { hasText: 'dev_lin' }).waitFor()
+  assert.deepEqual(await cells(v6, 'dev_lin', 5, 7), ['已被新池取代', '已被更新池取代（pool_superseded）'])
+  await capture('v6-superseded')
+
+  // 服务重启：同一 --data-dir 再启动，设备重连收到同一修订和投影的新信封，台账状态不变。
+  for (const ws of sockets.splice(0)) ws.close()
+  assert.equal(await stopServer(), 0)
+  const restarted = await startServer()
+  assert.equal(restarted.http_url, http, '重启沿用同一端口才能复用页面会话')
+  const again = device(restarted, 'dev_lin')
+  await again.opened
+  again.hello(91)
+  await again.next(f => f.type === 'welcome')
+  const resent = await again.next(f => f.type === 'config')
+  assert.deepEqual([resent.revision, resent.route_pool.projection_id], [91, 'prj_91'])
+  assert.notEqual(resent.route_pool.secrets[0].nonce, config.route_pool.secrets[0].nonce, '重封换新信封')
+  v7 = await openPool('add B')
+  await v7.getByRole('button', { name: '已应用 1', exact: true }).waitFor()
+  assert.deepEqual(await cells(v7, 'dev_lin', 3, 6), ['91', '91', '已应用'])
+
+  // 拒绝优先于需升级和过期，dev_fix 已拒绝后保持已拒绝；下面两种状态各用一份新播种的数据目录。
+  for (const ws of sockets.splice(0)) ws.close()
+  assert.equal(await stopServer(), 0)
+
+  // target_expired：新目录先正常启动一次，停掉后加 --now 越过有效期再启动。从未应用的 dev_fix 显示 target_expired。
+  dir = await freshDir()
+  await startServer()
+  assert.equal(await stopServer(), 0)
+  await useSession(await startServer(['--now', '2026-11-22T02:11:00Z']))
+  const expired = await openPool('seed v6')
+  await expired.locator('tbody tr', { hasText: 'dev_fix' }).waitFor()
+  const fixRow = await cells(expired, 'dev_fix', 3, 7)
+  assert.deepEqual([fixRow[0], fixRow[1], fixRow[3]], ['92', '未应用', '目标已过期（target_expired）'])
+  await capture('v6-expired')
+  assert.equal(await stopServer(), 0)
+
+  // needs_upgrade：新目录里 dev_lin 用 hello 不带能力连接 → ack unsupported_capability 与 cutoff contract，rol_v7 行为需升级。
+  dir = await freshDir()
+  const gatedInfo = await startServer()
+  await useSession(gatedInfo)
+  const legacy = device(gatedInfo, 'dev_lin')
+  await legacy.opened
+  legacy.send({ type: 'hello', id: 'h_legacy', edge_version: '0.1.0', os: 'darwin', arch: 'arm64', config_revision: 90, outbox_last_seq: 0, lease_id: null,
+    capability_policy_v2: true, policy_runtime_v1: true, agent_cache: true })
+  const gated = await legacy.ack('h_legacy')
+  assert.deepEqual([gated.ok, gated.error.code], [false, 'unsupported_capability'])
+  assert.equal((await legacy.next(f => f.type === 'cutoff')).reason, 'contract')
+  const gatedV7 = await openPool('add B')
+  await gatedV7.getByRole('button', { name: '需升级 Edge 1', exact: true }).click()
+  await gatedV7.locator('tbody tr', { hasText: 'dev_lin' }).waitFor()
+  assert.deepEqual(await cells(gatedV7, 'dev_lin', 3, 7), ['91', '未应用', '需升级 Edge', '设备未协商路由池能力（unsupported_capability）'])
+  await capture('v7-needs-upgrade')
 
   assert.deepEqual(errors, [])
-  console.log('routing-projection-live-check ok: real HTTP ledger via ' + script + ' — v91 offline→pending→applied, replay/receipt_changed/wrong projection keep head, v92 rejected missing_envelope, state filter')
+  console.log('routing-projection-live-check ok: real HTTP ledger via ' + script + ' — v91 offline→pending→applied, replay/receipt_changed/wrong projection keep head, '
+    + 'v92 rejected missing_envelope, state filter, superseded, restart resend keeps applied, target_expired via --now, needs_upgrade gate')
 } finally {
   for (const ws of sockets) ws.close()
   await browser?.close()
-  if (child) { child.kill('SIGTERM'); await child.exited }
-  await rm(dir, { recursive: true, force: true })
+  await stopServer()
+  for (const d of dirs) await rm(d, { recursive: true, force: true })
 }
