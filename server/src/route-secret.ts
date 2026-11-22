@@ -102,20 +102,29 @@ type RouteConfig = {
   route_pool: { projection_id: string; revocation_revision: number; secrets: RouteSecretEnvelope[] } & Record<string, unknown>;
 } & Record<string, unknown>;
 
-/**
- * Seals exactly one envelope per distinct (credential_id, credential_version) referenced by routes.
- * A missing or non-inference material rejects the whole configuration.
- */
-export function sealRoutePoolConfig<T extends RouteConfig>(config: T, target: { tenant_id: string; device_id: string; recipient_public_key: string },
-  material: (credential_id: string, credential_version: number) => RouteSecretMaterial | null): T {
+/** Distinct (credential_id, credential_version) referenced by routes, in a stable order. */
+function routeCredentialRefs(config: RouteConfig) {
   const refs = new Map<string, { credential_id: string; credential_version: number }>();
   for (const route of config.routes) {
     const ref = route.credential_ref;
     if (!ref) throw new RouteSecretError('missing_route_credential', 'route_without_credential_ref');
-    refs.set(JSON.stringify([ref.credential_id, ref.credential_version]), ref);
+    refs.set(JSON.stringify([ref.credential_id, ref.credential_version]), { credential_id: ref.credential_id, credential_version: ref.credential_version });
   }
-  const secrets = [...refs.values()].sort((a, b) => a.credential_id < b.credential_id ? -1 : a.credential_id > b.credential_id ? 1
-    : a.credential_version - b.credential_version).map((ref) => {
+  return [...refs.values()].sort((a, b) => a.credential_id < b.credential_id ? -1 : a.credential_id > b.credential_id ? 1
+    : a.credential_version - b.credential_version);
+}
+
+/**
+ * Seals exactly one envelope per distinct (credential_id, credential_version) referenced by routes.
+ * The configuration's own tenant and device must be the sealing target. A missing or non-inference
+ * material rejects the whole configuration.
+ */
+export function sealRoutePoolConfig<T extends RouteConfig>(config: T, target: { tenant_id: string; device_id: string; recipient_public_key: string },
+  material: (credential_id: string, credential_version: number) => RouteSecretMaterial | null): T {
+  if (config.policy?.tenant_id !== target.tenant_id || config.policy?.device_id !== target.device_id) {
+    throw new RouteSecretError('invalid_config', 'seal_target_mismatch', { tenant_id: target.tenant_id, device_id: target.device_id });
+  }
+  const secrets = routeCredentialRefs(config).map((ref) => {
     const found = material(ref.credential_id, ref.credential_version);
     if (!found) throw new RouteSecretError('missing_route_credential', 'missing_material', ref);
     return sealRouteSecret({ recipient_public_key: target.recipient_public_key, material: found,
@@ -124,12 +133,14 @@ export function sealRoutePoolConfig<T extends RouteConfig>(config: T, target: { 
   return { ...config, route_pool: { ...config.route_pool, secrets } };
 }
 
-/** Effective projection content: excludes the frame id and envelope key_id/nonce/ciphertext, keeps every credential id and version. */
+/**
+ * Business digest of a projection. The secrets list is rebuilt from the routes' distinct credential
+ * references, so the frame id and the actual envelopes (count, key_id, nonce, ciphertext) never affect it;
+ * whether envelopes are complete is checked separately when staging.
+ */
 export function routeProjectionDigest(config: RouteConfig) {
   const { id: _, ...rest } = config;
-  const secrets = [...config.route_pool.secrets].map(({ credential_id, credential_version }) => ({ credential_id, credential_version }))
-    .sort((a, b) => JSON.stringify([a.credential_id, a.credential_version]) < JSON.stringify([b.credential_id, b.credential_version]) ? -1 : 1);
-  return digest(canonical({ ...rest, route_pool: { ...config.route_pool, secrets } }));
+  return digest(canonical({ ...rest, route_pool: { ...config.route_pool, secrets: routeCredentialRefs(config) } }));
 }
 
 export type ProjectionIdentity = { revision: number; projection_id: string; digest: string; revocation_revision: number };
