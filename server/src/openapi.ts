@@ -233,6 +233,9 @@ const salesRateFields = {model_id:text,commerce_plan_id:text,source_rate_key:nul
   input_multiplier_basis:{const:'cny_1_per_mtok_input'},input_multiplier_ppm:sequence};
 const signedSalesRates = listItems(object({...salesRateFields,rate_version_id:text,platform_revision:revision,
   valid_from:timestamp,valid_until:nullable(timestamp)}));
+const tenantSignedSalesRates = listItems(object({rate_version_id:text,model_id:text,
+  input_multiplier_basis:salesRateFields.input_multiplier_basis,input_multiplier_ppm:sequence,
+  valid_from:timestamp,valid_until:nullable(timestamp),...priceFields}));
 const commerceFields={monthly_grant_milli:sequence,monthly_fee_fen:sequence,
   tiers:listItems(object({from_milli:sequence,ratio_ppm:sequence})),commitment:nullable(object({up_to_milli:sequence,ratio_ppm:sequence})),
   model_prices:listItems(modelPrice),model_budgets:listItems(object({model_id:text,monthly_milli:sequence})),
@@ -289,6 +292,11 @@ const policyPaths = {
       devices:object({items:listItems(impactRow),total:sequence,next_cursor:nullableText,actions})}) }),
     [contractTenantPath,...listParams,{name:'member_cursor',in:'query',schema:text,description:'受影响成员的分页游标。cursor 用于受影响设备。'}]) },
   [policyTenant + '/signatures']: { get: listOf(object(policySignature)) },
+  [policyTenant + '/signatures/{revision}']: { get: {
+    ...policyDetail(object({ revision,issued_at:timestamp,sales_rate_snapshots:tenantSignedSalesRates,actions }),
+      [namedPath('revision', revision)]),
+    summary: '户主读取本租户签发版本的销售费率',
+  } },
   [policyTenant + '/configurations/{scope}']: { get: listOf(object({
     id: text, name: text, role, group_id: nullableText, parent_id: nullableText, actions,
   }, ['id', 'name', 'actions']), [namedPath('scope', { type: 'string', enum: ['group', 'member'] })]) },

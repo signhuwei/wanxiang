@@ -7,7 +7,7 @@ import { ApiError } from '../src/api';
 import { commerceRates, commerceRoutes } from '../src/commerce';
 import { hash, randomToken } from '../src/credentials';
 import { policyRoutes } from '../src/policy-routes';
-import { seedTenant } from '../src/seed';
+import { ensureUser, seedTenant } from '../src/seed';
 import { Store, type Transaction } from '../src/store';
 import { body, clock, minutes, seedSupply } from './routing-fixture';
 
@@ -24,19 +24,25 @@ test('immutable plan prices survive repricing, signature replay, tenant narrowin
   const store = new Store(dir, 2);
   try {
     const { tenantId, userId } = await seedTenant(store, {target:'owner@signing.test', platformAdmin:true, now:clock});
-    const platform = randomToken(), tenant = randomToken();
-    await store.system.write(sql => {
+    const platform = randomToken(), tenant = randomToken(), admin = randomToken(), other = randomToken();
+    const otherTenant = await seedTenant(store,{target:'other@signing.test',now:clock});
+    const adminId=await store.system.write(sql => {
       seedSupply(sql);
       insertPublishedRate(sql, 'prate_4', 4000);
+      const otherAdmin = ensureUser(sql,{kind:'email',value:'admin@signing.test'},clock);
       sql.run(`INSERT INTO sessions (token_hash,user_id,tenant_id,kind,expires_at)
-        VALUES (?,?,NULL,'web',?),(?,?,?,'web',?)`, [hash(platform),userId,minutes(60), hash(tenant),userId,tenantId,minutes(60)]);
+        VALUES (?,?,NULL,'web',?),(?,?,?,'web',?),(?,?,?,'web',?),(?,?,?,'web',?)`,
+      [hash(platform),userId,minutes(60),hash(tenant),userId,tenantId,minutes(60),
+        hash(admin),otherAdmin.id,tenantId,minutes(60),hash(other),otherTenant.userId,otherTenant.tenantId,minutes(60)]);
       // Clauses may be customized: the adapter selects the policy meaning.
       for (const id of ['access.models', 'billing.plan']) {
         sql.run(`INSERT INTO policy_definitions SELECT ?,version,json_set(definition_json,'$.id',?)
           FROM policy_definitions WHERE id=? AND version=1`, ['custom.'+id,'custom.'+id,id]);
       }
+      return otherAdmin.id;
     });
     const db = store.tenant(tenantId), app = new Hono(), opts = {codeSecret:'test', now:()=>clock, dataDir:dir};
+    await db.write(sql=>sql.run("INSERT INTO members (user_id,role,status) VALUES (?,'admin','active')",[adminId]));
     app.onError((err,c) => err instanceof ApiError ? c.json(err.body(),err.status) : c.json({error:'write failed'},500));
     commerceRoutes(app,store,opts); policyRoutes(app,store,opts);
     const call = (path:string, payload?:unknown, key=randomToken(), token=platform, method=payload?'POST':'GET') =>
@@ -77,6 +83,18 @@ test('immutable plan prices survive repricing, signature replay, tenant narrowin
     expect(tenantAccount.plan.terms.model_prices[0]).toEqual({ model_id: 'mdl_m', ...rates });
     const platformAccount = await body(await call('/platform/commerce/tenants/' + tenantId));
     expect(platformAccount.plan.terms.model_prices[0]).toEqual({ ...modelPrice, ...rates });
+    const signatureHistory='/policy/signatures';
+    const ownerHistory=await body(await call(signatureHistory,undefined,'owner-history',tenant));
+    expect(ownerHistory.items[0].actions).toEqual(['read','read_rates']);
+    const adminHistory=await body(await call(signatureHistory,undefined,'admin-history',admin));
+    expect(adminHistory.items[0].actions).toEqual(['read']);
+    const tenantDetail=await body(await call(signatureHistory+'/1',undefined,'tenant-signature',tenant));
+    expect(tenantDetail).toEqual({ revision:1,issued_at:minutes(0),actions:['read'],sales_rate_snapshots:[{
+      rate_version_id:snapshot.rate_version_id,model_id:'mdl_m',input_multiplier_basis:'cny_1_per_mtok_input',
+      input_multiplier_ppm:4000000,valid_from:minutes(0),valid_until:null,...rates,
+    }] });
+    expect((await call(signatureHistory+'/1',undefined,'admin-signature',admin)).status).toBe(403);
+    expect((await call(signatureHistory+'/1',undefined,'foreign-signature',other)).status).toBe(404);
     await expect(db.write(sql => sql.run('UPDATE sales_rate_snapshots SET output_milli_per_mtok=1'))).rejects.toThrow('immutable');
     await expect(db.write(sql => sql.run('DELETE FROM sales_rate_snapshots'))).rejects.toThrow('immutable');
     expect(await body(await call(signatures,draft,'first'))).toEqual(issued);
@@ -122,6 +140,7 @@ test('immutable plan prices survive repricing, signature replay, tenant narrowin
     const unpriced = await call(signatures,noPlan);
     expect(unpriced.status).toBe(201);
     expect((await body(unpriced)).sales_rate_snapshots).toEqual([]);
+    expect((await body(await call(signatureHistory+'/4',undefined,'empty-price-history',tenant))).sales_rate_snapshots).toEqual([]);
     expect(count()).toBe(3);
   } finally { store.close(); rmSync(dir,{recursive:true,force:true}); }
 });

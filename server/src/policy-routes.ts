@@ -294,13 +294,14 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
     const head=readHead(db);
     return c.json({...row,...(head??noPolicy),balance:balance(db,at),actions:['read','sign',...(head?['topup']:[])]});
   });
-  function signatureList(c:Context,db:PolicyReader,id:string,canSign:boolean) {
+  function signatureList(c:Context,db:PolicyReader,id:string,canSign:boolean,canReadRates=false) {
     const p=pagination(c),head=readHead(db)??noPolicy;
     const where="WHERE instr(lower(CAST(revision AS TEXT) || ' ' || reason || ' ' || issued_by),lower(?)) > 0";
     const {n}=db.get<{n:number}>(`SELECT count(*) AS n FROM policy_signatures ${where}`,[p.query])!;
     const rows=db.all<Omit<Signature,'entries'>>(`SELECT revision,reason,issued_by,issued_at FROM policy_signatures ${where}
       ORDER BY revision DESC LIMIT ? OFFSET ?`,[p.query,p.limit,p.offset]);
-    return c.json(p.page(rows.map(row=>({...row,...head,tenant_id:id,current:row.revision===head.platform_revision,actions:['read']})),n,canSign?['sign']:[]));
+    const actions=canReadRates?['read','read_rates']:['read'];
+    return c.json(p.page(rows.map(row=>({...row,...head,tenant_id:id,current:row.revision===head.platform_revision,actions})),n,canSign?['sign']:[]));
   }
   app.get(`${contracts}/:tenant_id/signatures`,c=>{
     const {db,id}=platformTenant(c,opts.now());
@@ -309,7 +310,21 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
   app.get(`${tenant}/signatures`,c=>{
     const actor=tenantActor(store,c,opts.now());
     requireTenantRole(actor,['owner','admin']);
-    return signatureList(c,actor.db,actor.id,false);
+    return signatureList(c,actor.db,actor.id,false,actor.role==='owner');
+  });
+  app.get(`${tenant}/signatures/:revision`,c=>{
+    const actor=tenantActor(store,c,opts.now());
+    requireTenantRole(actor,['owner']);
+    const revision=pathVersion(c.req.param('revision'),'revision');
+    const signature=actor.db.get<{issued_at:string}>('SELECT issued_at FROM policy_signatures WHERE revision = ?', [revision]);
+    if (!signature) throw new ApiError('not_found');
+    const sales_rate_snapshots=readSalesRateSnapshots(actor.db,revision).map((rate)=>({
+      rate_version_id:rate.rate_version_id,model_id:rate.model_id,input_multiplier_basis:rate.input_multiplier_basis,
+      input_multiplier_ppm:rate.input_multiplier_ppm,valid_from:rate.valid_from,valid_until:rate.valid_until,
+      input_milli_per_mtok:rate.input_milli_per_mtok,output_milli_per_mtok:rate.output_milli_per_mtok,
+      cache_read_milli_per_mtok:rate.cache_read_milli_per_mtok,cache_write_milli_per_mtok:rate.cache_write_milli_per_mtok,
+    }));
+    return c.json({revision,issued_at:signature.issued_at,sales_rate_snapshots,actions:['read']});
   });
   app.get(`${contracts}/:tenant_id/signatures/:revision`,c=>{
     const {db,id}=platformTenant(c,opts.now());
