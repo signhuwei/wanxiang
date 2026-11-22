@@ -1,6 +1,7 @@
 import pkg from '../package.json';
 import { personalLoginTokenPattern } from './credentials';
 import { observedAgents } from './observe';
+import { quoteDimensions } from './procurement';
 import { commitPattern, digestPattern, MAX_RELEASE_BYTES } from './release-package';
 
 const text = { type: 'string' };
@@ -320,15 +321,16 @@ const routingPagination = listParams.slice(1);
 const routingSearch = { name: 'q', in: 'query', schema: { ...text, maxLength: 200 } };
 const readActions = { ...actions, const: ['read'] };
 
-function routingList(item: object, parameters: object[], pageActions: object, extras = {}) {
+function routingList(item: object, parameters: object[], pageActions: object, extras = {}, optionalFields = {}) {
   const list = listOf(item);
+  const fields = { items: listItems(item), total: sequence, next_cursor: nullableText, actions: pageActions, ...extras };
   return { ...list, parameters, responses: { ...list.responses, 404: error('对象不存在'),
-    200: response('分页结果', object({ items: listItems(item), total: sequence, next_cursor: nullableText, actions: pageActions, ...extras })) } };
+    200: response('分页结果', object({ ...fields, ...optionalFields }, Object.keys(fields))) } };
 }
 
 const providerDeployment = object({ id: routingId, revision, deployment_revision: revision, display_name: text, raw_model: text,
   account_id: routingId, endpoint_id: routingId, capabilities: listItems(text),
-  status: { ...text, enum: ['active', 'disabled', 'archived'] }, actions: readActions,
+  status: { ...text, enum: ['active', 'disabled', 'archived'] }, actions: { ...actions, const: ['read', 'read_quotes'] },
   archive_blockers: listItems(object({ kind: { const: 'active_pool' }, model_id: routingId, pool_revision: revision })) });
 const routingMatchStatus = { ...text, enum: ['suggested', 'needs_review', 'accepted', 'rejected'] };
 const routingCandidateFields = { candidate_id: routingId, discovery_id: nullableText, catalog_item_id: nullableText,
@@ -390,6 +392,81 @@ const routingPaths = {
   },
 };
 
+const procurementTime = { ...timestamp, pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,3})?Z$' };
+const procurementStart = { ...procurementTime, description: '起点包含在有效区间内。新版本的起点必须晚于当前发布头。' };
+const procurementEnd = { ...procurementTime, description: '终点不包含在有效区间内，且必须晚于起点。' };
+const procurementCurrency = { ...text, pattern: '^[A-Z]{3}$' };
+const procurementFxBase = { ...procurementCurrency, not: { const: 'CNY' } };
+const procurementFxTarget = { ...text, const: 'CNY' };
+const procurementPositiveDecimal = { ...text, pattern: '^[1-9][0-9]{0,37}$' };
+const procurementSourceFields = { kind: { const: 'manual' }, reference: nullable({ ...text, maxLength: 200, pattern: '\\S' }) };
+const procurementSourceInput = { ...object(procurementSourceFields, ['kind']), additionalProperties: false };
+const procurementReason = { ...text, maxLength: 500, pattern: '\\S' };
+const procurementPublication = { source: object(procurementSourceFields), reason: procurementReason,
+  published_by: text, published_at: timestamp, actions: readActions };
+const procurementLookupWindow = {
+  lookup_until: { ...nullable(procurementTime), description: '查找截止时间，取有效终点和下一版起点中较早的一项。两者都未设置时为 null。' },
+  superseded_from: { ...nullable(procurementTime), description: '下一版的起点。没有下一版时为 null。' },
+};
+const procurementAsOf = { name: 'as_of', in: 'query', schema: procurementTime,
+  description: '按此时点查询开始最晚的版本。该版本过期时，旧版本不会恢复生效。' };
+function procurementApplicable(record: object, reasonCodes: string[]) {
+  return {
+    applicable: { ...nullable(record), description: '仅传入 as_of 时返回。没有适用版本时为 null。' },
+    applicable_reason: { ...text, enum: reasonCodes, description: '仅传入 as_of 且查不到适用版本时返回。' },
+  };
+}
+
+const procurementQuoteItem = { ...object({ dimension: { ...text, enum: [...quoteDimensions] },
+  rate_micro: { ...text, pattern: '^(?:0|[1-9][0-9]{0,37})$', description: '原币百万分之一单位的整数文本。' },
+  quantity_basis: { ...revision, maximum: Number.MAX_SAFE_INTEGER }, unit: { ...text, enum: ['token', 'request'] } }),
+  additionalProperties: false, if: { properties: { dimension: { const: 'request' } } },
+  then: { properties: { unit: { const: 'request' } } }, else: { properties: { unit: { const: 'token' } } } };
+const procurementQuoteFields = { deployment_revision: revision, currency: procurementCurrency,
+  tariff_scope: { ...object({ kind: { const: 'deployment' } }), additionalProperties: false },
+  valid_from: procurementStart, valid_until: nullable(procurementEnd),
+  items: { ...listItems(procurementQuoteItem), minItems: 1, maxItems: quoteDimensions.length, description: '同一计价维度只能提交一次。' } };
+const procurementQuoteInputFields = { ...procurementQuoteFields, expected_quote_revision: sequence,
+  source: procurementSourceInput, reason: procurementReason };
+const procurementQuoteInput = { ...object(procurementQuoteInputFields,
+  Object.keys(procurementQuoteInputFields).filter(field => field !== 'valid_until')), additionalProperties: false };
+const procurementQuoteRecord = { ...procurementQuoteFields, ...procurementPublication, quote_id: routingId, quote_revision: revision,
+  deployment_id: routingId, provider_id: routingId, account_id: routingId };
+const procurementQuoteView = object({ ...procurementQuoteRecord, ...procurementLookupWindow });
+
+const procurementFxFields = { base_currency: procurementFxBase, quote_currency: procurementFxTarget,
+  rate_numerator: procurementPositiveDecimal, rate_denominator: procurementPositiveDecimal,
+  observed_at: { ...procurementTime, description: '不得晚于服务端当前时间。' }, valid_from: procurementStart, valid_until: procurementEnd };
+const procurementFxInput = { ...object({ ...procurementFxFields, expected_fx_revision: sequence,
+  source: procurementSourceInput, reason: procurementReason }), additionalProperties: false };
+const procurementFxRecord = { ...procurementFxFields, ...procurementPublication, fx_revision: revision };
+const procurementFxView = object({ ...procurementFxRecord, ...procurementLookupWindow });
+
+const procurementDeploymentId = namedPath('deployment_id', routingId);
+const procurementQuotePath = '/v1/platform/deployments/{deployment_id}/quotes';
+const procurementFxPath = '/v1/platform/procurement/fx-rates';
+const procurementPaths = {
+  [procurementQuotePath]: {
+    get: routingList(procurementQuoteView, [procurementDeploymentId, ...routingPagination, procurementAsOf],
+      { ...actions, enum: [[], ['publish_quote']] }, { deployment_revision: revision, head_revision: sequence },
+      procurementApplicable(procurementQuoteView, ['missing_quote', 'quote_expired', 'quote_deployment_revision_changed'])),
+    post: policyWrite(procurementQuoteInput, object(procurementQuoteRecord), 'create', [procurementDeploymentId]),
+  },
+  [procurementQuotePath + '/{quote_id}/revisions/{quote_revision}']: {
+    get: policyDetail(procurementQuoteView, [procurementDeploymentId, namedPath('quote_id', routingId), namedPath('quote_revision', revision)]),
+  },
+  [procurementFxPath]: {
+    get: routingList(procurementFxView, [{ name: 'base_currency', in: 'query', required: true, schema: procurementFxBase },
+      ...routingPagination, procurementAsOf], { ...actions, const: ['publish_fx_rate'] }, { head_revision: sequence },
+      procurementApplicable(procurementFxView, ['missing_fx', 'fx_expired'])),
+    post: policyWrite(procurementFxInput, object(procurementFxRecord), 'create'),
+  },
+  [procurementFxPath + '/{base_currency}/{quote_currency}/revisions/{fx_revision}']: {
+    get: policyDetail(procurementFxView, [namedPath('base_currency', procurementFxBase), namedPath('quote_currency', procurementFxTarget),
+      namedPath('fx_revision', revision)]),
+  },
+};
+
 const ledgerFields = { id: text, kind: text, amount_milli: { type: 'integer' }, user_id: nullableText, lease_id: nullableText,
   request_ref: nullableText, by: nullableText, at: text, note: nullableText, actions };
 const ledger = object({ ...ledgerFields, discount_month: text }, Object.keys(ledgerFields));
@@ -407,6 +484,7 @@ export const openapi = {
   paths: {
     ...policyPaths,
     ...routingPaths,
+    ...procurementPaths,
     '/v1/healthz': { get: { summary: '健康检查', responses: { 200: response('正常', object({ status: { const: 'ok' }, version: text, commit: text })) } } },
     '/v1/openapi.json': { get: { summary: '接口文档', responses: { 200: response('OpenAPI 文档', { type: 'object' }) } } },
     '/v1/auth/code': { post: { summary: '请求验证码', parameters: headers, requestBody: requestBody(object({ target: text })),
