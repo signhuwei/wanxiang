@@ -120,32 +120,34 @@ function recordFailure(sql: Transaction, deviceId: string, revision: number, cod
 }
 
 /**
- * Sends the device's current authorized projection, resealed with fresh envelopes for the same identity.
- * Before resealing, the original authorization, validity and revocation are re-checked by rebuilding the basis:
- * an unchanged, still valid target is resent (even if already applied); an expired or changed one records the
- * reason and a new target is generated, which takes a higher revision.
+ * Resends the device's latest persisted target, resealed with fresh envelopes for the same identity, only while it
+ * is still authorized: the basis is rebuilt to re-check the original authorization, validity and revocation.
+ * Connecting never creates a target or picks the newest pool; explicit release jobs do. An expired or changed target
+ * records the reason and is not sent; a later job generates a higher revision.
  */
 export async function sendCurrentTarget(store: Store, projector: RoutingProjector, tenantId: string, deviceId: string, at: number,
   live: () => boolean, send: (frame: Record<string, unknown>) => void) {
   const db = store.tenant(tenantId);
   const now = iso(at);
-  const latest = latestSnapshot(db, deviceId);
-  let token: string | null = null;
-  try { token = buildProjection(store, db, projector.inputs, tenantId, deviceId, at).source_token; }
-  catch (error) {
-    if (!(error instanceof ProjectionFailure)) throw error;
-    if (latest) await db.write(sql => recordFailure(sql, deviceId, latest.config_revision, error.reason, error.reason, now));
+  const snapshot = latestSnapshot(db, deviceId);
+  if (!snapshot) return null;
+  let reason: string | null = snapshot.valid_until <= now ? 'target_expired' : null;
+  if (!reason) {
+    try {
+      const built = buildProjection(store, db, projector.inputs, tenantId, deviceId, at);
+      if (built.revocation_revision !== snapshot.revocation_revision) reason = 'revocation_changed';
+      else if (built.source_token !== snapshot.source_token) reason = 'authorization_changed';
+    } catch (error) {
+      if (!(error instanceof ProjectionFailure)) throw error;
+      reason = error.reason;
+    }
+  }
+  if (reason) {
+    const code = reason;
+    await db.write(sql => recordFailure(sql, deviceId, snapshot.config_revision, code, code, now));
     return null;
   }
-  if (latest && (latest.valid_until <= now || latest.source_token !== token)) {
-    const reason = latest.valid_until <= now ? 'target_expired' : 'authorization_changed';
-    await db.write(sql => recordFailure(sql, deviceId, latest.config_revision, reason, reason, now));
-  }
-  let target;
-  try { target = await projector.project(tenantId, deviceId, at, { notify: false }); }
-  catch (error) { if (error instanceof ProjectionFailure) return null; throw error; }
   if (!live()) return null;
-  const snapshot = readSnapshot(db, deviceId, target.config_revision)!;
   const device = db.get<{ public_key: string }>(deviceQuery, [deviceId, now]);
   let frame: RoutePoolConfig;
   try {
@@ -159,7 +161,8 @@ export async function sendCurrentTarget(store: Store, projector: RoutingProjecto
     return null;
   }
   send(frame);
-  await db.write(sql => sql.run(`UPDATE routing_config_deliveries SET retry_count = retry_count + (sent_at IS NOT NULL), sent_at = coalesce(sent_at, ?)
+  await db.write(sql => sql.run(`UPDATE routing_config_deliveries SET retry_count = retry_count + (sent_at IS NOT NULL), sent_at = coalesce(sent_at, ?),
+    last_failure_json = CASE WHEN rejected_at IS NULL THEN NULL ELSE last_failure_json END
     WHERE device_id = ? AND config_revision = ?`, [now, deviceId, snapshot.config_revision]));
   return { config_revision: snapshot.config_revision, projection_id: snapshot.projection_id };
 }

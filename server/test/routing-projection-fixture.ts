@@ -83,9 +83,11 @@ export async function seedProjection(store: Store, dir: string, now: () => numbe
   let grants: RouteGrant[] = [{ ...followGrant, user_ids: [userId] },
     { ...followGrant, binding_id: 'bnd_codex_m_fixed', pool: { mode: 'pinned', pool_revision: 6 }, user_ids: [pinnedUser] }];
   let projectionSeq = 90;
+  let revocation = 0;
   let selected = (_tenant: string, _device: string) => true;
   const inputs: RoutingProjectionInputs = {
     grants: () => grants,
+    revocationRevision: () => revocation,
     credentialRef: (deployment, revision) => fixtureRefs[`${deployment}@${revision}`] ?? null,
     credentialMaterial: (id, version) => {
       const value = credentials[`${id}@${version}`];
@@ -96,5 +98,6 @@ export async function seedProjection(store: Store, dir: string, now: () => numbe
   };
   return { db, tenantId, userId, pinnedUser, platform, tokens, signature, inputs, publicKey,
     setGrants: (next: RouteGrant[]) => { grants = next; },
+    setRevocation: (next: number) => { revocation = next; },
     setSelection: (next: (tenant: string, device: string) => boolean) => { selected = next; } };
 }
