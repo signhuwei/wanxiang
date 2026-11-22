@@ -145,6 +145,28 @@ test('a preview is not publishable after a quote boundary, an FX expiry or a rev
   } finally { f.close(); }
 });
 
+test('a legacy model with an old rate but no active pool cannot form a signable version', async () => {
+  const f = await setup();
+  try {
+    await f.store.system.write((sql) => sql.run(`INSERT INTO rates (model_id, input_milli_per_mtok, output_milli_per_mtok, cache_read_milli_per_mtok,
+      cache_write_milli_per_mtok, effective_from) VALUES ('mdl_legacy', 2000, 8000, 500, 2500, ?)`, [minutes(-120)]));
+    const request = { expected_pool_revision: 0, expected_source_rate_key: null, manual_input_multiplier_ppm: 4_000_000, reason: '旧型号人工定价' };
+    const response = await f.call(f.platform, '/models/mdl_legacy/input-multiplier/preview', request);
+    expect(response.status).toBe(200);
+    const view = await body(response);
+    expect(view).toMatchObject({ pool_revision: 0, channels: [], calculation_status: 'unavailable', input_multiplier_ppm: 4_000_000,
+      output_milli_per_mtok: 8000, blocking: [{ code: 'missing_pool_revision' }], actions: ['read'] });
+    const refused = await f.call(f.platform, '/models/mdl_legacy/input-multiplier/revisions',
+      { ...request, pricing_at: view.pricing_at, preview_basis: view.preview_basis }, 'legacy-no-pool');
+    expect(refused.status).toBe(422);
+    expect((await body(refused)).error.detail).toEqual({ fields: ['body'], issues: [expect.objectContaining({ code: 'missing_pool_revision' })] });
+    expect(f.store.system.get('SELECT count(*) AS n FROM platform_rate_versions')).toEqual({ n: 0 });
+    expect(f.store.system.get('SELECT count(*) AS n FROM platform_rate_heads')).toEqual({ n: 0 });
+    const ledger = (await body(await f.call(f.platform, '/models'))).items.find((row: Json) => row.id === 'mdl_legacy');
+    expect(ledger).toMatchObject({ current_source_rate_key: null, input_multiplier_ppm: 2_000_000 });
+  } finally { f.close(); }
+});
+
 test('multiplier routes are platform-only and closed for disabled models', async () => {
   const f = await setup();
   try {

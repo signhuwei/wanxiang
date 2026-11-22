@@ -30,6 +30,7 @@ const messages: Record<string, string> = {
   missing_sales_rates: '没有可沿用的输出和缓存费率',
   reason_required: '存在缺项、偏离建议或手调为零时必须填写理由',
   multiplier_out_of_range: '报价换算后的倍率超出可表示范围',
+  missing_pool_revision: '签约型号还没有已发布的模型池，不能形成可签倍率',
 };
 const issue = (code: string) => ({ code, message: messages[code] ?? code });
 
@@ -136,6 +137,8 @@ export function evaluateMultiplier(sql: Reader, secret: string, actor: string, m
   const final = request.manual_input_multiplier_ppm ?? recommended;
   const base = salesBase(sql, modelId, source_rate_key, pricingAt);
   const blocking = [];
+  // A signable version must cite a published pool; legacy models with only an old rate have none.
+  if (pool_revision === 0) blocking.push(issue('missing_pool_revision'));
   if (recommendation.out_of_range) blocking.push(issue('multiplier_out_of_range'));
   if (final === null) blocking.push(issue('multiplier_unavailable'));
   if (!base) blocking.push(issue('missing_sales_rates'));
@@ -233,9 +236,11 @@ export function inputMultiplierRoutes(app: Hono, store: Store, opts: ManagementO
       checkExpected(sql, modelId, request);
       const now = iso(at);
       const result = evaluateMultiplier(sql, opts.codeSecret, actor, modelId, request, request.pricing_at!);
-      if (result.preview_basis !== request.preview_basis || !result.publishable) {
+      if (result.preview_basis !== request.preview_basis) {
         throw versionConflict('preview_stale', result.pool_revision, result.source_rate_key, ['preview_basis']);
       }
+      // A matching basis for a blocked draft is refused with the same issues the preview showed.
+      if (!result.publishable) throw new ApiError('invalid', { fields: ['body'], issues: result.blocking });
       // A preview priced at another instant is only valid while the same quote, FX and eligibility still apply now.
       const live = evaluateMultiplier(sql, opts.codeSecret, actor, modelId, request, now);
       if (digest(channelRefs(live.rows)) !== digest(channelRefs(result.rows)) || live.base?.source !== result.base?.source) {
