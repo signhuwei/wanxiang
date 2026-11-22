@@ -13,6 +13,7 @@ import {
 } from './routing-format.js'
 import { mountTabs } from './policy-controls.js'
 import { multiplierTab } from './routing-pricing.js'
+import { rolloutSection } from './routing-rollouts.js'
 
 const enc = encodeURIComponent
 const hasAction = (data, action) => data?.actions?.includes(action) === true
@@ -423,6 +424,7 @@ function poolPanel(host, api, model, signal, onChanged) {
         sub.body.append(ok)
       }
       renderRevision(sub.body, data)
+      rolloutSection(sub.body, api, data.rollout ?? (published?.rollout_id ? { rollout_id: published.rollout_id } : null), signal)
     })
   }
 
