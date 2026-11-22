@@ -15,7 +15,9 @@ const jobStatus = { succeeded: '成功', partial: '部分完成', failed: '失�
 const jobReasons = {
   missing_credential: '缺少查询凭据', credential_rejected: '上游拒绝认证', permission_denied: '上游限制访问',
   unsupported_capability: '此接口不提供模型目录', probe_timeout: '请求上游超时', schema_mismatch: '上游目录格式无法读取',
-  upstream_unavailable: '上游暂不可达', redirected: '上游返回重定向'
+  upstream_unavailable: '上游暂不可达', probe_unreachable: '上游暂不可达', redirect_denied: '上游返回重定向',
+  destination_denied: '目标地址无法用于查询', upstream_error: '上游返回错误', malformed_items: '部分条目格式错误',
+  pagination_incomplete: '供应方分页未完成', response_limit: '响应体超出读取限制', catalog_limit: '目录超过单次作业上限'
 }
 const success = (notice, text) => { notice.textContent = text; notice.className = 'notice' }
 const failure = (notice, text) => { notice.textContent = text; notice.className = 'notice error' }
@@ -218,6 +220,8 @@ function confirmReview(pane, api, discovered, model, identity, signal, done) {
   const facts = el('div', 'policy-facts')
   facts.append(el('p', null, '原始型号 ' + discovered.raw_model),
     el('p', null, '签约型号 ' + [identity.maker_id, identity.model_family, identity.model_variant, identity.model_snapshot].filter(Boolean).join(' / ')))
+  if (discovered.snapshot_claim) facts.append(el('p', null, '上游声明快照 ' + discovered.snapshot_claim))
+  if (discovered.variant_claim) facts.append(el('p', null, '上游声明变体 ' + discovered.variant_claim))
   pane.body.replaceChildren(notice, facts, el('p', 'muted', '核对型号身份和证据后勾选已确认的能力。归并后的候选可在签约型号中选入活动池。'),
     checks.node, inputField('归并证据与理由', reason, true))
   let busy = false, signature, key
