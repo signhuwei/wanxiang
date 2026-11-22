@@ -74,7 +74,7 @@ test('relay balances are verified against the configured account before updating
       return JSON.parse(raw) as Record<string, any>;
     }
     async function provider(name: string, base = external) {
-      const saved = await api('/providers', { name, base_url: `${base}/v1`, protocol: 'openai_chat', secret: inference }, 201);
+      const saved = await api('/providers', { name, base_url: `${base}/v1`, protocol: 'openai_chat', secret: `${inference} ` }, 201);
       const view = await api(`/providers/${saved.id}/channel`);
       return { provider: saved, base: `/providers/${saved.id}`, account: view.accounts[0].account_id as string,
         path: `/providers/${saved.id}/accounts/${view.accounts[0].account_id}` };

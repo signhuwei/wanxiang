@@ -152,8 +152,10 @@ export function channelBalanceRoutes(app: Hono, store: Store, opts: ManagementOp
       const aad = credentialScope(scope, adapter, expectedUser);
       let encrypted = current?.credential_ciphertext;
       if (credential !== undefined) {
-        const inference = decryptProviderSecret(opts.masterKey, target.provider_id, target.inference_ciphertext).toString('utf8');
-        if (inference === credential) throw conflict('separate_management_credential_required');
+        const inference = decryptProviderSecret(opts.masterKey, target.provider_id, target.inference_ciphertext);
+        try {
+          if (inference.toString('utf8').trim() === credential) throw conflict('separate_management_credential_required');
+        } finally { inference.fill(0); }
         encrypted = encryptProviderSecret(opts.masterKey, aad, credential);
       } else if (!current || !encrypted || aad !== savedScope(current)) {
         throw conflict('separate_management_credential_required');
@@ -233,7 +235,11 @@ export function channelBalanceRoutes(app: Hono, store: Store, opts: ManagementOp
       if (!opts.masterKey) reading = noBalance('missing_credential');
       else if (usable(target, profile)) {
         let token: string | null = null;
-        try { token = decryptProviderSecret(opts.masterKey, savedScope(profile), profile.credential_ciphertext).toString('utf8'); }
+        try {
+          const plaintext = decryptProviderSecret(opts.masterKey, savedScope(profile), profile.credential_ciphertext);
+          try { token = plaintext.toString('utf8'); }
+          finally { plaintext.fill(0); }
+        }
         catch { reading = noBalance('credential_unavailable'); }
         if (token) reading = await observeRelayBalance(profile, token, opts.providerChannelFetch);
       }
