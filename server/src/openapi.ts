@@ -506,7 +506,7 @@ const multiplierChannel = object({ ...multiplierChannelFields, reason_code: mult
 const multiplierPreviewChannel = { ...object({ ...multiplierChannel.properties, eligibility_codes: listItems(text) }, multiplierChannel.required),
   if: { required: ['reason_code'], properties: { reason_code: { const: 'deployment_ineligible' } } },
   then: { required: ['eligibility_codes'] } };
-const multiplierBlocking = object({ code: { ...text, enum: ['multiplier_unavailable', 'missing_sales_rates', 'reason_required', 'multiplier_out_of_range'] }, message: text });
+const multiplierBlocking = object({ code: { ...text, enum: ['missing_pool_revision', 'multiplier_unavailable', 'missing_sales_rates', 'reason_required', 'multiplier_out_of_range'] }, message: text });
 const multiplierPreview = { ...object({ model_id: routingId, expected_pool_revision: multiplierPoolRevision,
   expected_source_rate_key: nullable(routingId), pool_revision: multiplierPoolRevision, pricing_at: procurementTime,
   input_multiplier_basis: multiplierBasis, calculation_status: multiplierCalculation, channels: listItems(multiplierPreviewChannel),
