@@ -174,7 +174,8 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
           }
           if (msg.type === 'pong' || (msg.type === 'ack' && isText(msg.re) && typeof msg.ok === 'boolean')) return;
           if (msg.type === 'config_applied' && isText(msg.id)) {
-            if (['projection_id', 'result', 'error'].some((key) => Object.hasOwn(msg, key))) {
+            const frame = msg;
+            if (['projection_id', 'result', 'error'].some((key) => Object.hasOwn(frame, key))) {
               send({ type: 'ack', re: msg.id, ok: false,
                 error: { code: 'unsupported_capability', message: '设备连接未协商路由池回执' } });
               return;
