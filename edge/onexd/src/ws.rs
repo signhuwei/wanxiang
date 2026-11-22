@@ -240,6 +240,8 @@ async fn handshake(opts: &WsOptions, state: &State, outbox: &Outbox, tx: &mut Tx
             config_revision: state.config_revision(),
             lease_id: state.lease.lease_id(),
             outbox_last_seq: outbox.last_seq(),
+            // route_pool.v1 在原子应用、信封和连续回执完成前不声明（contracts/routing-p0.md）。
+            capabilities: Vec::new(),
         }),
     )
     .await?;
@@ -507,6 +509,9 @@ fn apply_config(state: &State, welcome: &Welcome, mut c: Config) -> Result<Optio
         id: id::new("msg"),
         config_revision: c.revision,
         policy_revision: applied.summary.policy_revision,
+        projection_id: None,
+        result: None,
+        error: None,
     });
     if proof.is_some() {
         state.secrets.write().unwrap().clear();
