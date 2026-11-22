@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 
 use crate::route_stage::AppliedIdentity;
 
-/// 2：加隔离租约表（`contracts/routing-lease-gate.md`）。1 的库打开时就地升级。
-const SCHEMA_VERSION: i64 = 3;
+/// Versions 2–4 add isolated leases, measured receipts, and attempt identities.
+const SCHEMA_VERSION: i64 = 4;
 
 /// 配置域：服务、租户、成员、设备。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -186,6 +186,12 @@ impl Store {
                  lease_id TEXT NOT NULL, request_id TEXT NOT NULL, seq INTEGER, payload TEXT, acked INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY(server_origin,tenant_id,user_id,device_id,lease_id),
                  UNIQUE(server_origin,tenant_id,user_id,device_id,seq)
+             );
+             CREATE TABLE IF NOT EXISTS pool_runtime_attempts (
+                 server_origin TEXT NOT NULL, tenant_id TEXT NOT NULL, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                 request_id TEXT NOT NULL, attempt_id TEXT NOT NULL, deployment_id TEXT NOT NULL, deployment_revision INTEGER NOT NULL,
+                 outcome TEXT NOT NULL CHECK(outcome IN ('started', 'connect_refused', 'completed')),
+                 PRIMARY KEY(server_origin,tenant_id,user_id,device_id,attempt_id)
              );",
         )?;
         let version: Option<i64> =
@@ -195,7 +201,7 @@ impl Store {
                 conn.execute("INSERT INTO meta (k, v) VALUES ('schema', ?1)", [SCHEMA_VERSION])?;
             }
             // Previous versions only need the additive tables defined above.
-            Some(1 | 2) => {
+            Some(1..=3) => {
                 conn.execute("UPDATE meta SET v = ?1 WHERE k = 'schema'", [SCHEMA_VERSION])?;
             }
             Some(SCHEMA_VERSION) => {}
@@ -493,6 +499,41 @@ impl Store {
         )? == 1)
     }
 
+    pub fn start_isolated_attempt(
+        &self,
+        scope: &Scope,
+        request_id: &str,
+        attempt_id: &str,
+        deployment_id: &str,
+        deployment_revision: u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let [origin, tenant, user, device] = scope_params(scope);
+        conn.execute(
+            "INSERT INTO pool_runtime_attempts VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'started')",
+            params![origin, tenant, user, device, request_id, attempt_id, deployment_id, deployment_revision],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_isolated_refusal(&self, scope: &Scope, attempt_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::complete_attempt(&conn, scope, attempt_id, "connect_refused")
+    }
+
+    fn complete_attempt(conn: &Connection, scope: &Scope, attempt_id: &str, outcome: &str) -> Result<()> {
+        let [origin, tenant, user, device] = scope_params(scope);
+        let updated = conn.execute(
+            "UPDATE pool_runtime_attempts SET outcome=?6 WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3
+             AND device_id=?4 AND attempt_id=?5 AND outcome='started'",
+            params![origin, tenant, user, device, attempt_id, outcome],
+        )?;
+        if updated != 1 {
+            bail!("isolated route attempt has no pending start");
+        }
+        Ok(())
+    }
+
     /// Write the metered response and its replay sequence atomically before returning it to the local client.
     pub fn complete_isolated_request(
         &self,
@@ -509,6 +550,8 @@ impl Store {
             params![origin, tenant, user, device], |r| r.get(0),
         )?;
         payload["seq"] = seq.into();
+        let attempt = payload["attempt_id"].as_str().context("missing isolated attempt identity")?;
+        Self::complete_attempt(&tx, scope, attempt, "completed")?;
         let updated = tx.execute(
             "UPDATE pool_runtime_receipts SET seq=?7,payload=?8 WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3
              AND device_id=?4 AND lease_id=?5 AND request_id=?6 AND payload IS NULL",

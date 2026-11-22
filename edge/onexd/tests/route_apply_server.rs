@@ -54,9 +54,12 @@ impl Server {
         Self::spawn(checkout, command).await
     }
 
-    async fn start_one_chain(checkout: &Path, data_dir: &Path) -> Self {
+    async fn start_one_chain(checkout: &Path, data_dir: &Path, primary_offline: bool) -> Self {
         let mut command = Command::new("bun");
         command.args(["--no-env-file", "tests/e2e/routing/one-chain-server.ts", "--data-dir"]).arg(data_dir);
+        if primary_offline {
+            command.arg("--primary-offline");
+        }
         Self::spawn(checkout, command).await
     }
 
@@ -403,12 +406,21 @@ async fn joint_lease_gate_first_lease_and_restart() {
 /// 本地原生 Responses 请求用上游终态用量结算，并核对供应商与租户两边台账。
 #[tokio::test]
 async fn signed_pool_native_responses_settles_both_ledgers() {
+    run_signed_pool_responses(false).await;
+}
+
+#[tokio::test]
+async fn signed_pool_falls_back_only_after_primary_refuses_connection() {
+    run_signed_pool_responses(true).await;
+}
+
+async fn run_signed_pool_responses(primary_offline: bool) {
     let Some(checkout) = std::env::var_os("ONEX_ONE_CHAIN_SERVER_CHECKOUT").map(PathBuf::from) else {
         eprintln!("skipped: set ONEX_ONE_CHAIN_SERVER_CHECKOUT to run the signed pool chain");
         return;
     };
     let server_dir = tempfile::tempdir().unwrap();
-    let server = Server::start_one_chain(&checkout, server_dir.path()).await;
+    let server = Server::start_one_chain(&checkout, server_dir.path(), primary_offline).await;
     let info = &server.info;
     let value = |field: &str| info[field].as_str().unwrap();
     let scope = Scope::new(value("ws_url"), value("tenant_id"), value("user_id"), value("device_id")).unwrap();
@@ -459,6 +471,8 @@ async fn signed_pool_native_responses_settles_both_ledgers() {
     let status = answer.status();
     let answer: Value = answer.json().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::OK, "native response: {answer}");
+    let selected_vendor = if primary_offline { "vendor-b" } else { "vendor-a" };
+    assert!(answer["model"].as_str().unwrap().starts_with(selected_vendor));
     assert_eq!(answer["usage"]["input_tokens"], 10_000);
     assert_eq!(answer["usage"]["output_tokens"], 2_000);
 
@@ -475,20 +489,32 @@ async fn signed_pool_native_responses_settles_both_ledgers() {
     assert_eq!(receipt["projection_id"], lease.projection_id);
     assert_eq!(receipt["measurement_basis"], "upstream_usage");
     assert_eq!(receipt["cost_milli"], 64);
+    let primary = value("primary_deployment_id");
+    let backup = value("backup_deployment_id");
+    let selected = if primary_offline { backup } else { primary };
+    assert_eq!(receipt["deployment_id"], selected);
+    let outcomes = if primary_offline {
+        vec![(primary, "connect_refused"), (backup, "completed")]
+    } else {
+        vec![(primary, "completed")]
+    };
+    let attempts = receipt["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), outcomes.len());
+    assert_eq!(attempts.last().unwrap()["attempt_id"], receipt["attempt_id"]);
 
     let db = rusqlite::Connection::open_with_flags(
         server_dir.path().join(format!("tenant-{}.sqlite", value("tenant_id"))),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();
-    let charges: i64 = db
+    let (charge_count, charges): (i64, i64) = db
         .query_row(
-            "SELECT sum(amount_milli) FROM ledger WHERE kind='settle' AND lease_id=?1",
+            "SELECT count(*),sum(amount_milli) FROM ledger WHERE kind='settle' AND lease_id=?1",
             [&lease.lease_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(charges, 64);
+    assert_eq!((charge_count, charges), (1, 64));
     let expected_fields = [
         receipt["request_id"].as_str().unwrap(),
         receipt["attempt_id"].as_str().unwrap(),
@@ -500,23 +526,52 @@ async fn signed_pool_native_responses_settles_both_ledgers() {
         "SELECT count(*),coalesce(sum(u.cost_milli),0) FROM route_runtime_usage r JOIN usage u USING(device_id,seq)
           WHERE r.request_id=?1 AND r.attempt_id=?2 AND r.projection_id=?3 AND r.deployment_id=?4 AND r.rate_version_id=?5
             AND r.procurement_state='posted' AND u.settlement_status='reconciled'
+            AND json_extract(r.procurement_json,'$.amount_cny_micro')='50000'
             AND u.input_tokens=10000 AND u.output_tokens=2000",
         expected_fields, |row| Ok((row.get(0)?,row.get(1)?)),
     ).unwrap();
     assert_eq!(runtime_rows, (1, 64));
-    let wallet: Value = http
-        .get(format!("{}/v1{}", value("http_url"), value("origin_channel")))
-        .bearer_auth(value("platform_session"))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
+    let mut statement = db
+        .prepare(
+            "SELECT attempt_id,deployment_id,outcome FROM route_runtime_attempts
+      WHERE device_id=?1 AND seq=?2 ORDER BY ordinal",
+        )
         .unwrap();
-    assert_eq!(wallet["accounts"][0]["spent_micro"], 50_000);
-    assert_eq!(wallet["accounts"][0]["balance_micro"], 3_200_000);
+    let stored = statement
+        .query_map((&scope.device_id, seq.unwrap()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(stored.len(), outcomes.len());
+    for ((record, (deployment, outcome)), wire) in stored.iter().zip(outcomes).zip(attempts) {
+        assert_eq!(record.0, wire["attempt_id"]);
+        assert_eq!((record.1.as_str(), record.2.as_str()), (deployment, outcome));
+    }
+
+    let supplier_debit = if primary_offline { 6_667 } else { 50_000 };
+    let selected_wallet_balance = 3_250_000 - supplier_debit;
+    for (field, chosen, currency) in
+        [("origin_channel", !primary_offline, "CNY"), ("backup_channel", primary_offline, "USD")]
+    {
+        let wallet: Value = http
+            .get(format!("{}/v1{}", value("http_url"), value(field)))
+            .bearer_auth(value("platform_session"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let expenses = wallet["items"].as_array().unwrap().iter().filter(|item| item["kind"] == "expense").count();
+        assert_eq!(expenses, usize::from(chosen));
+        assert_eq!(wallet["accounts"][0]["currency"], currency);
+        assert_eq!(wallet["accounts"][0]["spent_micro"], if chosen { supplier_debit } else { 0 });
+        assert_eq!(wallet["accounts"][0]["balance_micro"], if chosen { selected_wallet_balance } else { 3_250_000 });
+    }
     evidence(
         "native_responses_channel_and_tenant_charged",
         json!({
@@ -525,7 +580,9 @@ async fn signed_pool_native_responses_settles_both_ledgers() {
             "provider_id": receipt["provider_id"], "deployment_id": receipt["deployment_id"],
             "deployment_revision": receipt["deployment_revision"], "signed_pool": info["signed_pool"],
             "input_tokens": 10_000, "output_tokens": 2_000, "tenant_debit_milli": charges,
-            "supplier_debit_micro": 50_000, "supplier_balance_micro": 3_200_000,
+            "primary_offline": primary_offline, "attempts": attempts,
+            "supplier_debit_micro": supplier_debit, "supplier_amount_cny_micro": 50_000,
+            "supplier_balance_micro": selected_wallet_balance,
         }),
     );
     http_task.abort();

@@ -1,10 +1,12 @@
 //! Loopback-only native Responses proof for the isolated signed route flow.
 //! Successful non-streaming calls persist measured usage before replying. A call with an unknown outcome
 //! keeps its local lease intent open rather than settling it at zero or trying another supplier.
+use std::error::Error as _;
+use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, StatusCode};
@@ -29,6 +31,20 @@ pub(crate) fn loopback(raw: &str, scheme: &str) -> bool {
             .host_str()
             .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
             .is_some_and(|ip| ip.is_loopback())
+}
+
+fn refused_before_send(error: &reqwest::Error) -> bool {
+    if !error.is_connect() || error.is_timeout() {
+        return false;
+    }
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return io.kind() == ErrorKind::ConnectionRefused;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 fn blocked() -> Response {
@@ -98,40 +114,83 @@ pub(crate) async fn responses(rt: Arc<Router>, headers: HeaderMap, body: Bytes) 
     let Ok(plan) = route_select::select(&view.config, &request, &context) else {
         return error(StatusCode::FORBIDDEN, "model_not_allowed", "当前签约模型无可执行渠道。");
     };
-    let Some(route) = plan.candidates.first() else { return blocked() };
     let budget =
         lease.budget_milli.min(*lease.model_budgets.get(&plan.binding.model_id).unwrap_or(&lease.budget_milli));
     let reservation =
         cost_milli(&plan.rate.base, &Tokens { input: estimated_input, output: max_output, ..Tokens::default() });
-    if reservation > budget || route.base.protocol != "openai_responses" || !loopback(&route.base.base_url, "http") {
+    if reservation > budget {
         return blocked();
     }
-    let Some(key) = view.key(&route.credential_ref).map(|value| Zeroizing::new(value.to_owned())) else {
-        return blocked();
-    };
-    let request_id = crate::id::new("req");
-    let attempt_id = crate::id::new("att");
-    if !store.reserve_isolated_request(&view.scope, &lease.lease_id, &request_id).unwrap_or(false)
-        || !rt.state.isolated_route_execution.load(Ordering::Acquire)
-        || rt.state.generation() != generation
-    {
-        return blocked();
-    }
-
-    let base = route.base.base_url.trim_end_matches('/');
-    let url = format!("{}/v1/responses", base.strip_suffix("/v1").unwrap_or(base));
-    req["model"] = route.base.upstream_model.as_deref().unwrap_or(&route.base.model).into();
-    req["store"] = false.into();
-    let deadline = Duration::from_millis(plan.pool.attempt_timeout_ms.min(plan.pool.total_timeout_ms));
-    let Ok(client) =
-        reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(deadline).build()
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
     else {
         return error(StatusCode::BAD_GATEWAY, "upstream_error", "无法创建隔离上游客户端。");
     };
-    let start_at = format_ms(now);
-    let Ok(upstream) = client.post(url).bearer_auth(key.as_str()).json(&req).send().await else {
-        return error(StatusCode::BAD_GATEWAY, "upstream_error", "上游送达情况待核对。");
+    let request_id = crate::id::new("req");
+    if !store.reserve_isolated_request(&view.scope, &lease.lease_id, &request_id).unwrap_or(false) {
+        return blocked();
+    }
+
+    let start = Instant::now();
+    let total = Duration::from_millis(plan.pool.total_timeout_ms);
+    let attempt_limit = Duration::from_millis(plan.pool.attempt_timeout_ms);
+    let mut attempts = Vec::new();
+    let mut result = None;
+    for route in plan.candidates.iter().take(plan.pool.max_attempts as usize) {
+        if !rt.state.isolated_route_execution.load(Ordering::Acquire)
+            || rt.state.generation() != generation
+            || !rt.state.route.read().unwrap().ready().is_some_and(|current| Arc::ptr_eq(current, &view))
+            || view.clock.now_ms() >= lease.expires_at_ms
+            || route.base.protocol != "openai_responses"
+            || !loopback(&route.base.base_url, "http")
+        {
+            return blocked();
+        }
+        let Some(remaining) = total.checked_sub(start.elapsed()).filter(|value| !value.is_zero()) else { break };
+        let Some(key) = view.key(&route.credential_ref).map(|value| Zeroizing::new(value.to_owned())) else {
+            return blocked();
+        };
+        let attempt_id = crate::id::new("att");
+        if store
+            .start_isolated_attempt(
+                &view.scope,
+                &request_id,
+                &attempt_id,
+                &route.deployment_id,
+                route.deployment_revision,
+            )
+            .is_err()
+        {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "无法持久化渠道尝试。");
+        }
+        let base = route.base.base_url.trim_end_matches('/');
+        let url = format!("{}/v1/responses", base.strip_suffix("/v1").unwrap_or(base));
+        req["model"] = route.base.upstream_model.as_deref().unwrap_or(&route.base.model).into();
+        req["store"] = false.into();
+        let response =
+            client.post(url).bearer_auth(key.as_str()).json(&req).timeout(attempt_limit.min(remaining)).send().await;
+        let outcome = match &response {
+            Ok(_) => "completed",
+            Err(cause) if refused_before_send(cause) => "connect_refused",
+            Err(_) => return error(StatusCode::BAD_GATEWAY, "upstream_error", "上游送达情况待核对。"),
+        };
+        attempts.push(json!({"attempt_id": attempt_id, "deployment_id": route.deployment_id,
+            "deployment_revision": route.deployment_revision, "outcome": outcome}));
+        if let Ok(response) = response {
+            result = Some((route, attempt_id, response));
+            break;
+        }
+        if store.record_isolated_refusal(&view.scope, &attempt_id).is_err() {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "无法持久化连接拒绝。");
+        }
+    }
+    let Some((route, attempt_id, upstream)) = result else {
+        return error(StatusCode::BAD_GATEWAY, "upstream_error", "已签约渠道的连接均不可用。");
     };
+    let start_at = format_ms(now);
     if !upstream.status().is_success() {
         return error(StatusCode::BAD_GATEWAY, "upstream_error", "上游未返回已确认用量。");
     }
@@ -160,7 +219,7 @@ pub(crate) async fn responses(rt: Arc<Router>, headers: HeaderMap, body: Bytes) 
         "provider_id": route.base.provider_id,"model": model,"model_id": plan.binding.model_id,
         "deployment_id": route.deployment_id,"deployment_revision": route.deployment_revision,"attempt_id": attempt_id,
         "rate_version_id": plan.rate.rate_version_id,"config_revision": view.identity.revision,
-        "projection_id": view.identity.projection_id,"input_tokens": counts.input,
+        "projection_id": view.identity.projection_id,"attempts": attempts,"input_tokens": counts.input,
         "output_tokens": counts.output,"cache_read_tokens": counts.cache_read,"cache_write_tokens": counts.cache_write,
         "cost_milli": cost,"at": start_at,"status":"ok","complete":true,"measurement_basis":"upstream_usage" });
     if store.complete_isolated_request(&view.scope, &lease.lease_id, &request_id, receipt).is_err() {
