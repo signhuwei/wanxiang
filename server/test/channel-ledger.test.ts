@@ -32,5 +32,5 @@ test('shared channel funding records recharge, observed balance and cost exactly
     expect(first.total).toBe(3);
     expect((await fixture.call(fixture.platform, ledgerB + '?cursor=' + first.next_cursor)).status).toBe(422);
     await expect(fixture.store.system.write(sql => sql.run('DELETE FROM channel_ledger'))).rejects.toThrow('immutable');
-  } finally { fixture.close(); }
+  } finally { await fixture.close(); }
 });

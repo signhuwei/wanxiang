@@ -48,6 +48,17 @@ test('migrations persist version, WAL mode and independent tenant databases', as
   }
 });
 
+test('closing a store finalizes queries beyond the statement cache', () => {
+  const db = store();
+  try {
+    for (let n = 0; n < 24; n++) {
+      expect(db.system.get(`SELECT ${n} AS n`)).toEqual({ n });
+    }
+  } finally {
+    db.close();
+  }
+});
+
 test('existing contract rows migrate intact without becoming signed entitlements', () => {
   const path = mkdtempSync(join(tmpdir(), 'onex-contract-migration-'));
   roots.push(path);

@@ -1260,6 +1260,7 @@ test('an offline lease is settled on return and late usage reconciles without a 
   expect(await (await f.request('/balance', undefined, scoped)).json()).toMatchObject({ month_used_milli: 3 });
 });
 
+// The snapshot and each statistics query start a separate DuckDB worker.
 test('statistics exports scoped daily aggregates without conversation bodies', async () => {
   const f = await fixture(15_000, Date.parse('2027-01-31T16:30:00.000Z'));
   const owner = await f.select(await f.login());
@@ -1306,7 +1307,7 @@ test('statistics exports scoped daily aggregates without conversation bodies', a
   expect(parquet.subarray(0, 4).toString()).toBe('PAR1');
   expect(parquet.toString().includes('private message')).toBe(false);
   expect(f.store.tenant(f.tenantId).get("SELECT actor FROM audit WHERE action = 'observe.statistics.export'")).toEqual({ actor: employeeAuth.user.id });
-});
+}, 15_000);
 
 test('complete desktop installers can be staged and verified without enabling an unqualified runtime', async () => {
   const f = await fixture();

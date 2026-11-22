@@ -1,6 +1,7 @@
-import { Database, type SQLQueryBindings } from 'bun:sqlite';
+import { Database, type SQLQueryBindings, type Statement } from 'bun:sqlite';
 import { mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { sqliteTransaction } from './sqlite-transaction';
 
 type Params = SQLQueryBindings[];
 type Reader = {
@@ -9,10 +10,12 @@ type Reader = {
 };
 export type Transaction = Reader & { run(sql: string, params?: Params): { changes: number } };
 type Job = { execute: (sql: Transaction) => unknown; resolve: (value: unknown) => void; reject: (error: unknown) => void };
+const statementCacheSize = 20;
 
 export class QueuedDatabase implements Reader {
   private readonly db: Database;
   private readonly tx: Transaction;
+  private readonly statements = new Map<string, Statement<unknown, Params>>();
   private jobs: Job[] = [];
   private timer?: ReturnType<typeof setTimeout>;
   private readonly drained = new Set<() => void>();
@@ -20,9 +23,9 @@ export class QueuedDatabase implements Reader {
   constructor(file: string, kind: 'system' | 'tenant', private readonly idle: () => void = () => {}) {
     this.db = new Database(file, { create: true, strict: true });
     this.tx = {
-      get: (sql, params = []) => this.db.query(sql).get(...params) as never,
-      all: (sql, params = []) => this.db.query(sql).all(...params) as never,
-      run: (sql, params = []) => this.db.query(sql).run(...params),
+      get: (sql, params = []) => this.withStatement(sql, (statement) => statement.get(...params)) as never,
+      all: (sql, params = []) => this.withStatement(sql, (statement) => statement.all(...params)) as never,
+      run: (sql, params = []) => this.withStatement(sql, (statement) => statement.run(...params)),
     };
     try {
       this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
@@ -35,16 +38,29 @@ export class QueuedDatabase implements Reader {
         const next = Number(name.split('_')[0]);
         if (next <= version) continue;
         if (next !== version + 1) throw new Error(`Missing migration ${version + 1}`);
-        this.db.transaction(() => {
+        sqliteTransaction(this.db, () => {
           this.db.exec(readFileSync(join(dir, name), 'utf8'));
           this.db.exec(`PRAGMA user_version = ${next}`);
-        }).immediate();
+        });
         version = next;
       }
     } catch (error) {
-      this.db.close();
+      this.close();
       throw error;
     }
+  }
+
+  private withStatement<T>(sql: string, execute: (statement: Statement<unknown, Params>) => T): T {
+    const cached = this.statements.get(sql);
+    if (cached) return execute(cached);
+    // Bun 1.3.5 leaves queries beyond its cache limit to garbage collection.
+    if (this.statements.size >= statementCacheSize) {
+      using statement = this.db.prepare<unknown, Params>(sql);
+      return execute(statement);
+    }
+    const statement = this.db.prepare<unknown, Params>(sql);
+    this.statements.set(sql, statement);
+    return execute(statement);
   }
 
   get<T>(sql: string, params?: Params) { return this.tx.get<T>(sql, params); }
@@ -68,11 +84,10 @@ export class QueuedDatabase implements Reader {
     this.timer = undefined;
     const batch = this.jobs.splice(0);
     try {
-      const runJob = this.db.transaction((job: Job) => job.execute(this.tx));
-      const results = this.db.transaction(() => batch.map((job) => {
-        try { return { ok: true as const, value: runJob(job) }; }
+      const results = sqliteTransaction(this.db, () => batch.map((job) => {
+        try { return { ok: true as const, value: sqliteTransaction(this.db, () => job.execute(this.tx)) }; }
         catch (error) { return { ok: false as const, error }; }
-      })).immediate();
+      }));
       results.forEach((result, i) => result.ok ? batch[i].resolve(result.value) : batch[i].reject(result.error));
     } catch (error) {
       for (const job of batch) job.reject(error);
@@ -85,7 +100,9 @@ export class QueuedDatabase implements Reader {
 
   close() {
     if (this.busy) throw new Error('Cannot close a SQLite queue with outstanding writes');
-    this.db.close();
+    for (const statement of this.statements.values()) statement.finalize();
+    this.statements.clear();
+    this.db.close(true);
   }
 }
 
@@ -119,8 +136,8 @@ export class Store {
     for (const [id, db] of this.tenants) {
       if (this.tenants.size <= this.capacity) break;
       if (id === keep || db.busy) continue;
-      this.tenants.delete(id);
       db.close();
+      this.tenants.delete(id);
     }
   }
 

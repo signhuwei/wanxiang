@@ -18,7 +18,7 @@ test('routing migrations keep legacy tables readable and foreign keys consistent
     expect(byId.mdl_legacy).toMatchObject({ current_pool_revision: 0, channel_count: 0 });
     expect(models.actions).toEqual(['create_model']);
     expect((await f.call(f.platform, '/models?provider_id=prv_b')).status).toBe(200);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('platform routing reads and writes reject tenant and non-platform sessions', async () => {
@@ -37,7 +37,7 @@ test('platform routing reads and writes reject tenant and non-platform sessions'
     expect((await f.call(f.platform, '/deployments?target_model_id=mdl_none')).status).toBe(404);
     expect((await f.call(f.platform, '/deployments')).status).toBe(422);
     expect((await f.call(f.platform, '/models/mdl_m/pool/revisions/99')).status).toBe(404);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('channel cards and candidates explain eligibility and assemble the shared draft', async () => {
@@ -69,7 +69,7 @@ test('channel cards and candidates explain eligibility and assemble the shared d
     expect(members).toEqual(fixture.http.draft.members);
     const b = await body(await f.call(f.platform, '/deployments?target_model_id=mdl_m&provider_id=prv_b&match=accepted'));
     expect(b.items.map((row: Json) => row.deployment_id)).toEqual(['dep_b']);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('shared sample publishes v6 to v7 once, replays idempotently and rejects stale previews', async () => {
@@ -152,7 +152,7 @@ test('shared sample publishes v6 to v7 once, replays idempotently and rejects st
     expect(cards.items[0].archive_blockers).toEqual([{ kind: 'active_pool', model_id: 'mdl_m', pool_revision: 7 }]);
     const again = await body(await f.call(f.platform, '/models/mdl_m/pool/preview', { ...draft, expected_pool_revision: 7 }));
     expect(again).toMatchObject({ publishable: false, blocking: [{ code: 'no_change' }], diff: { added: [], removed: [], updated: [] } });
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('publishing away from the verified legacy image deployment refreshes only once', async () => {
@@ -179,7 +179,7 @@ test('publishing away from the verified legacy image deployment refreshes only o
     expect(f.configChanges()).toBe(1);
     expect((await publish()).status).toBe(201);
     expect(f.configChanges()).toBe(1);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('equal priorities stay publishable and order by deployment id', async () => {
@@ -193,7 +193,7 @@ test('equal priorities stay publishable and order by deployment id', async () =>
     expect(response.status).toBe(201);
     const v7 = await body(await f.call(f.platform, '/models/mdl_m/pool/revisions/7'));
     expect(v7.members.map((row: Json) => [row.deployment_id, row.priority])).toEqual([['dep_a', 10], ['dep_b', 10]]);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 async function stalePublish(f: Awaited<ReturnType<typeof setup>>, change: (sql: Transaction) => void, code: string, key: string) {
@@ -220,7 +220,7 @@ test('an endpoint revision moved after preview makes the draft stale', async () 
         VALUES ('ep_b', 2, 'openai_responses', 'https://prv_b.example.test/v2', 'cn', 'fd_b', 'bearer', ?)`, [minutes(0)]);
       sql.run("UPDATE provider_endpoints SET current_revision = 2 WHERE endpoint_id = 'ep_b'");
     }, 'endpoint_revision_changed', 'endpoint');
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('superseded evidence makes the draft stale before its validity ends', async () => {
@@ -231,7 +231,7 @@ test('superseded evidence makes the draft stale before its validity ends', async
         observed_at, valid_until, supersedes_id, created_by) VALUES ('ev_b2', 'dep_b', 2, 'runtime_probe', 'failed', 0, '[]', ?, ?, 'ev_b', 'seed')`,
         [minutes(0), minutes(60)]);
     }, 'evidence_superseded', 'superseded');
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('a deployment revision cannot point at an endpoint other than its deployment head', async () => {
@@ -240,7 +240,7 @@ test('a deployment revision cannot point at an endpoint other than its deploymen
     await expect(f.store.system.write((sql) => sql.run(`INSERT INTO model_deployment_revisions (deployment_id, deployment_revision, endpoint_id,
       endpoint_revision, upstream_model, capabilities_json, created_by, created_at) VALUES ('dep_b', 3, 'ep_a', 1, 'vendor-b/m', '[]', 'seed', ?)`,
       [minutes(0)]))).rejects.toThrow(/FOREIGN KEY/);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('only the identity head authorizes; disabled models stay readable without drafting', async () => {
@@ -265,7 +265,7 @@ test('only the identity head authorizes; disabled models stay readable without d
     expect((await f.call(f.platform, '/models/mdl_m/pool/revisions/6')).status).toBe(200);
     const candidates = await body(await f.call(f.platform, '/deployments?target_model_id=mdl_m&match=accepted'));
     expect(candidates.items.map((row: Json) => row.actions)).toEqual([['read'], ['read']]);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('cursors reject a modified offset; raw model search is case-sensitive', async () => {
@@ -281,5 +281,5 @@ test('cursors reject a modified offset; raw model search is case-sensitive', asy
     expect(await raw('vendor-b/m-int4')).toEqual(['dep_quant']);
     expect(await raw('VENDOR-B/M-INT4')).toEqual([]);
     expect(await raw('b · m int4')).toEqual(['dep_quant']);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });

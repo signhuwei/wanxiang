@@ -9,6 +9,7 @@ import { iso } from './credentials';
 import { pagination, platformActor, type ManagementOptions } from './management';
 import { commitPattern, isManifest, MAX_RELEASE_BYTES, releaseKey, verifyManifest } from './release-package';
 import { activeRollout, openReleaseStore, releasePaths, type Rollout, type ServerRelease } from './release-store';
+import { sqliteTransaction } from './sqlite-transaction';
 import type { Store } from './store';
 
 const base = '/v1/platform/server-releases';
@@ -70,7 +71,7 @@ export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOpt
     const signer = key();
     if (!signer) throw new ApiError('conflict', { reason: 'signer_unavailable' });
     if (!verifyManifest(signer, body)) invalid('signature');
-    const result = db.transaction(() => {
+    const result = sqliteTransaction(db, () => {
       const previous = db.query<ServerRelease, [string]>('SELECT * FROM server_releases WHERE "commit" = ?').get(body.commit);
       if (previous) {
         if (previous.size !== body.size || previous.sha256 !== body.sha256) throw new ApiError('conflict', { reason: 'commit_has_other_artifact' });
@@ -82,7 +83,7 @@ export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOpt
       db.run('INSERT INTO server_releases ("commit", sha256, size, signature, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?)',
         [body.commit, body.sha256, body.size, body.signature, iso(opts.now()), actor]);
       return { item: view(release(body.commit), false), status: 201 as const };
-    }).immediate();
+    });
     return c.json(result.item, result.status);
   });
   app.get(`${base}/:commit`, (c) => {
@@ -102,14 +103,14 @@ export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOpt
       checkActor(c);
       const currentKey = key();
       if (!currentKey || !verifyManifest(currentKey, row)) throw new ApiError('conflict', { reason: 'signer_unavailable' });
-      const updated = db.transaction(() => {
+      const updated = sqliteTransaction(db, () => {
         const current = release(row.commit);
         if (!current.uploaded_at) {
           renameSync(temp, paths.artifact(row.commit));
           db.run('UPDATE server_releases SET uploaded_at = ? WHERE "commit" = ?', [iso(opts.now()), row.commit]);
         }
         return release(row.commit);
-      }).immediate();
+      });
       return c.json(view(updated, ready() && !activeRollout(db)));
     } finally {
       await unlink(temp).catch(() => {});
@@ -124,7 +125,7 @@ export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOpt
     if (typeof expected !== 'string' || !commitPattern.test(expected)) invalid('expected_commit');
     if (!requestKey || !/^[\x21-\x7e]{1,128}$/.test(requestKey)) invalid('Idempotency-Key');
     const commit = c.req.param('commit');
-    const job = db.transaction(() => {
+    const job = sqliteTransaction(db, () => {
       const prior = db.query<Rollout, [string, string]>('SELECT * FROM server_rollouts WHERE actor_id = ? AND request_key = ?').get(actor, requestKey);
       if (prior) {
         if (prior.commit !== commit || prior.expected_commit !== expected) throw new ApiError('conflict');
@@ -141,7 +142,7 @@ export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOpt
       db.run(`INSERT INTO server_rollouts (id, "commit", expected_commit, actor_id, request_key, status, created_at)
         VALUES (?, ?, ?, ?, ?, 'queued', ?)`, [id, commit, expected, actor, requestKey, iso(opts.now())]);
       return db.query<Rollout, [string]>('SELECT * FROM server_rollouts WHERE id = ?').get(id)!;
-    }).immediate();
+    });
     return c.json(rolloutView(job), 202);
   });
   app.get('/v1/platform/server-rollouts/:id', (c) => {
@@ -150,5 +151,5 @@ export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOpt
     if (!job) throw new ApiError('not_found');
     return c.json(rolloutView(job));
   });
-  return () => db.close();
+  return () => db.close(true);
 }

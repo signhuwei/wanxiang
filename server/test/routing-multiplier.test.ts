@@ -71,7 +71,7 @@ test('A/B sample recommends 3x, publishes a manual 4x and reads back its basis w
     expect(f.store.system.all('SELECT input_milli_per_mtok, output_milli_per_mtok FROM rates')).toEqual([{ input_milli_per_mtok: 3500, output_milli_per_mtok: 12000 }]);
     expect(f.store.tenant(f.tenantId).get('SELECT count(*) AS n FROM policy_signatures')).toEqual({ n: 0 });
     expect(f.configChanges()).toBe(0);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('missing, expired and ineligible samples are shown per channel and require a reason', async () => {
@@ -104,7 +104,7 @@ test('missing, expired and ineligible samples are shown per channel and require 
     expect(zero).toMatchObject({ input_multiplier_ppm: 0, input_milli_per_mtok: 0, blocking: [] });
     expect((await preview(f, { ...base, manual_input_multiplier_ppm: 4_000_500, reason: 'x' })).status).toBe(422);
     expect((await preview(f, { expected_pool_revision: 7 })).status).toBe(422);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('a preview is not publishable after a quote boundary, an FX expiry or a revision change', async () => {
@@ -142,7 +142,7 @@ test('a preview is not publishable after a quote boundary, an FX expiry or a rev
     expect((await body(stalePool)).error.detail).toEqual({ reason: 'revision_changed', current_pool_revision: 7, current_source_rate_key: null,
       changed: ['pool_revision'] });
     expect(f.store.system.get('SELECT count(*) AS n FROM platform_rate_versions')).toEqual({ n: 0 });
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('a legacy model with an old rate but no active pool cannot form a signable version', async () => {
@@ -164,7 +164,7 @@ test('a legacy model with an old rate but no active pool cannot form a signable 
     expect(f.store.system.get('SELECT count(*) AS n FROM platform_rate_heads')).toEqual({ n: 0 });
     const ledger = (await body(await f.call(f.platform, '/models'))).items.find((row: Json) => row.id === 'mdl_legacy');
     expect(ledger).toMatchObject({ current_source_rate_key: null, input_multiplier_ppm: 2_000_000 });
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('multiplier routes are platform-only and closed for disabled models', async () => {
@@ -179,5 +179,5 @@ test('multiplier routes are platform-only and closed for disabled models', async
     await f.store.system.write((sql) => sql.run("UPDATE models SET status = 'disabled' WHERE id = 'mdl_m'"));
     expect((await preview(f, base)).status).toBe(403);
     expect((await body(await f.call(f.platform, '/models'))).items.find((row: Json) => row.id === 'mdl_m').actions).toEqual(['read', 'update']);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });

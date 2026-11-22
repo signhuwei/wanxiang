@@ -55,7 +55,7 @@ test('quotes publish immutably, replay by key and read back exactly', async () =
     expect((await f.call(f.platform, `/deployments/dep_b/quotes/${record.quote_id}/revisions/2`)).status).toBe(404);
     expect(await body(await f.call(f.platform, '/deployments/dep_a/quotes'))).toMatchObject({ total: 0, head_revision: 0, deployment_revision: 3, items: [] });
     expect(f.configChanges()).toBe(0);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('quote and FX input is validated field by field', async () => {
@@ -95,7 +95,7 @@ test('quote and FX input is validated field by field', async () => {
     }
     expect((await f.call(f.platform, '/procurement/fx-rates')).status).toBe(422);
     expect((await f.call(f.platform, '/procurement/fx-rates?base_currency=CNY')).status).toBe(422);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('the latest started version applies; a next start truncates, expiry never revives, and the deployment revision must match', async () => {
@@ -127,7 +127,7 @@ test('the latest started version applies; a next start truncates, expiry never r
     expect((await f.call(f.platform, '/deployments/dep_b/quotes', { ...later, expected_quote_revision: 2, valid_from: minutes(95), valid_until: null }, 'q4')).status).toBe(409);
     expect((await f.call(f.platform, '/deployments/dep_b/quotes', { ...later, expected_quote_revision: 2, deployment_revision: 3, valid_from: minutes(95),
       valid_until: null }, 'q5')).status).toBe(201);
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('FX revisions publish, replay and resolve as of a time, and expired FX is not revived', async () => {
@@ -156,7 +156,7 @@ test('FX revisions publish, replay and resolve as of a time, and expired FX is n
       expect((await f.call(f.platform, path)).status).toBe(404);
     }
     expect(f.store.system.get("SELECT count(*) AS n FROM platform_audit WHERE action = 'procurement_fx.publish'")).toEqual({ n: 1 });
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });
 
 test('procurement reads and writes are platform-only', async () => {
@@ -172,5 +172,5 @@ test('procurement reads and writes are platform-only', async () => {
     }
     expect(f.store.system.get('SELECT count(*) AS n FROM procurement_quotes')).toEqual({ n: 2 });
     expect(f.store.system.get('SELECT count(*) AS n FROM rates')).toEqual({ n: 1 });
-  } finally { f.close(); }
+  } finally { await f.close(); }
 });

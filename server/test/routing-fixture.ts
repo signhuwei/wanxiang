@@ -111,6 +111,10 @@ export async function setup() {
   });
   return { store, dir, platform, tenant, outsider, tenantId, call, configChanges: () => configChanges,
     setClock: (value: number) => { at = value; },
-    close: () => { store.system.close(); rmSync(dir, { recursive: true, force: true }); } };
+    close: async () => {
+      await store.drain();
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    } };
 }
 export type RoutingFixture = Awaited<ReturnType<typeof setup>>;
