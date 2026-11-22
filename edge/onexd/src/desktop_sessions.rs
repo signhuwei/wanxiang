@@ -207,7 +207,10 @@ impl DesktopSessions {
         .await
         .ok()??;
         let token = self
-            .receive(&control, Batch { bind_model: true, native_id: native.to_string(), records: vec![], documents: vec![] })
+            .receive(
+                &control,
+                Batch { bind_model: true, native_id: native.to_string(), records: vec![], documents: vec![] },
+            )
             .ok()???;
         let mut registry = self.0.lock().unwrap();
         let binding = registry.claude_models.get(&token)?.1.clone();
@@ -374,7 +377,9 @@ impl DesktopSessions {
         let token = crate::id::token();
         let now = std::time::Instant::now();
         let grant = Grant {
-            owner: credential.to_owned(), expires: now + std::time::Duration::from_secs(60), binding,
+            owner: credential.to_owned(),
+            expires: now + std::time::Duration::from_secs(60),
+            binding,
             documents: batch.documents,
         };
         registry.models.retain(|_, grant| grant.expires > now);
@@ -498,7 +503,10 @@ pub(crate) struct PromptDocument {
 
 /// Substitute only handles produced by the original prompt. A changed vendor
 /// serialization is surfaced before sending a request with missing contents.
-pub(crate) fn project_prompt_documents(body: &mut serde_json::Value, documents: &[PromptDocument]) -> Result<(), &'static str> {
+pub(crate) fn project_prompt_documents(
+    body: &mut serde_json::Value,
+    documents: &[PromptDocument],
+) -> Result<(), &'static str> {
     if documents.is_empty() {
         return Ok(());
     }
@@ -508,12 +516,16 @@ pub(crate) fn project_prompt_documents(body: &mut serde_json::Value, documents: 
     let mut project = |value: &mut serde_json::Value| -> Result<(), &'static str> {
         let Some(mut source) = value.as_str() else { return Ok(()) };
         let mut result = String::new();
-        while let Some((start, index, document)) = documents.iter().enumerate()
+        while let Some((start, index, document)) = documents
+            .iter()
+            .enumerate()
             .filter_map(|(index, document)| source.find(&document.marker).map(|at| (at, index, document)))
             .min_by_key(|(at, _, _)| *at)
         {
             inserted += document.name.len() + document.text.len() + 48;
-            if inserted > 256 * 1024 { return Err("本次请求的附件展开内容超过大小限制。") }
+            if inserted > 256 * 1024 {
+                return Err("本次请求的附件展开内容超过大小限制。");
+            }
             result.push_str(&source[..start]);
             result.push_str(&format!("[附件 {} 的文本]\n{}\n[附件结束]", document.name, document.text));
             seen[index] = true;
@@ -539,12 +551,14 @@ pub(crate) fn project_prompt_documents(body: &mut serde_json::Value, documents: 
 }
 
 pub(crate) fn accepts_images(route: &onex_core::ws::Route) -> bool {
-    route.protocol == "openai_chat" && route.input_capabilities.as_ref().is_some_and(|capability| {
-        capability.modalities.contains(&onex_core::ws::InputModality::Image)
-            && capability.valid_until.as_deref().is_none_or(|expiry| {
-                crate::pricing::parse_ms(expiry).is_some_and(|time| time > now_ms())
-            })
-    })
+    route.protocol == "openai_chat"
+        && route.input_capabilities.as_ref().is_some_and(|capability| {
+            capability.modalities.contains(&onex_core::ws::InputModality::Image)
+                && capability
+                    .valid_until
+                    .as_deref()
+                    .is_none_or(|expiry| crate::pricing::parse_ms(expiry).is_some_and(|time| time > now_ms()))
+        })
 }
 
 #[derive(Deserialize)]
@@ -583,9 +597,14 @@ impl Batch {
             && self.documents.len() <= 8
             && self.documents.iter().map(|file| file.text.len()).sum::<usize>() <= 128 * 1024
             && self.documents.iter().all(|file| {
-                !file.name.is_empty() && file.name.len() <= 255 && !file.name.chars().any(char::is_control)
-                    && !file.marker.is_empty() && file.marker.len() <= 4096
-                    && !file.text.trim().is_empty() && file.text.len() <= 64 * 1024 && !file.text.contains('\0')
+                !file.name.is_empty()
+                    && file.name.len() <= 255
+                    && !file.name.chars().any(char::is_control)
+                    && !file.marker.is_empty()
+                    && file.marker.len() <= 4096
+                    && !file.text.trim().is_empty()
+                    && file.text.len() <= 64 * 1024
+                    && !file.text.contains('\0')
             })
             && self.records.len() <= 32
             && self.records.iter().all(|record| {

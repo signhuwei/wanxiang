@@ -37,3 +37,11 @@ OneX 只发布自有 profile：同目录独占临时写、同步、原子替换�
 2026-11-21 在只读挂载的官方 0.2.1-rc.3 DMG 核对整包 SHA-256、Apple 深度签名、Team ID 和 CDHash。Edge 通过厂商 Cordis `llm/stream`、`sessionPersistence` 和公开的 `LocalCredentialProvider` 接入。每次原生调用取得单次本地凭据，厂商连接身份和其他凭据仍由原生隔离 profile 保存。
 
 在 `edge` 下设置 `ONEX_DEEPSEEK_QA_BUNDLE` 为该应用的完整路径后，运行 `cargo test -p onexd --lib original_gui_restores_native_session_and_settles_each_turn -- --ignored`。该显式真机用例分两次打开签名的原厂进程，通过其公开的 SessionController 提交输入，并恢复同一原生 SID。实测两轮合计 6 个输入 token 和 4 个输出 token。OneX Router 为每轮计入 0.007 块橡皮，归到同一测试租约。持久 outbox 中仅一个会话开始事件、两次原生输入和两次原生回复。上游为本机流式 Chat 测试服务。通过的精确发行在 `server/src/desktop-qualifications.json` 中登记。
+
+## OneX 受管附件
+
+受管 `llm-pi-ai` 在签约型号的实际 Chat 渠道有有效图片审核证据时声明 `input: [text, image]`。原厂附件服务将图片规范化并存入当前受管会话，从同一 `openai-completions` 入口送出图片。Edge 在请求时重新检查实际渠道的能力及有效期，备选也要满足图片能力。输入预留按图片类型和尺寸估算，最终仍按上游报告的用量结算。
+
+同一原厂附件服务处理可读文本和带文本层的 PDF。OneX 从原生会话内已验过长度及摘要的文件引用读取，PDF 由本机 PDFKit 提取。抽取结果与本次一次性模型令牌一起登记，Edge 把原厂文件提示对应的文本送入同一签约上下文。回流记录保留附件提示和文件名。PDF 支持 16 MiB 及 64 页内的未加密文本文件，单份抽取结果及 UTF-8 文本文件限 64 KiB，合计限 128 KiB。扫描件、加密文件和超限内容会明确报错。其他文件沿用原厂可供 Agent 文件工具读取的本地引用。
+
+附件联验需先构建 `onexd`，以 `ONEX_DEEPSEEK_QA_DAEMON` 指定该可执行文件，再运行 `cargo test -p onexd --lib original_gui_preserves_image_and_document_prompts -- --ignored`。实际签名 GUI 按原生附件协议提交 PNG、PDF 和 TXT，重开同一原生会话后再次核对模拟上游收到的图片和文字。两次成功请求各按实际用量结算一次，持久 outbox 回流附件提示及可见文本。

@@ -163,9 +163,15 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
                 return err_before_headers(StatusCode::FORBIDDEN, "model_not_allowed", &message);
             }
         };
-    if deepseek && crate::route_select::required_features("openai_chat", &req).contains(crate::route_select::feature::IMAGES) {
+    if deepseek
+        && crate::route_select::required_features("openai_chat", &req).contains(crate::route_select::feature::IMAGES)
+    {
         if !crate::desktop_sessions::accepts_images(&route) {
-            return err_before_headers(StatusCode::FORBIDDEN, "model_not_allowed", "当前签约模型的渠道没有核验图片输入能力。");
+            return err_before_headers(
+                StatusCode::FORBIDDEN,
+                "model_not_allowed",
+                "当前签约模型的渠道没有核验图片输入能力。",
+            );
         }
         execution.require_verified_images();
     }

@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{Json, http::HeaderMap, routing::post};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use base64::{Engine, engine::general_purpose::STANDARD};
 use onex_core::ws::{AgentRelease, Lease, Rate, Route, UpstreamAuth};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -25,7 +27,7 @@ use crate::{
 const INPUT_PLUGIN: &str = r#"
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 export const name = 'onex-qualification-input'
-export const inject = ['sessionController','workspaceRegistry']
+export const inject = ['sessionController','workspaceRegistry','fileUploads']
 export function apply(ctx, config) {
   const timer = setTimeout(async () => {
     try {
@@ -38,8 +40,13 @@ export function apply(ctx, config) {
         sessionId = result.sessionId
         writeFileSync(config.marker, sessionId, {flag:'wx', mode:0o600})
       }
-      await ctx.sessionController.prompt({ sessionId, requestId:crypto.randomUUID(), mode:'followup',
-        content:[{type:'text', text:config.input}] }, signal)
+      const content = [{type:'text', text:config.input}]
+      if (config.image) content.push({type:'image', name:'one.png', mediaType:'image/png', data:config.image})
+      for (const [name, data] of Object.entries(config.files ?? {})) {
+        const staged = await ctx.fileUploads.uploadStream({sessionId,name,signal,data:(async function* () { yield Buffer.from(data,'base64') })()})
+        content.push({type:'file', receiptId:staged.receiptId})
+      }
+      await ctx.sessionController.prompt({ sessionId, requestId:crypto.randomUUID(), mode:'followup', content }, signal)
     } catch (error) { writeFileSync(config.failure, error.message, {mode:0o600}) }
   }, 4000)
   ctx.on('dispose', () => clearTimeout(timer))
@@ -92,11 +99,19 @@ fn fixture_release(agent: &str) -> AgentRelease {
 
 async fn router_fixture(
     release: &AgentRelease,
+    observe: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
 ) -> anyhow::Result<(Arc<State>, String, tokio::sync::mpsc::UnboundedReceiver<crate::router::UsageRecord>)> {
     let upstream = TcpListener::bind("127.0.0.1:0").await?;
     let base_url = format!("http://{}/v1", upstream.local_addr()?);
+    let images = observe.is_some();
+    let route = post(move |headers: HeaderMap, body: Json<Value>| async move {
+        if let Some(observe) = observe {
+            let _ = observe.send(body.0.clone());
+        }
+        reply(headers, body).await
+    });
     tokio::spawn(async move {
-        axum::serve(upstream, axum::Router::new().route("/v1/chat/completions", post(reply))).await.unwrap();
+        axum::serve(upstream, axum::Router::new().route("/v1/chat/completions", route)).await.unwrap();
     });
 
     let state = Arc::new(State::default());
@@ -112,6 +127,10 @@ async fn router_fixture(
             upstream_model: Some("wire-model".into()),
             auth: UpstreamAuth::Bearer,
             proxy: None,
+            input_capabilities: images.then(|| onex_core::ws::InputCapabilities {
+                modalities: vec![onex_core::ws::InputModality::Text, onex_core::ws::InputModality::Image],
+                valid_until: None,
+            }),
         });
         config.rates.push(Rate {
             model_id: "model".into(),
@@ -144,6 +163,59 @@ async fn router_fixture(
     Ok((state, addr, usage))
 }
 
+#[tokio::test]
+async fn deepseek_rejects_unverified_image_routes_and_unmatched_documents() -> anyhow::Result<()> {
+    let release = fixture_release("deepseek-desktop");
+    let (observed, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+    let (state, addr, _) = router_fixture(&release, Some(observed)).await?;
+    state.config.write().unwrap().routes[0].input_capabilities.as_mut().unwrap().valid_until =
+        Some(format_ms(now_ms() - 1));
+    let root = tempfile::tempdir()?;
+    let outbox = Arc::new(Outbox::open(&root.path().join("events.sqlite"))?);
+    state.desktop_sessions.start(
+        "attachment-test".into(),
+        "device".into(),
+        release.agent,
+        release.version,
+        release.id,
+        "onex-qa".into(),
+        "workspace".into(),
+        outbox,
+    );
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    for (documents, messages, expected) in [
+        (
+            json!([]),
+            json!([{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAE="}}]}]),
+            403,
+        ),
+        (
+            json!([{"name":"fixture.txt","marker":"[native file]","text":"must stay local"}]),
+            json!([{"role":"user","content":"without the file reference"}]),
+            422,
+        ),
+    ] {
+        let grant: Value = client
+            .post(format!("http://{addr}/v1/onex/desktop/session"))
+            .bearer_auth("attachment-test")
+            .json(&json!({"native_id":"native","records":[],"bind_model":true,"documents":documents}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let response = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth(grant["model_token"].as_str().unwrap())
+            .json(&json!({"model":"onex-qa","messages":messages}))
+            .send()
+            .await?;
+        assert_eq!(response.status().as_u16(), expected);
+        assert!(incoming.try_recv().is_err());
+    }
+    Ok(())
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 #[ignore = "requires the original local WorkBuddy DMG and the app mounted from it"]
@@ -164,13 +236,30 @@ fn original_workbuddy_container_and_apple_signature_match_manifest() -> anyhow::
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "opens a signed DeepSeek GUI twice; set ONEX_DEEPSEEK_QA_BUNDLE to its mounted app"]
 async fn original_gui_restores_native_session_and_settles_each_turn() -> anyhow::Result<()> {
+    run_original_deepseek(false).await
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opens a signed DeepSeek GUI; set ONEX_DEEPSEEK_QA_BUNDLE and ONEX_DEEPSEEK_QA_DAEMON"]
+async fn original_gui_preserves_image_and_document_prompts() -> anyhow::Result<()> {
+    run_original_deepseek(true).await
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+async fn run_original_deepseek(attachments: bool) -> anyhow::Result<()> {
+    const IMAGE: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGMQL/sPRwzEcQB1UhjB1HLtUgAAAABJRU5ErkJggg==";
+    const PDF_TEXT: &str = "Onex fixture PDF has cobalt seven";
+    const TXT_TEXT: &str = "Onex fixture text has amber eleven";
     let bundle_path = std::env::var("ONEX_DEEPSEEK_QA_BUNDLE")?;
     let release = manifest_release("deepseek-desktop", std::env::var("ONEX_DEEPSEEK_QA_SHA256").ok().as_deref())?;
     let entry = super::Bundle::candidate(&release).unwrap().verify(Path::new(&bundle_path))?;
     let root = tempfile::tempdir()?;
     let cwd = root.path().join("workspace");
     std::fs::create_dir(&cwd)?;
-    let (state, addr, mut usage) = router_fixture(&release).await?;
+    let (observed, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+    let (state, addr, mut usage) = router_fixture(&release, attachments.then_some(observed)).await?;
     let outbox = Arc::new(Outbox::open(&root.path().join("outbox.sqlite"))?);
     let marker = root.path().join("native-id");
     let failure = root.path().join("input-error");
@@ -189,6 +278,7 @@ async fn original_gui_restores_native_session_and_settles_each_turn() -> anyhow:
                 model_bearer: None,
                 router: &addr,
                 model: "onex-qa",
+                image_input: attachments,
             },
             None,
         )?;
@@ -196,8 +286,23 @@ async fn original_gui_restores_native_session_and_settles_each_turn() -> anyhow:
         std::fs::write(&plugin, INPUT_PLUGIN)?;
         let patch_file = launch.config_dir.join("profiles/desktop/cordis.patch.yml");
         let mut patch: Vec<Value> = serde_json::from_slice(&std::fs::read(&patch_file)?)?;
+        let mut test_config = json!({"workspace":cwd,"marker":marker,"failure":failure,"input":input});
+        if attachments {
+            for entry in
+                patch.iter_mut().filter_map(|row| row.get_mut("insert").and_then(Value::as_array_mut)).flatten()
+            {
+                if entry["id"] == "onex-managed-session" {
+                    entry["config"]["extractor"] = std::env::var("ONEX_DEEPSEEK_QA_DAEMON")?.into();
+                }
+            }
+            if turn == 1 {
+                test_config["image"] = IMAGE.into();
+                let pdf = crate::attachment_pdf::fixture_pdf(1, &format!("BT /F1 16 Tf 20 200 Td ({PDF_TEXT}) Tj ET"));
+                test_config["files"] = json!({"one.pdf":STANDARD.encode(pdf), "two.txt":STANDARD.encode(TXT_TEXT)});
+            }
+        }
         patch.push(json!({"insert":[{"id":"onex-qualification-input","name":reqwest::Url::from_file_path(plugin).unwrap().as_str(),
-            "config":{"workspace":cwd,"marker":marker,"failure":failure,"input":input}}]}));
+            "config":test_config}]}));
         std::fs::write(patch_file, serde_json::to_vec(&patch)?)?;
         state.desktop_sessions.start(
             launch_token.clone(),
@@ -240,7 +345,23 @@ async fn original_gui_restores_native_session_and_settles_each_turn() -> anyhow:
                     assert!(rows.iter().all(|row| row.item["session_id"] == session));
                     assert_eq!(rows.iter().filter(|row| row.item["kind"] == "session_start").count(), 1);
                     assert_eq!(rows.iter().filter(|row| row.item["kind"] == "user_message").count(), turn);
-                    assert!(rows.iter().any(|row| row.item["payload"]["content"] == input));
+                    assert!(
+                        rows.iter().any(|row| row.item["payload"]["content"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(&input)))
+                    );
+                    if attachments {
+                        let body = incoming.try_recv()?;
+                        let messages = body["messages"].to_string();
+                        assert!(messages.contains(PDF_TEXT), "PDF text missing at the upstream");
+                        assert!(messages.contains(TXT_TEXT), "TXT text missing at the upstream");
+                        assert!(messages.contains("\"type\":\"image_url\""));
+                        assert!(messages.contains("data:image/"));
+                        assert!(!messages.contains("verbatim read-only copy saved at"));
+                        let journal = rows.iter().map(|row| row.item.to_string()).collect::<String>();
+                        assert!(journal.contains("文件附件 one.pdf") && journal.contains("图片附件"));
+                        assert!(!journal.contains(PDF_TEXT) && !journal.contains(TXT_TEXT) && !journal.contains(IMAGE));
+                    }
                     assert!(request.usage_final);
                     assert_eq!(request.cost_milli, 7);
                     assert_eq!((request.tokens.input, request.tokens.output), (3, 2));
@@ -273,7 +394,7 @@ async fn original_gui_restores_native_session_and_settles_each_turn() -> anyhow:
 #[tokio::test]
 async fn workbuddy_interleaved_requests_bill_only_the_registered_native_task() -> anyhow::Result<()> {
     let release = fixture_release("workbuddy");
-    let (state, addr, mut usage) = router_fixture(&release).await?;
+    let (state, addr, mut usage) = router_fixture(&release, None).await?;
     state.config.write().unwrap().routes[0].model = "wire-model".into();
     assert!(state.workbuddy_turns.start("control", "model", "device", &release.id, "wire-model"));
     let root = tempfile::tempdir()?;
@@ -433,7 +554,7 @@ async fn workbuddy_interleaved_requests_bill_only_the_registered_native_task() -
 #[tokio::test]
 async fn codex_desktop_responses_bill_the_declared_native_turn_and_recheck_the_grant() -> anyhow::Result<()> {
     let release = fixture_release("codex-desktop");
-    let (state, addr, mut usage) = router_fixture(&release).await?;
+    let (state, addr, mut usage) = router_fixture(&release, None).await?;
     let dir = tempfile::tempdir()?;
     let outbox = Arc::new(Outbox::open(&dir.path().join("events.sqlite"))?);
     let control = "codex-control";

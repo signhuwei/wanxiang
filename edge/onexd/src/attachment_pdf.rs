@@ -97,10 +97,13 @@ fn append_page(document: &AnyObject, index: usize, output: &mut String) -> Resul
 }
 
 #[cfg(test)]
+pub(crate) use tests::fixture as fixture_pdf;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fixture(pages: usize, content: &str) -> Vec<u8> {
+    pub(crate) fn fixture(pages: usize, content: &str) -> Vec<u8> {
         let children = (0..pages).map(|index| format!("{} 0 R", index + 5)).collect::<Vec<_>>().join(" ");
         let mut objects = vec![
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),

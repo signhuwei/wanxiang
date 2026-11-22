@@ -707,9 +707,10 @@ async fn launch(
             .or_else(|| ipc.state.expected_device_id.read().unwrap().clone());
         let Some(owner) = owner else { return err("unauthenticated", "请先连接 OneX Server") };
         let model_bearer = (agent == "workbuddy").then(crate::id::token);
-        let image_input = agent == "deepseek-desktop" && protocol
-            .select_agent_route(&ipc.state.config.read().unwrap(), &model, Some(agent))
-            .is_some_and(crate::desktop_sessions::accepts_images);
+        let image_input = agent == "deepseek-desktop"
+            && protocol
+                .select_agent_route(&ipc.state.config.read().unwrap(), &model, Some(agent))
+                .is_some_and(crate::desktop_sessions::accepts_images);
         return start_desktop(
             ipc,
             ctx,

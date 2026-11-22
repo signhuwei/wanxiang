@@ -151,7 +151,10 @@ pub(crate) fn prepare(
                 launch::private_dir(&desktop)?;
                 let plugin = run.join("onex-desktop.mjs");
                 launch::write_private(&plugin, include_bytes!("desktop_adapters/deepseek.mjs"))?;
-                launch::write_private(&run.join("onex-attachments.mjs"), include_bytes!("desktop_adapters/deepseek-attachments.mjs"))?;
+                launch::write_private(
+                    &run.join("onex-attachments.mjs"),
+                    include_bytes!("desktop_adapters/deepseek-attachments.mjs"),
+                )?;
                 let credentials = run.join("onex-credentials.mjs");
                 launch::write_private(&credentials, include_bytes!("desktop_adapters/deepseek-credentials.mjs"))?;
                 let credentials_url = reqwest::Url::from_file_path(&credentials)
