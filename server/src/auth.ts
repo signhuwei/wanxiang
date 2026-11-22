@@ -9,12 +9,13 @@ import { quotaBinding, selfMonthUsage } from './billing';
 import { bearer, day, hash, hmac, iso, normalizedTarget, personalLoginTokenPattern, randomToken } from './credentials';
 import { ensureUser, findUser, type User } from './seed';
 import { indexDevice, indexMember, type Member, type Store, type Transaction } from './store';
+import { normalizeLoginName, passwordLoginLimiter, validLoginPassword, verifyLoginPassword } from './tenant-passwords';
 
 const codeCooldown = 60_000;
 const codeTtl = 10 * 60_000;
 export const deviceTtl = 30 * day;
 type Kind = 'web' | 'desktop';
-type Session = { user_id: string; tenant_id: string | null; kind: Kind; expires_at: string; login_token_id: string | null };
+type Session = { user_id: string; tenant_id: string | null; kind: Kind; expires_at: string; login_token_id: string | null; tenant_password_login: number };
 type LoginTokenLink = { id: string; expires_at: string };
 type Tenant = { id: string; name: string; status: string; revision: number };
 
@@ -27,12 +28,13 @@ export function isTenantId(value: unknown): value is string {
   return typeof value === 'string' && /^ten_[0-9A-HJKMNP-TV-Z]{26}$/.test(value);
 }
 
-function insertSession(sql: Transaction, token: string, user: string, tenant: string | null, kind: Kind, now: number, loginToken?: LoginTokenLink) {
+function insertSession(sql: Transaction, token: string, user: string, tenant: string | null, kind: Kind, now: number,
+  loginToken?: LoginTokenLink, tenantPasswordLogin = false) {
   const expiresAt = iso(now + (kind === 'desktop' ? 7 * day : day));
   const expiry = loginToken && loginToken.expires_at < expiresAt ? loginToken.expires_at : expiresAt;
   sql.run('DELETE FROM sessions WHERE expires_at <= ?', [iso(now)]);
-  sql.run('INSERT INTO sessions (token_hash, user_id, tenant_id, kind, expires_at, login_token_id) VALUES (?, ?, ?, ?, ?, ?)',
-    [hash(token), user, tenant, kind, expiry, loginToken?.id ?? null]);
+  sql.run('INSERT INTO sessions (token_hash, user_id, tenant_id, kind, expires_at, login_token_id, tenant_password_login) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [hash(token), user, tenant, kind, expiry, loginToken?.id ?? null, Number(tenantPasswordLogin)]);
 }
 
 function tokenOf(c: Context) {
@@ -42,7 +44,8 @@ function tokenOf(c: Context) {
 }
 
 function readSession(sql: Pick<Transaction, 'get'>, tokenHash: string, at: number) {
-  const s = sql.get<Session>('SELECT user_id, tenant_id, kind, expires_at, login_token_id FROM sessions WHERE token_hash = ? AND expires_at > ?', [tokenHash, iso(at)]);
+  const s = sql.get<Session>(`SELECT user_id, tenant_id, kind, expires_at, login_token_id, tenant_password_login
+    FROM sessions WHERE token_hash = ? AND expires_at > ?`, [tokenHash, iso(at)]);
   if (!s) throw new ApiError('unauthenticated');
   return s;
 }
@@ -52,6 +55,7 @@ export function authenticate(store: Store, c: Context, at: number) { return read
 export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; now: () => number; deliverCode?: (target: string, code: string) => void; onConfigChange?: (tenantId:string)=>void }) {
   const { now, codeSecret } = opts;
   const pending = new Map<string, Promise<Response>>();
+  const limitPasswordLogin = passwordLoginLimiter();
   const tenant = (id: string, sql: Pick<Transaction, 'get'> = store.system) =>
     sql.get<Tenant>("SELECT id, name, status, revision FROM tenants WHERE id = ? AND status = 'active'", [id]);
   const user = (id: string) => store.system.get<User>('SELECT * FROM platform_users WHERE id = ?', [id]);
@@ -183,6 +187,61 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
     finally { pending.delete(lock); }
   });
 
+  app.post('/v1/auth/password-login', async (c) => {
+    const body = await json(c);
+    const tenantName = normalizeLoginName(body.tenant);
+    const username = normalizeLoginName(body.username);
+    if (!tenantName) invalid('tenant');
+    if (!username) invalid('username');
+    const password = body.password;
+    if (!validLoginPassword(password)) invalid('password');
+    const k = kind(body.kind) ?? 'web';
+    const server = c.env as Pick<Bun.Server<unknown>, 'requestIP'> | undefined;
+    const address = server?.requestIP(c.req.raw)?.address ?? '';
+    const release = limitPasswordLogin(now(), address, `${tenantName.key}:${username.key}`);
+    try {
+      type Candidate = { tenant_id: string; user_id: string; password_hash: string };
+      // Treat full IDs as exact selectors. An alias needs a single credential
+      // match, since administrators may assign the same alias to multiple tenants.
+      const byId = isTenantId(tenantName.display);
+      const candidates = (sql: Pick<Transaction, 'all'>) => sql.all<Candidate>(`
+        SELECT a.tenant_id, a.user_id, a.password_hash
+        FROM tenant_login_accounts a JOIN tenants t ON t.id = a.tenant_id
+        WHERE t.status = 'active' AND ${byId ? 't.id' : 't.short_name_key'} = ? AND a.username_key = ?
+        ORDER BY a.tenant_id LIMIT 17`, [byId ? tenantName.display : tenantName.key, username.key]);
+      const checked = candidates(store.system);
+      if (checked.length === 0 || checked.length > 16) {
+        await verifyLoginPassword(password);
+        throw new ApiError('unauthenticated');
+      }
+      const matching: Candidate[] = [];
+      for (const row of checked) {
+        if (await verifyLoginPassword(password, row.password_hash)) matching.push(row);
+      }
+      if (!matching.length) throw new ApiError('unauthenticated');
+      return await store.system.write((sql) => {
+        const current = candidates(sql);
+        if (current.length !== checked.length || current.some((row, i) => {
+          const previous = checked[i]!;
+          return row.tenant_id !== previous.tenant_id || row.user_id !== previous.user_id || row.password_hash !== previous.password_hash;
+        })) throw new ApiError('unauthenticated');
+        const active = matching.flatMap((row) => {
+          const t = tenant(row.tenant_id, sql);
+          const m = t && store.tenant(t.id).get<Member>(`SELECT user_id, role, status FROM members
+            WHERE user_id = ? AND status = 'active'`, [row.user_id]);
+          return t && m ? [{ t, m }] : [];
+        });
+        if (active.length !== 1) throw new ApiError('unauthenticated');
+        const { t, m } = active[0]!;
+        const account = sql.get<User>('SELECT * FROM platform_users WHERE id = ?', [m.user_id]);
+        if (!account) throw new ApiError('unauthenticated');
+        const token = randomToken();
+        insertSession(sql, token, account.id, t.id, k, now(), undefined, true);
+        return c.json({ token, user: publicUser(account), tenants: [publicTenant(t, m)] });
+      });
+    } finally { release(); }
+  });
+
   app.post('/v1/auth/token-login', async (c) => {
     const body = await json(c);
     if (typeof body.token !== 'string' || !personalLoginTokenPattern.test(body.token)) invalid('token');
@@ -212,6 +271,7 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
     const at = now();
     const token = tokenOf(c);
     const s = session(token, at);
+    if (s.tenant_password_login) throw new ApiError('forbidden');
     const body = await json(c);
     const id = body.tenant_id;
     if (!isTenantId(id)) invalid('tenant_id');
@@ -247,7 +307,7 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
   app.get('/v1/me', async (c) => {
     const s = session(tokenOf(c), now());
     const u = user(s.user_id)!;
-    const is_platform_admin = !!store.system.get('SELECT 1 FROM platform_admins WHERE user_id = ?', [s.user_id]);
+    const is_platform_admin = !s.tenant_password_login && !!store.system.get('SELECT 1 FROM platform_admins WHERE user_id = ?', [s.user_id]);
     if (!s.tenant_id) return c.json({ user: publicUser(u), tenant: null, role: null, agents: [], is_platform_admin,
       actions: is_platform_admin ? platformCreateActions : [] });
     const { t, m } = await requireMember(s.tenant_id, s.user_id);
@@ -257,7 +317,7 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
     const quota = { quota_milli: binding?.quota_milli ?? null, month_used_milli: binding?.used_milli ?? selfMonthUsage(store.tenant(t.id), s.user_id, now()),
       remaining_milli: binding?.remaining_milli ?? null, limited_by: binding?.limited_by ?? null };
     return c.json({ user: publicUser(u), tenant: publicTenant(t, m), role: m.role, agents: contract ? JSON.parse(contract.allowed_agents_json) : [], is_platform_admin,
-      actions: tenantActions(m.role), quota });
+      actions: tenantActions(m.role), quota, ...(s.tenant_password_login && { tenant_password_login: true }) });
   });
 
   app.post('/v1/devices', async (c) => {

@@ -22,10 +22,13 @@
 | --- | --- | --- |
 | POST | `/auth/code` | `{target}`，202。发送验证码（开发环境打印到 Server 日志） |
 | POST | `/auth/login` | `{target, code, invite_code?, kind?}`，`kind` 为 `web`（默认）或 `desktop`。返回全局令牌 `{token, user, tenants[]}` |
+| POST | `/auth/password-login` | `{tenant, username, password, kind?}`，`kind` 为 `web`（默认）或 `desktop`。返回立即可用的租户范围令牌 `{token, user, tenants[]}`，数组只含本次登录的租户。 |
 | POST | `/auth/select-tenant` | `{tenant_id, kind?}`，`kind` 不传时继承当前令牌。返回新的租户范围令牌 |
 | POST | `/auth/logout` | 204 |
 | GET | `/me` | `{user, tenant, role, agents, is_platform_admin, actions}`；未选租户时 `tenant`、`role` 为 null |
 | POST | `/devices` | `{name, os, arch, public_key}`，201，返回 `{device_id, device_token}` |
+
+`tenant` 可填完整租户 ID 或简称。简称、用户名按 Unicode NFKC 归一并忽略大小写，允许多个租户共享简称，密码按原样校验。简称须唯一匹配有效成员的用户名和密码才可登录。若匹配结果不确定，用户可用完整租户 ID 指定租户。凭据错误统一为 401，频率超限返回 429。密码会话的 `/me` 含 `tenant_password_login: true`，只在所选租户内操作。平台管理员沿用个人令牌入口。
 
 ### 网页个人登录令牌
 
@@ -83,7 +86,8 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET/POST | `/platform/tenants` | 租户 |
+| GET/POST | `/platform/tenants` | 租户，列表与创建支持可选 `short_name` |
+| GET/POST/PATCH | `/platform/tenants/:id` | 租户详情、更新，`short_name: null` 清除简称，省略保留；简称允许重复 |
 | GET/POST | `/platform/providers`，`/platform/models`，`/platform/rates` | Provider、模型、倍率。`/platform/models?provider_id=`、`/platform/rates?model_id=` 在服务端过滤，`total` 和 `cursor` 都按过滤后的结果计算 |
 | GET/POST | `/platform/agent-releases` | Agent 发行目录 |
 

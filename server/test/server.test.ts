@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { DESKTOP_AGENT_PART_BYTES } from '../src/agent-catalog';
 import { createServer } from '../src/server';
 import { seedTenant } from '../src/seed';
+import { hashLoginPassword, normalizeLoginName } from '../src/tenant-passwords';
 import { seedMvp } from '../src/seed-mvp';
 import { MemoryPresence } from '../src/presence';
 import { day, hash, iso } from '../src/credentials';
@@ -205,8 +206,88 @@ test('health, OpenAPI, one-use codes, tenant selection and logout', async () => 
 
 const personalTokens = '/auth/personal-tokens';
 const tokenLogin = '/auth/token-login';
+const passwordLogin = '/auth/password-login';
 type PersonalTokenReply = { id: string; token: string; name: string; created_at: string; expires_at: string;
   last_used_at: string | null; revoked_at: string | null; revision: number; actions: string[] };
+
+type ServerFixture = Awaited<ReturnType<typeof fixture>>;
+async function setPassword(f: ServerFixture, tenantId: string, userId: string, shortName: string, username: string, password: string) {
+  const alias = normalizeLoginName(shortName)!;
+  const login = normalizeLoginName(username)!;
+  const passwordHash = await hashLoginPassword(password);
+  await f.store.system.write((sql) => {
+    sql.run('UPDATE tenants SET short_name = ?, short_name_key = ? WHERE id = ?', [alias.display, alias.key, tenantId]);
+    sql.run(`INSERT INTO tenant_login_accounts (tenant_id, username, username_key, user_id, password_hash) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT (tenant_id,username_key) DO UPDATE SET password_hash=excluded.password_hash`,
+    [tenantId, login.display, login.key, userId, passwordHash]);
+  });
+}
+
+test('password login binds duplicate aliases to the one matching tenant and cannot create global credentials', async () => {
+  const f = await fixture();
+  const other = await seedTenant(f.store, { target: f.owner, name: 'Other test tenant', platformAdmin: true });
+  const password = 'Test password exact! ';
+  await setPassword(f, f.tenantId, f.userId, 'Provisioning', 'Owner', password);
+  await setPassword(f, other.tenantId, other.userId, 'PROVISIONING', 'owner', 'Other password!');
+
+  const login = await f.request(passwordLogin, { tenant: ' ｐｒｏｖｉｓｉｏｎｉｎｇ ', username: 'Ｏｗｎｅｒ', password, kind: 'desktop' });
+  expect(login.status).toBe(200);
+  expect(login.headers.get('cache-control')).toBe('no-store');
+  const reply = await login.json() as { token: string; tenants: { id: string; role: string }[] };
+  expect(reply.tenants).toMatchObject([{ id: f.tenantId, role: 'owner' }]);
+  expect(await (await f.request('/me', undefined, reply.token)).json()).toMatchObject({
+    tenant: { id: f.tenantId }, role: 'owner', is_platform_admin: false, tenant_password_login: true,
+  });
+  expect((await f.request('/devices', f.device, reply.token)).status).toBe(201);
+  expect((await f.request('/auth/select-tenant', { tenant_id: other.tenantId }, reply.token)).status).toBe(403);
+  expect((await f.request('/platform/tenants', undefined, reply.token)).status).toBe(403);
+  expect((await f.request(personalTokens, { name: 'Escape attempt' }, reply.token)).status).toBe(403);
+  expect((await f.request(personalTokens, undefined, reply.token)).status).toBe(403);
+  expect((await f.request(passwordLogin, { tenant: f.tenantId, username: 'owner', password: password.trim() })).status).toBe(401);
+  expect((await f.request(passwordLogin, { tenant: other.tenantId, username: 'owner', password })).status).toBe(401);
+
+  await setPassword(f, other.tenantId, other.userId, 'PROVISIONING', 'owner', password);
+  const ambiguous = await f.request(passwordLogin, { tenant: 'Provisioning', username: 'owner', password });
+  expect(ambiguous.status).toBe(401);
+  expect(await ambiguous.json()).toMatchObject({ error: { code: 'unauthenticated' } });
+  expect((await f.request(passwordLogin, { tenant: other.tenantId, username: 'owner', password })).status).toBe(200);
+  await f.store.system.write((sql) => sql.run("UPDATE tenants SET status = 'suspended' WHERE id = ?", [other.tenantId]));
+  expect((await f.request(passwordLogin, { tenant: other.tenantId, username: 'owner', password })).status).toBe(401);
+  await f.store.tenant(f.tenantId).write((sql) => sql.run("UPDATE members SET status = 'disabled' WHERE user_id = ?", [f.userId]));
+  expect((await f.request(passwordLogin, { tenant: f.tenantId, username: 'owner', password })).status).toBe(401);
+});
+
+test('password login throttles repeated attempts and uses the exact password after the window', async () => {
+  const f = await fixture(15_000, Date.UTC(2026, 11, 22));
+  await setPassword(f, f.tenantId, f.userId, 'OneC', 'owner', 'Fictional strong password');
+  const body = { tenant: 'onec', username: 'OWNER', password: 'wrong' };
+  for (let i = 0; i < 8; i++) expect((await f.request(passwordLogin, body)).status).toBe(401);
+  const correct = { ...body, password: 'Fictional strong password' };
+  const throttled = await f.request(passwordLogin, correct);
+  expect(throttled.status).toBe(429);
+  expect(await throttled.json()).toMatchObject({ error: { code: 'rate_limited', detail: { retry_after_ms: 60_000 } } });
+  f.advance(60_000);
+  expect((await f.request(passwordLogin, correct)).status).toBe(200);
+});
+
+test('platform tenant list and details support shared short names and clearing a short name', async () => {
+  const f = await fixture();
+  await f.store.system.write((sql) => sql.run('INSERT INTO platform_admins VALUES (?)', [f.userId]));
+  const master = await f.login(f.owner, 'web');
+  const path = '/platform/tenants';
+  const first = await f.request(`${path}/${f.tenantId}`, { short_name: 'Demo', revision: 1 }, master, undefined, 'PATCH');
+  expect(first.status).toBe(200);
+  expect(await first.json()).toMatchObject({ id: f.tenantId, short_name: 'Demo', revision: 2 });
+  const duplicate = await f.request(path, { name: 'Other test tenant', short_name: 'DEMO', owner_user_id: f.userId }, master);
+  expect(duplicate.status).toBe(201);
+  const row = await duplicate.json() as { id: string };
+  expect(await (await f.request(`${path}/${row.id}`, undefined, master)).json()).toMatchObject({ id: row.id, short_name: 'DEMO', actions: ['read', 'update'] });
+  expect(await (await f.request(`${path}?q=demo`, undefined, master)).json()).toMatchObject({ total: 2 });
+  expect(await (await f.request('/platform/policy/contracts?q=demo', undefined, master)).json()).toMatchObject({ total: 2 });
+  const cleared = await f.request(`${path}/${f.tenantId}`, { short_name: null, revision: 2 }, master);
+  expect(await cleared.json()).toMatchObject({ short_name: null, revision: 3 });
+  expect(await (await f.request(`${path}?q=demo`, undefined, master)).json()).toMatchObject({ total: 1 });
+});
 
 test('personal tokens are account-owned, disclosed once, and can be managed by ordinary members', async () => {
   const f = await fixture();
