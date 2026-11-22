@@ -2,7 +2,7 @@
 use std::error::Error as _;
 use std::io::ErrorKind;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -10,6 +10,7 @@ use axum::response::Response;
 use onex_core::ws::{BalanceMode, Rate, UpstreamAuth};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
+use tokio::time::{Instant, timeout_at};
 use zeroize::Zeroizing;
 
 use crate::pricing::{Tokens, cost_milli, format_ms};
@@ -19,8 +20,12 @@ use crate::route_select::{self, Context, Request};
 use crate::router::{
     MAX_UPSTREAM_BODY, Router, estimate_request_fields, header_value, read_limited, response_headers, tokio_stream_from,
 };
-use crate::sse::Splitter;
+use crate::sse::{Batch, Event, Splitter};
 use crate::state::PoolExecution;
+
+// A native Agent can time out locally. Keep metering a disconnected reader only while the upstream is
+// making progress and while the original grant is valid.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn refused_before_send(error: &reqwest::Error) -> bool {
     if !error.is_connect() || error.is_timeout() {
@@ -140,7 +145,9 @@ pub(crate) async fn responses(rt: Arc<Router>, headers: HeaderMap, body: Bytes) 
         return blocked();
     };
 
-    let start = Instant::now();
+    let lease_remaining = lease.expires_at_ms.saturating_sub(view.clock.now_ms());
+    let lease_deadline = Instant::now() + Duration::from_millis(u64::try_from(lease_remaining).unwrap_or_default());
+    let mut total_deadline = None;
     let total = Duration::from_millis(plan.pool.total_timeout_ms);
     let attempt_limit = Duration::from_millis(plan.pool.attempt_timeout_ms);
     let mut attempts = Vec::new();
@@ -158,15 +165,15 @@ pub(crate) async fn responses(rt: Arc<Router>, headers: HeaderMap, body: Bytes) 
         {
             return blocked();
         }
-        let Some(remaining) = total.checked_sub(start.elapsed()).filter(|value| !value.is_zero()) else { break };
-        let Some((client, url)) =
-            crate::pool_egress::responses_target(&route.base, mode, remaining.min(attempt_limit)).await
-        else {
+        let start = Instant::now();
+        let deadline = (start + attempt_limit).min(*total_deadline.get_or_insert(start + total)).min(lease_deadline);
+        let Some(remaining) = deadline.checked_duration_since(start).filter(|time| !time.is_zero()) else { break };
+        let Some((client, url)) = crate::pool_egress::responses_target(&route.base, mode, remaining).await else {
             return blocked();
         };
-        let Some(remaining) = total.checked_sub(start.elapsed()).filter(|remaining| !remaining.is_zero()) else {
+        if Instant::now() >= deadline {
             break;
-        };
+        }
         if rt.state.pool_execution() != Some(mode)
             || rt.state.generation() != generation
             || !rt.state.route.read().unwrap().ready().is_some_and(|current| Arc::ptr_eq(current, &view))
@@ -193,12 +200,14 @@ pub(crate) async fn responses(rt: Arc<Router>, headers: HeaderMap, body: Bytes) 
         }
         req["model"] = route.base.upstream_model.as_deref().unwrap_or(&route.base.model).into();
         req["store"] = false.into();
-        let outgoing = client.post(url).json(&req).timeout(attempt_limit.min(remaining));
+        let outgoing = client.post(url).json(&req);
         let outgoing = match route.base.auth {
             UpstreamAuth::Bearer => outgoing.bearer_auth(key.as_str()),
             UpstreamAuth::XApiKey => outgoing.header("x-api-key", header_value(&key)),
         };
-        let response = outgoing.send().await;
+        let Ok(response) = timeout_at(deadline, outgoing.send()).await else {
+            return error(StatusCode::GATEWAY_TIMEOUT, "upstream_error", "等待上游响应超时，送达情况待核对。");
+        };
         let outcome = match &response {
             Ok(_) => "completed",
             Err(cause) if refused_before_send(cause) => "connect_refused",
@@ -207,14 +216,14 @@ pub(crate) async fn responses(rt: Arc<Router>, headers: HeaderMap, body: Bytes) 
         attempts.push(json!({"attempt_id": attempt_id, "deployment_id": route.deployment_id,
             "deployment_revision": route.deployment_revision, "outcome": outcome}));
         if let Ok(response) = response {
-            result = Some((route, attempt_id, response));
+            result = Some((route, attempt_id, response, deadline));
             break;
         }
         if store.record_connect_refusal(&view.scope, &attempt_id).is_err() {
             return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "无法持久化连接拒绝。");
         }
     }
-    let Some((route, attempt_id, upstream)) = result else {
+    let Some((route, attempt_id, mut upstream, first_deadline)) = result else {
         return error(StatusCode::BAD_GATEWAY, "upstream_error", "已签约渠道的连接均不可用。");
     };
     if !upstream.status().is_success() {
@@ -243,12 +252,28 @@ pub(crate) async fn responses(rt: Arc<Router>, headers: HeaderMap, body: Bytes) 
         first_session: binding.first_native_session,
     };
     let body = if stream {
+        let mut split = Splitter::default();
+        let first = match timeout_at(first_deadline, first_stream_batch(&mut upstream, &mut split)).await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => return error(StatusCode::BAD_GATEWAY, "upstream_error", "上游未返回有效的响应事件。"),
+            Err(_) => {
+                return error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream_error",
+                    "等待上游首个响应事件超时，送达情况待核对。",
+                );
+            }
+        };
         let (send, receive) = mpsc::channel(16);
-        tokio::spawn(pump(upstream, receipt, send));
+        tokio::spawn(pump(upstream, (split, first), receipt, send, lease_deadline));
         Body::from_stream(tokio_stream_from(receive))
     } else {
-        let Ok(bytes) = read_limited(upstream, MAX_UPSTREAM_BODY).await else {
-            return error(StatusCode::BAD_GATEWAY, "upstream_error", "上游响应不完整。");
+        let bytes = match timeout_at(first_deadline, read_limited(upstream, MAX_UPSTREAM_BODY)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(_)) => return error(StatusCode::BAD_GATEWAY, "upstream_error", "上游响应不完整。"),
+            Err(_) => {
+                return error(StatusCode::GATEWAY_TIMEOUT, "upstream_error", "等待上游首个响应超时，送达情况待核对。");
+            }
         };
         let Ok(result) = serde_json::from_slice::<Value>(&bytes) else {
             return error(StatusCode::BAD_GATEWAY, "upstream_error", "上游响应不包含可核对的用量。");
@@ -329,15 +354,59 @@ impl Receipt {
     }
 }
 
-async fn pump(mut upstream: reqwest::Response, receipt: Receipt, send: mpsc::Sender<Result<Bytes, std::io::Error>>) {
-    let mut split = Splitter::default();
-    let mut downstream_open = true;
+fn event_kind<'a>(value: &'a Value, event: &'a Event) -> Option<&'a str> {
+    value.as_object()?;
+    value["type"].as_str().or(event.event.as_deref())
+}
+
+fn starts_response(kind: &str, value: &Value) -> bool {
+    match kind {
+        "response.created" | "response.in_progress" | "response.completed" | "response.queued" => {
+            value["response"]["id"].as_str().is_some_and(|id| !id.is_empty())
+        }
+        "response.output_item.added" | "response.output_item.done" => value["item"].is_object(),
+        "response.content_part.added" | "response.content_part.done" => value["part"].is_object(),
+        "response.output_text.delta"
+        | "response.reasoning_text.delta"
+        | "response.reasoning_summary_text.delta"
+        | "response.refusal.delta"
+        | "response.function_call_arguments.delta" => value["delta"].is_string(),
+        _ => false,
+    }
+}
+
+/// HTTP headers, SSE comments and malformed events are insufficient to end the first-response timer.
+async fn first_stream_batch(upstream: &mut reqwest::Response, split: &mut Splitter) -> Option<Batch> {
     while let Ok(Some(chunk)) = upstream.chunk().await {
         let batch = split.push_framed(&chunk);
+        for (_, event) in &batch.events {
+            let Ok(value) = serde_json::from_str::<Value>(&event.data) else { continue };
+            match event_kind(&value, event) {
+                Some("response.failed" | "response.incomplete" | "error") => return None,
+                Some(kind) if starts_response(kind, &value) => return Some(batch),
+                _ => {}
+            }
+        }
+        if batch.oversized {
+            break;
+        }
+    }
+    None
+}
+
+async fn pump(
+    mut upstream: reqwest::Response,
+    (mut split, mut batch): (Splitter, Batch),
+    receipt: Receipt,
+    send: mpsc::Sender<Result<Bytes, std::io::Error>>,
+    lease_deadline: Instant,
+) {
+    let mut downstream_open = true;
+    loop {
         let mut previous = 0;
         for (end, event) in &batch.events {
             let Ok(value) = serde_json::from_str::<Value>(&event.data) else { continue };
-            match value["type"].as_str().or(event.event.as_deref()) {
+            match event_kind(&value, event) {
                 Some("response.completed") => {
                     if receipt.finish(&value["response"]).await {
                         write_frame(&send, &mut downstream_open, batch.raw.slice(..*end)).await;
@@ -356,9 +425,12 @@ async fn pump(mut upstream: reqwest::Response, receipt: Receipt, send: mpsc::Sen
             }
         }
         write_frame(&send, &mut downstream_open, batch.raw).await;
-        if batch.oversized {
+        if batch.oversized || Instant::now() >= lease_deadline {
             break;
         }
+        let deadline = (Instant::now() + STREAM_IDLE_TIMEOUT).min(lease_deadline);
+        let Ok(Ok(Some(chunk))) = timeout_at(deadline, upstream.chunk()).await else { break };
+        batch = split.push_framed(&chunk);
     }
     send_failure(&send, &mut downstream_open).await;
 }
@@ -378,6 +450,14 @@ async fn send_failure(send: &mpsc::Sender<Result<Bytes, std::io::Error>>, open: 
 mod tests {
     use super::*;
     use crate::route_apply::{PoolLease, PoolLeaseState};
+
+    #[test]
+    fn first_response_requires_recognized_native_data() {
+        assert!(!starts_response("response.keepalive", &json!({})));
+        assert!(!starts_response("response.created", &json!({"response":{}})));
+        assert!(starts_response("response.created", &json!({"response":{"id":"resp_1"}})));
+        assert!(starts_response("response.output_text.delta", &json!({"delta":"ready"})));
+    }
 
     #[test]
     fn route_intent_releases_only_without_possible_delivery() {

@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use onex_core::route_pool::ROUTE_POOL_V1;
@@ -23,7 +23,7 @@ use onexd::secret::DeviceKey;
 use onexd::state::{LaunchBinding, RouteApply, State};
 use onexd::ws::{self, WsOptions};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
@@ -60,11 +60,14 @@ impl Server {
         Self::spawn(checkout, command).await
     }
 
-    async fn start_one_chain(checkout: &Path, data_dir: &Path, primary_offline: bool) -> Self {
+    async fn start_one_chain(checkout: &Path, data_dir: &Path, primary_offline: bool, slow_stream: bool) -> Self {
         let mut command = Command::new("bun");
         command.args(["--no-env-file", "tests/e2e/routing/one-chain-server.ts", "--data-dir"]).arg(data_dir);
         if primary_offline {
             command.arg("--primary-offline");
+        }
+        if slow_stream {
+            command.arg("--slow-stream");
         }
         Self::spawn(checkout, command).await
     }
@@ -473,26 +476,66 @@ async fn replay_settlement(info: &Value, receipt: &Value, settlement: &Value, ex
 /// 本地原生 Responses 请求用上游终态用量结算，并核对供应商与租户两边台账。
 #[tokio::test]
 async fn signed_pool_native_responses_settles_both_ledgers() {
-    run_signed_pool_responses(false, false).await;
+    run_signed_pool_responses(false, None).await;
 }
 
 #[tokio::test]
 async fn signed_pool_falls_back_only_after_primary_refuses_connection() {
-    run_signed_pool_responses(true, false).await;
+    run_signed_pool_responses(true, None).await;
 }
 
 #[tokio::test]
 async fn signed_pool_stream_shares_cursor_with_native_session_events() {
-    run_signed_pool_responses(true, true).await;
+    run_signed_pool_responses(true, Some(StreamRead::Whole)).await;
 }
 
-async fn run_signed_pool_responses(primary_offline: bool, stream: bool) {
+#[tokio::test]
+async fn signed_pool_records_slow_terminal_usage_after_client_disconnect() {
+    run_signed_pool_responses(true, Some(StreamRead::Disconnect)).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamRead {
+    Whole,
+    Disconnect,
+}
+
+async fn disconnect_after_first_event(address: std::net::SocketAddr, token: &str, request: &Value) {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    let body = request.to_string();
+    let headers = format!(
+        "POST /v1/responses HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\n\
+        Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).await.unwrap();
+    stream.write_all(body.as_bytes()).await.unwrap();
+    let mut response = BufReader::new(stream);
+    timeout(T, async {
+        let mut line = String::new();
+        response.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("HTTP/1.1 200 "), "{line}");
+        loop {
+            line.clear();
+            assert_ne!(response.read_line(&mut line).await.unwrap(), 0, "connection closed before first SSE event");
+            if line.contains("event: response.created") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    response.into_inner().shutdown().await.unwrap();
+}
+
+async fn run_signed_pool_responses(primary_offline: bool, stream_read: Option<StreamRead>) {
+    let stream = stream_read.is_some();
     let Some(checkout) = std::env::var_os("ONEX_ONE_CHAIN_SERVER_CHECKOUT").map(PathBuf::from) else {
         eprintln!("skipped: set ONEX_ONE_CHAIN_SERVER_CHECKOUT to run the signed pool chain");
         return;
     };
     let server_dir = tempfile::tempdir().unwrap();
-    let server = Server::start_one_chain(&checkout, server_dir.path(), primary_offline).await;
+    let server = Server::start_one_chain(&checkout, server_dir.path(), primary_offline, stream).await;
     let info = &server.info;
     let value = |field: &str| info[field].as_str().unwrap();
     let scope = Scope::new(value("ws_url"), value("tenant_id"), value("user_id"), value("device_id")).unwrap();
@@ -558,26 +601,40 @@ async fn run_signed_pool_responses(primary_offline: bool, stream: bool) {
     if !stream {
         call["max_output_tokens"] = 2048.into();
     }
-    let answer = http.post(format!("http://{local}/v1/responses")).bearer_auth(token).json(&call).send().await.unwrap();
-    let status = answer.status();
-    let answer = answer.text().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::OK, "native response: {answer}");
-    let answer: Value = if stream {
-        assert!(answer.contains("event: response.output_text.delta"), "{answer}");
-        answer
-            .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .find(|event| event["type"] == "response.completed")
-            .unwrap_or_else(|| panic!("stream has no completed event: {answer}"))["response"]
-            .clone()
-    } else {
-        serde_json::from_str(&answer).unwrap()
-    };
+    let started = Instant::now();
+    let limit = |name: &str| Duration::from_millis(info["routing"][name].as_u64().unwrap());
     let selected_vendor = if primary_offline { "vendor-b" } else { "vendor-a" };
-    assert!(answer["model"].as_str().unwrap().starts_with(selected_vendor));
-    assert_eq!(answer["usage"]["input_tokens"], 10_000);
-    assert_eq!(answer["usage"]["output_tokens"], 2_000);
+    if stream_read == Some(StreamRead::Disconnect) {
+        disconnect_after_first_event(local, token, &call).await;
+        assert!(started.elapsed() < limit("attempt_timeout_ms"));
+        let intent = edge.store.route_usage_for_lease(&scope, &lease.lease_id).unwrap().unwrap();
+        assert!(intent.1.is_none(), "upstream completion should still be pending on disconnect");
+    } else {
+        let answer =
+            http.post(format!("http://{local}/v1/responses")).bearer_auth(token).json(&call).send().await.unwrap();
+        if stream {
+            assert!(started.elapsed() < limit("attempt_timeout_ms"));
+        }
+        let status = answer.status();
+        let answer = answer.text().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "native response: {answer}");
+        let answer: Value = if stream {
+            assert!(started.elapsed() > limit("total_timeout_ms"));
+            assert!(answer.contains("event: response.output_text.delta"), "{answer}");
+            answer
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|event| event["type"] == "response.completed")
+                .unwrap_or_else(|| panic!("stream has no completed event: {answer}"))["response"]
+                .clone()
+        } else {
+            serde_json::from_str(&answer).unwrap()
+        };
+        assert!(answer["model"].as_str().unwrap().starts_with(selected_vendor));
+        assert_eq!(answer["usage"]["input_tokens"], 10_000);
+        assert_eq!(answer["usage"]["output_tokens"], 2_000);
+    }
 
     wait_until("metered lease settlement", || {
         edge.store.pool_lease(&scope, &lease.lease_id).unwrap().unwrap().state == PoolLeaseState::Settled
@@ -585,6 +642,9 @@ async fn run_signed_pool_responses(primary_offline: bool, stream: bool) {
     .await;
     let (seq, receipt, acked) = edge.store.route_usage_for_lease(&scope, &lease.lease_id).unwrap().unwrap();
     let receipt = receipt.unwrap();
+    if stream {
+        assert!(started.elapsed() > limit("total_timeout_ms"));
+    }
     assert!(acked);
     assert_eq!(seq, Some(if stream { 2 } else { 1 }));
     if stream {
@@ -740,6 +800,7 @@ async fn run_signed_pool_responses(primary_offline: bool, stream: bool) {
             "deployment_revision": receipt["deployment_revision"], "signed_pool": info["signed_pool"],
             "input_tokens": 10_000, "output_tokens": 2_000, "tenant_debit_milli": charges,
             "primary_offline": primary_offline, "stream":stream, "attempts": attempts,
+            "client_disconnected":stream_read == Some(StreamRead::Disconnect), "elapsed_ms":started.elapsed().as_millis(),
             "usage_seq":seq, "replayed_usage_ack_seq": acked_through, "replayed_settlement_op_id": op.op_id,
             "supplier_debit_micro": supplier_debit, "supplier_amount_cny_micro": 50_000,
             "supplier_balance_micro": selected_wallet_balance,
