@@ -21,6 +21,7 @@ import { SERVER_ARTIFACT_UPLOAD_PATH, serverReleaseRoutes, type ReleaseRuntime }
 import { personalLoginTokenRoutes } from './personal-login-tokens';
 import { platformRoutes } from './platform-management';
 import { modelPoolRoutes } from './model-pool';
+import { procurementRoutes } from './procurement';
 import { policyDiscountRoutes, settleUnclosedDiscountMonths } from './policy-discounts';
 import { commerceRoutes } from './commerce';
 import { upstreamRoutes } from './tenant-upstreams';
@@ -105,6 +106,7 @@ export async function createServer(opts: Options) {
     tenantRoutes(app, store, management);
     platformRoutes(app, store, management);
     modelPoolRoutes(app, store, management);
+    procurementRoutes(app, store, management);
     capabilityRoutes(app, store, management);
     policyRoutes(app, store, management);
     upstreamRoutes(app,store,management);

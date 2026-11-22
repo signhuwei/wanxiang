@@ -1,19 +1,20 @@
-import { createHash } from 'node:crypto';
-import type { Context, Hono } from 'hono';
+import type { Hono } from 'hono';
 import { ulid } from 'ulid';
 import { ApiError, field, invalid, json, operation } from './api';
 import { hmac, iso } from './credentials';
 import { int, platformActor, type ManagementOptions } from './management';
 import { readEffective } from './policy-data';
+import { boundPage, canonical, conflict, digest, queryValue as query, replay, requirePlatformAdmin as actorPlatform, routeId,
+  routeIdPattern, strictObject } from './routing-http';
 import type { Store, Transaction } from './store';
 
 type Reader = Pick<Transaction, 'get' | 'all'>;
-type Member = { deployment_id: string; deployment_revision: number; priority: number; approved_match_id: string; evidence_ids: string[] };
+export type PoolMember = { deployment_id: string; deployment_revision: number; priority: number; approved_match_id: string; evidence_ids: string[] };
+type Member = PoolMember;
 type Routing = { strategy: 'ordered'; max_attempts: number; attempt_timeout_ms: number; total_timeout_ms: number };
 type Draft = { expected_pool_revision: number; members: Member[]; routing: Routing; reason: string };
 type Issue = { code: string; message: string; deployment_id?: string; field?: string };
 
-const idPattern = /^[A-Za-z0-9_.-]{1,128}$/;
 const MAX_MEMBERS = 32, MAX_ATTEMPTS = 8, MAX_TIMEOUT_MS = 600_000;
 const messages: Record<string, string> = {
   deployment_not_found: '渠道部署不存在',
@@ -31,34 +32,15 @@ const messages: Record<string, string> = {
   max_attempts_exceeds_members: '最大尝试次数超过成员数',
 };
 const issue = (code: string, extra: Omit<Issue, 'code' | 'message'> = {}): Issue => ({ code, message: messages[code] ?? code, ...extra });
-
-function id(value: unknown, name: string) {
-  const text = field(value, name);
-  if (!idPattern.test(text)) invalid(name);
-  return text;
-}
-function canonical(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonical);
-  if (value !== null && typeof value === 'object') {
-    const row = value as Record<string, unknown>;
-    return Object.fromEntries(Object.keys(row).sort().map((key) => [key, canonical(row[key])]));
-  }
-  return value;
-}
-const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
+const idPattern = routeIdPattern;
+const id = routeId;
+const object = strictObject;
 
 /** Stable member order: priority ascending, then deployment_id (binary). Equal priorities stay valid. */
 export function orderMembers<T extends { priority: number; deployment_id: string }>(rows: T[]) {
   return [...rows].sort((a, b) => a.priority - b.priority || (a.deployment_id < b.deployment_id ? -1 : a.deployment_id > b.deployment_id ? 1 : 0));
 }
 
-function object(value: unknown, name: string, keys: string[]) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) invalid(name);
-  const row = value as Record<string, unknown>;
-  const extra = Object.keys(row).filter((key) => !keys.includes(key));
-  if (extra.length) invalid(...extra.map((key) => `${name}.${key}`));
-  return row;
-}
 
 export function parseDraft(body: Record<string, unknown>, extraKeys: string[] = []): Draft {
   object(body, 'body', ['expected_pool_revision', 'members', 'routing', 'reason', ...extraKeys]);
@@ -224,46 +206,18 @@ export function evaluatePool(sql: Reader, secret: string, actor: string, modelId
   return { current, identity, preview_basis, blocking, warnings, diff, publishable: blocking.length === 0 };
 }
 
-const actorPlatform = (sql: Reader, actor: string) => {
-  if (!sql.get('SELECT 1 FROM platform_admins WHERE user_id = ?', [actor])) throw new ApiError('forbidden');
-};
-function requireModel(sql: Reader, modelId: string) {
+export function requireModel(sql: Reader, modelId: string) {
   const row = idPattern.test(modelId) ? sql.get<{ status: string }>('SELECT status FROM models WHERE id = ?', [modelId]) : null;
   if (!row) throw new ApiError('not_found');
   return row.status === 'active';
 }
 /** Disabled models keep their history readable but do not offer drafting or publishing. */
-function requireDraftableModel(sql: Reader, modelId: string) {
+export function requireDraftableModel(sql: Reader, modelId: string) {
   if (!requireModel(sql, modelId)) throw new ApiError('forbidden', { reason: 'model_disabled' });
 }
-const stale = (reason: string, current_revision: number, changed: string[] = []) =>
-  new ApiError('conflict', { reason, current_revision, ...(changed.length && { changed }) });
+const stale = (reason: string, current_revision: number, changed: string[] = []) => conflict(reason, current_revision, changed);
 
-/** Cursor bound to caller, resource and filters; changing any of them invalidates it. */
-function boundPage(c: Context, secret: string, actor: string, scope: unknown) {
-  const raw = c.req.query('limit') ?? '50';
-  if (!/^\d{1,3}$/.test(raw)) invalid('limit');
-  const limit = int(Number(raw), 'limit', 1, 200);
-  const sign = (offset: number) => hmac(secret, ['cursor', actor, c.req.path, canonical(scope), offset]).slice(0, 22);
-  const cursor = c.req.query('cursor');
-  let offset = 0;
-  if (cursor !== undefined) {
-    const match = /^(\d{1,9})\.([A-Za-z0-9_-]{22})$/.exec(cursor);
-    if (!match || match[2] !== sign(Number(match[1]))) invalid('cursor');
-    offset = Number(match![1]);
-  }
-  return {
-    limit, offset,
-    page<T>(items: T[], total: number, actions: readonly string[]) {
-      const next = offset + items.length;
-      return { items, total, next_cursor: items.length && next < total ? `${next}.${sign(next)}` : null, actions };
-    },
-  };
-}
-const query = (c: Context, name: string) => {
-  const value = c.req.query(name);
-  return value === undefined || value === '' ? undefined : value;
-};
+export { assessMember, currentIdentity, poolMembers };
 
 export function modelPoolRoutes(app: Hono, store: Store, opts: ManagementOptions) {
   const P = '/v1/platform';
@@ -290,7 +244,7 @@ export function modelPoolRoutes(app: Hono, store: Store, opts: ManagementOptions
       archive_blockers: store.system.all<{ model_id: string; pool_revision: number }>(`SELECT h.model_id, h.pool_revision FROM model_pool_heads h
         JOIN model_pool_deployments m ON m.model_id = h.model_id AND m.pool_revision = h.pool_revision WHERE m.deployment_id = ? ORDER BY h.model_id`,
         [row.deployment_id]).map((ref) => ({ kind: 'active_pool', ...ref })),
-      actions: ['read'],
+      actions: ['read', 'read_quotes'],
     }));
     return c.json(p.page(items, n, []));
   });
@@ -378,11 +332,7 @@ export function modelPoolRoutes(app: Hono, store: Store, opts: ManagementOptions
     const op = operation(c, opts.codeSecret, at, actor, { ...draft, preview_basis: basis });
     return store.system.write((sql) => {
       actorPlatform(sql, actor);
-      let cached;
-      try { cached = op.read(sql); } catch (error) {
-        if (error instanceof ApiError && error.code === 'conflict') throw new ApiError('conflict', { reason: 'idempotency_mismatch' });
-        throw error;
-      }
+      const cached = replay(op, sql);
       if (cached) return cached;
       requireDraftableModel(sql, modelId);
       const now = iso(at);
