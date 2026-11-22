@@ -1,5 +1,6 @@
 import pkg from '../package.json';
 import { personalLoginTokenPattern } from './credentials';
+import { INPUT_MULTIPLIER_BASIS } from './input-multiplier';
 import { observedAgents } from './observe';
 import { quoteDimensions } from './procurement';
 import { commitPattern, digestPattern, MAX_RELEASE_BYTES } from './release-package';
@@ -304,7 +305,7 @@ const invite = object({ id: text, role, group_id: nullableText, max_uses: sequen
 
 function platformPaths(path: string, fields: Record<string, unknown>, required: string[], additionalInput = {}, additionalOutput = {}, listOutput = additionalOutput) {
   const result = managed({ ...fields, ...additionalOutput });
-  const listResult = managed({ ...fields, ...listOutput });
+  const listResult = object({ ...fields, revision, actions, ...listOutput });
   const input = { ...fields, ...additionalInput, revision };
   const item = write(object(input, ['revision']), result, 'update', true);
   return {
@@ -398,6 +399,7 @@ const procurementEnd = { ...procurementTime, description: '终点不包含在有
 const procurementCurrency = { ...text, pattern: '^[A-Z]{3}$' };
 const procurementFxBase = { ...procurementCurrency, not: { const: 'CNY' } };
 const procurementFxTarget = { ...text, const: 'CNY' };
+const procurementUnsignedDecimal = { ...text, pattern: '^(?:0|[1-9][0-9]{0,37})$' };
 const procurementPositiveDecimal = { ...text, pattern: '^[1-9][0-9]{0,37}$' };
 const procurementSourceFields = { kind: { const: 'manual' }, reference: nullable({ ...text, maxLength: 200, pattern: '\\S' }) };
 const procurementSourceInput = { ...object(procurementSourceFields, ['kind']), additionalProperties: false };
@@ -418,7 +420,7 @@ function procurementApplicable(record: object, reasonCodes: string[]) {
 }
 
 const procurementQuoteItem = { ...object({ dimension: { ...text, enum: [...quoteDimensions] },
-  rate_micro: { ...text, pattern: '^(?:0|[1-9][0-9]{0,37})$', description: '原币百万分之一单位的整数文本。' },
+  rate_micro: { ...procurementUnsignedDecimal, description: '原币百万分之一单位的整数文本。' },
   quantity_basis: { ...revision, maximum: Number.MAX_SAFE_INTEGER }, unit: { ...text, enum: ['token', 'request'] } }),
   additionalProperties: false, if: { properties: { dimension: { const: 'request' } } },
   then: { properties: { unit: { const: 'request' } } }, else: { properties: { unit: { const: 'token' } } } };
@@ -466,6 +468,75 @@ const procurementPaths = {
       namedPath('fx_revision', revision)]),
   },
 };
+const multiplierPoolRevision = { ...sequence, maximum: Number.MAX_SAFE_INTEGER };
+const multiplierPpm = { ...sequence, multipleOf: 1000 };
+const multiplierBasis = { ...text, const: INPUT_MULTIPLIER_BASIS };
+const multiplierCalculation = { ...text, enum: ['complete', 'partial', 'unavailable'] };
+const multiplierStatus = { ...text, const: 'available_to_sign' };
+const multiplierRequest = {
+  expected_pool_revision: multiplierPoolRevision,
+  expected_source_rate_key: { ...nullable(routingId), description: '没有已发布的倍率版本时传 null。' },
+  manual_input_multiplier_ppm: nullable({ ...multiplierPpm, maximum: 1_000_000_000_000 }),
+  reason: nullable(procurementReason),
+};
+const multiplierRequestRequired = ['expected_pool_revision', 'expected_source_rate_key'];
+const multiplierPreviewInput = { ...object({ ...multiplierRequest, pricing_at: {
+  ...nullable(procurementTime), description: '省略或传 null 时采用服务端当前时间。',
+} }, multiplierRequestRequired), additionalProperties: false };
+const multiplierPublishInput = { ...object({ ...multiplierRequest, pricing_at: procurementTime, preview_basis: routingPreviewBasis },
+  [...multiplierRequestRequired, 'pricing_at', 'preview_basis']), additionalProperties: false };
+
+const multiplierChannelFields = { deployment_id: routingId, deployment_revision: revision, quote_id: nullable(routingId),
+  quote_revision: nullable(revision), currency: nullable(procurementCurrency), amount_micro: nullable(procurementUnsignedDecimal),
+  quantity_basis: nullable({ ...revision, maximum: Number.MAX_SAFE_INTEGER }), unit: nullable({ ...text, const: 'token' }),
+  fx_revision: nullable(revision), rate_numerator: nullable(procurementPositiveDecimal), rate_denominator: nullable(procurementPositiveDecimal),
+  input_cny_micro_per_mtok: nullable({ ...text, pattern: '^(?:0|[1-9][0-9]*)$' }) };
+const multiplierChannelReason = { ...text, enum: ['deployment_ineligible', 'missing_input_quote', 'quote_expired',
+  'quote_deployment_revision_changed', 'invalid_input_unit', 'missing_fx', 'fx_expired'] };
+const multiplierChannel = object({ ...multiplierChannelFields, reason_code: multiplierChannelReason }, Object.keys(multiplierChannelFields));
+const multiplierPreviewChannel = { ...object({ ...multiplierChannel.properties, eligibility_codes: listItems(text) }, multiplierChannel.required),
+  if: { required: ['reason_code'], properties: { reason_code: { const: 'deployment_ineligible' } } },
+  then: { required: ['eligibility_codes'] } };
+const multiplierBlocking = object({ code: { ...text, enum: ['multiplier_unavailable', 'missing_sales_rates', 'reason_required', 'multiplier_out_of_range'] }, message: text });
+const multiplierPreview = { ...object({ model_id: routingId, expected_pool_revision: multiplierPoolRevision,
+  expected_source_rate_key: nullable(routingId), pool_revision: multiplierPoolRevision, pricing_at: procurementTime,
+  input_multiplier_basis: multiplierBasis, calculation_status: multiplierCalculation, channels: listItems(multiplierPreviewChannel),
+  recommended_input_multiplier_ppm: nullable(multiplierPpm), input_multiplier_ppm: nullable(multiplierPpm),
+  input_milli_per_mtok: nullable(sequence), output_milli_per_mtok: nullable(sequence), cache_read_milli_per_mtok: nullable(sequence),
+  cache_write_milli_per_mtok: nullable(sequence), sales_rates_source: nullableText, manual_input_multiplier_ppm: multiplierRequest.manual_input_multiplier_ppm,
+  reason: multiplierRequest.reason, blocking: listItems(multiplierBlocking), preview_basis: routingPreviewBasis, actions }),
+  if: { properties: { blocking: { maxItems: 0 } } },
+  then: { properties: { actions: { ...actions, const: ['read', 'publish_input_multiplier'] } } },
+  else: { properties: { actions: readActions } } };
+const multiplierPublishedFields = { model_id: routingId, source_rate_key: routingId, input_multiplier_basis: multiplierBasis,
+  input_multiplier_ppm: multiplierPpm, input_milli_per_mtok: sequence, status: multiplierStatus };
+const multiplierDetail = object({ ...multiplierPublishedFields, recommended_input_multiplier_ppm: nullable(multiplierPpm),
+  output_milli_per_mtok: sequence, cache_read_milli_per_mtok: sequence, cache_write_milli_per_mtok: sequence, sales_rates_source: text,
+  pool_revision: revision, pricing_at: procurementTime, calculation_status: multiplierCalculation, based_on_source_rate_key: nullable(routingId),
+  override_reason: multiplierRequest.reason, channels: listItems(multiplierChannel), created_by: text, created_at: timestamp,
+  current: boolean, actions: readActions });
+
+const multiplierConflictFields = { current_pool_revision: multiplierPoolRevision, current_source_rate_key: nullable(routingId) };
+const multiplierRevisionChanged = object({ reason: { const: 'revision_changed' }, ...multiplierConflictFields,
+  changed: { ...listItems({ ...text, enum: ['pool_revision', 'source_rate_key'] }), minItems: 1, maxItems: 2, uniqueItems: true } });
+const multiplierPreviewStale = object({ reason: { const: 'preview_stale' }, ...multiplierConflictFields,
+  changed: { ...listItems(text), enum: [['preview_basis'], ['pricing_window']] } });
+const multiplierIdempotencyMismatch = object({ reason: { const: 'idempotency_mismatch' } });
+const multiplierConflict = (description: string, detail: object) => response(description,
+  object({ error: object({ code: { const: 'conflict' }, message: text, detail }) }));
+const multiplierInvalid = response('请求字段无效。', object({ error: object({ code: { const: 'invalid' }, message: text,
+  detail: object({ fields: listItems(text) }) }) }));
+const multiplierPreviewOperation = policyPreview(multiplierPreviewInput, multiplierPreview, [routingModelId]);
+const multiplierPublishOperation = policyWrite(multiplierPublishInput, object(multiplierPublishedFields), 'create', [routingModelId]);
+const multiplierPath = '/v1/platform/models/{model_id}/input-multiplier';
+const multiplierPaths = {
+  [multiplierPath + '/preview']: { post: { ...multiplierPreviewOperation, responses: { ...multiplierPreviewOperation.responses,
+    409: multiplierConflict('模型池或倍率版本已变更。', multiplierRevisionChanged), 422: multiplierInvalid } } },
+  [multiplierPath + '/revisions']: { post: { ...multiplierPublishOperation, responses: { ...multiplierPublishOperation.responses,
+    409: multiplierConflict('倍率发布依据已变更或幂等键已用于不同请求。',
+      { oneOf: [multiplierRevisionChanged, multiplierPreviewStale, multiplierIdempotencyMismatch] }), 422: multiplierInvalid } } },
+  [multiplierPath + '/revisions/{source_rate_key}']: { get: policyDetail(multiplierDetail, [routingModelId, namedPath('source_rate_key', routingId)]) },
+};
 
 const ledgerFields = { id: text, kind: text, amount_milli: { type: 'integer' }, user_id: nullableText, lease_id: nullableText,
   request_ref: nullableText, by: nullableText, at: text, note: nullableText, actions };
@@ -485,6 +556,7 @@ export const openapi = {
     ...policyPaths,
     ...routingPaths,
     ...procurementPaths,
+    ...multiplierPaths,
     '/v1/healthz': { get: { summary: '健康检查', responses: { 200: response('正常', object({ status: { const: 'ok' }, version: text, commit: text })) } } },
     '/v1/openapi.json': { get: { summary: '接口文档', responses: { 200: response('OpenAPI 文档', { type: 'object' }) } } },
     '/v1/auth/code': { post: { summary: '请求验证码', parameters: headers, requestBody: requestBody(object({ target: text })),
@@ -612,7 +684,10 @@ export const openapi = {
     ...platformPaths('/v1/platform/providers', providers, ['name', 'protocol', 'base_url', 'secret'], { secret: { ...text, writeOnly: true } }),
     ...platformPaths('/v1/platform/models', models, ['provider_id', 'upstream_name', 'display_name', 'context_window'], {}, {}, {
       current_identity_revision: nullable(revision), current_pool_revision: { ...sequence, description: '0 表示未发布模型池。' },
-      channel_count: sequence,
+      channel_count: sequence, current_source_rate_key: nullable(routingId), input_multiplier_ppm: {
+        ...nullable(multiplierPpm), description: '没有已发布的倍率版本时，回显现行旧平台费率对应的倍率。没有可用费率时为 null。',
+      }, actions: { ...actions, enum: [['read', 'update'], ['read', 'update', 'preview_input_multiplier']],
+        description: '仅启用的模型可预览倍率。' },
     }),
     ...platformPaths('/v1/platform/agent-releases', releases, ['agent', 'version', 'os', 'arch', 'url', 'sha256', 'size'], {},
       releaseSupply),
