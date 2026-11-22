@@ -19,6 +19,28 @@ export function bindTokenLoginTrigger(button, label, open) {
   })
 }
 
+export function tenantChoiceList(tenants, select, onError) {
+  const list = el('div', 'tenant-list')
+  for (const tenant of tenants) {
+    const item = el('button', 'tenant-item')
+    item.type = 'button'
+    item.appendChild(el('span', null, tenant.name))
+    if (tenant.role) item.appendChild(el('small', 'muted', '角色：' + (ROLE_TEXT[tenant.role] || tenant.role)))
+    item.addEventListener('click', async () => {
+      const choices = list.querySelectorAll('button')
+      choices.forEach(choice => { choice.disabled = true })
+      try {
+        await select(tenant)
+      } catch (error) {
+        choices.forEach(choice => { choice.disabled = false })
+        onError(error)
+      }
+    })
+    list.appendChild(item)
+  }
+  return list
+}
+
 export function renderLogin(host, { api, mockOn, signal, setPendingToken, onSession }) {
   const wrap = el('div', 'login-wrap')
   const panel = el('div', 'login-panel')
@@ -169,10 +191,10 @@ export function renderLogin(host, { api, mockOn, signal, setPendingToken, onSess
       return { token: loginRes.token, user: me.user, tenant: me.tenant, role: me.role }
     }
     const tenants = loginRes.tenants || []
+    if (me.is_platform_admin === true) {
+      return { ...me, globalActions: me.actions || [], token: globalToken, globalToken, tenantChoices: tenants }
+    }
     if (tenants.length === 0) {
-      if (me.is_platform_admin) {
-        return { ...me, globalActions: me.actions || [], token: globalToken, globalToken }
-      }
       throw new Error('该账号不属于任何租户，请联系管理员获取邀请码')
     }
     if (tenants.length === 1) {
@@ -189,24 +211,12 @@ export function renderLogin(host, { api, mockOn, signal, setPendingToken, onSess
     fieldsBox.hidden = true
     submitBtn.hidden = true
     hint.hidden = true
-    const list = el('div', 'tenant-list')
-    for (const t of tenants) {
-      const item = el('button', 'tenant-item')
-      item.appendChild(el('span', null, t.name))
-      item.appendChild(el('small', 'muted', t.role ? '角色：' + (ROLE_TEXT[t.role] || t.role) : ''))
-      item.addEventListener('click', async () => {
-        item.disabled = true
-        try {
-          onSession(await finishWithTenant(t))
-        } catch (e) {
-          item.disabled = false
-          hint.hidden = false
-          setHint(e.message || '选择租户失败', true)
-        }
-      })
-      list.appendChild(item)
-    }
-    panel.appendChild(list)
+    panel.appendChild(tenantChoiceList(tenants, async tenant => {
+      onSession(await finishWithTenant(tenant))
+    }, error => {
+      hint.hidden = false
+      setHint(error.message || '选择租户失败', true)
+    }))
   }
 
   async function submit() {

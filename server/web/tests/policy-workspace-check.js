@@ -14,6 +14,7 @@ import desktopBuilds from '../../src/desktop-qualifications.json'
 const dir = await mkdtemp(join(tmpdir(), 'onex-policy-web-'))
 const target = 'owner@example.test'
 const groupManagerTarget = 'group-manager@example.test'
+const platformTarget = 'platform-only@example.test'
 let code
 const app = await createServer({ dataDir: dir, hostname: '127.0.0.1', port: 0, heartbeatMs: 15000,
   tenantCacheSize: 2, presence: new MemoryPresence(), commit: 'test', codeSecret: crypto.randomUUID(),
@@ -30,7 +31,11 @@ try {
     sql.run('INSERT INTO members (user_id, role, status, group_id) VALUES (?, ?, ?, ?)',
       [member.user_id, member.role, member.status, subgroupId])
   })
-  await app.store.system.write(sql => indexMember(sql, tenant.tenantId, member))
+  await app.store.system.write(sql => {
+    indexMember(sql, tenant.tenantId, member)
+    const platformUser = ensureUser(sql, { kind: 'email', value: platformTarget }, Date.now())
+    sql.run('INSERT INTO platform_admins (user_id) VALUES (?)', [platformUser.id])
+  })
   browser = await chromium.launch({ channel: 'chrome', args: ['--disable-gpu'] })
   const page = await browser.newPage({ baseURL: app.server.url.href, viewport: { width: 1024, height: 800 } })
   page.setDefaultTimeout(6500)
@@ -45,6 +50,15 @@ try {
   const link = name => page.getByRole('link', { name, exact: true })
   const button = name => page.getByRole('button', { name, exact: true })
   const label = name => page.getByLabel(name, { exact: true })
+  const accountMenu = page.locator('.account-menu summary')
+  async function login(browserPage, email) {
+    await browserPage.goto(app.server.url.href)
+    await browserPage.getByPlaceholder('邮箱或手机号').fill(email)
+    await browserPage.getByRole('button', { name: '发送验证码', exact: true }).click()
+    await browserPage.getByText('验证码已发送，请查收').waitFor()
+    await browserPage.getByPlaceholder('6 位验证码').fill(code)
+    await browserPage.getByRole('button', { name: '登录', exact: true }).click()
+  }
   const wait = async text => {
     try { await page.getByText(text, { exact: true }).first().waitFor() }
     catch (error) {
@@ -52,14 +66,12 @@ try {
       throw error
     }
   }
-  await page.goto(app.server.url.href)
-  await page.getByPlaceholder('邮箱或手机号').fill(target)
-  await button('发送验证码').click()
-  await page.getByText('验证码已发送，请查收').waitFor()
-  await page.getByPlaceholder('6 位验证码').fill(code)
-  await button('登录').click()
-  await button('生成邀请码').waitFor()
-  await link('平台').click()
+  await login(page, target)
+  await page.waitForURL(/#\/platform$/)
+  await link('平台').waitFor()
+  assert.equal(await link('租户').count(), 0)
+  assert.equal(await page.locator('.tenant-name').count(), 0)
+  assert.equal(await page.locator('.quota-item').count(), 0)
   await link('能力管理').click()
   await link('Agent').click()
   await button('登记发行').click()
@@ -215,7 +227,14 @@ try {
   await wait('浏览器联调充值')
   const result = await page.locator('.inline-head h2').last().innerText()
   const receiptId = result.split(' · ').at(-1)
-  await link('租户').click()
+  await accountMenu.click()
+  await link('进入租户工作台').click()
+  await page.waitForURL(/#\/tenant\/select$/)
+  await page.getByRole('button', { name: /^合约联调租户(?:\s|$)/ }).click()
+  await button('生成邀请码').waitFor()
+  await link('租户').waitFor()
+  assert.equal(await link('平台').count(), 0)
+  assert.equal(await page.locator('.tenant-name').innerText(), '合约联调租户')
   await link('合约').click()
   await button('签发记录').click()
   await wait('首次版本')
@@ -287,26 +306,47 @@ try {
   await wait('浏览器联调充值')
   assert.equal(await button('充值').count(), 0)
 
+  await accountMenu.click()
+  await link('进入平台工作台').click()
+  await page.waitForURL(/#\/platform(?:\/contracts)?$/)
+  await link('平台').waitFor()
+  assert.equal(await link('租户').count(), 0)
+  assert.equal(await page.locator('.tenant-name').count(), 0)
+  assert.equal(await page.locator('.quota-item').count(), 0)
+
   const managerPage = await browser.newPage({ baseURL: app.server.url.href, viewport: { width: 1024, height: 800 } })
   managerPage.setDefaultTimeout(6500)
   managerPage.on('pageerror', error => errors.push(error.message))
   const managerButton = name => managerPage.getByRole('button', { name, exact: true })
-  await managerPage.goto(app.server.url.href)
-  await managerPage.getByPlaceholder('邮箱或手机号').fill(groupManagerTarget)
-  await managerButton('发送验证码').click()
-  await managerPage.getByText('验证码已发送，请查收').waitFor()
-  await managerPage.getByPlaceholder('6 位验证码').fill(code)
-  await managerButton('登录').click()
+  await login(managerPage, groupManagerTarget)
   await managerButton('所管分组').waitFor()
   assert.equal(await managerButton('相邻分组').count(), 0)
+  await managerPage.goto(new URL('#/platform/contracts', app.server.url.href).href)
+  await managerPage.waitForURL(/#\/tenant\/groups$/)
+  await managerButton('所管分组').waitFor()
+  assert.equal(await managerPage.getByRole('link', { name: '平台', exact: true }).count(), 0)
   await managerButton('所管分组').click()
   await managerButton('编辑配置').waitFor()
   await managerPage.getByRole('link', { name: '橡皮', exact: true }).click()
   await managerButton('所管分组').click()
   await managerPage.getByRole('heading', { name: '本月配额', exact: true }).waitFor()
   assert.equal(await managerButton('充值').count(), 0)
+
+  const platformPage = await browser.newPage({ baseURL: app.server.url.href })
+  platformPage.setDefaultTimeout(6500)
+  platformPage.on('pageerror', error => errors.push(error.message))
+  await login(platformPage, platformTarget)
+  await platformPage.waitForURL(/#\/platform$/)
+  for (const route of ['#/tenant/select', '#/tenant/members']) {
+    await platformPage.goto(new URL(route, app.server.url.href).href)
+    await platformPage.waitForURL(/#\/platform(?:\/contracts)?$/)
+    await platformPage.getByRole('link', { name: '平台', exact: true }).waitFor()
+  }
+  assert.equal(await platformPage.getByRole('link', { name: '租户', exact: true }).count(), 0)
+  await platformPage.locator('.account-menu summary').click()
+  assert.equal(await platformPage.getByRole('link', { name: '进入租户工作台', exact: true }).count(), 0)
   assert.deepEqual(errors, [])
-  console.log('PASS real server: agent engine upload, Tools release, signatures, recharge, discount drill, nested policies, and group-admin scope')
+  console.log('PASS real server: workspace isolation, agent engine upload, Tools release, signatures, recharge, discount drill, nested policies, and group-admin scope')
 } finally {
   await browser?.close()
   app.server.stop(true)
