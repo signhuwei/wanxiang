@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
 
 use axum::body::{Body, Bytes};
@@ -616,6 +617,58 @@ async fn managed_codex_prefers_native_route_for_same_alias_and_disables_store() 
     assert_eq!(no_release.status(), StatusCode::FORBIDDEN);
     assert_eq!(no_release.json::<Value>().await.unwrap()["error"]["code"], "agent_not_allowed");
     assert_eq!(env.calls(), 1, "revocation takes effect before accessing the upstream");
+}
+
+#[tokio::test]
+async fn responses_to_chat_transports_inline_images_without_text_metering() {
+    let mut env = env_with("openai_chat").await;
+    grant(&env.state, "lse_media", 2, 600, 60_000);
+    let image = STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGMwXhX6HwAEeAIy+TSxQAAAAABJRU5ErkJggg==")
+        .unwrap();
+    let (prefix, iend) = image.split_at(image.len() - 12);
+    // A valid PNG tEXt chunk increases the binary payload without changing its visual dimensions.
+    let mut chunk = b"tEXtComment\0".to_vec();
+    chunk.resize(48_000, b'x');
+    let mut crc = !0_u32;
+    for byte in &chunk {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    let mut png = prefix.to_vec();
+    png.extend(((chunk.len() - 4) as u32).to_be_bytes());
+    png.extend(chunk);
+    png.extend((!crc).to_be_bytes());
+    png.extend(iend);
+    let uri = format!("data:image/png;base64,{}", STANDARD.encode(png));
+
+    let body = json!({"model":"codex-model","max_output_tokens":25,"instructions":"scenario:chat",
+        "input":[{"role":"user","content":[{"type":"input_text","text":"before"},
+            {"type":"input_image","image_url":uri,"detail":"high"},{"type":"input_text","text":"after"}]}]});
+    let reply = env.http.post(&env.url).bearer_auth(LOCAL).json(&body).send().await.unwrap();
+    let status = reply.status();
+    let reply: Value = reply.json().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["usage"]["input_tokens"], 10);
+    assert_eq!(env.usage().await.cost_milli, 20);
+    assert_eq!(env.ledger(), (20, 0));
+    let actual = env.upstream.seen.lock().unwrap().body.clone().unwrap();
+    assert_eq!(
+        actual["messages"][1]["content"],
+        json!([
+            {"type":"text","text":"before"}, {"type":"image_url","image_url":{"url":uri,"detail":"high"}},
+            {"type":"text","text":"after"}
+        ])
+    );
+
+    let file = json!({"model":"codex-model","input":[{"role":"user","content":[
+        {"type":"input_file","file_data":"data:application/pdf;base64,JVBERg=="}]}]});
+    let reply = env.http.post(&env.url).bearer_auth(LOCAL).json(&file).send().await.unwrap();
+    assert_eq!(reply.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(reply.text().await.unwrap().contains("input_file"));
+    assert_eq!(env.calls(), 1);
 }
 
 #[tokio::test]

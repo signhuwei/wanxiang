@@ -515,8 +515,8 @@ pub(crate) fn response_failed_event(code: &str, message: &str) -> Bytes {
 // ---- Responses → Chat 请求 ----
 
 /// OpenAI Responses 的 `instructions` + `input`（有序 items）→ Chat 的 `messages`。
-/// 只做 Codex 用得到的子集：文本 message、function_call、function_call_output；
-/// reasoning item 和非文本 content 跨协议不可靠回放，明确拒绝（不是静默丢弃）。
+/// Converts text, user image URLs, and the supported tool calls and results. File references and
+/// other unsupported content need a native Responses upstream.
 fn request_to_chat(req: &Value, upstream_model: &str, stream: bool) -> Result<Value, String> {
     let mut msgs = Vec::new();
     let mut system = Vec::new();
@@ -576,6 +576,11 @@ fn responses_item_to_chat(item: &Value, msgs: &mut Vec<Value>, system: &mut Vec<
     match kind {
         "message" => {
             let role = item["role"].as_str().unwrap_or("user");
+            if role == "user" {
+                let content = responses_user_content(&item["content"])?;
+                msgs.push(json!({"role": role, "content": content}));
+                return Ok(());
+            }
             let text = responses_content_text(&item["content"])?;
             if role == "assistant" {
                 let last = assistant_message(msgs);
@@ -628,6 +633,9 @@ fn responses_item_to_chat(item: &Value, msgs: &mut Vec<Value>, system: &mut Vec<
                 .filter(|s| !s.is_empty())
                 .ok_or("工具结果缺少 call_id。")?;
             let output = match item.get("output") {
+                Some(value) if tool_output_has_media(value) => {
+                    return Err("Chat 工具结果不支持图像或文件内容，请换用原生 Responses 上游。".into());
+                }
                 Some(Value::String(s)) => s.clone(),
                 Some(v) => v.to_string(),
                 None => String::new(),
@@ -646,6 +654,63 @@ fn assistant_message(msgs: &mut Vec<Value>) -> &mut Value {
     msgs.last_mut().unwrap()
 }
 
+fn responses_user_content(content: &Value) -> Result<Value, String> {
+    let Some(parts) = content.as_array().filter(|parts| parts.iter().any(|part| part["type"] == "input_image")) else {
+        return responses_content_text(content).map(Value::String);
+    };
+    let mut chat_parts = Vec::with_capacity(parts.len());
+    for part in parts {
+        let kind = part["type"].as_str();
+        let chat_part = match kind {
+            Some("input_text" | "output_text") => json!({"type":"text", "text":part["text"].as_str().unwrap_or("")}),
+            Some("input_image") => {
+                let url = part["image_url"].as_str().filter(|url| image_url_for_chat(url));
+                let Some(url) = url.filter(|_| part["file_id"].is_null()) else {
+                    return Err(
+                        "Chat 的 input_image 需要有效的图片 URL 或内联图片，文件 ID 需用原生 Responses。".into()
+                    );
+                };
+                let mut image = json!({"url": url});
+                if let Some(detail) = part.get("detail").filter(|value| !value.is_null()) {
+                    let detail = detail.as_str().ok_or("input_image 的 detail 必须是字符串。")?;
+                    image["detail"] = detail.into();
+                }
+                json!({"type":"image_url", "image_url":image})
+            }
+            other => return Err(unsupported_content(other)),
+        };
+        chat_parts.push(chat_part);
+    }
+    Ok(chat_parts.into())
+}
+
+fn image_url_for_chat(url: &str) -> bool {
+    if let Some(inline) = url.strip_prefix("data:image/") {
+        return inline.split_once(',').is_some_and(|(format, data)| {
+            format.strip_suffix(";base64").is_some_and(|mime| !mime.is_empty()) && !data.is_empty()
+        });
+    }
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.has_host()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
+fn tool_output_has_media(output: &Value) -> bool {
+    let is_media =
+        |value: &Value| matches!(value["type"].as_str(), Some("input_image" | "input_file" | "image_url" | "file"));
+    is_media(output) || output.as_array().is_some_and(|parts| parts.iter().any(is_media))
+}
+
+fn unsupported_content(kind: Option<&str>) -> String {
+    format!(
+        "OneX 把 Responses 请求转换到 OpenAI Chat 接口时不支持 content 里的 {} 类型，请换用原生 Responses 上游。",
+        kind.unwrap_or("?")
+    )
+}
+
 fn responses_content_text(v: &Value) -> Result<String, String> {
     match v {
         Value::String(s) => Ok(s.clone()),
@@ -656,12 +721,7 @@ fn responses_content_text(v: &Value) -> Result<String, String> {
                     Some("input_text" | "output_text") => {
                         out.push(p.get("text").and_then(Value::as_str).unwrap_or("").to_string())
                     }
-                    other => {
-                        return Err(format!(
-                            "OneX 把 Responses 请求转换到 OpenAI Chat 接口时不支持 content 里的 {} 类型，请换用原生 Responses 上游。",
-                            other.unwrap_or("?")
-                        ));
-                    }
+                    other => return Err(unsupported_content(other)),
                 }
             }
             Ok(out.join("\n\n"))
@@ -1767,6 +1827,21 @@ mod tests {
         let bad_content =
             json!({"model": "m", "input": [{"type": "message", "role": "user", "content": [{"type": "input_image"}]}]});
         assert!(request_to_chat(&bad_content, "m", false).unwrap_err().contains("input_image"));
+    }
+
+    #[test]
+    fn request_to_chat_rejects_files_and_unusable_image_references() {
+        for (part, expected) in [
+            (json!({"type":"input_file","file_data":"data:application/pdf;base64,JVBERg=="}), "input_file"),
+            (json!({"type":"input_image","file_id":"file_fixture"}), "input_image"),
+            (json!({"type":"input_image","image_url":"file:///tmp/picture.png"}), "input_image"),
+        ] {
+            let payload = json!({"input":[{"role":"user","content":[part]}]});
+            assert!(request_to_chat(&payload, "m", false).unwrap_err().contains(expected));
+        }
+        let attachment = json!({"input":[{"type":"function_call_output","call_id":"reply","output":[
+            {"type":"input_image","image_url":"https://example.test/fixture.png"}]}]});
+        assert!(request_to_chat(&attachment, "m", false).is_err());
     }
 
     #[test]

@@ -27,6 +27,7 @@ mod policy;
 mod pool_egress;
 mod pool_execution;
 pub mod pricing;
+mod request_meter;
 mod responses;
 pub mod route_apply;
 pub mod route_select;

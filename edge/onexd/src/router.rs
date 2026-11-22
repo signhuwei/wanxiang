@@ -1013,27 +1013,10 @@ async fn forward_count_tokens(
     unavailable()
 }
 
-/// 估算请求的输入 token：所有字符串值的字节数按 3 字节 1 个 token 算，跳过图片等 base64 的 `data`。
+pub(crate) use crate::request_meter::estimate_request_fields;
+
 fn estimate_input(req: &Value) -> u64 {
     estimate_request_fields(req, &["system", "messages", "tools"])
-}
-
-pub(crate) fn estimate_request_fields(req: &Value, fields: &[&str]) -> u64 {
-    fn walk(v: &Value, n: &mut usize) {
-        match v {
-            Value::String(s) => *n += s.len(),
-            Value::Array(a) => a.iter().for_each(|x| walk(x, n)),
-            Value::Object(o) => o.iter().filter(|(k, _)| k.as_str() != "data").for_each(|(_, x)| walk(x, n)),
-            _ => {}
-        }
-    }
-    let mut n = 0;
-    for &key in fields {
-        if let Some(v) = req.get(key) {
-            walk(v, &mut n);
-        }
-    }
-    estimate_tokens(n)
 }
 
 /// 进行中的请求：计量、租约票据和收尾。
@@ -1969,10 +1952,11 @@ mod tests {
     fn reservation_includes_estimated_input() {
         let req = json!({"model":"m","max_tokens":1000,"system":"x".repeat(300),
             "messages":[{"role":"user","content":[{"type":"text","text":"y".repeat(2700)},
-                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"z".repeat(90000)}}]}]});
-        // 300 + 2700 + "user" + "text" + "image" + "base64" + "image/png" 字节，图片数据不算
+                {"type":"image","source":{"type":"base64","media_type":"image/png", "data":
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGMwXhX6HwAEeAIy+TSxQAAAAABJRU5ErkJggg=="}}]}]});
+        // Text, typed-block metadata, and the 1×1 image's 255-token visual reservation.
         let n = estimate_input(&req);
-        assert!((1000..1020).contains(&n), "{n}");
+        assert!((1255..1275).contains(&n), "{n}");
         // 1000 输入 × 3000 + 1000 输出 × 15000 = 18
         assert_eq!(Meter::new(rate(), 1000, 1000).reservation, 18);
     }
