@@ -10,7 +10,7 @@ const capabilities = ['route_pool.v1', 'route_pool.exec.v1'];
 test('the runtime cohort parses only explicit tenant and device IDs and boots from persisted contracts', async () => {
   expect(configuredRoutePoolDevices('')).toEqual([]);
   expect(() => configuredRoutePoolDevices('tenant=any')).toThrow('tenant ID and device ID pairs');
-  const fixture = await startOneChain(undefined, false, true);
+  const fixture = await startOneChain({ production: true });
   const { info, api, service } = fixture;
   const scope = `${info.tenant_id}:${info.device_id}`;
   expect(configuredRoutePoolDevices(scope)).toEqual([{ tenantId: info.tenant_id, deviceId: info.device_id }]);
@@ -71,5 +71,20 @@ test('the runtime cohort parses only explicit tenant and device IDs and boots fr
   } finally {
     for (const edge of sockets) edge.close();
     await fixture.close();
+  }
+});
+
+test('a deployment with an incompatible procurement wallet is excluded before credential delivery', async () => {
+  const { info, close } = await startOneChain({ production: true, backupWalletCurrency: 'EUR' });
+  const edge = connectDeviceSocket(info.ws_url, info.device_token);
+  try {
+    await edge.hello({ capabilities });
+    const config = await edge.nextOf('config');
+    expect(config.routes.map((route: { deployment_id: string }) => route.deployment_id)).toEqual([info.primary_deployment_id]);
+    expect(config.route_pool.secrets).toHaveLength(1);
+    expect(config.route_pool.bindings[0].deployment_ids).toEqual([info.primary_deployment_id]);
+  } finally {
+    edge.close();
+    await close();
   }
 });

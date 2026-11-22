@@ -45,7 +45,9 @@ async function channel(letter: string) {
   return { secret, raw, hits, url, stopListening, async close() { await stopListening(); await upstream.stop(); } };
 }
 
-export async function startOneChain(directory?: string, primaryOffline = false, production = false) {
+type ChainOptions = { directory?: string; primaryOffline?: boolean; production?: boolean; backupWalletCurrency?: string };
+
+export async function startOneChain({ directory, primaryOffline = false, production = false, backupWalletCurrency = 'USD' }: ChainOptions = {}) {
   const clock = Date.now();
   const dataDir = directory ?? mkdtempSync(join(tmpdir(), 'onex-one-chain-'));
   const [a,b] = await Promise.all([channel('a'),channel('b')]);
@@ -119,7 +121,7 @@ export async function startOneChain(directory?: string, primaryOffline = false, 
       if(!picked) throw new Error('Raw model missing from catalogue');
       const account=(await api(path+'/channel')).accounts[0];
       const wallet=path+'/channel-ledger';
-      const required={account_id:account.account_id,currency:index?'USD':'CNY',note:'测试上游账单'};
+      const required={account_id:account.account_id,currency:index?backupWalletCurrency:'CNY',note:'测试上游账单'};
       await api(wallet+'/observations',{...required,balance_micro:2_000_000,reference:'statement-opening'});
       await api(wallet+'/recharges',{...required,amount_micro:1_250_000,reference:'supplier-recharge'},`supplier-${index}`);
       const state=await api(wallet);
@@ -151,6 +153,7 @@ export async function startOneChain(directory?: string, primaryOffline = false, 
       valid_from:earlier,valid_until:null,source,reason:'联验采购价',items:[
         {dimension:'input',rate_micro:index?'400000':'2000000',quantity_basis:1_000_000,unit:'token'},
         {dimension:'output',rate_micro:index?'1333333':'15000000',quantity_basis:1_000_000,unit:'token'},
+        {dimension:'cache_read',rate_micro:index?'100000':'500000',quantity_basis:1_000_000,unit:'token'},
       ]});
     await api('/platform/procurement/fx-rates',{base_currency:'USD',quote_currency:'CNY',expected_fx_revision:0,rate_numerator:'15',
       rate_denominator:'2',observed_at:earlier,valid_from:earlier,valid_until:expires,source,reason:'联验汇率'});
@@ -214,7 +217,8 @@ export async function startOneChain(directory?: string, primaryOffline = false, 
 
 if(import.meta.main) {
   const index=process.argv.indexOf('--data-dir');
-  const fixture=await startOneChain(index===-1 ? undefined : process.argv[index+1],process.argv.includes('--primary-offline'));
+  const fixture=await startOneChain({ directory: index===-1 ? undefined : process.argv[index+1],
+    primaryOffline: process.argv.includes('--primary-offline') });
   console.log(JSON.stringify(fixture.info));
   for(const signal of ['SIGTERM','SIGINT'] as const) process.once(signal,async()=>{await fixture.close();process.exit(0);});
 }

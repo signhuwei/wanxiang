@@ -62,9 +62,14 @@ export function productionRouting(store: Store, dataDir: string, key: Uint8Array
     },
     productionCandidate(deployment, revision, sourceRate) {
       const quote = store.system.get(`SELECT 1 FROM platform_rate_channels c
-        JOIN procurement_quotes q ON q.quote_id=c.quote_id AND q.quote_revision=c.quote_revision
+        JOIN model_deployments d ON d.deployment_id=c.deployment_id AND d.current_revision=c.deployment_revision
+        JOIN procurement_quotes q ON q.quote_id=c.quote_id AND q.quote_revision=c.quote_revision AND q.deployment_id=c.deployment_id
+          AND q.deployment_revision=c.deployment_revision AND q.provider_id=d.provider_id AND q.account_id=d.account_id
+        JOIN provider_accounts a ON a.account_id=q.account_id AND a.provider_id=q.provider_id
+        JOIN channel_wallets w ON w.funding_id=coalesce(a.funding_id,a.account_id) AND w.currency=q.currency
         JOIN procurement_quote_items i ON i.quote_id=q.quote_id AND i.quote_revision=q.quote_revision AND i.dimension='input'
         JOIN procurement_quote_items o ON o.quote_id=q.quote_id AND o.quote_revision=q.quote_revision AND o.dimension='output'
+        JOIN procurement_quote_items r ON r.quote_id=q.quote_id AND r.quote_revision=q.quote_revision AND r.dimension='cache_read'
         WHERE c.source_rate_key=? AND c.deployment_id=? AND c.deployment_revision=? AND c.reason_code IS NULL`, [sourceRate, deployment, revision]);
       return !!quote;
     },

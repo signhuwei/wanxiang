@@ -382,7 +382,10 @@ export function routingProjector(store: Store, inputs: RoutingProjectionInputs, 
         const snapshot = readSnapshot(db, device.id, target.config_revision)!;
         const projected = (JSON.parse(snapshot.payload_json) as RoutePoolConfig).route_pool.pools
           .some((pool: { model_id: string; pool_revision: number }) => pool.model_id === job.model_id && pool.pool_revision === job.pool_revision);
-        await markRoster(rolloutId, tenantId, device.id, stamp, projected ? { target } : { outcome: 'superseded', reason: 'pool_superseded' });
+        const skipped = inputs.productionExecution && pinned
+          ? { outcome: 'failed' as const, reason: 'no_eligible_deployment' }
+          : { outcome: 'superseded' as const, reason: 'pool_superseded' };
+        await markRoster(rolloutId, tenantId, device.id, stamp, projected ? { target } : skipped);
       }
     }
     await store.system.write(sql => sql.run("UPDATE route_release_jobs SET status = 'done' WHERE job_id = ? AND status = 'running'", [rolloutId]));

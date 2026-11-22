@@ -1,6 +1,6 @@
 # 已应用投影与租约
 
-本批在隔离的 `route_pool.v1` 联验中验证发租、原租约结清和重放。生产启动、未协商连接及已有协议沿用 [Edge WebSocket 协议](edge-ws.md)。Server 的测试注入 `leaseGate` 和 Edge 的独立测试选项默认关闭。关闭时继续返回 `forbidden/route_pool_lease_pending`。联验租约只消费合成账本，路由执行需等待逐请求用量、连续序号与按租约结清联验。
+隔离联验与生产试运行共用 `route_pool.v1` 的投影和租约关联。生产试运行通过 `route_pool.exec.v1` 额外协商逐请求计费，启用范围见[正式运行入口](routing-one-chain.md#正式运行入口)。其余设备沿用 [Edge WebSocket 协议](edge-ws.md) 的原租约路径。仅协商投影且关闭租约门禁时返回 `forbidden/route_pool_lease_pending`。
 
 ## 数据与事务
 
@@ -20,7 +20,7 @@ Server 按本认证租户、成员及设备查 `policy_device_applications` 的�
 
 ## 续租与结清
 
-- `lease_renew{id,op_id,lease_id,used_milli,model_used_milli?,release_only?}`。`op_id`、旧租约、累计用量和分模型快照在发送前持久化；同一操作重发沿用这些值。用量按原租约的计费和额度结清，同一操作只能结清一次。在途或用量不明的请求保留在原租约。续租用量凭证协议另按设计稿 `routing-runtime-plan.md` 对齐。
+- `lease_renew{id,op_id,lease_id,used_milli,model_used_milli?,release_only?,usage_through_seq?}`。逐请求计费会话使用 `usage_through_seq` 引用已累计确认的同设备用量。`op_id`、旧租约、累计用量、分模型快照和游标在发送前持久化，同一操作重发沿用这些值。用量按原租约的计费和额度结清，同一操作只能结清一次。在途或用量不明的请求保留在原租约。
 - 普通续租先结清，再按首领规则决定是否发后继租约。成功的后继 `lease` 同时带 `settled_lease_id`。有结清且未发可用后继时返回 `cutoff{id,re,reason,settled_lease_id,detail?:{reason,lease_id?}}`。租约门禁原因使用 `reason:"contract"`，现有余额／配额原因保留。未完成结清的回复没有 `settled_lease_id`。Edge 只按当前在途请求的 `re` 和匹配的旧租约 ID 移除结清记录，不移除后来接受的租约。
 - 同 `op_id` 异内容返回 `conflict`。重放已结清的操作不得再次扣费、预留或发租。缓存的后继租约仍有效且授权允许时才重申原租约；已失效时回 `cutoff`，保留原 `settled_lease_id`，`detail.reason="successor_lease_unavailable"`，若仍有待结清后继则附 `detail.lease_id`。后继不可用不改变旧租约已经结清的事实。
 - `release_only:true` 仅用于 Edge 在当前认证代次明确拒用、且持久确认从未接纳或放行过请求的租约。持久化拒用标记、`op_id`、`used_milli:0` 以及 `model_budgets` 中每个已分配型号的零用量。服务端校验旧租约属于本设备、已有隔离投影关联并验证零用量明细。结清释放预留后回 `cutoff{reason:"contract",settled_lease_id,detail:{reason:"lease_released"}}`，本操作不发后继。已经接受或使用情况不明的租约走常规结清流程。Edge 对不匹配的发租响应上报 `lease_projection_mismatch`；失败 ACK 本身不会结清。
@@ -30,4 +30,4 @@ Server 按本认证租户、成员及设备查 `policy_device_applications` 的�
 1. 无匹配应用、被拒绝的回执、异设备、成员授权收紧、签发／方案变更、撤销和过期均不能新增预留。合法应用不主动发租，随后首领精确绑定应用头。
 2. 纯换池时既有租约的计费身份稳定；新发租约使用当时仍获授权的应用头。迟到 ACK、重启后的合法重封和失效的缓存发租回复分别验收。
 3. 旧租约按原价原额度结清且可重放。后继失效时，重放仍确认旧租约已结清且不会扣第二次。拒用租约逐型号报零，只释放预留；未知用量仍留在原租约。
-4. 测试开关关闭时保留 `route_pool_lease_pending`，旧连接的发租、续租与切断逐帧回归。真实请求执行及 `usage_through_seq` 的生产门禁以完整结算联验为准。
+4. 测试开关关闭时保留 `route_pool_lease_pending`，旧连接的发租、续租与切断逐帧回归。逐请求计费会话的已确认用量、续租游标和账本分别验证。
