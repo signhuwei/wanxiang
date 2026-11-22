@@ -3,7 +3,7 @@ import fixture from '../../../tests/fixtures/routing/p0-ab.json'
 import { eraserMilli } from '../contract-controls.js'
 import {
   modelPriceBody, priceRowFromSaved, rateSourceOptions, salesRateHead, salesRateRow, targetReasonLabel, targetStateLabel,
-  rolloutCounts, TARGET_STATES, jobStatusLabel
+  rolloutCounts, TARGET_STATES, jobStatusLabel, planRateSummary
 } from '../routing-format.js'
 
 const four = { input_milli_per_mtok: 4000, output_milli_per_mtok: 12000, cache_read_milli_per_mtok: 1000, cache_write_milli_per_mtok: 5000 }
@@ -48,6 +48,12 @@ test('sales rate rows: platform shows source, tenant view drops platform-only fi
   expect(salesRateHead({ tenant: true })).not.toContain('费率来源')
   expect(salesRateHead({ tenant: true }).length).toBe(salesRateRow(rate, { tenant: true }).length)
   expect(salesRateHead({ frozen: false }).length).toBe(salesRateRow(rate, { frozen: false }).length)
+})
+
+test('signing plan labels name each model, its multiplier and exact rate source', () => {
+  expect(planRateSummary({ terms: { model_prices: [{ model_id: 'mdl_m', source_rate_key: 'prate_m_2', ...four }] } })).toBe('mdl_m 4× · prate_m_2')
+  expect(planRateSummary({ terms: { model_prices: [{ model_id: 'm', input_milli_per_mtok: 1500 }] } })).toBe('m 1.5× · 方案手填')
+  expect(planRateSummary({ terms: { model_prices: [] } })).toBe('不含模型协议价')
 })
 
 test('target states follow the contract and device reasons come from detail.reason', () => {

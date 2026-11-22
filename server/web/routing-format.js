@@ -241,7 +241,14 @@ export function rateSourceOptions(model, originalKey) {
   return options
 }
 
-export const rateAmountsText = rate => RATE_FIELDS.map(([key, label]) => label + ' ' + blocks(rate?.[milliKey(key)])).join(' · ') + ' 块／百万 Token'
+// 签发选方案时的辨认文字：每个型号的输入倍率和精确费率来源。
+export function planRateSummary(plan) {
+  const prices = plan?.terms?.model_prices ?? []
+  if (!prices.length) return '不含模型协议价'
+  return prices.map(p => p.model_id + ' ' + formatMultiplier(p.input_milli_per_mtok * 1000) + ' · ' + (p.source_rate_key ?? '方案手填')).join('；')
+}
+
+export const rateAmountsText =rate => RATE_FIELDS.map(([key, label]) => label + ' ' + blocks(rate?.[milliKey(key)])).join(' · ') + ' 块／百万 Token'
 
 // 售价表行。tenant=true 时只取户主可见字段，忽略多余字段。
 export function salesRateRow(rate, { tenant = false, frozen = true } = {}) {

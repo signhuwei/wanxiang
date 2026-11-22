@@ -48,7 +48,7 @@ function changed(node) {
 }
 
 export function versionEntries(api, prefix, initial, {
-  signal, definitionsEndpoint = prefix + '/definitions', definitions, allowTemplates = false, signed = false
+  signal, definitionsEndpoint = prefix + '/definitions', definitions, allowTemplates = false, signed = false, catalogDetail
 } = {}) {
   const node = el('div', 'policy-entries')
   const entries = el('div', 'policy-entry-list')
@@ -70,15 +70,22 @@ export function versionEntries(api, prefix, initial, {
     const editor = el('div')
     const mode = signed ? optionSelect([['inherit', '继承引用基准'], ['adjust', '单独调整']],
       Object.hasOwn(entry, 'adjustment') ? 'adjust' : 'inherit') : null
-    const baseline = signed ? el('small', 'muted', '基准 ' + policyValue(definition, entry.base_value ?? definition.default_value, entry.display)) : null
+    const baseValue = entry.base_value ?? definition.default_value
+    const baseline = signed ? el('small', 'muted', '基准 ' + policyValue(definition, baseValue, entry.display)) : null
+    // 目录条目（如 billing.plan）可附加只读说明，便于辨认所选资源的内容。
+    const detail = catalogDetail?.(definition)
+    const baseDetail = detail && signed ? el('small', 'muted policy-catalog-detail') : null
+    if (baseDetail) detail.describe(baseValue, baseDetail)
     let field
     function refresh() {
       if (mode?.value === 'inherit') {
         editor.replaceChildren()
         field = null
+        if (baseDetail) baseDetail.hidden = false
       } else {
-        field = valueField(api, prefix, definition, draftValue, { display: entry.display, signal })
+        field = valueField(api, prefix, definition, draftValue, { display: entry.display, signal, detail })
         editor.replaceChildren(field.node)
+        if (baseDetail) baseDetail.hidden = true
       }
     }
     mode?.addEventListener('change', () => {
@@ -88,6 +95,8 @@ export function versionEntries(api, prefix, initial, {
     row.append(head)
     if (source.textContent) row.append(source)
     if (mode) row.append(inputField('调节方式', mode), baseline)
+    if (baseDetail) row.append(baseDetail)
+    if (detail?.footer) row.append(detail.footer())
     row.append(editor, button('移除', () => {
       rows.delete(ref.id)
       row.remove()

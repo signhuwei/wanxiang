@@ -139,7 +139,7 @@ try {
   const template = await fetch(new URL('/v1/platform/policy/templates', app.server.url), { method: 'POST',
     headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
     body: JSON.stringify({ id: 'projection-template', expected_version: 0, name: '投影签发模板', description: '', scope: 'platform',
-      entries: [{ clause_ref: { id: 'access.models', version: 1 }, value: ['mdl_m'] }, { clause_ref: { id: 'billing.plan', version: 1 }, value: [fresh.id] }] }) })
+      entries: [{ clause_ref: { id: 'access.models', version: 1 }, value: ['mdl_m'] }, { clause_ref: { id: 'billing.plan', version: 1 }, value: ['cmp_old'] }] }) })
   assert.equal(template.status, 201, await template.clone().text())
   await link('平台合约').click()
   await button(tenantName).click()
@@ -148,7 +148,23 @@ try {
   await recordPane.getByLabel('签发原因', { exact: true }).fill('引用可签 4× 签发')
   await recordPane.getByText('添加模板条目', { exact: true }).click()
   await recordPane.locator('.policy-picker tr').getByText('投影签发模板', { exact: true }).click()
+  // 经办人在 billing.plan 条目里辨认：模板基准是旧方案（3× · prate_m_1），改选可签 4× 方案
+  const planEntry = recordPane.locator('.policy-entry').filter({ hasText: '商业计费方案' })
+  await planEntry.getByText('所含型号：mdl_m 3× · prate_m_1').waitFor()
+  await planEntry.getByText('在商业计费发布引用新费率的方案', { exact: true }).waitFor()
+  await planEntry.getByLabel('调节方式', { exact: true }).selectOption('adjust')
+  await planEntry.getByText('选择商业计费方案', { exact: true }).click()
+  const option = planEntry.locator('label.contract-choice').filter({ hasText: '可签费率方案 v1' })
+  await option.getByText('所含型号：mdl_m 4× · prate_m_2').waitFor()
+  await planEntry.locator('label.contract-choice').filter({ hasText: '旧协议方案副本 v1' }).getByText('所含型号：mdl_m 3× · prate_m_1').waitFor()
+  await option.getByRole('checkbox').check()
+  await planEntry.locator('.policy-picker > p.policy-catalog-detail').getByText('所含型号：mdl_m 4× · prate_m_2').waitFor()
+  await capture('signature-plan-choice')
+  const previewRequest = page.waitForRequest(r => r.method() === 'POST' && r.url().endsWith('/preview'))
   await button('预览变更').click()
+  const planChoice = (await previewRequest).postDataJSON().entries.find(e => e.clause_ref.id === 'billing.plan')
+  assert.deepEqual(planChoice, { clause_ref: { id: 'billing.plan', version: 1 }, template_ref: { id: 'projection-template', version: 1 }, adjustment: [fresh.id] },
+    '只沿用既有 billing.plan 调整值，不新增签发字段')
   const proposed = recordPane.getByRole('table', { name: '拟签售价' })
   await proposed.getByRole('cell', { name: '4×', exact: true }).waitFor()
   await proposed.getByRole('cell', { name: 'prate_m_2', exact: true }).waitFor()
