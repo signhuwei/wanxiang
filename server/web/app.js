@@ -329,7 +329,7 @@ function route() {
     else if (path === 'agents') agentReleasesPage(view, platformApi, signal)
     else if (path === 'tools') platformToolsPage(view, platformApi, signal)
     else if (path === 'releases') releasesPage(view, platformApi, session.globalActions || [])
-    else if (path === 'catalog') catalog(view, platformApi, session.globalActions || [])
+    else if (path === 'catalog') catalog(view, platformApi, session.globalActions || [], 'provider', null, signal)
     else if (path === 'models') signedModelsPage(view, platformApi, signal)
     else if (path === 'fx-rates') fxRatesPage(view, platformApi, signal)
     else location.replace('#/platform/contracts')

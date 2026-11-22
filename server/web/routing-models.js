@@ -3,6 +3,7 @@
 // 候选直接使用服务端的 approved_match_id/evidence_ids；409 保留草稿并提供重新预览。
 
 import { createLedger } from './ledger.js'
+import { catalog } from './catalog.js'
 import { button, detailPanel, el } from './panel.js'
 import { createPager } from './pager.js'
 import { formatDateTime } from './format.js'
@@ -483,7 +484,8 @@ export function signedModelsPage(host, api, signal) {
       pane.body.classList.add('policy-contract-workspace')
       mountTabs(pane.body, [
         ['pool', '模型池版本', (area, s) => poolPanel(area, api, row, s, () => pane.changed())],
-        ['multiplier', '输入倍率', (area, s) => multiplierTab(area, api, row, s, () => pane.changed())]
+        ['multiplier', '输入倍率', (area, s) => multiplierTab(area, api, row, s, () => pane.changed())],
+        ['sales', '基础销售费率', (area, s) => catalog(area, api, null, 'rate', row, s)]
       ], signal)
     })
   })

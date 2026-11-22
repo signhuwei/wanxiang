@@ -20,7 +20,9 @@ export function detailPanel(host, ledger = () => null) {
   return (title, draw) => {
     const list = ledger(), snap = list?.suspend()
     if (active) active.close()
+    const controller = new AbortController()
     active = openDrill(host, { title, onClose() {
+      controller.abort()
       active = null
       if (list && snap) {
         list.resume(snap)
@@ -28,8 +30,10 @@ export function detailPanel(host, ledger = () => null) {
       }
       dirty = false
     }, render(pane) {
-      const tools = { ...pane, changed: () => { dirty = true } }
-      Promise.resolve(draw(tools)).catch(e => pane.body.replaceChildren(el('p', 'error-row', e.message)))
+      const tools = { ...pane, signal: controller.signal, changed: () => { dirty = true } }
+      Promise.resolve(draw(tools)).catch(e => {
+        if (!controller.signal.aborted) pane.body.replaceChildren(el('p', 'error-row', e.message))
+      })
     } })
   }
 }
