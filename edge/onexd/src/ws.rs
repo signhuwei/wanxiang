@@ -29,7 +29,7 @@ use crate::outbox::{AckOutcome, Kind, Outbox};
 use crate::route_apply::{AckMatch, AppliedRecord, Scope, Store as RouteStore};
 use crate::state::{ConfigSnapshot, Phase, RouteApply, RouteView, SessionClock, State};
 use crate::{diagnostics, id, route_apply, route_stage};
-use onex_core::route_pool::{ApplyResult, ROUTE_POOL_V1};
+use onex_core::route_pool::{ApplyResult, ROUTE_POOL_EXEC_V1, ROUTE_POOL_V1};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Tx = SplitSink<Ws, Message>;
@@ -51,6 +51,7 @@ pub struct WsOptions {
     /// 关闭时隔离连接照旧对租约回 `forbidden/route_pool_lease_pending`。
     route_pool_leases: bool,
     isolated_route_execution: bool,
+    production_route_execution: bool,
     pub edge_version: String,
     pub backoff_min: Duration,
     pub backoff_max: Duration,
@@ -70,6 +71,7 @@ impl WsOptions {
             route_pool: None,
             route_pool_leases: false,
             isolated_route_execution: false,
+            production_route_execution: false,
             backoff_min: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
@@ -105,6 +107,19 @@ impl WsOptions {
     pub fn with_route_pool_execution_for_isolated_test(mut self) -> Self {
         self.isolated_route_execution = true;
         self
+    }
+
+    /// Advertise metered route pools only on authenticated TLS control connections.
+    pub fn with_route_pool_execution(mut self, store: Arc<RouteStore>) -> Result<Self> {
+        anyhow::ensure!(store.shares_outbox(), "production route pools require the common outbox");
+        anyhow::ensure!(
+            crate::pool_egress::parse_url(&self.url, "wss").is_some(),
+            "production route pools require a credential-free WSS server URL"
+        );
+        self.route_pool = Some(store);
+        self.production_route_execution = true;
+        self.route_pool_leases = true;
+        Ok(self)
     }
 
     fn declared_capabilities(&self) -> Vec<String> {
@@ -151,6 +166,7 @@ pub async fn run(opts: WsOptions, state: Arc<State>, outbox: Arc<Outbox>, cancel
         state.set_phase(Phase::Connecting);
         let end = session(&opts, &state, &outbox, &token, &cancel).await;
         state.isolated_route_execution.store(false, std::sync::atomic::Ordering::Release);
+        state.production_route_execution.store(false, std::sync::atomic::Ordering::Release);
         // 控制连接断开不影响本机进行中的请求，只把等待中的续租记为不可达。
         state.lease.on_disconnected();
         let reason = match &end {
@@ -224,15 +240,19 @@ async fn session(opts: &WsOptions, state: &State, outbox: &Outbox, token: &str, 
         Err(e) => return lost(anyhow!(e).context("connect")),
     };
 
+    let declared = match declarations(opts, state, outbox) {
+        Ok(declared) => declared,
+        Err(error) => return lost(error),
+    };
     let welcome = match tokio::select! {
         _ = cancel.cancelled() => return End::Cancelled,
-        r = handshake(opts, state, outbox, &mut tx, &mut rx) => r,
+        r = handshake(opts, state, outbox, &declared, &mut tx, &mut rx) => r,
     } {
         Ok(w) => w,
         Err(e) => return classify(e, false),
     };
 
-    match connected(opts, state, outbox, (&mut tx, &mut rx), &welcome, token, cancel).await {
+    match connected(opts, state, outbox, (&mut tx, &mut rx), (&welcome, &declared), token, cancel).await {
         Ok(()) => {
             let _ =
                 tx.send(Message::Close(Some(CloseFrame { code: CloseCode::Normal, reason: "shutdown".into() }))).await;
@@ -279,7 +299,26 @@ async fn connect(opts: &WsOptions, token: &str) -> Result<Ws, WsError> {
     }
 }
 
-async fn handshake(opts: &WsOptions, state: &State, outbox: &Outbox, tx: &mut Tx, rx: &mut Rx) -> Result<Welcome> {
+fn declarations(opts: &WsOptions, state: &State, outbox: &Outbox) -> Result<Vec<String>> {
+    if !opts.production_route_execution {
+        return Ok(opts.declared_capabilities());
+    }
+    // Finish the previous mode's lease and backlog before negotiated cutover. A previously enrolled device
+    // must keep its mode even if the connection drops while measured receipts are pending.
+    if outbox.is_pool_mode()? || (state.lease.lease_id().is_none() && outbox.last_seq() == outbox.ack_seq()?) {
+        return Ok(vec![ROUTE_POOL_V1.into(), ROUTE_POOL_EXEC_V1.into()]);
+    }
+    Ok(Vec::new())
+}
+
+async fn handshake(
+    opts: &WsOptions,
+    state: &State,
+    outbox: &Outbox,
+    declared: &[String],
+    tx: &mut Tx,
+    rx: &mut Rx,
+) -> Result<Welcome> {
     let hello_id = id::new("msg");
     send(
         tx,
@@ -298,7 +337,7 @@ async fn handshake(opts: &WsOptions, state: &State, outbox: &Outbox, tx: &mut Tx
             config_revision: state.config_revision(),
             lease_id: state.lease.lease_id(),
             outbox_last_seq: outbox.last_seq(),
-            capabilities: opts.declared_capabilities(),
+            capabilities: declared.to_vec(),
         }),
     )
     .await?;
@@ -330,19 +369,36 @@ async fn connected(
     state: &State,
     outbox: &Outbox,
     socket: (&mut Tx, &mut Rx),
-    welcome: &Welcome,
+    negotiation: (&Welcome, &[String]),
     token: &str,
     cancel: &CancellationToken,
 ) -> Result<()> {
     let (tx, rx) = socket;
+    let (welcome, declared) = negotiation;
     if state.expected_device_id.read().unwrap().as_ref().is_some_and(|id| id != &welcome.device_id) {
         return Err(Special::Unauthenticated.into());
     }
     // 读 token 之后再读代次：换号时代次先推进，任一不符都视为旧登录。
     let generation = state.generation();
     // 先于任何状态变更：welcome 选中未声明的能力时整条连接作废。
-    let capabilities = negotiated(&opts.declared_capabilities(), welcome)?;
-    let pool = match (&opts.route_pool, capabilities.iter().any(|c| c == ROUTE_POOL_V1)) {
+    let capabilities = negotiated(declared, welcome)?;
+    let has_pool = capabilities.iter().any(|capability| capability == ROUTE_POOL_V1);
+    let has_execution = capabilities.iter().any(|capability| capability == ROUTE_POOL_EXEC_V1);
+    let production = opts.production_route_execution && has_pool && has_execution;
+    anyhow::ensure!(!has_execution || production, "inconsistent route pool execution negotiation");
+    anyhow::ensure!(
+        !opts.production_route_execution || !has_pool || production,
+        "metered route pool capability was not selected"
+    );
+    if production {
+        anyhow::ensure!(welcome.ack_seq <= outbox.last_seq(), "server claims routing usage beyond the local outbox");
+        anyhow::ensure!(state.lease.lease_id().is_none(), "legacy lease must close before entering route pool mode");
+        outbox.enter_pool_mode()?;
+    } else if outbox.is_pool_mode()? {
+        *state.route.write().unwrap() = RouteApply::Closed;
+        bail!("this device requires a route pool execution connection");
+    }
+    let pool = match (&opts.route_pool, has_pool) {
         (Some(store), true) => Some(PoolSession::start(opts, state, store, welcome, token, generation)?),
         _ => None,
     };
@@ -386,15 +442,19 @@ async fn connected(
     // 模型池测试连接不碰生产 Ledger：不领、不续旧租约。租约门禁打开时只用隔离租约存储。
     let leases = pool.is_none();
     let lease_gate = pool.is_some() && opts.route_pool_leases;
-    let execution = lease_gate && opts.isolated_route_execution && crate::pool_execution::loopback(&opts.url, "ws");
-    if execution && outbox.last_seq() != 0 {
+    let isolated = lease_gate && opts.isolated_route_execution && crate::pool_egress::loopback(&opts.url, "ws");
+    let execution = production || isolated;
+    let shared_execution = execution && pool.as_ref().is_some_and(|p| p.store.shares_outbox());
+    let separate_execution = isolated && !shared_execution;
+    if separate_execution && outbox.last_seq() != 0 {
         bail!("isolated route execution needs a fresh dedicated outbox");
     }
-    state.isolated_route_execution.store(execution, std::sync::atomic::Ordering::Release);
+    state.isolated_route_execution.store(isolated, std::sync::atomic::Ordering::Release);
+    state.production_route_execution.store(production, std::sync::atomic::Ordering::Release);
     let mut runtime_poll = tokio::time::interval(Duration::from_millis(100));
     let mut sent_usage = None;
     if execution && let Some(p) = &pool {
-        p.store.ack_isolated_usage(&p.scope, welcome.ack_seq)?;
+        p.store.ack_route_usage(&p.scope, welcome.ack_seq)?;
     }
     let mut pool_leases = PoolLeases::new();
     if leases {
@@ -407,7 +467,7 @@ async fn connected(
         p.drive_leases(state, tx, &mut pool_leases).await?;
     }
 
-    flush(opts, outbox, tx, &mut sent, acked).await?;
+    flush(opts, outbox, tx, &mut sent, acked, leases, shared_execution).await?;
     let mut token_rx = state.token.subscribe();
     loop {
         tokio::select! {
@@ -429,7 +489,7 @@ async fn connected(
             }
             _ = runtime_poll.tick(), if execution => {
                 if let Some(p) = &pool {
-                    if sent_usage.is_none() && let Some((seq, payload)) = p.store.pending_isolated_usage(&p.scope)? {
+                    if separate_execution && sent_usage.is_none() && let Some((seq, payload)) = p.store.pending_route_usage(&p.scope)? {
                         let id = id::new("usage");
                         send_value(tx, &json!({"type":"usage","id": id,"batch":[payload]})).await?;
                         sent_usage = Some((id, seq));
@@ -439,7 +499,7 @@ async fn connected(
             }
             r = outbox_rx.changed() => {
                 r.context("outbox closed")?;
-                flush(opts, outbox, tx, &mut sent, acked).await?;
+                flush(opts, outbox, tx, &mut sent, acked, leases, shared_execution).await?;
             }
             r = renew_rx.changed(), if leases => {
                 r.context("lease closed")?;
@@ -507,20 +567,24 @@ async fn connected(
                     Msg::Ping { id } => send(tx, &Msg::Pong { re: Some(id) }).await?,
                     Msg::Pong { .. } => {}
                     Msg::EventsAck(a) => {
-                        if execution {
+                        if separate_execution {
                             if let (Some(p), Some((id, seq))) = (&pool, &sent_usage)
                                 && a.re.as_deref() == Some(id.as_str()) && a.ack_seq >= *seq
                             {
-                                p.store.ack_isolated_usage(&p.scope, *seq)?;
+                                p.store.ack_route_usage(&p.scope, *seq)?;
                                 sent_usage = None;
                             }
                             continue;
                         }
                         note_ack(outbox, a.ack_seq)?;
+                        if shared_execution && let Some(p) = &pool {
+                            anyhow::ensure!(a.ack_seq <= outbox.last_seq(), "unexpected route pool acknowledgement");
+                            p.store.ack_route_usage(&p.scope, a.ack_seq)?;
+                        }
                         acked = acked.max(a.ack_seq.min(outbox.last_seq()));
                         // 重连时可能还有更早发出的确认，sent 不能落到 acked 之后。
                         sent = sent.max(acked);
-                        flush(opts, outbox, tx, &mut sent, acked).await?;
+                        flush(opts, outbox, tx, &mut sent, acked, leases, shared_execution).await?;
                     }
                     Msg::Config(c) => {
                         let id = c.id.clone();
@@ -596,8 +660,9 @@ async fn connected(
                             p.drive_leases(state, tx, &mut pool_leases).await?;
                         }
                     }
-                    Msg::Ack(a) if execution && !a.ok && sent_usage.as_ref().is_some_and(|(id, _)| id == &a.re) => {
-                        bail!("isolated route usage rejected: {:?}", a.error);
+                    Msg::Ack(a) if !a.ok && ((separate_execution && sent_usage.as_ref().is_some_and(|(id, _)| id == &a.re))
+                        || (shared_execution && a.re.starts_with("routeusage_"))) => {
+                        bail!("route usage rejected: {:?}", a.error);
                     }
                     Msg::Ack(a) if lease_gate && pool.is_some() => {
                         let p = pool.as_ref().unwrap();
@@ -1096,14 +1161,9 @@ impl PoolSession {
         let Some(view) = self.acked_view(state) else { return Ok(()) };
         // 2. 已接受但不再可用的租约：先结清。
         if let Ok(Some(held)) = self.store.accepted_pool_lease(&self.scope) {
-            if let Some((_, payload, acked)) = self.store.isolated_usage_for_lease(&self.scope, &held.lease_id)? {
+            if let Some((_, payload, acked)) = self.store.route_usage_for_lease(&self.scope, &held.lease_id)? {
                 if acked && let Some(payload) = payload {
-                    let op = self.store.begin_isolated_metered_settlement(
-                        &self.scope,
-                        &held,
-                        &payload,
-                        self.clock.now_ms(),
-                    )?;
+                    let op = self.store.begin_metered_settlement(&self.scope, &held, &payload, self.clock.now_ms())?;
                     self.send_pool_operation(tx, &op).await?;
                     leases.sent_op = Some(op.op_id);
                 }
@@ -1131,7 +1191,7 @@ impl PoolSession {
 
     async fn send_pool_operation(&self, tx: &mut Tx, op: &route_apply::PoolLeaseOp) -> Result<()> {
         let mut frame = op.to_frame();
-        if let Some((Some(seq), _, true)) = self.store.isolated_usage_for_lease(&self.scope, &op.lease_id)? {
+        if let Some((Some(seq), _, true)) = self.store.route_usage_for_lease(&self.scope, &op.lease_id)? {
             frame["usage_through_seq"] = seq.into();
         }
         send_value(tx, &frame).await
@@ -1180,7 +1240,7 @@ impl PoolSession {
             }
             leases.gated = None;
             info!(lease_id = %frame.lease.lease_id, revision = frame.lease.config_revision,
-                projection_id = %frame.lease.projection_id, "route_pool lease accepted (synthetic ledger only)");
+                projection_id = %frame.lease.projection_id, "route_pool lease accepted");
             send(tx, &ack_ok(frame.id)).await?;
             return Ok(());
         }
@@ -1255,7 +1315,7 @@ impl PoolSession {
                 (Some("lease_settlement_required"), Some(lease_id)) => {
                     match self.store.pool_lease(&self.scope, lease_id)? {
                         Some(held) if held.state == route_apply::PoolLeaseState::Accepted => {
-                            if self.store.isolated_usage_for_lease(&self.scope, &held.lease_id)?.is_none() {
+                            if self.store.route_usage_for_lease(&self.scope, &held.lease_id)?.is_none() {
                                 let op = self.store.begin_settlement(&self.scope, &held, self.clock.now_ms())?;
                                 self.send_pool_operation(tx, &op).await?;
                                 leases.sent_op = Some(op.op_id);
@@ -1318,18 +1378,28 @@ fn note_ack(outbox: &Outbox, ack_seq: u64) -> Result<()> {
 }
 
 /// 把 seq > sent 的条目按 batch 发出去，连续同类的放在一条消息里。
-async fn flush(opts: &WsOptions, outbox: &Outbox, tx: &mut Tx, sent: &mut u64, acked: u64) -> Result<()> {
+async fn flush(
+    opts: &WsOptions,
+    outbox: &Outbox,
+    tx: &mut Tx,
+    sent: &mut u64,
+    acked: u64,
+    legacy_usage: bool,
+    route_usage: bool,
+) -> Result<()> {
     while *sent - acked < opts.window {
         let limit = (opts.window - (*sent - acked)).min(opts.batch_max as u64) as usize;
         let rows = outbox.pending(*sent, limit)?;
         let Some(last) = rows.last().map(|r| r.seq) else { break };
         for group in rows.chunk_by(|a, b| a.kind == b.kind) {
-            let ty = match group[0].kind {
-                Kind::Events => "events",
-                Kind::Usage => "usage",
+            let (ty, prefix) = match group[0].kind {
+                Kind::Events => ("events", "msg"),
+                Kind::Usage if legacy_usage => ("usage", "msg"),
+                Kind::RouteUsage if route_usage => ("usage", "routeusage"),
+                _ => bail!("outbox usage does not match the negotiated routing mode"),
             };
             let batch: Vec<&Value> = group.iter().map(|r| &r.item).collect();
-            let text = json!({"type": ty, "id": id::new("msg"), "batch": batch}).to_string();
+            let text = json!({"type": ty, "id": id::new(prefix), "batch": batch}).to_string();
             tx.send(Message::text(text)).await?;
         }
         debug!(from = *sent + 1, to = last, "outbox sent");
@@ -1459,6 +1529,32 @@ fn ack_err(re: String, code: &str, message: &str) -> Msg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metered_pool_opt_in_needs_tls_and_accepts_only_a_clean_legacy_cutover() {
+        let home = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(Outbox::open(&home.path().join("outbox.sqlite")).unwrap());
+        let store = Arc::new(RouteStore::open_with_outbox(outbox.clone()).unwrap());
+        let state = State::default();
+        assert!(WsOptions::new("ws://example.test/v1/edge/ws").with_route_pool_execution(store.clone()).is_err());
+        let url = "wss://example.test/v1/edge/ws";
+        let legacy = WsOptions::new(url);
+        assert!(declarations(&legacy, &state, &outbox).unwrap().is_empty());
+        let production = WsOptions::new(url).with_route_pool_execution(store).unwrap();
+        let expected = [ROUTE_POOL_V1, ROUTE_POOL_EXEC_V1];
+        assert_eq!(declarations(&production, &state, &outbox).unwrap(), expected);
+        let legacy_seq = outbox.append(Kind::Usage, json!({})).unwrap();
+        assert!(declarations(&production, &state, &outbox).unwrap().is_empty());
+        assert!(outbox.enter_pool_mode().is_err());
+        outbox.ack(legacy_seq).unwrap();
+        outbox.enter_pool_mode().unwrap();
+        assert!(outbox.append(Kind::Usage, json!({})).is_err());
+        let native = outbox.append(Kind::Events, json!({})).unwrap();
+        assert_eq!(native, legacy_seq + 1);
+        let reopened = Outbox::open(&home.path().join("outbox.sqlite")).unwrap();
+        assert!(reopened.is_pool_mode().unwrap());
+        assert_eq!(declarations(&production, &state, &reopened).unwrap(), expected);
+    }
 
     #[test]
     fn backoff_grows_and_caps_with_jitter() {

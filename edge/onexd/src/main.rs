@@ -5,6 +5,7 @@
 //!   Windows `%LOCALAPPDATA%\OneX`
 //! - `ONEX_SERVER`：Server 的 WS 地址，例如 `wss://onex.example.com/v1/edge/ws`。Windows 发行版
 //!   没设这个变量时回退到编译期写死的 `ONEX_WINDOWS_DEFAULT_SERVER`，见 `windows_server_default()`
+//! - `ONEX_ROUTE_POOL=1`：允许 WSS Server 为此设备选择已签发的模型池执行能力
 //! - `ONEX_ROUTER_PORT`：本机 router 端口，默认 0（随机）
 //! - `RUST_LOG`：日志级别，默认 `info`
 
@@ -97,6 +98,11 @@ async fn run(home: PathBuf, started_at: time::OffsetDateTime) -> Result<()> {
     let data_dir = home.join("devices").join(credentials::fingerprint(&device_key.public_b64()));
     create_private_dir(&data_dir)?;
     let outbox = Arc::new(Outbox::open(&data_dir.join("outbox.sqlite"))?);
+    let route_pool = if std::env::var("ONEX_ROUTE_POOL").as_deref() == Ok("1") && server.is_some() {
+        Some(Arc::new(onexd::route_apply::Store::open_with_outbox(outbox.clone())?))
+    } else {
+        None
+    };
     let lease = Arc::new(Ledger::open(data_dir.join("lease.json"), LeaseOptions::default(), &outbox)?);
     let state = Arc::new(State {
         lease: lease.clone(),
@@ -124,7 +130,12 @@ async fn run(home: PathBuf, started_at: time::OffsetDateTime) -> Result<()> {
     let (usage_tx, mut usage_rx) = mpsc::unbounded_channel::<UsageRecord>();
     // 默认客户端遵从 HTTPS_PROXY / NO_PROXY。
     let http = router::client_builder().build()?;
-    let app = Router::new(state.clone(), local_token.clone(), http, usage_tx).app();
+    let router = Router::new(state.clone(), local_token.clone(), http, usage_tx);
+    let app = if let Some(store) = &route_pool {
+        router.with_route_pool_execution(store.clone()).app()
+    } else {
+        router.app()
+    };
     onexd::launch::clean_stale(&data_dir);
     let sd = shutdown.clone();
     let router_task =
@@ -163,7 +174,10 @@ async fn run(home: PathBuf, started_at: time::OffsetDateTime) -> Result<()> {
 
     let ws_task = match server {
         Some(url) => {
-            let options = ws::WsOptions::new(url).with_diagnostic_logs(home.join("logs"), started_at);
+            let mut options = ws::WsOptions::new(url).with_diagnostic_logs(home.join("logs"), started_at);
+            if let Some(store) = route_pool {
+                options = options.with_route_pool_execution(store)?;
+            }
             Some(tokio::spawn(ws::run(options, state, outbox, shutdown.clone())))
         }
         None => {

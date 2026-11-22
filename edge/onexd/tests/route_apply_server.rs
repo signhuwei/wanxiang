@@ -16,7 +16,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use onex_core::route_pool::ROUTE_POOL_V1;
 use onex_core::ws::PROTOCOL_VERSION;
-use onexd::outbox::Outbox;
+use onexd::outbox::{Kind, Outbox};
 use onexd::route_apply::{PoolLeaseOp, PoolLeaseState, Scope, Store};
 use onexd::router::Router;
 use onexd::secret::DeviceKey;
@@ -115,12 +115,13 @@ struct Edge {
     store: Arc<Store>,
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<()>,
-    _outbox: tempfile::TempDir,
+    outbox: Arc<Outbox>,
+    _outbox_dir: tempfile::TempDir,
 }
 
 impl Edge {
     fn start(url: &str, token: &str, key_hex: &str, store_path: &Path, lease_gate: bool) -> Self {
-        Self::start_with_execution(url, token, key_hex, store_path, lease_gate, false)
+        Self::start_with_execution(url, token, key_hex, store_path, lease_gate, None)
     }
 
     fn start_with_execution(
@@ -129,31 +130,38 @@ impl Edge {
         key_hex: &str,
         store_path: &Path,
         lease_gate: bool,
-        execution: bool,
+        shared_execution: Option<bool>,
     ) -> Self {
         let bytes: [u8; 32] = (0..32)
             .map(|i| u8::from_str_radix(&key_hex[i * 2..i * 2 + 2], 16).unwrap())
             .collect::<Vec<_>>()
             .try_into()
             .unwrap();
-        let store = Arc::new(Store::open(store_path).unwrap());
         let outbox_dir = tempfile::tempdir().unwrap();
-        let outbox = Arc::new(Outbox::open(&outbox_dir.path().join("outbox.sqlite")).unwrap());
+        let separate_outbox = outbox_dir.path().join("outbox.sqlite");
+        let (outbox, store) = if shared_execution == Some(true) {
+            let outbox = Arc::new(Outbox::open(store_path).unwrap());
+            let store = Store::open_with_outbox(outbox.clone()).unwrap();
+            (outbox, store)
+        } else {
+            (Arc::new(Outbox::open(&separate_outbox).unwrap()), Store::open(store_path).unwrap())
+        };
+        let store = Arc::new(store);
         let state = Arc::new(State { device_key: DeviceKey::from_bytes(bytes), ..Default::default() });
         state.replace_token(Some(token.into()));
         let mut o = WsOptions::new(url).with_route_pool_for_isolated_test(store.clone());
         if lease_gate {
             o = o.with_route_pool_leases_for_isolated_test();
         }
-        if execution {
+        if shared_execution.is_some() {
             o = o.with_route_pool_execution_for_isolated_test();
         }
         o.backoff_min = Duration::from_millis(50);
         o.backoff_max = Duration::from_millis(300);
         o.connect_timeout = Duration::from_secs(3);
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(ws::run(o, state.clone(), outbox, cancel.clone()));
-        Self { state, store, cancel, task, _outbox: outbox_dir }
+        let task = tokio::spawn(ws::run(o, state.clone(), outbox.clone(), cancel.clone()));
+        Self { state, store, cancel, task, outbox, _outbox_dir: outbox_dir }
     }
 
     async fn stop(self) {
@@ -425,7 +433,7 @@ async fn wait_reply(socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, id:
     .unwrap_or_else(|_| panic!("timed out awaiting reply to {id}"))
 }
 
-async fn replay_settlement(info: &Value, receipt: &Value, settlement: &Value, expected: &Value) {
+async fn replay_settlement(info: &Value, receipt: &Value, settlement: &Value, expected: &Value, acked_through: u64) {
     let edge_version = env!("CARGO_PKG_VERSION");
     let mut request = info["ws_url"].as_str().unwrap().into_client_request().unwrap();
     let token = info["device_token"].as_str().unwrap();
@@ -437,20 +445,20 @@ async fn replay_settlement(info: &Value, receipt: &Value, settlement: &Value, ex
         "type":"hello", "id":"msg_one_chain_replay", "edge_version":edge_version,
         "os":onex_core::ipc::os_name(), "arch":onex_core::ipc::arch_name(),
         "agent_cache":true, "capability_contract_v1":true, "capability_policy_v2":true,
-        "policy_runtime_v1":true, "config_revision":info["config_revision"], "outbox_last_seq":receipt["seq"],
+        "policy_runtime_v1":true, "config_revision":info["config_revision"], "outbox_last_seq":acked_through,
         "capabilities":[ROUTE_POOL_V1],
     });
     socket.send(Message::Text(hello.to_string().into())).await.unwrap();
     let welcome = wait_reply(&mut socket, "msg_one_chain_replay").await;
     assert_eq!(welcome["type"], "welcome", "{welcome}");
     assert_eq!(welcome["capabilities"], json!([ROUTE_POOL_V1]));
-    assert_eq!(welcome["ack_seq"], receipt["seq"]);
+    assert_eq!(welcome["ack_seq"], acked_through);
 
     let usage = json!({"type":"usage", "id":"usage_one_chain_replay", "batch":[receipt]});
     socket.send(Message::Text(usage.to_string().into())).await.unwrap();
     let ack = wait_reply(&mut socket, "usage_one_chain_replay").await;
     assert_eq!(ack["type"], "events_ack", "{ack}");
-    assert_eq!(ack["ack_seq"], receipt["seq"]);
+    assert_eq!(ack["ack_seq"], acked_through);
 
     socket.send(Message::Text(settlement.to_string().into())).await.unwrap();
     let reply = wait_reply(&mut socket, settlement["id"].as_str().unwrap()).await;
@@ -465,15 +473,20 @@ async fn replay_settlement(info: &Value, receipt: &Value, settlement: &Value, ex
 /// 本地原生 Responses 请求用上游终态用量结算，并核对供应商与租户两边台账。
 #[tokio::test]
 async fn signed_pool_native_responses_settles_both_ledgers() {
-    run_signed_pool_responses(false).await;
+    run_signed_pool_responses(false, false).await;
 }
 
 #[tokio::test]
 async fn signed_pool_falls_back_only_after_primary_refuses_connection() {
-    run_signed_pool_responses(true).await;
+    run_signed_pool_responses(true, false).await;
 }
 
-async fn run_signed_pool_responses(primary_offline: bool) {
+#[tokio::test]
+async fn signed_pool_stream_shares_cursor_with_native_session_events() {
+    run_signed_pool_responses(true, true).await;
+}
+
+async fn run_signed_pool_responses(primary_offline: bool, stream: bool) {
     let Some(checkout) = std::env::var_os("ONEX_ONE_CHAIN_SERVER_CHECKOUT").map(PathBuf::from) else {
         eprintln!("skipped: set ONEX_ONE_CHAIN_SERVER_CHECKOUT to run the signed pool chain");
         return;
@@ -491,7 +504,7 @@ async fn run_signed_pool_responses(primary_offline: bool) {
         value("device_private_key_hex"),
         &edge_store_path,
         true,
-        true,
+        Some(stream),
     );
     wait_until("signed pool lease", || edge.store.accepted_pool_lease(&scope).unwrap().is_some()).await;
     let lease = edge.store.accepted_pool_lease(&scope).unwrap().unwrap();
@@ -504,10 +517,17 @@ async fn run_signed_pool_responses(primary_offline: bool) {
     let rate = &info["signed_rate"]["rate_version_id"];
     let release_id = binding.agent_release_id.clone();
     let token = "one-chain-native-launch";
+    let session = "ses_one_chain";
+    if stream {
+        let event = json!({"kind":"session_start", "session_id":session,
+            "at":onexd::pricing::format_ms(onexd::outbox::now_ms()), "payload":{"agent":"codex"}});
+        assert_eq!(edge.outbox.append(Kind::Events, event).unwrap(), 1);
+        wait_until("normal session event ACK", || edge.outbox.ack_seq().unwrap() == 1).await;
+    }
     edge.state.launch_tokens.write().unwrap().insert(
         token.into(),
         LaunchBinding {
-            session_id: "ses_one_chain".into(),
+            session_id: session.into(),
             agent: "codex".into(),
             release_id: Some(release_id),
             approved_model: Some(model.into()),
@@ -517,20 +537,43 @@ async fn run_signed_pool_responses(primary_offline: bool) {
     let http = loopback_client();
     let (usage, _legacy_usage) = tokio::sync::mpsc::unbounded_channel();
     let router = Router::new(edge.state.clone(), "separate-local-token".into(), http.clone(), usage)
-        .with_isolated_pool_execution(edge.store.clone());
+        .with_route_pool_execution(edge.store.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local = listener.local_addr().unwrap();
     let http_task = tokio::spawn(async move { axum::serve(listener, router.app()).await.unwrap() });
-    let answer = http
-        .post(format!("http://{local}/v1/responses"))
-        .bearer_auth(token)
-        .json(&json!({"model": model, "input": "loopback e2e", "max_output_tokens": 2048, "stream": false}))
-        .send()
-        .await
-        .unwrap();
+    if let Some(cap) = view.config.policy.runtime.as_ref().and_then(|rules| rules.max_output) {
+        let excessive = http
+            .post(format!("http://{local}/v1/responses"))
+            .bearer_auth(token)
+            .json(&json!({"model":model,"input":"must be rejected","max_output_tokens":cap+1}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(excessive.status(), reqwest::StatusCode::FORBIDDEN);
+        let excessive: Value = excessive.json().await.unwrap();
+        assert_eq!(excessive["error"]["code"], "output_too_large");
+        assert!(edge.store.route_usage_for_lease(&scope, &lease.lease_id).unwrap().is_none());
+    }
+    let mut call = json!({"model": model, "input": "loopback e2e", "stream": stream});
+    if !stream {
+        call["max_output_tokens"] = 2048.into();
+    }
+    let answer = http.post(format!("http://{local}/v1/responses")).bearer_auth(token).json(&call).send().await.unwrap();
     let status = answer.status();
-    let answer: Value = answer.json().await.unwrap();
+    let answer = answer.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::OK, "native response: {answer}");
+    let answer: Value = if stream {
+        assert!(answer.contains("event: response.output_text.delta"), "{answer}");
+        answer
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["type"] == "response.completed")
+            .unwrap_or_else(|| panic!("stream has no completed event: {answer}"))["response"]
+            .clone()
+    } else {
+        serde_json::from_str(&answer).unwrap()
+    };
     let selected_vendor = if primary_offline { "vendor-b" } else { "vendor-a" };
     assert!(answer["model"].as_str().unwrap().starts_with(selected_vendor));
     assert_eq!(answer["usage"]["input_tokens"], 10_000);
@@ -540,10 +583,17 @@ async fn run_signed_pool_responses(primary_offline: bool) {
         edge.store.pool_lease(&scope, &lease.lease_id).unwrap().unwrap().state == PoolLeaseState::Settled
     })
     .await;
-    let (seq, receipt, acked) = edge.store.isolated_usage_for_lease(&scope, &lease.lease_id).unwrap().unwrap();
+    let (seq, receipt, acked) = edge.store.route_usage_for_lease(&scope, &lease.lease_id).unwrap().unwrap();
     let receipt = receipt.unwrap();
     assert!(acked);
-    assert_eq!(seq, Some(1));
+    assert_eq!(seq, Some(if stream { 2 } else { 1 }));
+    if stream {
+        let event = json!({"kind":"assistant_message", "session_id":session,
+            "at":onexd::pricing::format_ms(onexd::outbox::now_ms()), "payload":{"text":"fixture output"}});
+        assert_eq!(edge.outbox.append(Kind::Events, event).unwrap(), 3);
+        wait_until("shared contiguous sequence", || edge.outbox.ack_seq().unwrap() == 3).await;
+    }
+    let acked_through = if stream { 3 } else { 1 };
     assert_eq!(receipt["lease_id"], lease.lease_id);
     assert_eq!(receipt["rate_version_id"], *rate);
     assert_eq!(receipt["projection_id"], lease.projection_id);
@@ -601,11 +651,21 @@ async fn run_signed_pool_responses(primary_offline: bool) {
         )
         .unwrap();
     let expected: Value = serde_json::from_str(&cached).unwrap();
-    replay_settlement(info, &receipt, &settlement, &expected).await;
+    replay_settlement(info, &receipt, &settlement, &expected, acked_through).await;
 
     let usage_count: i64 =
         db.query_row("SELECT count(*) FROM usage WHERE device_id=?1", [&scope.device_id], |row| row.get(0)).unwrap();
     assert_eq!(usage_count, 1);
+    if stream {
+        let mut events =
+            db.prepare("SELECT seq FROM session_events WHERE device_id=?1 AND session_id=?2 ORDER BY seq").unwrap();
+        let native_slots = events
+            .query_map((&scope.device_id, session), |row| row.get::<_, u64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(native_slots, [1, 3]);
+    }
     let (charge_count, charges): (i64, i64) = db
         .query_row(
             "SELECT count(*),sum(amount_milli) FROM ledger WHERE kind='settle' AND lease_id=?1",
@@ -679,8 +739,8 @@ async fn run_signed_pool_responses(primary_offline: bool) {
             "provider_id": receipt["provider_id"], "deployment_id": receipt["deployment_id"],
             "deployment_revision": receipt["deployment_revision"], "signed_pool": info["signed_pool"],
             "input_tokens": 10_000, "output_tokens": 2_000, "tenant_debit_milli": charges,
-            "primary_offline": primary_offline, "attempts": attempts,
-            "replayed_usage_ack_seq": seq, "replayed_settlement_op_id": op.op_id,
+            "primary_offline": primary_offline, "stream":stream, "attempts": attempts,
+            "usage_seq":seq, "replayed_usage_ack_seq": acked_through, "replayed_settlement_op_id": op.op_id,
             "supplier_debit_micro": supplier_debit, "supplier_amount_cny_micro": 50_000,
             "supplier_balance_micro": selected_wallet_balance,
         }),

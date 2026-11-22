@@ -4,7 +4,7 @@
 //! 确认过的行保留 72 小时（总量不超过 200 MB，超出先删最旧的），供 Server 丢数据时重传。
 //! seq 从 meta 继续分配，所以删行和进程重启都不会让 seq 回退。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +22,7 @@ const SIZE_PRUNE_EVERY_MS: i64 = 60_000;
 pub enum Kind {
     Events,
     Usage,
+    RouteUsage,
 }
 
 impl Kind {
@@ -29,6 +30,7 @@ impl Kind {
         match self {
             Kind::Events => "events",
             Kind::Usage => "usage",
+            Kind::RouteUsage => "route_usage",
         }
     }
 
@@ -36,6 +38,7 @@ impl Kind {
         match s {
             "events" => Ok(Kind::Events),
             "usage" => Ok(Kind::Usage),
+            "route_usage" => Ok(Kind::RouteUsage),
             _ => anyhow::bail!("unknown outbox kind {s:?}"),
         }
     }
@@ -59,6 +62,7 @@ pub enum AckOutcome {
 }
 
 pub struct Outbox {
+    path: PathBuf,
     conn: Mutex<Connection>,
     last_seq_tx: watch::Sender<u64>,
     retain_ms: i64,
@@ -128,6 +132,7 @@ impl Outbox {
         )?;
         let last = meta(&conn, "last_seq")?;
         Ok(Self {
+            path: path.to_path_buf(),
             conn: Mutex::new(conn),
             last_seq_tx: watch::Sender::new(last),
             retain_ms,
@@ -136,21 +141,65 @@ impl Outbox {
         })
     }
 
-    /// 分配下一个 seq 并写入。`item` 必须是 JSON 对象，`seq` 字段由这里填。
-    pub fn append(&self, kind: Kind, mut item: Value) -> Result<u64> {
-        let obj = item.as_object_mut().context("outbox item must be a JSON object")?;
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn note_sequence(&self, seq: u64) {
+        self.last_seq_tx.send_if_modified(|last| {
+            if seq <= *last {
+                return false;
+            }
+            *last = seq;
+            true
+        });
+    }
+
+    pub(crate) fn is_pool_mode(&self) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        pool_mode(&conn)
+    }
+
+    /// Transition a device whose legacy stream is drained. Future reconnections must keep the same mode.
+    pub(crate) fn enter_pool_mode(&self) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let seq = meta(&tx, "last_seq")? + 1;
+        if !pool_mode(&tx)? {
+            let ack = meta(&tx, "ack_seq")?;
+            let pending: bool =
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM outbox WHERE kind='usage' AND seq>?)", [ack], |row| {
+                    row.get(0)
+                })?;
+            anyhow::ensure!(!pending, "legacy usage must be acknowledged before entering route pool mode");
+            tx.execute("INSERT INTO meta(k,v) VALUES('route_pool_mode',1)", [])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Allocate the next sequence and write the item in the caller's database transaction.
+    pub(crate) fn enqueue(tx: &Transaction<'_>, kind: Kind, item: &mut Value) -> Result<u64> {
+        let obj = item.as_object_mut().context("outbox item must be a JSON object")?;
+        let seq = meta(tx, "last_seq")? + 1;
         obj.insert("seq".into(), seq.into());
         tx.execute(
             "INSERT INTO outbox (seq, kind, item) VALUES (?1, ?2, ?3)",
             params![seq as i64, kind.as_str(), item.to_string()],
         )?;
         tx.execute("UPDATE meta SET v = ?1 WHERE k = 'last_seq'", [seq as i64])?;
+        Ok(seq)
+    }
+
+    /// 分配下一个 seq 并写入。`item` 必须是 JSON 对象，`seq` 字段由这里填。
+    pub fn append(&self, kind: Kind, mut item: Value) -> Result<u64> {
+        anyhow::ensure!(kind != Kind::RouteUsage, "metered route usage must be persisted with its receipt");
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        anyhow::ensure!(kind != Kind::Usage || !pool_mode(&tx)?, "legacy usage is closed for this route pool device");
+        let seq = Self::enqueue(&tx, kind, &mut item)?;
         tx.commit()?;
         drop(conn);
-        self.last_seq_tx.send_replace(seq);
+        self.note_sequence(seq);
         Ok(seq)
     }
 
@@ -345,7 +394,7 @@ impl Outbox {
         )?;
         tx.commit()?;
         drop(conn);
-        self.last_seq_tx.send_replace(seq);
+        self.note_sequence(seq);
         Ok(true)
     }
 
@@ -383,7 +432,7 @@ impl Outbox {
         let seq = append_event_rows(&tx, events)?;
         tx.commit()?;
         drop(conn);
-        self.last_seq_tx.send_replace(seq);
+        self.note_sequence(seq);
         Ok(())
     }
 }
@@ -457,6 +506,10 @@ fn append_event_rows(tx: &Transaction<'_>, events: Vec<Value>) -> Result<u64> {
     tx.execute("UPDATE meta SET v = ?1 WHERE k = 'last_seq'", [seq as i64])?;
     Ok(seq)
 }
+fn pool_mode(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE k='route_pool_mode' AND v=1)", [], |row| row.get(0))?)
+}
+
 fn meta(conn: &Connection, k: &str) -> Result<u64> {
     let v: Option<i64> = conn.query_row("SELECT v FROM meta WHERE k = ?1", [k], |r| r.get(0)).optional()?;
     Ok(v.context("outbox meta missing")? as u64)

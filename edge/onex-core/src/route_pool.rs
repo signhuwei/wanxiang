@@ -14,6 +14,7 @@ use crate::ws::{AgentRelease, CapabilityContract, Cutoff, Lease, Policy, Rate, R
 
 /// `hello.capabilities` / `welcome.capabilities` 里的能力名。
 pub const ROUTE_POOL_V1: &str = "route_pool.v1";
+pub const ROUTE_POOL_EXEC_V1: &str = "route_pool.exec.v1";
 /// `route_pool.abi` 当前唯一支持的值。
 pub const ROUTE_POOL_ABI: u32 = 1;
 /// 首版输入倍率基准：人民币 1 元／百万普通输入 Token 为 1×。

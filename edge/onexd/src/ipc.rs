@@ -514,7 +514,9 @@ async fn launch(
         return err("agent_not_allowed", &format!("OneX 暂不支持启动 {agent}"));
     };
     {
+        let pool = ipc.state.pool_launch_config();
         let config = ipc.state.config.read().unwrap();
+        let config = pool.as_ref().unwrap_or(&config);
         if config.policy_blocked {
             return err("agent_not_allowed", "设备策略尚未成功同步");
         }
@@ -535,7 +537,9 @@ async fn launch(
     }
     let (os, arch) = (onex_core::ipc::os_name(), onex_core::ipc::arch_name());
     let (approved, tool_releases, search_releases) = {
+        let pool = ipc.state.pool_launch_config();
         let cfg = ipc.state.config.read().unwrap();
+        let cfg = pool.as_ref().unwrap_or(&cfg);
         if cfg.policy_blocked {
             return err("agent_not_allowed", "设备策略尚未成功同步");
         }
@@ -642,7 +646,9 @@ async fn launch(
     };
     // 别名候选：精确名字的路由；通配路由用它固定的上游模型名（server 的 MVP seed 是 `*` → Qwen3.8-27B）
     let (models, routable) = {
+        let pool = ipc.state.pool_launch_config();
         let cfg = ipc.state.config.read().unwrap();
+        let cfg = pool.as_ref().unwrap_or(&cfg);
         if cfg.policy_blocked {
             return err("agent_not_allowed", "设备策略尚未成功同步");
         }
@@ -747,7 +753,9 @@ async fn launch(
                 warn!(agent, %error, "could not prepare managed tools");
                 return err("invalid", "无法加载受管工具");
             }
+            let pool = ipc.state.pool_launch_config();
             let cfg = ipc.state.config.read().unwrap();
+            let cfg = pool.as_ref().unwrap_or(&cfg);
             let release_unchanged = if let Some(release) = &approved {
                 crate::managed_runtime::select(&cfg.agents, agent, os, arch).ok() == Some(release)
             } else {
@@ -785,7 +793,7 @@ async fn launch(
             ipc.state.launch_tokens.write().unwrap().insert(
                 local_token.clone(),
                 crate::state::LaunchBinding {
-                    approved_model: None,
+                    approved_model: pool.is_some().then(|| model.clone()),
                     session_id: l.session_id.clone(),
                     agent: agent.into(),
                     release_id: approved.as_ref().map(|release| release.id.clone()),
@@ -987,7 +995,9 @@ fn status(ipc: &Ipc) -> Status {
         e.map(|(outcome, request_id, at)| json!({"outcome": outcome, "request_id": request_id, "at": format_ms(at)}))
     };
     let (agent_cache, config_revision, capability_contract, releases, policy, notices, policy_blocked) = {
+        let pool = ipc.state.pool_launch_config();
         let config = ipc.state.config.read().unwrap();
+        let config = pool.as_ref().unwrap_or(&config);
         (
             config.agent_cache,
             config.revision,

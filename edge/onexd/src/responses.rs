@@ -43,7 +43,7 @@ enum Wire {
 }
 
 pub async fn responses(AxState(rt): AxState<Arc<Router>>, headers: HeaderMap, body: Bytes) -> Response {
-    if rt.isolated_pool_store.is_some() && rt.state.route_pool_engaged() {
+    if rt.pool_store.is_some() && rt.state.route_pool_engaged() {
         return crate::pool_execution::responses(rt, headers, body).await;
     }
     openai_request(rt, headers, body, Wire::Responses).await
@@ -506,7 +506,7 @@ fn err_body(kind: &str, code: &str, message: &str) -> Value {
 }
 
 /// 已发响应头之后（流已经开始）用的终态事件：`response.failed`。
-fn response_failed_event(code: &str, message: &str) -> Bytes {
+pub(crate) fn response_failed_event(code: &str, message: &str) -> Bytes {
     let body = json!({"type": "response.failed", "response": {"status": "failed",
         "error": {"code": code, "message": message}}});
     Bytes::from(format!("event: response.failed\ndata: {body}\n\n"))

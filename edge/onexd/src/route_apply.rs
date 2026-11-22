@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use onex_core::route_pool::ApplyResult;
@@ -15,6 +15,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::outbox::{Kind, Outbox};
 use crate::route_stage::AppliedIdentity;
 
 /// Versions 2–4 add isolated leases, measured receipts, and attempt identities.
@@ -102,10 +103,19 @@ pub enum AckMatch {
 pub struct Store {
     conn: Mutex<Connection>,
     fault: Mutex<Option<Fault>>,
+    outbox: Option<Arc<Outbox>>,
 }
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_db(path, None)
+    }
+
+    pub fn open_with_outbox(outbox: Arc<Outbox>) -> Result<Self> {
+        Self::open_db(outbox.path(), Some(outbox.clone()))
+    }
+
+    fn open_db(path: &Path, outbox: Option<Arc<Outbox>>) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open route apply store {}", path.display()))?;
         #[cfg(unix)]
         {
@@ -207,7 +217,7 @@ impl Store {
             Some(SCHEMA_VERSION) => {}
             Some(other) => bail!("route apply store schema {other} is newer than {SCHEMA_VERSION}"),
         }
-        Ok(Self { conn: Mutex::new(conn), fault: Mutex::new(None) })
+        Ok(Self { conn: Mutex::new(conn), fault: Mutex::new(None), outbox })
     }
 
     /// 让下一次 [`Store::commit_applied`] 在指定位置失败一次。
@@ -486,8 +496,12 @@ pub struct PoolLeaseOp {
 }
 
 impl Store {
-    /// One durable intent per isolated lease. An unconfirmed upstream result keeps the lease unavailable.
-    pub fn reserve_isolated_request(&self, scope: &Scope, lease_id: &str, request_id: &str) -> Result<bool> {
+    pub(crate) fn shares_outbox(&self) -> bool {
+        self.outbox.is_some()
+    }
+
+    /// One durable intent per pool lease. An unconfirmed upstream result keeps the lease unavailable.
+    pub fn reserve_route_request(&self, scope: &Scope, lease_id: &str, request_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let [origin, tenant, user, device] = scope_params(scope);
         Ok(conn.execute(
@@ -499,7 +513,7 @@ impl Store {
         )? == 1)
     }
 
-    pub fn start_isolated_attempt(
+    pub fn start_route_attempt(
         &self,
         scope: &Scope,
         request_id: &str,
@@ -516,7 +530,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn record_isolated_refusal(&self, scope: &Scope, attempt_id: &str) -> Result<()> {
+    pub fn record_connect_refusal(&self, scope: &Scope, attempt_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         Self::complete_attempt(&conn, scope, attempt_id, "connect_refused")
     }
@@ -529,13 +543,13 @@ impl Store {
             params![origin, tenant, user, device, attempt_id, outcome],
         )?;
         if updated != 1 {
-            bail!("isolated route attempt has no pending start");
+            bail!("route attempt has no pending start");
         }
         Ok(())
     }
 
     /// Write the metered response and its replay sequence atomically before returning it to the local client.
-    pub fn complete_isolated_request(
+    pub fn complete_route_request(
         &self,
         scope: &Scope,
         lease_id: &str,
@@ -545,12 +559,17 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let [origin, tenant, user, device] = scope_params(scope);
-        let seq: u64 = tx.query_row(
-            "SELECT coalesce(max(seq),0)+1 FROM pool_runtime_receipts WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3 AND device_id=?4",
-            params![origin, tenant, user, device], |r| r.get(0),
-        )?;
-        payload["seq"] = seq.into();
-        let attempt = payload["attempt_id"].as_str().context("missing isolated attempt identity")?;
+        let seq = if self.shares_outbox() {
+            Outbox::enqueue(&tx, Kind::RouteUsage, &mut payload)?
+        } else {
+            let seq: u64 = tx.query_row(
+                "SELECT coalesce(max(seq),0)+1 FROM pool_runtime_receipts WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3 AND device_id=?4",
+                params![origin, tenant, user, device], |r| r.get(0),
+            )?;
+            payload["seq"] = seq.into();
+            seq
+        };
+        let attempt = payload["attempt_id"].as_str().context("missing route attempt identity")?;
         Self::complete_attempt(&tx, scope, attempt, "completed")?;
         let updated = tx.execute(
             "UPDATE pool_runtime_receipts SET seq=?7,payload=?8 WHERE server_origin=?1 AND tenant_id=?2 AND user_id=?3
@@ -558,13 +577,17 @@ impl Store {
             params![origin, tenant, user, device, lease_id, request_id, seq, payload.to_string()],
         )?;
         if updated != 1 {
-            bail!("isolated route receipt has no open intent");
+            bail!("route receipt has no open intent");
         }
         tx.commit()?;
+        drop(conn);
+        if let Some(outbox) = &self.outbox {
+            outbox.note_sequence(seq);
+        }
         Ok(())
     }
 
-    pub fn pending_isolated_usage(&self, scope: &Scope) -> Result<Option<(u64, Value)>> {
+    pub fn pending_route_usage(&self, scope: &Scope) -> Result<Option<(u64, Value)>> {
         let conn = self.conn.lock().unwrap();
         let [origin, tenant, user, device] = scope_params(scope);
         let row: Option<(u64, String)> = conn
@@ -578,7 +601,7 @@ impl Store {
         row.map(|(seq, payload)| Ok((seq, serde_json::from_str(&payload)?))).transpose()
     }
 
-    pub fn ack_isolated_usage(&self, scope: &Scope, through: u64) -> Result<()> {
+    pub fn ack_route_usage(&self, scope: &Scope, through: u64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let [origin, tenant, user, device] = scope_params(scope);
         conn.execute(
@@ -589,7 +612,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn isolated_usage_for_lease(
+    pub fn route_usage_for_lease(
         &self,
         scope: &Scope,
         lease_id: &str,
@@ -604,7 +627,7 @@ impl Store {
             .transpose()
     }
 
-    pub fn begin_isolated_metered_settlement(
+    pub fn begin_metered_settlement(
         &self,
         scope: &Scope,
         lease: &PoolLease,

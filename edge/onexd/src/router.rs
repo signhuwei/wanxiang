@@ -399,7 +399,7 @@ fn is_business_error_body(v: &Value) -> bool {
 
 pub struct Router {
     pub(crate) state: Arc<State>,
-    pub(crate) isolated_pool_store: Option<Arc<crate::route_apply::Store>>,
+    pub(crate) pool_store: Option<Arc<crate::route_apply::Store>>,
     local_token: String,
     gate: crate::runtime_gate::Gate,
     /// 遵从环境变量代理的默认客户端
@@ -420,7 +420,7 @@ impl Router {
         let direct = client_builder().no_proxy().build().expect("http client");
         Arc::new(Self {
             state,
-            isolated_pool_store: None,
+            pool_store: None,
             local_token,
             http,
             direct,
@@ -430,9 +430,8 @@ impl Router {
         })
     }
 
-    #[doc(hidden)]
-    pub fn with_isolated_pool_execution(mut self: Arc<Self>, store: Arc<crate::route_apply::Store>) -> Arc<Self> {
-        Arc::get_mut(&mut self).expect("configure isolated router before sharing").isolated_pool_store = Some(store);
+    pub fn with_route_pool_execution(mut self: Arc<Self>, store: Arc<crate::route_apply::Store>) -> Arc<Self> {
+        Arc::get_mut(&mut self).expect("configure the router before sharing").pool_store = Some(store);
         self
     }
 

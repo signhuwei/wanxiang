@@ -211,6 +211,12 @@ impl RouteApply {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolExecution {
+    Isolated,
+    Production,
+}
+
 pub struct State {
     /// device_token。S0 只存内存，重启后需要重新 login。改它用 [`State::replace_token`]。
     pub token: watch::Sender<Option<String>>,
@@ -219,6 +225,8 @@ pub struct State {
     pub route: RwLock<RouteApply>,
     #[doc(hidden)]
     pub isolated_route_execution: AtomicBool,
+    #[doc(hidden)]
+    pub production_route_execution: AtomicBool,
     /// 设备 X25519 私钥，解密下发的上游密钥。每次启动新生成、只在内存，所以重启后要重新登录注册设备。
     pub device_key: DeviceKey,
     /// When set, only this registered device can acknowledge or replay this outbox.
@@ -245,6 +253,7 @@ impl Default for State {
             auth_generation: AtomicU64::new(0),
             route: Default::default(),
             isolated_route_execution: Default::default(),
+            production_route_execution: Default::default(),
             device_key: DeviceKey::generate(),
             expected_device_id: Default::default(),
             conn: Default::default(),
@@ -291,11 +300,79 @@ impl State {
         self.auth_generation.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// 本进程已进入 `route_pool.v1` 隔离流程。此后真实模型入口一律拒绝：联验租约只消费合成账本，
-    /// 路由执行等逐请求用量与按租约结清联验（`contracts/routing-lease-gate.md`）。残留的旧配置、
-    /// 旧密钥或旧租约都不能借此访问上游。
+    pub(crate) fn pool_execution(&self) -> Option<PoolExecution> {
+        if self.production_route_execution.load(Ordering::Acquire) {
+            Some(PoolExecution::Production)
+        } else if self.isolated_route_execution.load(Ordering::Acquire) {
+            Some(PoolExecution::Isolated)
+        } else {
+            None
+        }
+    }
+
+    /// Once a pool projection owns the device, stale legacy grants cannot route requests.
     pub fn route_pool_engaged(&self) -> bool {
         !matches!(*self.route.read().unwrap(), RouteApply::None)
+    }
+
+    /// Launch and status read the selected route pool's public grants, without the inference keys.
+    pub(crate) fn pool_launch_config(&self) -> Option<ConfigSnapshot> {
+        let route = self.route.read().unwrap();
+        if matches!(*route, RouteApply::None) {
+            return None;
+        }
+        let Some(view) = route.ready().filter(|view| self.pool_execution().is_some() && view.executable()) else {
+            return Some(ConfigSnapshot { policy_blocked: true, ..ConfigSnapshot::default() });
+        };
+        let cfg = &view.config;
+        let agents: Vec<_> = cfg
+            .agents
+            .iter()
+            .filter(|release| {
+                release.agent == "codex"
+                    && cfg.route_pool.bindings.iter().any(|binding| {
+                        binding.agent_release_id == release.id && binding.ingress_protocol == "openai_responses"
+                    })
+            })
+            .cloned()
+            .collect();
+        let mut routes = Vec::new();
+        for binding in cfg
+            .route_pool
+            .bindings
+            .iter()
+            .filter(|binding| agents.iter().any(|release| release.id == binding.agent_release_id))
+        {
+            if let Some(deployment) = cfg.routes.iter().find(|route| {
+                route.base.protocol == "openai_responses"
+                    && route.base.model_id == binding.model_id
+                    && binding.deployment_ids.contains(&route.deployment_id)
+            }) {
+                routes.extend(
+                    binding.aliases.iter().map(|alias| Route { model: alias.clone(), ..deployment.base.clone() }),
+                );
+            }
+        }
+        let policy = AppliedPolicy {
+            summary: cfg.policy.summary.clone(),
+            notices: cfg.policy.notices.clone(),
+            balance: cfg.policy.balance.clone(),
+            runtime: cfg.policy.runtime.clone().unwrap_or_default(),
+            commerce_plan_id: cfg.policy.commerce_plan_id.clone(),
+            search_tools: Vec::new(),
+            keys: HashMap::new(),
+        };
+        Some(ConfigSnapshot {
+            agent_cache: true,
+            revision: cfg.revision,
+            capability_contract: cfg.capability_contract,
+            policy: Some(policy),
+            policy_blocked: false,
+            routes,
+            rates: Vec::new(),
+            agents,
+            tools: Vec::new(),
+        })
     }
 
     pub fn generation(&self) -> u64 {
