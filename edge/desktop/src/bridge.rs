@@ -207,10 +207,7 @@ const AGENT_LAUNCHERS: &[AgentLauncher] = &[
         #[cfg(target_os = "macos")]
         script: "onex-run-kimi.command",
     },
-    #[cfg(any(
-        all(target_os = "macos", target_arch = "aarch64"),
-        all(windows, target_arch = "x86_64", debug_assertions)
-    ))]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
     AgentLauncher {
         gui: true,
         id: "deepseek-desktop",
@@ -1041,6 +1038,29 @@ mod tests {
 
         status["device_id"] = json!("dev_other");
         assert!(bridge.ready_agents(Some(&status), &inner).is_empty());
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn windows_workbench_projects_qualified_deepseek_actions() {
+        let bridge = Bridge::new(PathBuf::new());
+        let inner = Inner { device_id: Some("dev_a".into()), ..Default::default() };
+        let mut status = json!({"logged_in": true, "ws": "connected", "device_id": "dev_a", "policy": {},
+        "managed_agents": [
+            {"id": "deepseek-desktop", "version": "0.2.1-rc.3", "status": "available"},
+            {"id": "workbuddy", "version": "5.3.8", "status": "cached"},
+            {"id": "codex-desktop", "version": "26.1117.41037", "status": "cached"},
+            {"id": "claude-desktop", "version": "6.28899.6", "status": "cached"}
+        ]});
+        let agents = bridge.ready_agents(Some(&status), &inner);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, "deepseek-desktop");
+        assert_eq!(agents[0].runtime_kind, "gui");
+        assert_eq!(agents[0].actions, ["download"]);
+
+        status["managed_agents"][0]["status"] = json!("cached");
+        let agents = bridge.ready_agents(Some(&status), &inner);
+        assert_eq!(agents[0].actions, ["launch"]);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
