@@ -269,7 +269,7 @@ mod tests {
         fn new() -> Self {
             let path = std::env::current_exe().unwrap().canonicalize().unwrap();
             let command = format!("\"{}\" \"%1\"", path.display());
-            let container = format!(r"Software\OneX-DshProtocol-Test-{}", uuid::Uuid::new_v4());
+            let container = format!(r"Software\OneX-DshProtocol-Test-{}", crate::launch::uuid_v4());
             Self { hive: RegKey::predef(HKEY_CURRENT_USER), base: join(&container, "dsh"), container, path, command }
         }
 
