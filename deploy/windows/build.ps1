@@ -48,6 +48,11 @@ function Assert-X64 {
 }
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$bunVersion = (Get-Content -Raw -LiteralPath (Join-Path $repo 'deploy\bun-version')).Trim()
+$actualBun = Invoke-Checked 'bun' @('--version')
+if ($actualBun -ne $bunVersion) {
+    throw "Expected Bun $bunVersion, got $actualBun."
+}
 $edge = Join-Path $repo 'edge'
 $desktop = Join-Path $edge 'desktop'
 $appVersion = (Get-Content -Raw -LiteralPath (Join-Path $desktop 'tauri.conf.json') | ConvertFrom-Json).version
@@ -69,7 +74,6 @@ try {
     New-Item -ItemType Directory -Path $staging -Force | Out-Null
     Invoke-Checked 'rustup' @('target', 'add', $target)
     Invoke-Checked 'cargo' @('tauri', '--version')
-    Invoke-Checked 'bun' @('--version')
 
     Push-Location (Join-Path $repo 'server')
     try { Invoke-Checked 'bun' @('install', '--frozen-lockfile') } finally { Pop-Location }

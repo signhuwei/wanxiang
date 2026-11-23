@@ -2,14 +2,14 @@
 
 2026-11-19 由总督从官方发布渠道查得。SHA-256 来自 GitHub Releases API 的 `digest` 字段和项目自己发布的 hash 文件，两边交叉核对时以项目发布为准。
 
-## Bun 1.3.5（与本机开发环境一致）
+## Bun 1.4.5
 
 | 平台 | 资产 | SHA-256 |
 | --- | --- | --- |
-| macOS arm64 | `https://github.com/oven-sh/bun/releases/download/bun-v1.3.5/bun-darwin-aarch64.zip` | `db17588a4aea8804856825d4bead3f05e1f37276ca606f37e369b4f72f35d3fb` |
-| Linux x86_64 | `https://github.com/oven-sh/bun/releases/download/bun-v1.3.5/bun-linux-x64.zip` | `7051d86a924aefea3e0b96213b5fd8f79c0793f9cae6534233e627e5c3db4669` |
+| macOS arm64 | `https://github.com/oven-sh/bun/releases/download/bun-v1.4.5/bun-darwin-aarch64.zip` | `b5d6bc2e13caf14e57c89661e89efd073ff16165b41bfe43882616410609cd10` |
+| Linux x86_64 | `https://github.com/oven-sh/bun/releases/download/bun-v1.4.5/bun-linux-x64.zip` | `94559b3b528995a49452f9f2404cec74f2efd7d06e0a000a8cd214b02c3666eb` |
 
-211 的 CPU 支持 AVX2（2026-11-19 核实），用普通版即可。不支持 AVX2 的机器要用 `bun-linux-x64-baseline.zip`（`6bddacd6a65855698b9816f2d74871eda4dd0b7fa921140c6445248f94a742fd`）。脚本用 `grep -q avx2 /proc/cpuinfo` 判断。
+211 使用标准 Linux x64 制品。部署脚本也接受该版本的 `bun-linux-x64-baseline.zip`（`dcb23a18a1c2fff12d57bcef696dbbb42eb67fde29f43816ecb595459a24c463`）。Bun 资产摘要于 2026-11-23 从官方发布元数据核对。 [Bun 1.4.5 发布](https://github.com/oven-sh/bun/releases/tag/bun-v1.4.5)
 
 ## Valkey 8.1.5
 

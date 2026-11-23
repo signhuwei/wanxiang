@@ -156,6 +156,8 @@ async function publishEdge(origin: string, os: string, version: string, archive:
 }
 
 try {
+  const version = readFileSync(join(import.meta.dir, 'bun-version'), 'utf8').trim();
+  if (Bun.version !== version) throw new Error(`Run with Bun ${version}`);
   let result;
   if (command === 'pack-server' && (args.length === 1 || args.length === 2)) result = await packServer(args[0], args[1]);
   else if (command === 'publish-server' && args.length === 3) result = await publishServer(args[0], args[1], args[2]);

@@ -11,14 +11,19 @@ if [[ $mode == --rollback ]]; then
   ssh "$host" 'bash "$HOME/apps/onex/current/deploy/remote-release.sh" rollback'
   exit
 fi
+bun_version=$(<"$root/deploy/bun-version")
+if [[ "$(bun --version)" != "$bun_version" ]]; then
+  echo "Run with Bun $bun_version" >&2
+  exit 1
+fi
 
 commit=$(git -C "$root" rev-parse HEAD)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/onex-release.XXXXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 mkdir "$tmp/tree"
 git -C "$root" archive "$commit" server deploy | tar -xf - -C "$tmp/tree"
-# Runtime dependencies are pure JavaScript. Build the production tree locally from the pinned lockfile.
-bun install --cwd "$tmp/tree/server" --frozen-lockfile --production
+# Build the Linux production tree, including the target-specific DuckDB bindings.
+bun install --cwd "$tmp/tree/server" --frozen-lockfile --production --ignore-scripts --os=linux --cpu=x64
 if [[ $mode == --upload-deps ]]; then
   platform=$(ssh "$host" 'uname -s; uname -m; if grep -qw avx2 /proc/cpuinfo; then printf "avx2\n"; fi')
   case "$platform" in

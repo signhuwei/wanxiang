@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
+bun_version=$(<"$(dirname -- "${BASH_SOURCE[0]}")/bun-version")
 
 home=${ONEX_HOME:-$HOME/apps/onex}
 cache=${ONEX_ASSET_CACHE:-$home/cache}
@@ -12,7 +13,7 @@ mkdir -p "$cache"
 case "$platform" in
   Darwin-arm64)
     bun_asset=bun-darwin-aarch64
-    bun_sha=db17588a4aea8804856825d4bead3f05e1f37276ca606f37e369b4f72f35d3fb
+    bun_sha=b5d6bc2e13caf14e57c89661e89efd073ff16165b41bfe43882616410609cd10
     valkey_url=https://github.com/valkey-io/valkey/archive/refs/tags/8.1.5.tar.gz
     valkey_file=valkey-8.1.5-src.tar.gz
     valkey_sha=2d47a6afaec7a5383813579c2367193053ec885bc135e810284fe94ccdd324d2
@@ -23,10 +24,10 @@ case "$platform" in
     if [[ $(uname -s) != Linux && $mode != --download-only ]]; then echo 'Cannot install Linux binaries on macOS' >&2; exit 2; fi
     if [[ $platform == Linux-x86_64-baseline ]] || { [[ -z ${ONEX_ASSET_PLATFORM:-} && $(uname -s) == Linux ]] && ! grep -qw avx2 /proc/cpuinfo; }; then
       bun_asset=bun-linux-x64-baseline
-      bun_sha=6bddacd6a65855698b9816f2d74871eda4dd0b7fa921140c6445248f94a742fd
+      bun_sha=dcb23a18a1c2fff12d57bcef696dbbb42eb67fde29f43816ecb595459a24c463
     else
       bun_asset=bun-linux-x64
-      bun_sha=7051d86a924aefea3e0b96213b5fd8f79c0793f9cae6534233e627e5c3db4669
+      bun_sha=94559b3b528995a49452f9f2404cec74f2efd7d06e0a000a8cd214b02c3666eb
     fi
     valkey_file=valkey-8.1.5-jammy-x86_64.tar.gz
     valkey_url=https://download.valkey.io/releases/$valkey_file
@@ -60,9 +61,9 @@ asset() {
   mv -f -- "$tmp" "$cache/$file"
 }
 
-bun_zip=$bun_asset.zip
+bun_zip=$bun_asset-$bun_version.zip
 rustfs_zip=$rustfs_asset.zip
-bun_url=https://github.com/oven-sh/bun/releases/download/bun-v1.3.5/$bun_zip
+bun_url=https://github.com/oven-sh/bun/releases/download/bun-v$bun_version/$bun_asset.zip
 rustfs_url=https://github.com/rustfs/rustfs/releases/download/1.0.6/$rustfs_zip
 if [[ $mode == --download-only ]]; then
   asset "$bun_zip" "$bun_url" "$bun_sha"
@@ -77,11 +78,13 @@ put() {
   install -m 0755 "$1" "$bin/.$2.new.$$"
   mv -f -- "$bin/.$2.new.$$" "$bin/$2"
 }
-if [[ ! -x $bin/bun || $("$bin/bun" --version) != 1.3.5 ]]; then
+if [[ ! -x $bin/bun || $("$bin/bun" --version) != "$bun_version" ]]; then
   asset "$bun_zip" "$bun_url" "$bun_sha"
   mkdir "$work/bun"
   unzip -q "$cache/$bun_zip" -d "$work/bun"
-  put "$work/bun/$bun_asset/bun" bun
+  checked_bun=$work/bun/$bun_asset/bun
+  [[ $("$checked_bun" --version) == "$bun_version" ]] || { echo "Expected Bun $bun_version" >&2; exit 1; }
+  put "$checked_bun" bun
 fi
 if [[ ! -x $bin/valkey-server || ! -x $bin/valkey-cli || $("$bin/valkey-server" --version) != *'v=8.1.5 '* ]]; then
   asset "$valkey_file" "$valkey_url" "$valkey_sha"

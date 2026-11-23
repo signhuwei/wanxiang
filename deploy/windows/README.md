@@ -1,6 +1,6 @@
 # Windows x64 内测安装器
 
-在 Windows 的 PowerShell 中执行。构建端使用 Git、Rust MSVC、Bun 和 Tauri CLI 2.10.0。开发环境的 Bun 版本见根目录的 [`mise.toml`](../../mise.toml)，构建前用 `bun --version` 确认。按 Tauri 指南准备 Microsoft C++ Build Tools 的「使用 C++ 的桌面开发」工作负载及 WebView2。 [Tauri Windows 前置条件](https://v2.tauri.app/start/prerequisites/#windows)
+在 Windows PowerShell 中执行。构建端使用 Git、Rust MSVC、Bun 1.4.5 和 Tauri CLI 2.10.0。构建脚本按 [deploy/bun-version](../bun-version) 检查 Bun，使用 mise 时在仓库根目录运行 `mise install`。按 Tauri 指南准备 Microsoft C++ Build Tools 的「使用 C++ 的桌面开发」工作负载及 WebView2。 [Tauri Windows 前置条件](https://v2.tauri.app/start/prerequisites/#windows)
 
 在已拉取的候选提交根目录运行以下命令。内测 Server 地址可以按环境调整。
 

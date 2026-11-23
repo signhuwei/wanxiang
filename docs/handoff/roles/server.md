@@ -46,7 +46,7 @@ bun run --cwd server start
 
 ## 易踩的坑
 
-- Bun 固定 1.3.5。它可能在服务端发起 WS close 后仍保留内部连接计数，使 `server.stop()` 的 Promise 不结束；Server 用实际 `onClose`、进行中的工作和 SQLite 队列控制关闭。测试也要按帧类型读，不能假设心跳后下一帧不是配置。
+- 开发与部署使用 Bun 1.4.5。此前在 1.3.5 观察到，Server 发起 WebSocket close 后内部连接计数可能仍有残留，导致 `server.stop()` 的 Promise 等待。Server 用实际 `onClose`、进行中的工作和 SQLite 队列控制关闭。测试按帧类型读取，心跳后还可能收到配置。
 - 依赖安装校验固定 SHA-256。macOS 的 Valkey 需 Xcode 命令行工具编译；若 GitHub 需代理，设置 `HTTPS_PROXY`。上一个开发会话的外网下载和 Bash 脚本执行受限，验证由 governor 完成。没有预先授权不要换工具绕开权限。
 - 数据、密钥和 release 分离；升级或回退前确认 SQLite schema 兼容。部署脚本会依赖远端既有的主密钥解密 Provider 凭据，不能重建或把它复制回本地。开发验证码不会通过 API 返回，只在 Server 日志中可见。LAN MVP 的 HTTP/WS 无加密，仅限受控局域网，不要对公网开放。
 - 同一会话属于最先上报的设备，序号在该设备内递增。`welcome.ack_seq` 和 `events_ack` 只推进到事件、用量已共同持久化的连续位置。

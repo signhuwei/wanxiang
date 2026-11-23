@@ -4,7 +4,9 @@ Run these commands from the checkout root. The non-root dependency installer sup
 
 ## Local verification (macOS)
 
-Use a fresh `ONEX_HOME` so no existing service, port or data is modified unintentionally. Set `HTTPS_PROXY` if the download requires it.
+Use Bun 1.4.5 for development, packaging, and deployment. [mise.toml](../mise.toml) pins development. [deploy/bun-version](bun-version) pins the installer and release tools. To run a development command with mise, use `mise install` and then `mise exec -- bun --version` from the checkout root.
+
+Use a fresh `ONEX_HOME` for standalone verification. The installer puts Bun in `$ONEX_HOME/deps/bin` and the OneX services invoke it by absolute path. Set `HTTPS_PROXY` if the download requires it.
 
 ```sh
 export ONEX_HOME="$HOME/apps/onex-local-check"
@@ -29,6 +31,8 @@ bash deploy/deploy.sh root@192.168.3.211
 ```
 
 If the host cannot download dependencies, use `bash deploy/deploy.sh root@192.168.3.211 --upload-deps` instead. This downloads and checks Linux assets locally (selecting Bun for the host CPU), uploads them with the release and verifies them again remotely. To switch to the previous release, use `bash deploy/deploy.sh root@192.168.3.211 --rollback`. Rollback restores program files, not data or SQLite schema. Back up `~/apps/onex/data` and `~/apps/onex/secrets` before schema-changing deployments, and only roll back to a schema-compatible release.
+
+Before a Bun version change, preserve the private `$ONEX_HOME/deps/bin/bun` executable. OneX code rollback uses the runtime at that same path. Restore the preserved executable separately if the previous release requires it. On Linux, verify the running Server's Bun version with `/proc/$(systemctl show -p MainPID --value onex-server.service)/exe --version`.
 
 Data remains in `~/apps/onex/data`; secrets are generated on the host into `~/apps/onex/secrets`, with mode `0600`, and are not transferred. Keep the master key stable. The five most recent retained releases include the active and previous revisions. Status prints free space, with a warning below 10 GB. Logs rotate by UTC day and at 16 MiB, with a combined 1 GB limit across the three streams. Use `bash ~/apps/onex/current/deploy/onex.sh logs server` on the host for the latest server log.
 

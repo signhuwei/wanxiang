@@ -1,6 +1,6 @@
 # OneX Server — S0
 
-Run from the repository root with Bun 1.3.5 or newer. Seed the data directory **before** starting the Server; S0 supports only one SQLite writer process per data directory.
+Run from the repository root with Bun 1.4.5, as pinned in [mise.toml](../mise.toml). Seed the data directory **before** starting the Server. S0 supports one SQLite writer process per data directory.
 
 ```sh
 bun install --cwd server --frozen-lockfile
