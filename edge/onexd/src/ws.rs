@@ -336,7 +336,7 @@ async fn handshake(
             capability_policy_v2: true,
             policy_runtime_v1: true,
             mac_desktop_v1: cfg!(all(target_os = "macos", target_arch = "aarch64")),
-            windows_deepseek_desktop_v1: crate::desktop_bundle::windows_qa_for_server(&opts.url),
+            windows_deepseek_desktop_v1: crate::desktop_bundle::windows_deepseek_available(&opts.url),
             codex_desktop_v1: cfg!(all(target_os = "macos", target_arch = "aarch64")),
             claude_desktop_v1: cfg!(all(target_os = "macos", target_arch = "aarch64")),
             id: hello_id.clone(),

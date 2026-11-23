@@ -42,6 +42,13 @@ pub mod secret;
 pub mod sse;
 pub mod state;
 mod tools;
+#[cfg(windows)]
+mod windows_desktop_job;
+#[cfg(windows)]
+mod windows_dsh_protocol;
+#[cfg(windows)]
+#[doc(hidden)]
+pub use windows_dsh_protocol::recover as recover_windows_dsh_protocol;
 mod workbuddy_capture;
 #[doc(hidden)]
 pub mod workbuddy_hook;

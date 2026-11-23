@@ -40,10 +40,14 @@ security-framework = "3"
 security-framework-sys = "2"
 
 [target.'cfg(windows)'.dependencies]
+winreg = { version = "0.55", features = ["transactions"] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Credentials",
     "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
 ] }

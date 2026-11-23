@@ -74,6 +74,10 @@ async fn main() -> Result<()> {
     create_private_dir(&home)?;
     let started_at = time::OffsetDateTime::now_utc();
     let _log_guard = init_logging(&home)?;
+    #[cfg(windows)]
+    if let Err(error) = onexd::recover_windows_dsh_protocol() {
+        tracing::warn!(%error, "could not recover the previous DeepSeek protocol association");
+    }
     if let Err(e) = run(home, started_at).await {
         error!(error = %format!("{e:#}"), "onexd exited with error");
         return Err(e);

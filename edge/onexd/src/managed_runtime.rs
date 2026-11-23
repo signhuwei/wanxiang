@@ -73,8 +73,8 @@ fn validate(r: &AgentRelease) -> Result<(), ResolveError> {
         let mac = cfg!(all(target_os = "macos", target_arch = "aarch64"))
             && r.os == "darwin"
             && Bundle::for_release(r).is_some();
-        let windows_qa = crate::desktop_bundle::windows_qa_release(r);
-        if !(desktop && (mac || windows_qa) && is_server_artifact(r)) {
+        let windows = crate::desktop_bundle::windows_deepseek_release(r);
+        if !(desktop && (mac || windows) && is_server_artifact(r)) {
             return Err(ResolveError::BadRelease("unsupported agent"));
         }
     }
@@ -163,7 +163,7 @@ pub(crate) fn cache_ready(home: &Path, release: &AgentRelease) -> bool {
     if !has_size(&path, release.size) {
         return false;
     }
-    if !Bundle::manages(&release.agent) || crate::desktop_bundle::windows_qa_release(release) {
+    if !Bundle::manages(&release.agent) {
         return true;
     }
     Bundle::for_release(release).is_some_and(|bundle| {
@@ -196,10 +196,10 @@ pub(crate) async fn resolve_with_progress(
     progress: impl Fn(ArtifactProgress),
 ) -> Result<PathBuf> {
     let release = select(releases, agent, os, arch)?;
-    if crate::desktop_bundle::windows_qa_release(release) {
+    if crate::desktop_bundle::windows_deepseek_release(release) {
         anyhow::ensure!(
-            access.is_some_and(|access| crate::desktop_bundle::windows_qa_for_server(access.origin)),
-            "Windows DeepSeek QA requires a loopback OneX Server"
+            access.is_some_and(|access| crate::desktop_bundle::windows_deepseek_available(access.origin)),
+            "Windows DeepSeek needs the verified OneX extractor"
         );
     }
     let path = cache_path(home, agent, release);

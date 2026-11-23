@@ -3,7 +3,7 @@ import { hasDesktopRuntime, qualifiedDesktopRelease } from '../src/agent-catalog
 import builds from '../src/desktop-qualifications.json';
 
 test('native runtime qualification follows the exact approved build', () => {
-  const official = builds.find(row => row.agent === 'deepseek-desktop' && row.qualified)!;
+  const official = builds.find(row => row.agent === 'deepseek-desktop' && row.os === 'darwin' && row.qualified)!;
   expect(qualifiedDesktopRelease(official)).toBeTrue();
   expect(hasDesktopRuntime(official.agent, official.os, official.arch)).toBeTrue();
   for (const replacement of [

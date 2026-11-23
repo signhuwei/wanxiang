@@ -360,7 +360,21 @@ async fn history_daemon(url: String) -> (Bridge, tempfile::TempDir) {
                 shutdown: CancellationToken::new(),
             });
             ipc::serve(listener, socket.clone(), service).await;
-            listener = ipc::bind(&socket).await.unwrap();
+            // Windows keeps the previously connected pipe alive until both handles close.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            listener = loop {
+                match ipc::bind(&socket).await {
+                    Ok(listener) => break listener,
+                    Err(error)
+                        if cfg!(windows)
+                            && error.to_string().starts_with("another onexd is listening")
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    Err(error) => panic!("fixture daemon did not rebind: {error}"),
+                }
+            };
         }
     });
     (bridge, dir)
@@ -436,6 +450,24 @@ async fn desktop_recovers_the_original_device_only_for_the_same_account() {
     stale.restore_session().await;
     assert_eq!(stale.call(Op::State).await.unwrap().phase, "ready");
     assert_eq!(daemon_request(dir.path(), Request::Logout).await["ok"], true);
+    // Wait for the mock daemon's asynchronous logout and restart to finish.
+    let socket = dir.path().join("onexd.sock");
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if let Ok(Ok(status)) = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                onex_core::daemon::exchange(&socket, &Request::Status),
+            )
+            .await
+                && status["logged_in"] == false
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("fixture daemon should be ready for the next login");
     let snapshot = bob.call(login("bob")).await.unwrap();
     assert_eq!(snapshot.user.unwrap().name, "Bob");
     let profile = std::fs::read_to_string(&profile_file).unwrap();

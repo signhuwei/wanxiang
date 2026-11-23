@@ -5,7 +5,9 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+use anyhow::bail;
 use onex_core::ws::AgentRelease;
 
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
@@ -18,7 +20,7 @@ pub(crate) struct Bundle {
     size: u64,
     sha256: &'static str,
     #[serde(flatten)]
-    vendor: VendorBundle,
+    payload: DesktopPayload,
     pub(crate) runtime: Option<RuntimeBundle>,
 }
 
@@ -42,11 +44,20 @@ pub(crate) struct VendorBundle {
     pub cdhash: &'static str,
 }
 
-impl std::ops::Deref for Bundle {
-    type Target = VendorBundle;
-    fn deref(&self) -> &Self::Target {
-        &self.vendor
-    }
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(untagged)]
+#[serde(bound(deserialize = "'de: 'static"))]
+enum DesktopPayload {
+    Windows { windows: WindowsBundle },
+    Apple(VendorBundle),
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+struct WindowsBundle {
+    executable: &'static str,
+    executable_sha256: &'static str,
+    asar_sha256: &'static str,
+    payload_sha256: &'static str,
 }
 
 impl std::ops::Deref for RuntimeBundle {
@@ -85,6 +96,18 @@ impl Bundle {
         })
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn windows_deepseek(self) -> Option<WindowsBundle> {
+        match self.payload {
+            DesktopPayload::Windows { windows }
+                if self.agent == "deepseek-desktop" && self.os == "win32" && self.arch == "x64" =>
+            {
+                Some(windows)
+            }
+            _ => None,
+        }
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) async fn install(self, image: PathBuf) -> Result<PathBuf> {
         tokio::task::spawn_blocking(move || self.install_sync(&image)).await?
@@ -95,15 +118,16 @@ impl Bundle {
         use std::fs;
         use std::process::{Command, Stdio};
 
+        let vendor = self.apple()?;
         let cache = image.parent().ok_or_else(|| anyhow::anyhow!("invalid image cache path"))?;
-        let installed = cache.join(self.name);
+        let installed = cache.join(vendor.name);
         if installed.symlink_metadata().is_ok() {
             return self.verify(&installed);
         }
 
         let temporary = cache.join(format!(".install-{}", crate::id::new("app")));
         let mount = temporary.join("volume");
-        let staging = temporary.join(self.name);
+        let staging = temporary.join(vendor.name);
         crate::launch::private_dir(&temporary)?;
         let result = (|| {
             crate::launch::private_dir(&mount)?;
@@ -120,9 +144,9 @@ impl Bundle {
             }
 
             let copy = (|| {
-                self.verify(&mount.join(self.name))?;
+                self.verify(&mount.join(vendor.name))?;
                 let copied = Command::new("/usr/bin/ditto")
-                    .arg(mount.join(self.name))
+                    .arg(mount.join(vendor.name))
                     .arg(&staging)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
@@ -146,7 +170,7 @@ impl Bundle {
             }
             copy?;
             fs::rename(&staging, &installed)?;
-            Ok(installed.join(self.executable))
+            Ok(installed.join(vendor.executable))
         })();
         // Never recursively clean a volume that remains mounted.
         let _ = fs::remove_dir(&mount);
@@ -157,7 +181,15 @@ impl Bundle {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(super) fn verify(self, app: &Path) -> Result<PathBuf> {
-        self.vendor.verify(app)
+        self.apple()?.verify(app)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn apple(self) -> Result<VendorBundle> {
+        match self.payload {
+            DesktopPayload::Apple(vendor) => Ok(vendor),
+            DesktopPayload::Windows { .. } => bail!("desktop bundle is not an Apple application"),
+        }
     }
 }
 
@@ -197,46 +229,48 @@ impl VendorBundle {
 }
 
 pub(crate) async fn executable(release: &AgentRelease, image: PathBuf, server: Option<&str>) -> Result<PathBuf> {
-    #[cfg(all(windows, target_arch = "x86_64", debug_assertions))]
-    if windows_qa_release(release) && server.is_some_and(windows_qa_for_server) {
-        return tokio::task::spawn_blocking(move || windows_qa::install(&image)).await?;
+    let bundle = Bundle::for_release(release).ok_or_else(|| anyhow::anyhow!("desktop release not approved"))?;
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        let vendor = bundle.windows_deepseek().ok_or_else(|| anyhow::anyhow!("unsupported Windows desktop release"))?;
+        let server = server.unwrap_or_default().to_owned();
+        tokio::task::spawn_blocking(move || windows::install(&image, bundle.sha256, vendor, &server)).await?
     }
-    let _ = server;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        let bundle = Bundle::for_release(release).ok_or_else(|| anyhow::anyhow!("desktop release not approved"))?;
+        let _ = server;
         bundle.install(image).await
     }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(not(any(all(windows, target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))))]
     {
-        let _ = (release, image);
-        bail!("native desktop bundles are currently available for Apple Silicon");
+        let _ = (bundle, image, server);
+        bail!("native desktop bundles are unavailable on this platform");
     }
 }
 
-pub(crate) fn windows_qa_release(release: &AgentRelease) -> bool {
-    #[cfg(all(windows, target_arch = "x86_64", debug_assertions))]
-    return windows_qa::matches(release) && windows_qa::extractor_path().is_some();
-    #[cfg(not(all(windows, target_arch = "x86_64", debug_assertions)))]
+pub(crate) fn windows_deepseek_release(release: &AgentRelease) -> bool {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    return Bundle::for_release(release).and_then(Bundle::windows_deepseek).is_some();
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
     {
         let _ = release;
         false
     }
 }
 
-pub(crate) fn windows_qa_for_server(server: &str) -> bool {
-    #[cfg(all(windows, target_arch = "x86_64", debug_assertions))]
-    return windows_qa::loopback(server) && windows_qa::extractor_path().is_some();
-    #[cfg(not(all(windows, target_arch = "x86_64", debug_assertions)))]
+pub(crate) fn windows_deepseek_available(server: &str) -> bool {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    return windows::extractor(server).is_ok();
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
     {
         let _ = server;
         false
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64", debug_assertions))]
-#[path = "desktop_bundle_windows_qa.rs"]
-mod windows_qa;
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[path = "desktop_bundle_windows.rs"]
+mod windows;
 
 #[cfg(test)]
 #[path = "desktop_qualification.rs"]

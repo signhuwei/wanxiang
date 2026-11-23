@@ -15,3 +15,7 @@ Edge 安装器写入应用前会执行 `git --version`，并检查 Git for Windo
 在 Windows x64 测试快照里验收两种情况。在已有 Git 的快照上，记录安装前后的 `git --version`，确认原版本继续可用。在没有 Git 的快照上，以普通用户运行 NSIS 安装器，确认安装器安装了 Git，再直接从完成页启动 OneX Desktop。登录内测租户后，从 OneX 启动 Agent 并执行 `git --version`。用没有 WinGet 的快照走一遍官方安装器下载路径。恢复一个已有 Edge、无 Git 的快照并暂时断网，执行原地重装，确认报告失败，原 Edge 和自启项保留。
 
 Windows 验收记录编译与测试退出状态、安装器及摘要，并在指定的测试用户下验证安装、自启、登录、受管终端、重开后的设备身份和卸载清理。测试只使用内测账号与合成对话。正式签名和外部发布按后续计划处理。 [Tauri NSIS 安装器](https://v2.tauri.app/distribute/windows-installer/)
+
+Windows x64 的 DeepSeek Harness Desktop 由 OneX 下载并校验原厂制品，随后从 OneX 私有缓存启动原厂 GUI。测试租户的有效合约须授予 DeepSeek 和模型，服务端须缓存并启用符合精确资格的 Windows 发行。验收时记录首次下载进度、原生会话冷恢复、两轮模型回复、回流、租约结算和退出后 `dsh://` 关联恢复。
+
+NSIS 内附原样的 7-Zip 26.06 命令行程序和 DLL，用于解包固定的原厂制品。7-Zip 采用 GNU LGPL 许可。安装目录内的 `onex-tools/7zip/License.txt` 和 `Source.txt` 记录组件许可和源码位置。 [7-Zip 项目](https://www.7-zip.org/) · [7-Zip 26.06 源码](https://github.com/ip7z/7zip/releases/tag/26.06)

@@ -72,6 +72,7 @@ try {
     $env:TAURI_CONFIG = $null
     $env:ONEX_WINDOWS_DEFAULT_SERVER = "${wsScheme}://$($origin.Authority)/v1/edge/ws"
     New-Item -ItemType Directory -Path $staging -Force | Out-Null
+    & (Join-Path $PSScriptRoot 'stage-7zip.ps1') -Staging $staging
     Invoke-Checked 'rustup' @('target', 'add', $target)
     Invoke-Checked 'cargo' @('tauri', '--version')
 
@@ -97,6 +98,12 @@ try {
                 targets = @('nsis')
                 icon = @('../target/onex-windows/inputs/icons/icon.ico')
                 externalBin = @('../target/onex-windows/inputs/onex', '../target/onex-windows/inputs/onexd')
+                resources = @{
+                    '../target/onex-windows/inputs/7zip/7z.exe' = 'onex-tools/7zip/7z.exe'
+                    '../target/onex-windows/inputs/7zip/7z.dll' = 'onex-tools/7zip/7z.dll'
+                    '../target/onex-windows/inputs/7zip/License.txt' = 'onex-tools/7zip/License.txt'
+                    '../target/onex-windows/inputs/7zip/Source.txt' = 'onex-tools/7zip/Source.txt'
+                }
                 windows = @{
                     nsis = @{
                         installMode = 'currentUser'

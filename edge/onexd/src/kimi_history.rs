@@ -579,7 +579,7 @@ mod tests {
         let request = launch::Request { local_token: "new-local-token", model: "new-model", ..request };
         let refreshed = prepare_kimi_code_with_history(&request, true).unwrap();
         let refreshed_session = refreshed.config_dir.join("sessions").join(WORKSPACE).join(NATIVE);
-        let refreshed_wire = refreshed_session.join("agents/main/wire.jsonl");
+        let refreshed_wire = refreshed_session.join("agents").join("main").join("wire.jsonl");
         assert_eq!(fs::read_to_string(&refreshed_wire).unwrap(), wire);
         let state = read_json(&refreshed_session.join("state.json"), &refreshed.config_dir, MAX_STATE_BYTES).unwrap();
         assert_eq!(state["agents"]["main"]["homedir"], json!(refreshed_wire.parent().unwrap()));

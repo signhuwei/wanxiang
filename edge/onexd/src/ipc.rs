@@ -644,7 +644,7 @@ async fn launch(
     let Some(protocol) = AgentProtocol::for_agent(agent).filter(|_| {
         let desktop_supported = cfg!(all(target_os = "macos", target_arch = "aarch64"))
             || (agent == "deepseek-desktop"
-                && ipc.server_url.as_deref().is_some_and(crate::desktop_bundle::windows_qa_for_server));
+                && ipc.server_url.as_deref().is_some_and(crate::desktop_bundle::windows_deepseek_available));
         LAUNCHABLE_AGENTS.contains(&agent) && (!desktop || desktop_supported)
     }) else {
         return err("agent_not_allowed", &format!("OneX 暂不支持启动 {agent}"));
@@ -1030,6 +1030,24 @@ async fn start_desktop(
                 return err("invalid", "无法准备私有桌面应用配置");
             }
         };
+    #[cfg(windows)]
+    let (job, mut protocol) = if request.agent == "deepseek-desktop" {
+        use crate::{windows_desktop_job::DesktopJob, windows_dsh_protocol::DshProtocolGuard};
+
+        match DesktopJob::new()
+            .map_err(anyhow::Error::from)
+            .and_then(|job| DshProtocolGuard::acquire(&launch.program).map(|protocol| (job, protocol)))
+        {
+            Ok((job, protocol)) => (Some(job), Some(protocol)),
+            Err(error) => {
+                let _ = crate::launch::finish(&ctx.home, &launch.launch_id);
+                warn!(%error, "could not prepare Windows desktop launch isolation");
+                return err("conflict", "无法准备 DeepSeek 窗口及协议关联保护");
+            }
+        }
+    } else {
+        (None, None)
+    };
     let workbuddy_capture = if request.agent == "workbuddy" {
         match crate::workbuddy_capture::Capture::new(
             &launch.config_dir,
@@ -1083,7 +1101,20 @@ async fn start_desktop(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let mut child = match command.spawn() {
+    let spawned = async {
+        let child = command.spawn()?;
+        #[cfg(windows)]
+        if let Some(job) = &job
+            && let Err(error) = job.attach(&child)
+        {
+            let mut child = child;
+            let _ = child.kill().await;
+            return Err(error);
+        }
+        Ok(child)
+    }
+    .await;
+    let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
             ipc.state.desktop_sessions.stop(request.token);
@@ -1148,6 +1179,19 @@ async fn start_desktop(
         tokio::select! {
             _ = child.wait() => {}
             _ = stop.cancelled() => { let _ = child.kill().await; }
+        }
+        #[cfg(windows)]
+        {
+            if let Some(job) = job
+                && let Err(error) = job.stop().await
+            {
+                warn!(%error, "Windows desktop child process cleanup did not finish");
+            }
+            if let Some(protocol) = protocol.as_mut()
+                && let Err(error) = protocol.restore()
+            {
+                warn!(%error, "could not restore the original DeepSeek protocol association");
+            }
         }
         let exited_at = crate::outbox::now_ms();
         capture_stop.cancel();

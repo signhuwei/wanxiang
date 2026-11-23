@@ -14,6 +14,21 @@
     "qualified": true
   },
   {
+    "agent": "deepseek-desktop",
+    "version": "0.2.1-rc.3",
+    "os": "win32",
+    "arch": "x64",
+    "size": 289415960,
+    "sha256": "1e3876baaa20c3f26371dba7b6873bb70c3ef9b91403f6d3f87d2b27d4fd1e3a",
+    "windows": {
+      "executable": "DeepSeek Harness.exe",
+      "executable_sha256": "fd7d298f4ba03ee9bab1719a892afeaef5c09bf50c574a592a64c85f64574c0c",
+      "asar_sha256": "04b32e3a872826ba15cfb2081c6a929a8d4ecaa65e09a2543e5a6b30e2eff1f0",
+      "payload_sha256": "0401a9394d5b69f1f3a820396d4ad43c7ca395780dfdfe04c32eb11410066093"
+    },
+    "qualified": true
+  },
+  {
     "agent": "workbuddy",
     "version": "5.3.8",
     "os": "darwin",

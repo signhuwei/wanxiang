@@ -1734,3 +1734,86 @@ test('signed release selections reach only compatible Apple Silicon Edges', asyn
   expect((await signReleases(1, [baseId, staged.id])).status).toBe(201);
   expect((await f.request(edgeRuntimePath, undefined, device.device_token)).status).toBe(404);
 });
+
+test('the qualified DeepSeek NSIS release reaches only authorized Windows x64 Edges', async () => {
+  const f = await fixture();
+  const admin = await f.login();
+  const tenant = await f.select(admin);
+  await f.store.system.write(sql => sql.run('INSERT INTO platform_admins VALUES (?)', [f.userId]));
+  const windows = { os: 'win32', arch: 'x64' };
+  const candidate = { ...windows, agent: 'deepseek-desktop', version: '0.2.1-rc.3', size: 289_415_960,
+    sha256: '1e3876baaa20c3f26371dba7b6873bb70c3ef9b91403f6d3f87d2b27d4fd1e3a',
+    url: 'https://download.deepseek.com/dsh-desk/bin/win-x64/deepseek-harness-0.2.1-rc.3-win-x64.exe' };
+  const releasePath = '/platform/agent-releases';
+  const wrongDigest = await f.request(releasePath, { ...candidate, sha256: 'a'.repeat(64), status: 'active' }, admin);
+  expect(wrongDigest.status).toBe(409);
+  expect(await wrongDigest.json()).toMatchObject({ error: { detail: { reason: 'desktop_qualification_required' } } });
+
+  const registration = await f.request(releasePath, { ...candidate, status: 'disabled' }, admin);
+  expect(registration.status).toBe(201);
+  const staged = await registration.json() as { id: string; revision: number };
+  expect(staged).toMatchObject({ format: 'nsis', artifact_cached: false, qualification_required: false });
+  const activate = () => f.request(releasePath + '/' + staged.id, { revision: staged.revision, status: 'active' }, admin);
+  const uncached = await activate();
+  expect(uncached.status).toBe(409);
+  expect(await uncached.json()).toMatchObject({ error: { detail: { reason: 'artifact_unavailable' } } });
+  const cache = join(f.dataDir, 'agent-artifacts');
+  mkdirSync(cache, { recursive: true });
+  // Model a completed cache entry. The vendor installer is not needed to verify download authorization.
+  const file = join(cache, candidate.sha256);
+  writeFileSync(file, '');
+  truncateSync(file, candidate.size);
+  expect((await activate()).status).toBe(200);
+
+  const winRegistration = await f.request('/devices', { ...f.device, ...windows, name: 'Windows' }, tenant);
+  expect(winRegistration.status).toBe(201);
+  const winDevice = await winRegistration.json() as DeviceReply;
+  const macRegistration = await f.request('/devices', f.device, tenant);
+  expect(macRegistration.status).toBe(201);
+  const macDevice = await macRegistration.json() as DeviceReply;
+  const downloadPath = '/edge/agent-artifacts/' + staged.id;
+  expect((await f.request(downloadPath)).status).toBe(401);
+  expect((await f.request(downloadPath, undefined, winDevice.device_token)).status).toBe(404);
+
+  const signaturePath = '/platform/policy/contracts/' + f.tenantId + '/signatures';
+  function signGrant(revision: number, releases?: string[]) {
+    const values = { 'seats.limit': 2, 'lease.budget': 2000, 'access.agents': ['deepseek-desktop'],
+      ...(releases && { 'access.releases': releases }) };
+    return f.request(signaturePath, { expected_policy_revision: revision, expected_platform_revision: revision,
+      base_revision: revision || null, reason: 'Windows DeepSeek eligibility',
+      entries: Object.entries(values).map(([id, adjustment]) => ({ clause_ref: { id, version: 1 }, template_ref: null, adjustment })) },
+    admin, 'windows-deepseek-grant-' + revision);
+  }
+  expect((await signGrant(0)).status).toBe(201);
+  expect((await f.request(downloadPath, undefined, macDevice.device_token)).status).toBe(404);
+  for (const { features, allowed } of [
+    { features: { agent_cache: true }, allowed: false },
+    { features: { mac_desktop_v1: true, agent_cache: true }, allowed: false },
+    { features: { windows_deepseek_desktop_v1: true }, allowed: false },
+    { features: { windows_deepseek_desktop_v1: true, agent_cache: true }, allowed: true },
+  ]) {
+    const edge = connect(f, winDevice.device_token);
+    expect(await edge.opened).toBe(true);
+    edge.send({ type: 'hello', id: 'windows-hello', edge_version: '0.1.0', ...windows,
+      config_revision: 0, outbox_last_seq: 0, capability_policy_v2: true, policy_runtime_v1: true, ...features });
+    await edge.nextOf('welcome');
+    await edge.nextOf('cutoff');
+    const config = await edge.nextOf('config');
+    expect(config.agents).toEqual(allowed ? [{ ...candidate, id: staged.id, url: '/v1' + downloadPath }] : []);
+    edge.ws.close();
+    await edge.closed;
+  }
+
+  const etag = '"' + candidate.sha256 + '"';
+  const resume = () => fetch(new URL('/v1' + downloadPath, f.server.url), {
+    headers: { authorization: 'Bearer ' + winDevice.device_token, range: 'bytes=5-11', 'if-range': etag },
+  });
+  const authorized = await resume();
+  expect(authorized.status).toBe(206);
+  expect(authorized.headers.get('content-range')).toBe(`bytes 5-11/${candidate.size}`);
+  expect(authorized.headers.get('content-disposition')).toBe('attachment; filename="onex-agent.exe"');
+  expect(authorized.headers.get('etag')).toBe(etag);
+  expect((await authorized.arrayBuffer()).byteLength).toBe(7);
+  expect((await signGrant(1, [])).status).toBe(201);
+  expect((await resume()).status).toBe(404);
+});
