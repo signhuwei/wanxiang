@@ -7,8 +7,11 @@
 //! 增量：游标 `(inode, offset)`，从 offset 读到最后一个换行，半行留到下次。事件和游标在 outbox 的同一个事务里提交。
 //! 文件变短或 inode 变了，记 gap 后从头重读。
 
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -69,22 +72,26 @@ pub struct Capture {
     outbox: Arc<Outbox>,
     key: String,
     desktop_source: Option<(PathBuf, String)>,
+    resumed_source: Option<PathBuf>,
 }
 
 impl Capture {
     pub fn new(s: Session, outbox: Arc<Outbox>) -> Self {
         let key = format!("claude-code:{}", s.session_id);
-        Self { s, outbox, key, desktop_source: None }
+        Self { s, outbox, key, desktop_source: None, resumed_source: None }
     }
 
     pub(crate) fn desktop(s: Session, path: PathBuf, native: String, outbox: Arc<Outbox>) -> Self {
         let key = format!("claude-desktop:{}", s.session_id);
-        Self { s, outbox, key, desktop_source: Some((path, native)) }
+        Self { s, outbox, key, desktop_source: Some((path, native)), resumed_source: None }
     }
 
     fn file(&self) -> Option<PathBuf> {
         if let Some((path, _)) = &self.desktop_source {
             return path.canonicalize().ok().filter(|resolved| resolved == path);
+        }
+        if let Some(path) = &self.resumed_source {
+            return Some(path.clone());
         }
         // 不自己推算项目目录的转义规则，在 projects/*/ 下找
         let name = format!("{}.jsonl", self.s.session_id);
@@ -102,7 +109,8 @@ impl Capture {
 
     /// 读一次新增内容。首次调用时补发 session_start。
     pub fn pass(&self) -> Result<Pass> {
-        let mut cur = self.outbox.cursor(&self.key)?.unwrap_or(json!({"started": false, "ino": null, "offset": 0}));
+        let saved = self.outbox.cursor(&self.key)?.unwrap_or(Value::Null);
+        let mut cur = if saved.is_null() { json!({"started": false, "ino": null, "offset": 0}) } else { saved.clone() };
         let mut events = Vec::new();
         if cur["started"] != true && self.desktop_source.is_none() {
             let cwd_hash = hex(&Sha256::digest(self.s.cwd.to_string_lossy().as_bytes()));
@@ -117,9 +125,15 @@ impl Capture {
         if let Some(path) = self.file() {
             self.read_file(&path, &mut cur, &mut events)?;
         }
+        if self.desktop_source.is_none() && !events.is_empty() {
+            if self.resumed_source.is_some() && saved["started"] == true && saved["ended"] != false {
+                events.insert(0, self.base("session_resume", json!({}), None));
+            }
+            cur["ended"] = false.into();
+        }
         let n = events.len();
-        if n > 0 || cur != self.outbox.cursor(&self.key)?.unwrap_or(Value::Null) {
-            self.outbox.append_events_with_cursor(events, &self.key, &cur)?;
+        if (n > 0 || cur != saved) && !self.outbox.append_if_cursor(events, &self.key, &cur, Some(&saved))? {
+            return Ok(Pass { events: 0 });
         }
         Ok(Pass { events: n })
     }
@@ -277,7 +291,14 @@ impl Capture {
     /// 进程退出：收尾写，然后发 session_end。
     pub fn end(&self, exit_code: Option<i32>) -> Result<()> {
         self.pass()?;
-        let cur = self.outbox.cursor(&self.key)?.unwrap_or(json!({}));
+        let saved = self.outbox.cursor(&self.key)?.unwrap_or(Value::Null);
+        if self.desktop_source.is_none() && saved["ended"] == true {
+            return Ok(());
+        }
+        let mut cur = saved.clone();
+        if self.desktop_source.is_none() {
+            cur["ended"] = true.into();
+        }
         let reason = match exit_code {
             Some(0) => "exited".to_string(),
             Some(c) => format!("exit_code:{c}"),
@@ -288,15 +309,26 @@ impl Capture {
             json!({"reason": reason, "uuid": null, "parentUuid": null, "sidechain": false, "agent_id": null}),
             None,
         );
-        self.outbox.append_events_with_cursor(vec![ev], &self.key, &cur)
+        self.outbox.append_if_cursor(vec![ev], &self.key, &cur, Some(&saved)).map(|_| ())
     }
 
     /// 每秒读一次，直到 `stop`；然后收尾并发 session_end。
-    pub async fn run(self, stop: CancellationToken, exit_code: Arc<std::sync::Mutex<Option<i32>>>) {
+    pub(crate) async fn run(
+        self,
+        stop: CancellationToken,
+        exit_code: Arc<Mutex<Option<i32>>>,
+        history: Arc<ClaudeHistory>,
+    ) {
         let me = Arc::new(self);
         loop {
             let m = me.clone();
-            match tokio::task::spawn_blocking(move || m.pass()).await {
+            let native = history.clone();
+            match tokio::task::spawn_blocking(move || {
+                native.flush(None);
+                m.pass()
+            })
+            .await
+            {
                 Ok(Ok(p)) if p.events > 0 => {
                     info!(session_id = %me.s.session_id, events = p.events, "session events captured")
                 }
@@ -312,8 +344,82 @@ impl Capture {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let code = *exit_code.lock().unwrap();
         let m = me.clone();
-        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || m.end(code)).await {
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || {
+            history.flush(Some(code));
+            m.end(code)
+        })
+        .await
+        {
             warn!(session_id = %me.s.session_id, error = %format!("{e:#}"), "session end");
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct ClaudeHistory {
+    launch: Session,
+    outbox: Arc<Outbox>,
+    resumed: Mutex<HashMap<uuid::Uuid, Arc<Capture>>>,
+}
+
+impl ClaudeHistory {
+    pub(crate) fn new(launch: Session, outbox: Arc<Outbox>) -> Self {
+        Self { launch, outbox, resumed: Mutex::new(HashMap::new()) }
+    }
+
+    pub(crate) fn bind(&self, native: uuid::Uuid) -> Option<String> {
+        let native_id = native.to_string();
+        if native_id == self.launch.session_id {
+            return Some(native_id);
+        }
+        if self.resumed.lock().unwrap().contains_key(&native) {
+            return Some(native_id);
+        }
+        let workspace = self.launch.cwd.canonicalize().ok()?;
+        let projects = self.launch.config_dir.join("projects");
+        let name = format!("{native_id}.jsonl");
+        let path = std::fs::read_dir(&projects).ok()?.flatten().find_map(|entry| {
+            let project = entry.path();
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                return None;
+            }
+            let path = project.join(&name);
+            let resolved = path.canonicalize().ok()?;
+            if !resolved.starts_with(self.launch.config_dir.canonicalize().ok()?.join("projects")) {
+                return None;
+            }
+            let file = crate::native_capture::open_private_regular(&path, &self.launch.config_dir)?;
+            let mut reader = BufReader::new(file.take(READ_CHUNK));
+            let mut line = Vec::new();
+            while reader.read_until(b'\n', &mut line).ok()? != 0 {
+                if let Ok(record) = serde_json::from_slice::<Value>(&line)
+                    && record["type"] == "user"
+                    && record["isMeta"] != true
+                    && record["isSidechain"] != true
+                    && record["sessionId"] == native_id
+                {
+                    let cwd = Path::new(record["cwd"].as_str()?).canonicalize().ok()?;
+                    return (cwd == workspace).then_some(path);
+                }
+                line.clear();
+            }
+            None
+        })?;
+        let mut session = self.launch.clone();
+        session.session_id.clone_from(&native_id);
+        let mut capture = Capture::new(session, self.outbox.clone());
+        capture.resumed_source = Some(path);
+        self.resumed.lock().unwrap().entry(native).or_insert_with(|| Arc::new(capture));
+        Some(native_id)
+    }
+
+    fn flush(&self, ending: Option<Option<i32>>) {
+        let captures: Vec<_> = self.resumed.lock().unwrap().values().cloned().collect();
+        for capture in captures {
+            let result = if let Some(code) = ending { capture.end(code) } else { capture.pass().map(|_| ()) };
+            if let Err(error) = result {
+                warn!(%error, session_id = %capture.s.session_id, "Claude Code session continuation capture failed");
+            }
         }
     }
 }
@@ -388,16 +494,26 @@ pub(crate) fn file_identity(_path: &Path, meta: &std::fs::Metadata) -> Result<u6
 /// 不含卷序列号：同一次采集过程里文件不会跨卷，加进去只会增加误判"换了"的概率。
 #[cfg(windows)]
 pub(crate) fn file_identity(path: &Path, _meta: &std::fs::Metadata) -> Result<u64> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let info = windows_file_info(&file)?;
+    Ok(((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_file_info(
+    file: &std::fs::File,
+) -> Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
-    let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: `f` 的句柄在这次调用期间保持有效（`f` 没有被 drop），`info` 是一块足够大小的
     // 栈上缓冲区，`GetFileInformationByHandle` 只在成功时写入它。`as_raw_handle()` 已经是
     // `HANDLE`（windows-sys 0.59 里是 `*mut c_void`）的等价表示，不需要再转成 `isize`。
-    let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) };
-    anyhow::ensure!(ok != 0, "GetFileInformationByHandle failed for {}", path.display());
-    Ok(((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error()).context("GetFileInformationByHandle");
+    }
+    Ok(info)
 }
 
 /// 只接受和受管配置目录同一个所有者创建的文件，拒绝别人（或符号链接指向别处）的文件。
@@ -470,6 +586,68 @@ fn windows_owner_sid(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_cli_reopens_the_native_cursor_in_its_own_workspace() {
+        let device = tempfile::tempdir().unwrap();
+        let other_device = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let other_workspace = tempfile::tempdir().unwrap();
+        let native: uuid::Uuid = SID.parse().unwrap();
+        let session = Session {
+            session_id: SID.into(),
+            config_dir: device.path().join("claude"),
+            agent_version: Some("old-release".into()),
+            model: "old-model".into(),
+            cwd: workspace.path().to_path_buf(),
+        };
+        let projects = session.config_dir.join("projects/project");
+        std::fs::create_dir_all(&projects).unwrap();
+        let transcript = projects.join(format!("{SID}.jsonl"));
+        let msg = |id: &str, text: &str| {
+            json!({"type":"user","uuid":id,"sessionId":SID,"cwd":workspace.path(),
+                "message":{"role":"user","content":text}})
+        };
+        std::fs::write(&transcript, format!("{}\n", msg("old", "old user line"))).unwrap();
+        let outbox = Arc::new(Outbox::open(&device.path().join("outbox.sqlite")).unwrap());
+        Capture::new(session.clone(), outbox.clone()).end(Some(0)).unwrap();
+        let upgraded = Session {
+            session_id: "new-launch".into(),
+            model: "new-model".into(),
+            agent_version: Some("new-release".into()),
+            ..session
+        };
+        let native_history = ClaudeHistory::new(upgraded.clone(), outbox.clone());
+        assert_eq!(native_history.bind(native).as_deref(), Some(SID));
+        let before = outbox.last_seq();
+        native_history.flush(None);
+        assert_eq!(outbox.last_seq(), before);
+        assert!(
+            ClaudeHistory::new(
+                Session { cwd: other_workspace.path().to_path_buf(), ..upgraded.clone() },
+                outbox.clone()
+            )
+            .bind(native)
+            .is_none()
+        );
+        assert!(
+            ClaudeHistory::new(Session { config_dir: other_device.path().join("claude"), ..upgraded }, outbox.clone())
+                .bind(native)
+                .is_none()
+        );
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+        writeln!(file, "{}", msg("new", "resumed user line")).unwrap();
+        native_history.flush(Some(Some(0)));
+        native_history.flush(Some(Some(0)));
+        let events: Vec<_> = outbox.pending(before, 10).unwrap().into_iter().map(|row| row.item).collect();
+        assert_eq!(
+            events.iter().map(|event| event["kind"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["session_resume", "user_message", "session_end"]
+        );
+        assert_eq!(events[1]["session_id"], SID);
+        assert_eq!(events[1]["payload"]["content"], "resumed user line");
+    }
     use std::io::Write;
 
     const SID: &str = "11111111-2222-4333-8444-555555555555";

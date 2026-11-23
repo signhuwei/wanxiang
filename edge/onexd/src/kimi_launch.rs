@@ -12,6 +12,12 @@ use crate::id;
 use crate::kimi_config;
 use crate::launch::{Launch, Request};
 
+#[path = "kimi_history.rs"]
+mod history;
+pub(crate) use history::{
+    KimiHistory, RestoredHistory, prune_unmodified_restored_sessions, restored_history, restored_history_floor,
+};
+
 /// 从员工环境里只带过来这些（终端和区域设置），其余一律不继承。和 `launch.rs::PASS_ENV`
 /// 是同一份名单，但那边是私有常量，这个文件故意不依赖 `launch.rs` 内部细节（governor 合并
 /// `869bcdf` 时不用改这个文件），所以在这里单独放一份；两边各自维护不是问题，这组变量
@@ -61,6 +67,10 @@ const PLACEHOLDER_MAX_CONTEXT_SIZE: u64 = 32_000;
 /// Kimi Code 的准备逻辑。调用前应已经做过 `r.program`/`r.cwd` 的公共校验
 /// （和 `launch::prepare` 对 Claude Code 的顺序一致），这里只做 Kimi Code 特有的部分。
 pub fn prepare_kimi_code(r: &Request) -> Result<Launch> {
+    prepare_kimi_code_with_history(r, true)
+}
+
+pub(crate) fn prepare_kimi_code_with_history(r: &Request, include_history: bool) -> Result<Launch> {
     if !r.program.is_absolute() {
         bail!("agent executable path must be absolute: {}", r.program.display());
     }
@@ -69,13 +79,18 @@ pub fn prepare_kimi_code(r: &Request) -> Result<Launch> {
     }
 
     let launch_id = id::new("lch");
-    let ns = r.home.join("agents/kimi-code/profiles").join(&launch_id);
+    let profiles = r.home.join("agents/kimi-code/profiles");
+    let ns = profiles.join(&launch_id);
     let config_dir = ns.join("kimi");
     let user_home = ns.join("home");
     let tmp = ns.join("tmp");
     let skills = ns.join("skills");
     for d in [&ns, &config_dir, &user_home, &tmp, &skills] {
         private_dir(d)?;
+    }
+
+    if include_history {
+        history::restore(r.home, &profiles, &config_dir, r.cwd)?;
     }
 
     let session_id = uuid_v4();

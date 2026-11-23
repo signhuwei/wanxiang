@@ -2346,6 +2346,7 @@ name = "onex-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

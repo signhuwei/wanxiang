@@ -12,6 +12,7 @@ pub mod credentials;
 mod desktop_bundle;
 mod desktop_launch;
 pub mod desktop_sessions;
+mod device_history;
 mod diagnostics;
 #[doc(hidden)]
 pub mod hosted_search;

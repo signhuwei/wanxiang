@@ -75,7 +75,7 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
     } else {
         rt.session_for(&headers)
     };
-    let Ok(binding) = binding else {
+    let Ok(mut binding) = binding else {
         return err_before_headers(
             StatusCode::UNAUTHORIZED,
             "unauthenticated",
@@ -98,6 +98,11 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
     };
     if !allowed {
         return err_before_headers(StatusCode::FORBIDDEN, "forbidden", "这个本机令牌无权使用该模型接口。");
+    }
+    if let Some(binding) = &mut binding
+        && rt.bind_codex_cli(&headers, binding).await.is_err()
+    {
+        return err_before_headers(StatusCode::FORBIDDEN, "forbidden", "未能核对本次 Codex CLI 原生会话。");
     }
 
     let mut req: Value = match serde_json::from_slice(&body) {

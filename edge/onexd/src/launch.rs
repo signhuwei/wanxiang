@@ -281,7 +281,14 @@ fn clean_launch_profile(home: &Path, agent: &str, launch_id: &str) -> Result<()>
 
 /// daemon 启动时清理上次残留的本次目录：旧的本机令牌已失效，留着也没用。
 pub fn clean_stale(home: &Path) {
-    let _ = std::fs::remove_dir_all(home.join("run"));
+    if let Ok(entries) = std::fs::read_dir(home.join("run")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_str().is_some_and(is_generated_launch_id) && !onex_core::run_lock::is_active(&entry.path()) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
     for agent in ["kimi-code", "codex"] {
         if let Some(profiles) = profiles(home, agent)
             && let Ok(entries) = std::fs::read_dir(profiles)
@@ -289,6 +296,7 @@ pub fn clean_stale(home: &Path) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 if let Some(id) = name.to_str().filter(|id| is_generated_launch_id(id))
+                    && !onex_core::run_lock::is_active(&home.join("run").join(id))
                     && let Err(error) = clean_launch_profile(home, agent, id)
                 {
                     tracing::warn!(agent, %error, "could not remove stale launch tool or configuration");
@@ -368,7 +376,7 @@ pub(crate) fn uuid_v4() -> String {
 /// `id::new("lch")` 的形状：`lch_` 后面严格跟 26 个 Crockford base32 字符（大写字母和数字，
 /// 不含 I、L、O、U）。白名单匹配，不是去掉已知危险字符——任何不是这个形状的输入都拒绝，
 /// 不管它看起来像不像路径穿越。
-fn is_generated_launch_id(s: &str) -> bool {
+pub(crate) fn is_generated_launch_id(s: &str) -> bool {
     const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     let Some(rest) = s.strip_prefix("lch_") else { return false };
     rest.len() == 26 && rest.bytes().all(|b| CROCKFORD.contains(&b))

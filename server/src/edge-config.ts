@@ -1,5 +1,3 @@
-import { createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, randomBytes } from 'node:crypto';
-import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
 import { ulid } from 'ulid';
 import { readContract } from './capability-data';
 import { readPlan } from './commerce-data';
@@ -7,6 +5,7 @@ import { commerceDisplay, commerceRates } from './commerce';
 import { tenantUpstreamTargets,platformUpstreamPriority,upstreamOrder } from './tenant-upstreams';
 import { balance } from './billing';
 import { iso } from './credentials';
+import { encryptEdgeSecret } from './edge-secret';
 import { allowedAgentReleases, artifactDownloadPath, hasPinnedAgentTarget, type DesktopCapabilities } from './agent-catalog';
 import { legacyInputCapabilities } from './model-pool';
 import { decryptProviderSecret } from './provider-secret';
@@ -16,8 +15,8 @@ import { readEffective, readHead, readPolicyDevice } from './policy-data';
 import type { Store } from './store';
 import { allowedToolReleases } from './tool-releases';
 
-const prefix = Buffer.from('302a300506032b656e032100', 'hex');
-const info = Buffer.from('onex-edge-secret-v1');
+export { encryptEdgeSecret } from './edge-secret';
+
 const maxPolicyScopeRefs = 64;
 type Subscription = DesktopCapabilities & { tenant: string; agentCache: boolean; supportsCapabilityContract: boolean; supportsCapabilityPolicy: boolean; supportsPolicyRuntime?: boolean;
   live: () => boolean; send: (value: Record<string, unknown>) => void };
@@ -44,27 +43,6 @@ export function allowedSearchTools(store: Store, policy: {
       }
       return [{id:row.id,name:row.name,version:row.version,agents}];
     });
-}
-
-export function encryptEdgeSecret(publicKey: string, providerId: string, plaintext: Uint8Array) {
-  // The wire key_id is the sender's ephemeral X25519 public key.
-  const raw = Buffer.from(publicKey, 'base64');
-  if (raw.length !== 32 || raw.toString('base64') !== publicKey) throw new Error('Invalid X25519 public key');
-  const remote = createPublicKey({ key: Buffer.concat([prefix, raw]), format: 'der', type: 'spki' });
-  const ephemeral = generateKeyPairSync('x25519');
-  const shared = diffieHellman({ privateKey: ephemeral.privateKey, publicKey: remote });
-  const key = Buffer.from(hkdfSync('sha256', shared, Buffer.alloc(0), info, 32));
-  try {
-    const nonce = randomBytes(24);
-    const ciphertext = xchacha20poly1305(key, nonce, Buffer.from(providerId)).encrypt(plaintext);
-    return {
-      key_id: ephemeral.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('base64'),
-      nonce: nonce.toString('base64'), ciphertext: Buffer.from(ciphertext).toString('base64'),
-    };
-  } finally {
-    shared.fill(0);
-    key.fill(0);
-  }
 }
 
 const runtimeKeys = ['model.max_output_tokens','rate.member_rpm','rate.member_tpm','rate.member_concurrent','rate.key_concurrent',

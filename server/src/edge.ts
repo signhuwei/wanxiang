@@ -27,7 +27,7 @@ const isSeq = (value: unknown) => typeof value === 'number' && Number.isSafeInte
 
 export function edgeGateway(app: Hono, store: Store, presence: Presence, now: () => number, heartbeatMs: number,
   config: ConfigPublisher, pending: PendingWork, publish: PublishSummary, diag: DiagChannel, projector?: RoutingProjector) {
-  const current = new Map<string, WSContext>();
+  const current = new Map<string, { socket: WSContext; tokenHash: string; stop: (code: number, reason: string) => void }>();
   const sockets = new Set<WSContext>();
   // A newly persisted target is delivered to online route_pool.v1 sessions.
   const routeSessions = new Map<string, { live: () => boolean; resend: () => Promise<void> }>();
@@ -69,9 +69,11 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
     let routePoolSelected = false;
     let routePoolGated = false;
 
-    const live = () => state !== 'closed' && current.get(deviceId) === socket;
+    const live = () => state !== 'closed' && current.get(deviceId)?.socket === socket;
+    // A queued write can run in the same tenant batch as a token rotation before socket invalidation runs.
+    const canWrite = () => live() && !!store.tenant(tenantId).get('SELECT 1 FROM devices WHERE id = ? AND token_hash = ?', [deviceId, tokenHash]);
     const send = (msg: Record<string, unknown>) => { if (live()) socket.send(JSON.stringify(msg)); };
-    const subscription = { tenant: tenantId, agentCache: false, macDesktop: false, windowsDeepseekDesktop: false, codexDesktop: false, claudeDesktop: false, supportsCapabilityContract: false, supportsCapabilityPolicy: false, supportsPolicyRuntime:false, live, send };
+    const subscription = { tenant: tenantId, agentCache: false, macDesktop: false, windowsDeepseekDesktop: false, codexDesktop: false, claudeDesktop: false, supportsCapabilityContract: false, supportsCapabilityPolicy: false, supportsPolicyRuntime:false, live: canWrite, send };
     const policyCap = () => subscription.supportsCapabilityPolicy && (subscription.supportsPolicyRuntime ||
       !requiresPolicyRuntime(store,readPolicyHot(store.tenant(tenantId),userId)));
     const stop = (code: number, reason: string) => {
@@ -105,9 +107,12 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
         socket = ws;
         sockets.add(ws);
         if (closing) { ws.close(1001, 'server shutdown'); return; }
+        if (!activeTenant(tenantId) || !store.tenant(tenantId).get(deviceQuery, [tokenHash, iso(now())])) {
+          stop(1008, 'device unavailable'); return;
+        }
         const old = current.get(deviceId);
-        current.set(deviceId, socket);
-        old?.close(4001, 'replaced');
+        current.set(deviceId, { socket, tokenHash, stop });
+        old?.stop(4001, 'replaced');
         timer = setTimeout(() => stop(1008, 'hello timeout'), ttl);
       },
       onMessage(event) { return pending.track(onMessage(event.data)); },
@@ -117,7 +122,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
         config.disconnect(deviceId, subscription);
         diag.disconnect(deviceId, send);
         clearTimeout(timer);
-        if (current.get(deviceId) === socket) current.delete(deviceId);
+        if (current.get(deviceId)?.socket === socket) current.delete(deviceId);
         void pending.track(presence.release(deviceId, connectionId).catch(() => {}));
         sockets.delete(socket);
         if (sockets.size === 0) allClosed?.();
@@ -186,7 +191,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
               return;
             }
             if (msg.lease_id == null) {
-              const reply = await initialLease(store, tenantId, deviceId, userId, now(), live,
+              const reply = await initialLease(store, tenantId, deviceId, userId, now(), canWrite,
                 subscription.supportsCapabilityContract, policyCap());
               if (subscription.supportsCapabilityPolicy) await config.balanceChanged(tenantId);
               send(reply);
@@ -217,13 +222,13 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
           if (routePoolGated && ['lease_renew', 'lease_request', 'config_applied', 'usage'].includes(String(msg.type)) && isText(msg.id)) throw unsupportedRoutePool();
           if (routePoolSelected && projector?.inputs.leaseGate && msg.type === 'lease_request' && isText(msg.id)) {
             if (!isText(msg.op_id)) throw new ApiError('invalid', { fields: ['op_id'] });
-            const reply = await requestRouteLease(store, projector.inputs, tenantId, deviceId, userId, now(), live);
+            const reply = await requestRouteLease(store, projector.inputs, tenantId, deviceId, userId, now(), canWrite);
             await config.balanceChanged(tenantId);
             send({ ...reply, re: msg.id });
             return;
           }
           if (routePoolSelected && projector?.inputs.leaseGate && msg.type === 'lease_renew' && isText(msg.id)) {
-            const reply = await renewRouteLease(store, projector.inputs, tenantId, deviceId, userId, now(), live, parseRenew(msg, meteredRouteExecution(projector.inputs)));
+            const reply = await renewRouteLease(store, projector.inputs, tenantId, deviceId, userId, now(), canWrite, parseRenew(msg, meteredRouteExecution(projector.inputs)));
             await config.balanceChanged(tenantId);
             send({ ...reply, re: msg.id });
             return;
@@ -231,7 +236,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
           if (routePoolSelected && (msg.type === 'lease_renew' || msg.type === 'lease_request') && isText(msg.id)) throw routePoolLeasePending();
           if (msg.type === 'config_applied' && isText(msg.id)) {
             if (routePoolSelected) {
-              await applyReceipt(store, tenantId, deviceId, parseReceipt(msg), now(), live);
+              await applyReceipt(store, tenantId, deviceId, parseReceipt(msg), now(), canWrite);
               send({ type: 'ack', re: msg.id, ok: true });
               return;
             }
@@ -254,14 +259,14 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             const opId = msg.op_id ?? msg.id;
             if (!isText(opId)) throw new ApiError('invalid', { fields: ['op_id'] });
             const used = int(msg.used_milli, 'used_milli');
-            const reply = await renewLease(store, tenantId, deviceId, userId, now(), live, msg.lease_id, used, opId,
+            const reply = await renewLease(store, tenantId, deviceId, userId, now(), canWrite, msg.lease_id, used, opId,
               subscription.supportsCapabilityContract, policyCap(),msg.model_used_milli);
             await config.balanceChanged(tenantId);
             send({ ...reply, re: msg.id });
             return;
           }
           if (msg.type === 'lease_request' && isText(msg.id)) {
-            const reply = await requestLease(store, tenantId, deviceId, userId, now(), live,
+            const reply = await requestLease(store, tenantId, deviceId, userId, now(), canWrite,
               subscription.supportsCapabilityContract, policyCap());
             if (subscription.supportsCapabilityPolicy) await config.balanceChanged(tenantId);
             send({ ...reply, re: msg.id });
@@ -275,19 +280,19 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
                   reference: [charge.tenant_id, charge.device_id, charge.request_id, charge.attempt_id].join('/'),
                   note: `采购报价 ${charge.quote_id}@${charge.quote_revision}`,
                 }));
-              }, live, publish)
-              : await ingestUsage(store, tenantId, deviceId, userId, now(), live, usageItems(msg.batch), publish);
+              }, canWrite, publish)
+              : await ingestUsage(store, tenantId, deviceId, userId, now(), canWrite, usageItems(msg.batch), publish);
             send({ type: 'events_ack', re: msg.id, ack_seq });
             return;
           }
           if (msg.type === 'events' && isText(msg.id)) {
-            const ack_seq = await ingestEvents(store, tenantId, deviceId, userId, now(), live, eventItems(msg.batch), publish, id => config.balanceChanged(id));
+            const ack_seq = await ingestEvents(store, tenantId, deviceId, userId, now(), canWrite, eventItems(msg.batch), publish, id => config.balanceChanged(id));
             send({ type: 'events_ack', re: msg.id, ack_seq });
             return;
           }
           if (msg.type === 'diag_result' && isText(msg.id)) {
             if (!isText(msg.diag_id) || typeof msg.ok !== 'boolean') throw new ApiError('invalid', { fields: ['diag_id', 'ok'] });
-            await diag.result(tenantId, deviceId, msg.diag_id, msg.ok, msg.detail, live);
+            await diag.result(tenantId, deviceId, msg.diag_id, msg.ok, msg.detail, canWrite);
             send({ type: 'ack', re: msg.id, ok: true });
             return;
           }
@@ -307,10 +312,16 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
         }
     }
   });
-  return function closeSockets() {
-    closing = true;
-    const done = sockets.size ? new Promise<void>((resolve) => { allClosed = resolve; }) : Promise.resolve();
-    for (const ws of sockets) ws.close(1001, 'server shutdown');
-    return done;
+  return {
+    invalidateDeviceToken(deviceId: string, previousTokenHash: string) {
+      const peer = current.get(deviceId);
+      if (peer?.tokenHash === previousTokenHash) peer.stop(1008, 'device unavailable');
+    },
+    close() {
+      closing = true;
+      const done = sockets.size ? new Promise<void>((resolve) => { allClosed = resolve; }) : Promise.resolve();
+      for (const ws of sockets) ws.close(1001, 'server shutdown');
+      return done;
+    },
   };
 }

@@ -122,7 +122,6 @@ export async function createServer(opts: Options) {
       onConfigChange: (id?: string) => { void pending.track(config.changed(id)); refreshRouteTargets(); },
       onBalanceChange: (id: string) => { void pending.track(config.balanceChanged(id)); refreshRouteTargets(); },
     };
-    authRoutes(app, store, management);
     personalLoginTokenRoutes(app, store, management);
     tenantRoutes(app, store, management);
     platformRoutes(app, store, management);
@@ -146,7 +145,8 @@ export async function createServer(opts: Options) {
     deviceRoutes(app, store, management, diag);
     desktopReleaseRoutes(app, store, management);
     closeReleases = serverReleaseRoutes(app, store, management);
-    const closeSockets = edgeGateway(app, store, opts.presence, now, opts.heartbeatMs, config, pending, observation.publish, diag, projection);
+    const edge = edgeGateway(app, store, opts.presence, now, opts.heartbeatMs, config, pending, observation.publish, diag, projection);
+    authRoutes(app, store, { ...management, onDeviceTokenRotated: edge.invalidateDeviceToken });
     let shuttingDown = false;
     const server = Bun.serve({ hostname: opts.hostname, port: opts.port,
       fetch: (request, server) => shuttingDown ? new Response(null, { status: 503 }) : pending.track(Promise.resolve(app.fetch(request, server))),
@@ -216,7 +216,7 @@ export async function createServer(opts: Options) {
           // Bun 1.3.5 can retain the WS count after a server-initiated close.
           void server.stop().catch(() => {});
           observation.close();
-          await closeSockets();
+          await edge.close();
           closeStatistics?.();
           await pending.drain();
           await store.drain();

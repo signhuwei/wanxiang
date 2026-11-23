@@ -25,6 +25,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::credentials::{CredentialStore, HistoryIdentity, HistoryScope};
 use crate::outbox::{AckOutcome, Kind, Outbox};
 use crate::route_apply::{AckMatch, AppliedRecord, Scope, Store as RouteStore};
 use crate::state::{ConfigSnapshot, Phase, RouteApply, RouteView, SessionClock, State};
@@ -61,6 +62,7 @@ pub struct WsOptions {
     /// 已发送未确认的条目上限，超过就等 events_ack。
     pub window: u64,
     logs: Option<diagnostics::LogSource>,
+    credentials: Option<Arc<dyn CredentialStore>>,
 }
 
 impl WsOptions {
@@ -78,11 +80,17 @@ impl WsOptions {
             batch_max: 500,
             window: 5000,
             logs: None,
+            credentials: None,
         }
     }
 
     pub fn with_diagnostic_logs(mut self, directory: PathBuf, started_at: time::OffsetDateTime) -> Self {
         self.logs = Some(diagnostics::LogSource { directory, started_at });
+        self
+    }
+
+    pub fn with_device_credentials(mut self, credentials: Option<Arc<dyn CredentialStore>>) -> Self {
+        self.credentials = credentials;
         self
     }
 
@@ -403,6 +411,17 @@ async fn connected(
         (Some(store), true) => Some(PoolSession::start(opts, state, store, welcome, token, generation)?),
         _ => None,
     };
+    if let Some(store) = &opts.credentials
+        && state.expected_device_id.read().unwrap().as_deref() == Some(&welcome.device_id)
+        && let Some(server) = onex_core::ipc::http_base(&opts.url).as_deref().and_then(crate::ipc::normalize_origin)
+    {
+        let scope = HistoryScope { server: &server, tenant_id: &welcome.tenant_id, user_id: &welcome.user_id };
+        let identity =
+            HistoryIdentity { device_id: welcome.device_id.clone(), device_key: state.device_key.bytes_for_keychain() };
+        if let Err(error) = store.save_history(&scope, &identity) {
+            warn!(%error, "could not keep the signed-in device's history identity");
+        }
+    }
     {
         let mut config = state.config.write().unwrap();
         if config.policy.as_ref().is_some_and(|policy| !crate::policy::matches_identity(&policy.summary, welcome)) {

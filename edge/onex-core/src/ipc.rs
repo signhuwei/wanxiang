@@ -58,14 +58,24 @@ pub enum Request {
         #[serde(default)]
         device_id: Option<String>,
     },
+    /// Uses a temporary scoped user session to restore this account's original device and history.
+    /// On success the daemon saves the rotated bearer and exits so its successor opens the original outbox.
+    ResumeDevice {
+        server: String,
+        session_token: String,
+    },
     /// 注销：先删 Keychain 里持久化的设备身份（失败则整体失败，不报告已注销），
-    /// 再断流、清内存里的配置和密钥、停掉正在跑的受管启动，和 `shutdown` 一样让 daemon 退出。
+    /// 受管 Agent 全部关闭后，断流、清内存里的配置和密钥，和 `shutdown` 一样让 daemon 退出。
     /// 打包环境由 LaunchAgent 用新设备身份重新拉起；手工调试按原来的方式重新执行 onexd。
     Logout,
+    /// The Desktop may only sign out the account displayed in its window.
+    LogoutDevice {
+        device_id: String,
+    },
     /// 注册设备用的信息：`{public_key, server_url}`。`server_url` 是 Server 的 HTTP 根地址，onexd 没配置 Server 时为 null。
     DeviceInfo,
-    /// 准备一次受管启动。onexd 建好目录和策略文件，回 `{launch_id, session_id, program, args, env, cwd, model}`，
-    /// 由调用方在自己的终端里用这份 env（清空后设置）前台启动。
+    /// 准备一次受管启动。onexd 返回进程参数、环境及 `run_dir`。
+    /// CLI 持有该目录的启动锁，并以给定的环境前台执行 Agent。
     Launch {
         agent: String,
         /// claude 的绝对路径。不填时 onexd 按 Server 下发的发行目录（`config.agents`）自己选型、下载、

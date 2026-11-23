@@ -173,7 +173,7 @@ async fn run(home: PathBuf, started_at: time::OffsetDateTime) -> Result<()> {
         router_addr: Some(router_addr.to_string()),
         server_url: server_url.clone(),
         launch: Some(ipc::LaunchCtx::new(data_dir, download_http)),
-        credentials: creds_store,
+        credentials: creds_store.clone(),
         identity_transition: Default::default(),
         shutdown: shutdown.clone(),
     });
@@ -181,7 +181,9 @@ async fn run(home: PathBuf, started_at: time::OffsetDateTime) -> Result<()> {
 
     let ws_task = match server {
         Some(url) => {
-            let mut options = ws::WsOptions::new(url).with_diagnostic_logs(home.join("logs"), started_at);
+            let mut options = ws::WsOptions::new(url)
+                .with_diagnostic_logs(home.join("logs"), started_at)
+                .with_device_credentials(creds_store);
             if let Some(store) = route_pool {
                 options = options.with_route_pool_execution(store)?;
             }

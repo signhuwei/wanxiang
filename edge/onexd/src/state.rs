@@ -227,7 +227,7 @@ pub struct State {
     pub isolated_route_execution: AtomicBool,
     #[doc(hidden)]
     pub production_route_execution: AtomicBool,
-    /// 设备 X25519 私钥，解密下发的上游密钥。每次启动新生成、只在内存，所以重启后要重新登录注册设备。
+    /// 设备 X25519 私钥，用于恢复设备身份及解密下发的密钥。
     pub device_key: DeviceKey,
     /// When set, only this registered device can acknowledge or replay this outbox.
     pub expected_device_id: RwLock<Option<String>>,
@@ -242,6 +242,12 @@ pub struct State {
     pub active_session: RwLock<Option<String>>,
     /// Each managed launch gets its own loopback route credential.
     pub launch_tokens: RwLock<HashMap<String, LaunchBinding>>,
+    #[doc(hidden)]
+    pub claude_history: RwLock<HashMap<String, Arc<crate::capture::ClaudeHistory>>>,
+    #[doc(hidden)]
+    pub codex_history: RwLock<HashMap<String, Arc<crate::native_capture::CodexHistory>>>,
+    #[doc(hidden)]
+    pub kimi_history: RwLock<HashMap<String, Arc<crate::kimi_launch::KimiHistory>>>,
     pub desktop_sessions: crate::desktop_sessions::DesktopSessions,
     pub workbuddy_turns: crate::workbuddy_turns::Turns,
 }
@@ -263,6 +269,9 @@ impl Default for State {
             upstream: Default::default(),
             active_session: Default::default(),
             launch_tokens: Default::default(),
+            claude_history: Default::default(),
+            codex_history: Default::default(),
+            kimi_history: Default::default(),
             desktop_sessions: Default::default(),
             workbuddy_turns: Default::default(),
         }

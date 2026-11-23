@@ -85,6 +85,10 @@ async fn cmd_login(args: &[String]) -> Result<()> {
         bail!("{USAGE}");
     }
 
+    let daemon = socket_path()?;
+    #[cfg(windows)]
+    let info = onex_core::daemon::wait_for_device_info(&daemon, None).await.context("本机 OneX 服务没有就绪")?;
+    #[cfg(not(windows))]
     let info = call(&Request::DeviceInfo).await?;
     let public_key = info["public_key"].as_str().context("onexd did not return a public key")?.to_string();
     let server = match server.or_else(|| info["server_url"].as_str().map(str::to_owned)) {
@@ -104,6 +108,7 @@ async fn cmd_login(args: &[String]) -> Result<()> {
             password: &password,
             device_name: &device_name,
             public_key: &public_key,
+            daemon: Some(&daemon),
         };
         login::login_password(&a).await?
     } else {
@@ -114,21 +119,21 @@ async fn cmd_login(args: &[String]) -> Result<()> {
             tenant,
             device_name,
             public_key,
+            daemon: Some(daemon),
         };
         login::login(&a, &mut prompt).await?
     };
 
-    let reply =
-        call(&Request::Login { token: r.device_token, server: Some(server), device_id: Some(r.device_id.clone()) })
-            .await?;
-    if reply["ok"] != Value::Bool(true) {
-        return print_reply(reply);
-    }
-    println!(
-        "已登录租户「{}」，设备 {} 已注册。onexd 正在连接 Server，可用 onex status 查看。",
-        r.tenant_name, r.device_id
-    );
-    println!("macOS 上设备身份已保存到系统 Keychain，onexd 重启后会自动恢复，不需要重新运行 onex login。");
+    let action = if let Some(token) = r.device_token {
+        let reply = call(&Request::Login { token, server: Some(server), device_id: Some(r.device_id.clone()) }).await?;
+        if reply["ok"] != Value::Bool(true) {
+            return print_reply(reply);
+        }
+        "已注册"
+    } else {
+        "已恢复"
+    };
+    println!("已登录租户「{}」，设备 {}{}。可用 onex status 查看连接状态。", r.tenant_name, r.device_id, action);
     Ok(())
 }
 
@@ -222,8 +227,16 @@ async fn cmd_run(agent: &str, args: &[String]) -> Result<()> {
     for (k, v) in l["env"].as_object().context("no env")? {
         cmd.env(k, v.as_str().context("bad env")?);
     }
+    let terminal = l["run_dir"].as_str().map(|path| onex_core::run_lock::claim(std::path::Path::new(path))).transpose();
     // Ctrl+C 交给前台的 Agent；这里只等它退出
-    let status = cmd.status().with_context(|| format!("启动 {binary} 失败"));
+    let status = match terminal {
+        Ok(terminal) => {
+            let result = cmd.status().with_context(|| format!("启动 {binary} 失败"));
+            drop(terminal);
+            result
+        }
+        Err(error) => Err(error).context("无法保留本次 Agent 启动状态，请重试"),
+    };
     let code = status.as_ref().ok().and_then(|s| s.code());
     let done = call(&Request::LaunchDone { launch_id, exit_code: code }).await;
     let status = status?;

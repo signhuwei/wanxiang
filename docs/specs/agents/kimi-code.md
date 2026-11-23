@@ -22,10 +22,18 @@ Agent→router 是 **Anthropic Messages**，入口 `/v1/messages`，认证来自
 
 运行前登记身份和私有 home，以 PTY 承载交互；独立心跳，不让控制 RPC 等待前台输出。实际退出以 daemon 持有的进程状态、退出码、清理结果为准，断管不自动重启。正常退出后同 cwd、正确历史锁且为纯聊天会话，可用 `--session <原生ID>` 续聊；旧会话存在保存任务时不自动恢复，避免重放有副作用的工作；清理未知或占用时不得显式续入。同 `edge/src/lifecycle/session_history.rs:303-309,325-378,500`；`docs/reports/c-si-bus-poc-20261025/windows-kimi-daemon-lost-20261027.md:7-21`。
 
+## 升级后的续聊
+
+同一 OneX 登录主体在原工作目录重新启动 Kimi 后，可在空闲时用 `/sessions`（也可用 `/resume`）选择旧会话。OneX 从当前设备身份的已结束受管启动中恢复可续聊的 v2 会话，保留原生 ID，在本次私有目录重建索引。正在写入的会话、带持久任务的会话和其他工作目录的会话保留在原位置。若已有同一主体的 Kimi 在运行，新的并行启动使用独立会话，待原进程关闭后可在下一次启动恢复。[Kimi 原生会话操作](https://www.kimi.com/code/docs/en/kimi-code-cli/guides/sessions)
+
+本次启动按当前合约重新生成模型和工具配置。恢复保留原始会话文件，采集校验复制内容后从原记录末尾续读，历史消息和工具事件不会再次上报。macOS arm64 已用官方 Kimi Code 2.3.0 和回环测试上游验证旧会话 ID 可见、续聊请求包含旧上下文且只追加本次副本。Windows 原生续聊待实测。
+
+原厂 2.3.0 的 Anthropic 请求在 `metadata.user_id` 携带 `session_<uuid>`。Edge 核对本次启动目录、工作目录和原生会话记录后逐请求关联用量，连续切换会话时也各自归属。请求没有原生 ID 时仍沿用会话发现逻辑。带有无法核对的原生 ID 的请求在本地拒绝。
+
 ## 已知故障与待验
 
 - Windows 报 daemon 丢失时，后台后来仍有心跳且确认收尾；五秒心跳过期可能是前台 IPC 失败的后果，不证明 daemon 崩溃。要分别注入握手失败、请求帧已发后断开、前台输出慢，验证只在确定未发送时重试。见上述 Windows 故障报告 `:7-27`。
 - 工具结果同时出现在 wire 的多个表示中，双采会虚增轮数。用公开合成形状的预期数（4 用户、3 助手、8 调用、8 结果）验收，另测合法多 session、部分行及不同 agent 复用 call ID。`contracts/poc-01/kimi-transcript.md:25-43`。
-- 待测：分别冻结 Mac、Windows 2.3.0 SHA 及实际 native wire 版本；验项目发现、个人凭据隔离、令牌文件残留、超时和跨租约长跑。Kimi CLI 的回环适配不证明某一 Kimi Code Plan 上游允许企业子密钥发放，采购/认证需另验。本文未运行服务、Agent 或模型。
+- 待测：分别冻结 Mac、Windows 2.3.0 SHA 及实际 native wire 版本；验项目发现、个人凭据隔离、令牌文件残留、超时和跨租约长跑。Kimi CLI 的回环适配不证明某一 Kimi Code Plan 上游允许企业子密钥发放，采购/认证需另验。试验范围限于隔离的本地 Agent 和回环上游。
 
 

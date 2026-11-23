@@ -4,14 +4,17 @@
 use std::sync::{Arc, Mutex};
 
 use axum::Json;
+use axum::extract::State as HttpState;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use onex_core::ipc::Request;
 use onex_desktop::bridge::{Bridge, Op};
+use onexd::credentials::{CredentialStore, DeviceCredentials, HistoryIdentity, HistoryScope};
 use onexd::ipc::{self, Ipc};
 use onexd::outbox::Outbox;
-use onexd::state::State;
+use onexd::secret::DeviceKey;
+use onexd::state::{Phase, State};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -299,6 +302,158 @@ async fn desktop_profile_failure_keeps_the_existing_cli_device_logged_in() {
     assert_eq!(status["logged_in"], true);
     assert_eq!(status["device_id"], "dev_cli");
     assert_eq!(seen.lock().unwrap().session_ended.as_deref(), Some("Bearer scoped_password"));
+}
+
+const HISTORY_DEVICE: &str = "dev_retained";
+const OTHER_DEVICE: &str = "dev_new";
+
+#[derive(Default)]
+struct HistoryVault(Mutex<Option<DeviceCredentials>>);
+
+impl CredentialStore for HistoryVault {
+    fn load(&self) -> anyhow::Result<Option<DeviceCredentials>> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+
+    fn save(&self, credentials: &DeviceCredentials) -> anyhow::Result<()> {
+        *self.0.lock().unwrap() = Some(credentials.clone());
+        Ok(())
+    }
+
+    fn clear(&self) -> anyhow::Result<()> {
+        self.0.lock().unwrap().take();
+        Ok(())
+    }
+
+    fn load_history(&self, scope: &HistoryScope<'_>) -> anyhow::Result<Option<HistoryIdentity>> {
+        Ok((scope.tenant_id == "ten_a" && scope.user_id == "usr_a")
+            .then(|| HistoryIdentity { device_id: HISTORY_DEVICE.into(), device_key: [7; 32] }))
+    }
+}
+
+async fn history_daemon(url: String) -> (Bridge, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_owned();
+    let socket = home.join("onexd.sock");
+    let bridge = Bridge::new(socket.clone());
+    let mut listener = ipc::bind(&socket).await.unwrap();
+    let vault = Arc::new(HistoryVault::default());
+    tokio::spawn(async move {
+        loop {
+            let mut state = State::default();
+            if let Some(credentials) = vault.load().unwrap() {
+                state.device_key = DeviceKey::from_bytes(credentials.device_key);
+                *state.expected_device_id.write().unwrap() = Some(credentials.device_id);
+                state.replace_token(Some(credentials.device_token));
+                state.set_phase(Phase::Connected);
+            }
+            let home = home.join(onexd::credentials::fingerprint(&state.device_key.public_b64()));
+            std::fs::create_dir_all(&home).unwrap();
+            let service = Arc::new(Ipc {
+                state: Arc::new(state),
+                outbox: Arc::new(Outbox::open(&home.join("outbox.sqlite")).unwrap()),
+                router_addr: None,
+                server_url: Some(url.clone()),
+                launch: None,
+                credentials: Some(vault.clone()),
+                identity_transition: Default::default(),
+                shutdown: CancellationToken::new(),
+            });
+            ipc::serve(listener, socket.clone(), service).await;
+            listener = ipc::bind(&socket).await.unwrap();
+        }
+    });
+    (bridge, dir)
+}
+
+#[tokio::test]
+async fn desktop_recovers_the_original_device_only_for_the_same_account() {
+    let calls = Arc::new(Mutex::new(Vec::<(&str, String)>::new()));
+    let app = axum::Router::new()
+        .route("/v1/auth/password-login", post(|Json(body): Json<Value>| async move {
+            let (token, user, name) = match body["username"].as_str() {
+                Some("alice") => ("account_a", "usr_a", "Alice"),
+                Some("bob") => ("account_b", "usr_b", "Bob"),
+                _ => panic!("unexpected test account"),
+            };
+            Json(json!({"token":token,"user":{"id":user,"name":name},"tenants":[{"id":"ten_a","name":"甲公司"}]}))
+        }))
+        .route("/v1/me", get(|headers: HeaderMap| async move {
+            let user = match authorization(&headers).as_deref() {
+                Some("Bearer account_a") => "usr_a",
+                Some("Bearer account_b") => "usr_b",
+                _ => panic!("expected a scoped test session"),
+            };
+            Json(json!({"user":{"id":user},"tenant":{"id":"ten_a"}}))
+        }))
+        .route("/v1/devices/dev_retained", get(|| async move {
+            Json(json!({"id":HISTORY_DEVICE,"user_id":"usr_a","status":"active"}))
+        }))
+        .route("/v1/devices/dev_retained/resume-challenge", post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+            assert_eq!(authorization(&headers).as_deref(), Some("Bearer account_a"));
+            assert_eq!(body, json!({}));
+            // Encrypted to the retained [7; 32] device key with onex-device-resume-v1 as the context.
+            Json(json!({"key_id":"jDBs15k5gw/GjMyMiJHeTzCJma9Nq6ZCP/mlsdiN2nM=","nonce":"Dz+V5pwYwmw3qqEb0AXTwev6xH8SEO01",
+                "ciphertext":"4AaLo6eCbzczFytzl135OjgStx1U+j0dS6UvkK4uTGhj04/jz6j/"}))
+        }))
+        .route("/v1/devices/dev_retained/resume", post(|HttpState(calls): HttpState<Arc<Mutex<Vec<_>>>>, headers: HeaderMap, Json(body): Json<Value>| async move {
+            calls.lock().unwrap().push(("resume", authorization(&headers).unwrap()));
+            assert!(headers.contains_key("idempotency-key"));
+            assert_eq!(body, json!({"proof":"desktop-account-a-proof"}));
+            Json(json!({"device_id":HISTORY_DEVICE,"device_token":"rotated_device_a"}))
+        }))
+        .route("/v1/devices", post(|HttpState(calls): HttpState<Arc<Mutex<Vec<_>>>>, headers: HeaderMap| async move {
+            calls.lock().unwrap().push(("register", authorization(&headers).unwrap()));
+            (StatusCode::CREATED, Json(json!({"device_id":OTHER_DEVICE,"device_token":"device_b"})))
+        }))
+        .route("/v1/auth/logout", post(|| async { StatusCode::NO_CONTENT }))
+        .with_state(calls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (alice, dir) = history_daemon(url).await;
+    let login = |username: &str| Op::PasswordLogin {
+        tenant: "ten_a".into(),
+        username: username.into(),
+        password: "fixture".into(),
+    };
+    let profile_file = dir.path().join("desktop-profile.json");
+    let snapshot = alice.call(login("alice")).await.unwrap();
+    assert_eq!(snapshot.user.unwrap().name, "Alice");
+    let retained_profile = std::fs::read_to_string(&profile_file).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&retained_profile).unwrap()["device_id"], HISTORY_DEVICE);
+    assert!(!retained_profile.contains("rotated_device_a"));
+    assert_eq!(*calls.lock().unwrap(), [("resume", "Bearer account_a".into())]);
+
+    let bob = Bridge::new(dir.path().join("onexd.sock"));
+    let wrong_device = bob.call(login("bob")).await.unwrap_err();
+    assert_eq!(wrong_device.code, "device_already_logged_in");
+    assert!(bob.call(Op::State).await.unwrap().user.is_none());
+    assert_eq!(std::fs::read_to_string(&profile_file).unwrap(), retained_profile);
+
+    let stale = Bridge::new(dir.path().join("onexd.sock"));
+    stale.restore_session().await;
+    assert_eq!(stale.call(Op::State).await.unwrap().phase, "ready");
+    assert_eq!(daemon_request(dir.path(), Request::Logout).await["ok"], true);
+    let snapshot = bob.call(login("bob")).await.unwrap();
+    assert_eq!(snapshot.user.unwrap().name, "Bob");
+    let profile = std::fs::read_to_string(&profile_file).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&profile).unwrap()["device_id"], OTHER_DEVICE);
+    assert!(!profile.contains("Alice") && !profile.contains("rotated_device_a"));
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [("resume", "Bearer account_a".into()), ("register", "Bearer account_b".into())]
+    );
+
+    let stale_state = alice.call(Op::State).await.unwrap();
+    assert_eq!(stale_state.phase, "signed_out");
+    assert!(stale_state.user.is_none() && stale_state.tenant.is_none());
+    assert_eq!(stale.call(Op::Logout).await.unwrap().phase, "signed_out");
+    let status = daemon_request(dir.path(), Request::Status).await;
+    assert_eq!(status["device_id"], OTHER_DEVICE);
+    assert_eq!(status["logged_in"], true);
+    assert_eq!(std::fs::read_to_string(&profile_file).unwrap(), profile);
 }
 
 #[tokio::test]

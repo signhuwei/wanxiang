@@ -47,7 +47,7 @@ fn blocked() -> Response {
 
 pub(crate) async fn responses(rt: Arc<Router>, headers: HeaderMap, body: Bytes) -> Response {
     let Some(mode) = rt.state.pool_execution() else { return blocked() };
-    let Ok(Some(binding)) = rt.session_for(&headers) else {
+    let Ok(Some(mut binding)) = rt.session_for(&headers) else {
         return error(StatusCode::UNAUTHORIZED, "unauthenticated", "需要受管 Agent 启动凭据。");
     };
     if binding.agent != "codex"
@@ -55,6 +55,9 @@ pub(crate) async fn responses(rt: Arc<Router>, headers: HeaderMap, body: Bytes) 
         || (mode == PoolExecution::Production && binding.approved_model.is_none())
     {
         return error(StatusCode::FORBIDDEN, "agent_not_allowed", "模型池需要已签发的 Codex 发行。");
+    }
+    if rt.bind_codex_cli(&headers, &mut binding).await.is_err() {
+        return error(StatusCode::FORBIDDEN, "forbidden", "未能核对本次 Codex CLI 原生会话。");
     }
     let Some(store) = &rt.pool_store else { return blocked() };
     let Some(view) = rt.state.route.read().unwrap().ready().cloned() else { return blocked() };

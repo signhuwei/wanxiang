@@ -27,8 +27,12 @@
 | POST | `/auth/logout` | 204 |
 | GET | `/me` | `{user, tenant, role, agents, is_platform_admin, actions}`；未选租户时 `tenant`、`role` 为 null |
 | POST | `/devices` | `{name, os, arch, public_key}`，201，返回 `{device_id, device_token}` |
+| POST | `/devices/:id/resume-challenge` | `{}`，200，返回 `{key_id, nonce, ciphertext}`。需要当前账号的 Desktop 租户会话，且设备和所属成员均有效。 |
+| POST | `/devices/:id/resume` | `{proof}`，必须带 `Idempotency-Key`。使用同一个 Desktop 租户会话，200，返回 `{device_id, device_token}`。 |
 
 `tenant` 可填完整租户 ID 或简称。简称、用户名按 Unicode NFKC 归一并忽略大小写，允许多个租户共享简称，密码按原样校验。简称须唯一匹配有效成员的用户名和密码才可登录。若匹配结果不确定，用户可用完整租户 ID 指定租户。凭据错误统一为 401，频率超限返回 429。密码会话的 `/me` 含 `tenant_password_login: true`，只在所选租户内操作。平台管理员沿用个人令牌入口。
+
+设备恢复使用和 Edge 密钥下发一致的 X25519、HKDF-SHA256 和 XChaCha20-Poly1305 信封。将 UTF-8 `onex-device-resume-v1` 用作附加认证数据，用当前设备私钥解开信封，然后将完整 UTF-8 明文作为 `proof` 发送。挑战两分钟内可用于当前会话，成功后重新签发设备令牌，保留设备 ID、已有会话和回传确认序号。设备令牌过期时仍可恢复有效设备。旧令牌和对应的 WebSocket 在成功后失效。请求超时可用相同幂等键重试同一请求以取回已签发的令牌。
 
 ### 网页个人登录令牌
 

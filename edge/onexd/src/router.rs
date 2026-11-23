@@ -500,10 +500,7 @@ impl Router {
 
     pub(crate) fn session_for(&self, h: &HeaderMap) -> Result<Option<crate::state::LaunchBinding>, ()> {
         // Claude Code 用 ANTHROPIC_API_KEY 时发 x-api-key，用 ANTHROPIC_AUTH_TOKEN 时发 Bearer。
-        let presented = h.get("x-api-key").and_then(|v| v.to_str().ok()).or_else(|| {
-            h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "))
-        });
-        let token = presented.ok_or(())?;
+        let token = local_bearer(h).ok_or(())?;
         if token.as_bytes().ct_eq(self.local_token.as_bytes()).into() {
             return Ok(self.state.active_session.read().unwrap().clone().map(|session_id| {
                 crate::state::LaunchBinding {
@@ -535,6 +532,43 @@ impl Router {
             })
             .map(Some)
             .ok_or(())
+    }
+
+    pub(crate) async fn bind_codex_cli(
+        &self,
+        headers: &HeaderMap,
+        binding: &mut crate::state::LaunchBinding,
+    ) -> Result<(), ()> {
+        if binding.agent != "codex" || !headers.contains_key("x-codex-turn-metadata") {
+            return Ok(());
+        }
+        if headers.contains_key("x-api-key") || headers.get_all(header::AUTHORIZATION).iter().count() != 1 {
+            return Err(());
+        }
+        let thread = crate::desktop_sessions::native_turn(headers).ok_or(())?.thread_id;
+        let token = local_bearer(headers).ok_or(())?;
+        let history = self.state.codex_history.read().unwrap().get(token).cloned().ok_or(())?;
+        let id = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                // Codex may send before the new thread's rollout is visible.
+                let history = history.clone();
+                if let Some(id) = tokio::task::spawn_blocking(move || history.bind(thread)).await.map_err(|_| ())? {
+                    return Ok(id);
+                }
+                if !self.state.launch_tokens.read().unwrap().contains_key(token) {
+                    return Err(());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| ())??;
+        if !self.state.launch_tokens.read().unwrap().contains_key(token) {
+            return Err(());
+        }
+        binding.session_id = id;
+        binding.first_native_session = None;
+        Ok(())
     }
 
     pub(crate) fn route_and_rate(
@@ -700,6 +734,13 @@ fn scoped_desktop_route<'a>(routes: &'a [Route], model: &str, protocol_allowed: 
     })
 }
 
+fn local_bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok())?.strip_prefix("Bearer "))
+}
+
 fn claude_session_id(request: &Value) -> Option<uuid::Uuid> {
     #[derive(Deserialize)]
     struct NativeIdentity {
@@ -710,6 +751,14 @@ fn claude_session_id(request: &Value) -> Option<uuid::Uuid> {
         return None;
     }
     serde_json::from_str::<NativeIdentity>(user_id).ok().map(|identity| identity.session_id)
+}
+
+async fn bind_kimi_session(state: &State, headers: &HeaderMap, native: &Value) -> Option<String> {
+    let token = local_bearer(headers)?;
+    let native = native.as_str()?.to_owned();
+    let history = state.kimi_history.read().unwrap().get(token).cloned()?;
+    let id = tokio::task::spawn_blocking(move || history.bind(&native)).await.ok()??;
+    state.launch_tokens.read().unwrap().contains_key(token).then_some(id)
 }
 
 async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
@@ -769,6 +818,29 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         if claim.approved_model.as_deref() != Some(model.as_str()) {
             return anthropic_error(StatusCode::FORBIDDEN, "permission_error", "该模型未获当前 OneX 能力合约授权。");
         }
+    }
+    if !counts_tokens
+        && let Some(claim) = binding.as_mut().filter(|claim| claim.agent == "claude-code")
+        && let Some(native) = claude_session_id(&req)
+    {
+        let history =
+            local_bearer(&headers).and_then(|token| rt.state.claude_history.read().unwrap().get(token).cloned());
+        if let Some(history) = history
+            && let Ok(Some(id)) = tokio::task::spawn_blocking(move || history.bind(native)).await
+        {
+            claim.session_id = id;
+        }
+    }
+    if !counts_tokens
+        && let Some(claim) = binding.as_mut().filter(|claim| claim.agent == "kimi-code")
+        && let Some(native) = req["metadata"].get("user_id").filter(|value| !value.is_null())
+    {
+        let Some(id) = bind_kimi_session(&rt.state, &headers, native).await else {
+            return anthropic_error(StatusCode::FORBIDDEN, "permission_error", "未能核对本次 Kimi Code 原生会话。");
+        };
+        claim.session_id = id;
+        // The vendor supplied an exact session. A discovery notification must not overwrite it.
+        claim.first_native_session = None;
     }
     let session_id = binding.as_ref().map(|claim| claim.session_id.clone());
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -1909,6 +1981,208 @@ mod tests {
         let success = usage.recv().await.unwrap();
         assert_eq!(success.provider_id, "two");
         assert_eq!(success.model_id, "mdl");
+    }
+
+    #[tokio::test]
+    async fn codex_responses_charge_the_requested_native_thread() {
+        use std::path::Path;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let app = AxumRouter::new().route(
+                "/v1/responses",
+                post(|| async { axum::Json(json!({"id":"upstream","usage":{"input_tokens":5,"output_tokens":3}})) }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = tempfile::tempdir().unwrap();
+        let foreign_config = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let foreign_cwd = tempfile::tempdir().unwrap();
+        let write_rollout = |config: &Path, cwd: &Path, thread: &str| {
+            let path = config.join("sessions/2026/11/23");
+            std::fs::create_dir_all(&path).unwrap();
+            let row = json!({"type":"session_meta", "payload":{"id":thread,"cwd":cwd}});
+            std::fs::write(path.join(format!("rollout-2026-11-23T12-00-00-{thread}.jsonl")), format!("{row}\n"))
+                .unwrap();
+        };
+        let first = "80e68dcc-912e-48ce-9589-abd8edbb1973";
+        let second = "70e68dcc-912e-48ce-9589-abd8edbb1973";
+        let other_launch = "60e68dcc-912e-48ce-9589-abd8edbb1973";
+        let other_workspace = "50e68dcc-912e-48ce-9589-abd8edbb1973";
+        let turn = "40e68dcc-912e-48ce-9589-abd8edbb1973";
+        write_rollout(config.path(), cwd.path(), first);
+        write_rollout(config.path(), cwd.path(), second);
+        write_rollout(foreign_config.path(), cwd.path(), other_launch);
+        write_rollout(config.path(), foreign_cwd.path(), other_workspace);
+
+        let state = Arc::new(State::default());
+        let mut fixture = route("model", "p");
+        fixture.protocol = "openai_responses".into();
+        fixture.base_url = format!("http://{addr}");
+        *state.config.write().unwrap() =
+            ConfigSnapshot { routes: vec![fixture], rates: vec![rate()], ..Default::default() };
+        state.secrets.write().unwrap().insert("p".into(), "fixture-key".into());
+        let (_first_tx, watch) = tokio::sync::watch::channel(Some("first-discovered".into()));
+        state.launch_tokens.write().unwrap().insert(
+            "codex-window".into(),
+            crate::state::LaunchBinding {
+                session_id: "launch-placeholder".into(),
+                agent: "codex".into(),
+                release_id: None,
+                approved_model: None,
+                first_native_session: Some(watch),
+            },
+        );
+        state.codex_history.write().unwrap().insert(
+            "codex-window".into(),
+            Arc::new(crate::native_capture::CodexHistory::new(
+                config.path().into(),
+                cwd.path().into(),
+                "dev-account-A".into(),
+            )),
+        );
+        state
+            .lease
+            .grant(
+                &serde_json::from_value(json!({"id":"g","lease_id":"lease", "expires_at":format_ms(now_ms()+60000),
+            "budget_milli":100000,"seq":1}))
+                .unwrap(),
+            )
+            .unwrap();
+        let (tx, mut usage) = mpsc::unbounded_channel();
+        let rt = Router::new(state, "daemon".into(), client_builder().no_proxy().build().unwrap(), tx);
+        let headers = |thread: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer codex-window"));
+            if let Some(thread) = thread {
+                let metadata = json!({"thread_id":thread,"turn_id":turn,"session_id":first});
+                headers.insert("x-codex-turn-metadata", metadata.to_string().parse().unwrap());
+                headers.insert("thread-id", thread.parse().unwrap());
+            }
+            headers
+        };
+        let infer = |headers| {
+            crate::responses::responses(
+                AxState(rt.clone()),
+                headers,
+                Bytes::from_static(br#"{"model":"model","input":"continue","max_output_tokens":20}"#),
+            )
+        };
+        for native in [first, second, first] {
+            assert_eq!(infer(headers(Some(native))).await.status(), StatusCode::OK);
+            let expected = crate::native_capture::session_id("dev-account-A", "codex", native);
+            assert_eq!(usage.recv().await.unwrap().session_id.as_deref(), Some(expected.as_str()));
+        }
+        // Older clients without native metadata can still use discovery.
+        assert_eq!(infer(headers(None)).await.status(), StatusCode::OK);
+        assert_eq!(usage.recv().await.unwrap().session_id.as_deref(), Some("first-discovered"));
+        let mut conflict = headers(Some(first));
+        conflict.insert("thread-id", second.parse().unwrap());
+        assert_eq!(infer(conflict).await.status(), StatusCode::FORBIDDEN);
+        for thread in [other_launch, other_workspace] {
+            assert_eq!(infer(headers(Some(thread))).await.status(), StatusCode::FORBIDDEN);
+        }
+        assert!(usage.try_recv().is_err());
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn kimi_model_requests_follow_exact_native_sessions() {
+        use std::path::Path;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let app = AxumRouter::new().route(
+                "/v1/messages",
+                post(|| async { axum::Json(json!({"id":"upstream","usage":{"input_tokens":5,"output_tokens":3}})) }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let device = tempfile::tempdir().unwrap();
+        let other_device = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let other_cwd = tempfile::tempdir().unwrap();
+        let config = device.path().join("agents/kimi-code/profiles/launch-a/kimi");
+        let foreign_config = other_device.path().join("agents/kimi-code/profiles/launch-b/kimi");
+        let write_session = |config: &Path, cwd: &Path, workspace: &str, native: &str| {
+            let path = config.join("sessions").join(workspace).join(native);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("state.json"), json!({"id":native,"cwd":cwd}).to_string()).unwrap();
+        };
+        let first = "session_80e68dcc-912e-48ce-9589-abd8edbb1973";
+        let second = "session_70e68dcc-912e-48ce-9589-abd8edbb1973";
+        let foreign = "session_60e68dcc-912e-48ce-9589-abd8edbb1973";
+        let wrong_workspace = "session_50e68dcc-912e-48ce-9589-abd8edbb1973";
+        write_session(&config, cwd.path(), "wd_current", first);
+        write_session(&config, cwd.path(), "wd_current", second);
+        write_session(&foreign_config, cwd.path(), "wd_current", foreign);
+        write_session(&config, other_cwd.path(), "wd_elsewhere", wrong_workspace);
+
+        let state = Arc::new(State::default());
+        let mut fixture = route("model", "p");
+        fixture.base_url = format!("http://{addr}");
+        *state.config.write().unwrap() =
+            ConfigSnapshot { routes: vec![fixture], rates: vec![rate()], ..Default::default() };
+        state.secrets.write().unwrap().insert("p".into(), "fixture-key".into());
+        let (_first_tx, first_native_session) = tokio::sync::watch::channel(Some("previous-discovery".into()));
+        state.launch_tokens.write().unwrap().insert(
+            "kimi-window".into(),
+            crate::state::LaunchBinding {
+                session_id: "launch-placeholder".into(),
+                agent: "kimi-code".into(),
+                release_id: None,
+                approved_model: None,
+                first_native_session: Some(first_native_session),
+            },
+        );
+        state.kimi_history.write().unwrap().insert(
+            "kimi-window".into(),
+            Arc::new(crate::kimi_launch::KimiHistory::new(
+                device.path().to_path_buf(),
+                config,
+                cwd.path().to_path_buf(),
+                "device-a".into(),
+            )),
+        );
+        state
+            .lease
+            .grant(
+                &serde_json::from_value(json!({
+                    "id":"g","lease_id":"lease","expires_at":format_ms(now_ms()+60000),"budget_milli":100000,"seq":1
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let (tx, mut usage) = mpsc::unbounded_channel();
+        let router = Router::new(state, "daemon".into(), client_builder().no_proxy().build().unwrap(), tx);
+        let send = |native| {
+            let mut body = json!({"model":"model","messages":[],"max_tokens":8});
+            if let Some(native) = native {
+                body["metadata"] = json!({"user_id":native});
+            }
+            let mut headers = HeaderMap::new();
+            headers.insert("x-api-key", HeaderValue::from_static("kimi-window"));
+            messages(AxState(router.clone()), "/v1/messages".parse().unwrap(), headers, Bytes::from(body.to_string()))
+        };
+        for native in [first, second, first] {
+            assert_eq!(send(Some(native)).await.status(), StatusCode::OK);
+            let recorded = tokio::time::timeout(Duration::from_secs(2), usage.recv()).await.unwrap().unwrap();
+            let expected = crate::native_capture::session_id("device-a", "kimi-code", native);
+            assert_eq!(recorded.session_id.as_deref(), Some(expected.as_str()));
+        }
+        for invalid in [foreign, wrong_workspace, "../legacy"] {
+            assert_eq!(send(Some(invalid)).await.status(), StatusCode::FORBIDDEN);
+            assert!(usage.try_recv().is_err());
+        }
+        assert_eq!(send(None).await.status(), StatusCode::OK);
+        let recorded = tokio::time::timeout(Duration::from_secs(2), usage.recv()).await.unwrap().unwrap();
+        assert_eq!(recorded.session_id.as_deref(), Some("previous-discovery"));
+        upstream.abort();
     }
 
     #[test]

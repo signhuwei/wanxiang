@@ -7,6 +7,14 @@ use anyhow::{Context, Result, bail};
 
 use crate::launch::{self, Launch, Request};
 
+#[path = "codex_history.rs"]
+mod history;
+pub(crate) use history::{HistoryLease, RestoredHistory, prefix_digest, restore_history};
+
+// The native resume picker uses a provider ID. Keep the ID independent of the
+// launch while the provider config, router token, and tools stay private.
+pub(super) const PROVIDER: &str = "onex";
+
 pub(crate) fn prepare(r: &Request) -> Result<Launch> {
     validate_project(r.cwd)?;
     #[cfg(target_os = "macos")]
@@ -23,12 +31,11 @@ pub(crate) fn prepare(r: &Request) -> Result<Launch> {
     }
 
     let suffix = launch_id.trim_start_matches("lch_");
-    let provider = format!("onex_{suffix}");
     let token_name = format!("ONEX_CODEX_TOKEN_{suffix}");
-    let provider_key = format!("model_providers.{provider}");
+    let provider_key = format!("model_providers.{PROVIDER}");
     let settings = [
         ("model".into(), quote(r.model)),
-        ("model_provider".into(), quote(&provider)),
+        ("model_provider".into(), quote(PROVIDER)),
         (format!("{provider_key}.name"), quote("OneX")),
         (format!("{provider_key}.base_url"), quote(&format!("http://{}/v1", r.router_addr))),
         (format!("{provider_key}.env_key"), quote(&token_name)),

@@ -143,6 +143,9 @@ async fn status_login_shutdown() {
     assert!(run_dir.join("settings.json").exists());
     let sid = l["session_id"].as_str().unwrap().to_string();
     assert_eq!(state.active_session.read().unwrap().as_deref(), Some(sid.as_str()));
+    let blocked_logout = c.call(r#"{"cmd":"logout"}"#).await;
+    assert_eq!(blocked_logout["error"]["code"], "agents_running");
+    assert_eq!(state.token.borrow().as_deref(), Some("dev_tok"));
     // Claude Code 写主会话文件，采集到 outbox
     let proj = dir.path().join("agents/claude-code/claude/projects/-tmp-x");
     std::fs::create_dir_all(&proj).unwrap();
@@ -286,6 +289,24 @@ async fn logout_clears_keychain_and_shuts_down() {
     assert!(state.secrets.read().unwrap().is_empty());
     assert_eq!(state.config.read().unwrap().routes.len(), 0);
     assert!(shutdown.is_cancelled());
+}
+
+#[tokio::test]
+async fn a_terminal_surviving_daemon_restart_keeps_its_account_until_it_closes() {
+    let dir = tempfile::tempdir().unwrap();
+    let launch = onexd::id::new("lch");
+    let run = dir.path().join("run").join(&launch);
+    std::fs::create_dir_all(&run).unwrap();
+    let lock = onex_core::run_lock::claim(&run).unwrap();
+    onexd::launch::clean_stale(dir.path());
+    assert!(run.is_dir());
+    let (_, mut client, shutdown) = start(dir.path(), None).await;
+    assert_eq!(client.call(r#"{"cmd":"logout"}"#).await["error"]["code"], "agents_running");
+    assert!(!shutdown.is_cancelled());
+    drop(lock);
+    assert_eq!(client.call(&json!({"cmd":"launch_done","launch_id":launch}).to_string()).await, json!({"ok":true}));
+    assert!(!run.exists());
+    assert_eq!(client.call(r#"{"cmd":"logout"}"#).await, json!({"ok":true}));
 }
 
 #[tokio::test]

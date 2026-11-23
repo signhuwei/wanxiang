@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::credentials::{CredentialStore, DeviceCredentials};
+use crate::credentials::{CredentialStore, DeviceCredentials, HistoryIdentity, HistoryScope};
 use crate::outbox::Outbox;
 use crate::pricing::format_ms;
 use crate::router::AgentProtocol;
@@ -58,6 +58,7 @@ struct Running {
     agent: String,
     stop: CancellationToken,
     code: Arc<std::sync::Mutex<Option<i32>>>,
+    capture: Option<tokio::task::JoinHandle<()>>,
     session_id: String,
     token: String,
     search: Option<SearchAccess>,
@@ -120,6 +121,25 @@ impl LaunchCtx {
             preparation.release_id = Some(release.to_owned());
         }
     }
+
+    fn has_previous_cli(&self) -> bool {
+        let Ok(entries) = std::fs::read_dir(self.home.join("run")) else { return false };
+        let current = self.running.lock().unwrap();
+        entries.flatten().any(|entry| {
+            entry.file_name().to_str().is_some_and(|id| {
+                crate::launch::is_generated_launch_id(id)
+                    && !current.contains_key(id)
+                    && onex_core::run_lock::is_active(&entry.path())
+            })
+        })
+    }
+
+    fn has_open_agents(&self) -> bool {
+        if !self.running.lock().unwrap().is_empty() {
+            return true;
+        }
+        self.has_previous_cli()
+    }
 }
 
 /// 绑定本机 IPC 入口（Unix socket 或 Windows 具名管道，权限收紧到当前用户，拒绝远程）。
@@ -147,14 +167,20 @@ pub async fn serve(listener: Listener, path: PathBuf, ipc: Arc<Ipc>) {
         }
     }
     if let Some(ctx) = &ipc.launch {
-        let tasks = std::mem::take(&mut *ctx.desktop_tasks.lock().unwrap());
+        let mut tasks = std::mem::take(&mut *ctx.desktop_tasks.lock().unwrap());
+        for launch in ctx.running.lock().unwrap().values_mut() {
+            if let Some(capture) = launch.capture.take() {
+                launch.stop.cancel();
+                tasks.push(capture);
+            }
+        }
         let joining = async {
             for task in tasks {
                 let _ = task.await;
             }
         };
         if tokio::time::timeout(std::time::Duration::from_secs(5), joining).await.is_err() {
-            warn!("desktop shutdown did not finish; outstanding sessions will recover after restart");
+            warn!("agent shutdown did not finish; outstanding sessions will recover after restart");
         }
     }
     transport::cleanup(&path);
@@ -175,7 +201,14 @@ async fn handle(stream: Connection, ipc: &Arc<Ipc>, socket: &Path) -> Result<()>
             return Ok(());
         }
         let request = serde_json::from_str::<Request>(line.trim());
-        let _identity = if matches!(request, Ok(Request::Login { .. } | Request::Logout | Request::Shutdown)) {
+        let _identity = if matches!(
+            request,
+            Ok(Request::Login { .. }
+                | Request::ResumeDevice { .. }
+                | Request::Logout
+                | Request::LogoutDevice { .. }
+                | Request::Shutdown)
+        ) {
             Some(ipc.identity_transition.lock().await)
         } else {
             None
@@ -201,7 +234,15 @@ async fn dispatch(req: Request, ipc: &Arc<Ipc>, socket: &Path) -> (Value, bool) 
     match req {
         Request::Status => (ok(status(ipc)), false),
         Request::Login { token, server, device_id } => (login(ipc, token, server, device_id), false),
+        Request::ResumeDevice { server, session_token } => resume_device(ipc, &server, &session_token).await,
         Request::Logout => logout(ipc),
+        Request::LogoutDevice { device_id } => {
+            if ipc.state.expected_device_id.read().unwrap().as_ref() != Some(&device_id) {
+                (err("conflict", "本机当前登录设备已变化"), false)
+            } else {
+                logout(ipc)
+            }
+        }
         // 只给公钥，私钥不出 daemon
         Request::DeviceInfo => {
             (json!({"ok": true, "public_key": ipc.state.device_key.public_b64(), "server_url": ipc.server_url}), false)
@@ -216,10 +257,19 @@ async fn dispatch(req: Request, ipc: &Arc<Ipc>, socket: &Path) -> (Value, bool) 
             (hosted_search(ipc, &launch_id, &capability, &release_id, &query, limit, &call_key).await, false)
         }
         Request::LaunchDone { launch_id, exit_code } => {
+            let _identity = ipc.identity_transition.lock().await;
             let Some(ctx) = &ipc.launch else { return (err("invalid", "这个 onexd 不支持启动 Agent"), false) };
             let launch = {
                 let mut running = ctx.running.lock().unwrap();
-                let Some(launch) = running.get(&launch_id) else { return (json!({"ok": true}), false) };
+                let Some(launch) = running.get(&launch_id) else {
+                    // A terminal from before a daemon restart can still close normally.
+                    if crate::launch::is_generated_launch_id(&launch_id)
+                        && !onex_core::run_lock::is_active(&ctx.home.join("run").join(&launch_id))
+                    {
+                        let _ = crate::launch::finish(&ctx.home, &launch_id);
+                    }
+                    return (json!({"ok": true}), false);
+                };
                 if crate::state::is_desktop_agent(&launch.agent) {
                     // The desktop supervisor drains the original journal before closing.
                     launch.stop.cancel();
@@ -229,10 +279,18 @@ async fn dispatch(req: Request, ipc: &Arc<Ipc>, socket: &Path) -> (Value, bool) 
             };
             info!(%launch_id, ?exit_code, "agent exited");
             ipc.state.launch_tokens.write().unwrap().remove(&launch.token);
+            ipc.state.claude_history.write().unwrap().remove(&launch.token);
+            ipc.state.codex_history.write().unwrap().remove(&launch.token);
+            ipc.state.kimi_history.write().unwrap().remove(&launch.token);
             ipc.state.desktop_sessions.stop(&launch.token);
             ipc.state.workbuddy_turns.stop(&launch.token);
             *launch.code.lock().unwrap() = exit_code;
             launch.stop.cancel();
+            if let Some(capture) = launch.capture
+                && let Err(error) = capture.await
+            {
+                warn!(%launch_id, %error, "final native transcript capture stopped");
+            }
             ipc.state.active_session.write().unwrap().take_if(|s| *s == launch.session_id);
             match crate::launch::finish(&ctx.home, &launch_id) {
                 Ok(()) => (json!({"ok": true}), false),
@@ -242,6 +300,55 @@ async fn dispatch(req: Request, ipc: &Arc<Ipc>, socket: &Path) -> (Value, bool) 
         Request::Shutdown => {
             info!("shutdown requested via ipc");
             (json!({"ok": true}), true)
+        }
+    }
+}
+
+async fn resume_device(ipc: &Ipc, origin: &str, session: &str) -> (Value, bool) {
+    if ipc.state.token.borrow().is_some() && ipc.state.phase() != crate::state::Phase::Unauthenticated {
+        return (err("conflict", "请先退出当前 OneX 账号"), false);
+    }
+    if ipc.launch.as_ref().is_some_and(LaunchCtx::has_open_agents) {
+        return (err("agents_running", "请关闭当前账号的受管 Agent 后重新登录"), false);
+    }
+    let Some(store) = &ipc.credentials else { return (json!({"ok":true,"resumed":false}), false) };
+    let Some(server) = ipc.server_url.as_deref().and_then(normalize_origin) else {
+        return (err("invalid", "缺少 OneX Server 地址"), false);
+    };
+    if normalize_origin(origin).as_deref() != Some(&server) {
+        return (err("invalid", "登录地址与本机服务配置不一致"), false);
+    }
+    let current = if ipc.state.token.borrow().is_some() {
+        let Some(device_id) = ipc.state.expected_device_id.read().unwrap().clone() else {
+            return (err("conflict", "请先退出当前 OneX 账号"), false);
+        };
+        Some(HistoryIdentity { device_id, device_key: ipc.state.device_key.bytes_for_keychain() })
+    } else {
+        None
+    };
+    match crate::device_history::resume(store.as_ref(), &server, session, current).await {
+        Ok(None) => {
+            if ipc.state.token.borrow().is_some() {
+                return (err("conflict", "请先退出当前 OneX 账号"), false);
+            }
+            (json!({"ok":true,"resumed":false}), false)
+        }
+        Ok(Some(credentials)) => {
+            if let Err(error) = store.save(&credentials) {
+                warn!(%error, "could not save the recovered device");
+                return (err("history_unavailable", "无法保存会话恢复所需的设备身份"), false);
+            }
+            (json!({"ok":true,"resumed":true,"device_id":credentials.device_id}), true)
+        }
+        Err(error) => {
+            if error.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status)
+                == Some(reqwest::StatusCode::NOT_FOUND)
+                && ipc.state.token.borrow().is_some()
+            {
+                return (err("conflict", "本机设备无法与当前登录账号匹配"), false);
+            }
+            warn!(%error, "could not authenticate the retained history identity");
+            (err("history_unavailable", "暂时无法恢复当前账号的本机会话"), false)
         }
     }
 }
@@ -310,10 +417,17 @@ pub fn normalize_origin(value: &str) -> Option<String> {
 /// 注销：Keychain 条目删不掉就整体失败，不报告"已注销"；成功后清断流所需的内存状态，
 /// 和 shutdown 一样让调用方知道要重新拉起 onexd（打包环境由 LaunchAgent 负责，手工调试自己重新执行）。
 fn logout(ipc: &Ipc) -> (Value, bool) {
-    if let Some(store) = &ipc.credentials
-        && store.clear().is_err()
-    {
-        return (err("internal", "无法清除系统钥匙串里的设备身份"), false);
+    if ipc.launch.as_ref().is_some_and(LaunchCtx::has_open_agents) {
+        return (err("agents_running", "请关闭当前账号的受管 Agent 后退出"), false);
+    }
+    if let Some(store) = &ipc.credentials {
+        if let Err(error) = preserve_logout_history(ipc, store.as_ref()) {
+            warn!(%error, "could not retain history before logging out");
+            return (err("history_unavailable", "无法保存会话恢复所需的设备身份"), false);
+        }
+        if store.clear().is_err() {
+            return (err("internal", "无法清除系统钥匙串里的设备身份"), false);
+        }
     }
     info!("device logged out via ipc; shutting down for a clean restart");
     if let Err(e) = ipc.state.lease.cutoff("logout", None) {
@@ -321,17 +435,36 @@ fn logout(ipc: &Ipc) -> (Value, bool) {
     }
     *ipc.state.config.write().unwrap() = Default::default();
     ipc.state.secrets.write().unwrap().clear();
-    if let Some(ctx) = &ipc.launch {
-        for (_, launch) in ctx.running.lock().unwrap().drain() {
-            launch.stop.cancel();
-        }
-    }
     ipc.state.launch_tokens.write().unwrap().clear();
+    ipc.state.claude_history.write().unwrap().clear();
+    ipc.state.codex_history.write().unwrap().clear();
+    ipc.state.kimi_history.write().unwrap().clear();
     ipc.state.desktop_sessions.clear();
     ipc.state.workbuddy_turns.clear();
     ipc.state.active_session.write().unwrap().take();
     ipc.state.replace_token(None);
     (json!({"ok": true}), true)
+}
+
+fn preserve_logout_history(ipc: &Ipc, store: &dyn CredentialStore) -> Result<()> {
+    let Some(device_id) = ipc.state.expected_device_id.read().unwrap().clone() else { return Ok(()) };
+    let Some(server) = ipc.server_url.as_deref().and_then(normalize_origin) else { return Ok(()) };
+    let identity = HistoryIdentity { device_id, device_key: ipc.state.device_key.bytes_for_keychain() };
+    let conn = ipc.state.conn.lock().unwrap();
+    if let (Some(device), Some(tenant_id), Some(user_id)) = (&conn.device_id, &conn.tenant_id, &conn.user_id)
+        && device == &identity.device_id
+    {
+        return store.save_history(&HistoryScope { server: &server, tenant_id, user_id }, &identity);
+    }
+    drop(conn);
+    let mut pending = store.load_unscoped_history(&server)?;
+    if !pending.iter().any(|known| known.device_id == identity.device_id) {
+        // Leave headroom under the Windows credential record size limit.
+        anyhow::ensure!(pending.len() < 8, "too many device keys awaiting account verification");
+        pending.push(identity);
+        store.save_unscoped_history(&server, &pending)?;
+    }
+    Ok(())
 }
 
 fn start_download(ipc: &Arc<Ipc>, agent: &str) -> Value {
@@ -641,6 +774,9 @@ async fn launch(
     {
         return err("unauthenticated", "请重新登录 OneX");
     }
+    if ctx.has_previous_cli() {
+        return err("agents_running", "请先关闭 Edge 重启前仍在运行的受管 Agent");
+    }
     let program = resolved_program.to_string_lossy().into_owned();
     let program = program.as_str();
     let tools_current = |cfg: &crate::state::ConfigSnapshot| {
@@ -744,7 +880,13 @@ async fn launch(
         cwd: Path::new(cwd),
         client_env: env,
     };
-    match crate::launch::prepare(&r) {
+    let prepared = if agent == "kimi-code" {
+        let include_history = !ctx.running.lock().unwrap().values().any(|launch| launch.agent == agent);
+        crate::kimi_launch::prepare_kimi_code_with_history(&r, include_history)
+    } else {
+        crate::launch::prepare(&r)
+    };
+    match prepared {
         Ok(mut l) => {
             let search = (!search_releases.is_empty()).then(|| SearchAccess {
                 capability: crate::id::token(),
@@ -761,6 +903,18 @@ async fn launch(
                 warn!(agent, %error, "could not prepare managed tools");
                 return err("invalid", "无法加载受管工具");
             }
+            let history_lease = if agent == "codex" {
+                match crate::codex_launch::restore_history(&l, &ctx.home) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        let _ = crate::launch::finish(&ctx.home, &l.launch_id);
+                        warn!(agent, %error, "could not restore the native conversation directory");
+                        return err("history_unavailable", "无法读取受管 Agent 的本机会话");
+                    }
+                }
+            } else {
+                None
+            };
             let pool = ipc.state.pool_launch_config();
             let cfg = ipc.state.config.read().unwrap();
             let cfg = pool.as_ref().unwrap_or(&cfg);
@@ -808,32 +962,52 @@ async fn launch(
                     first_native_session,
                 },
             );
-            ctx.running.lock().unwrap().insert(
-                l.launch_id.clone(),
-                Running {
-                    agent: agent.to_owned(),
-                    stop: stop.clone(),
-                    code: code.clone(),
-                    session_id: l.session_id.clone(),
-                    token: local_token.clone(),
-                    search,
-                },
-            );
-            *ipc.state.active_session.write().unwrap() = Some(l.session_id.clone());
-            if let Some((native, first_session)) = native {
+            let capture = if let Some((native, first_session)) = native {
                 let capture = crate::native_capture::LaunchCapture::new(
                     s,
                     ipc.state.clone(),
                     ipc.outbox.clone(),
-                    local_token,
+                    local_token.clone(),
                     first_session,
                 );
-                tokio::spawn(capture.run(native, stop, code));
+                if matches!(native, crate::native_capture::Agent::Kimi) {
+                    ipc.state
+                        .kimi_history
+                        .write()
+                        .unwrap()
+                        .insert(local_token.clone(), Arc::new(capture.kimi_history(&ctx.home)));
+                } else {
+                    ipc.state
+                        .codex_history
+                        .write()
+                        .unwrap()
+                        .insert(local_token.clone(), Arc::new(capture.codex_history()));
+                }
+                tokio::spawn(capture.run(native, stop.clone(), code.clone(), history_lease))
             } else {
-                tokio::spawn(crate::capture::Capture::new(s, ipc.outbox.clone()).run(stop, code));
-            }
+                let history = Arc::new(crate::capture::ClaudeHistory::new(s.clone(), ipc.outbox.clone()));
+                ipc.state.claude_history.write().unwrap().insert(local_token.clone(), history.clone());
+                tokio::spawn(crate::capture::Capture::new(s, ipc.outbox.clone()).run(
+                    stop.clone(),
+                    code.clone(),
+                    history,
+                ))
+            };
+            ctx.running.lock().unwrap().insert(
+                l.launch_id.clone(),
+                Running {
+                    agent: agent.to_owned(),
+                    stop,
+                    code,
+                    capture: Some(capture),
+                    session_id: l.session_id.clone(),
+                    token: local_token,
+                    search,
+                },
+            );
+            *ipc.state.active_session.write().unwrap() = Some(l.session_id.clone());
             json!({"ok": true, "launch_id": l.launch_id, "session_id": l.session_id, "program": l.program,
-                "args": l.args, "env": l.env, "cwd": l.cwd, "model": model})
+                "args": l.args, "env": l.env, "cwd": l.cwd, "model": model, "run_dir": l.run_dir})
         }
         Err(e) => err("invalid", &format!("无法准备启动：{e:#}")),
     }
@@ -929,6 +1103,7 @@ async fn start_desktop(
             agent: request.agent.to_owned(),
             stop: stop.clone(),
             code: Default::default(),
+            capture: None,
             session_id: launch.session_id,
             token: token.clone(),
             search: None,
@@ -1189,6 +1364,7 @@ mod hosted_search_tests {
                 agent: "claude-code".into(),
                 stop: CancellationToken::new(),
                 code: Default::default(),
+                capture: None,
                 session_id: "native-one".into(),
                 token: "model-only".into(),
                 search: Some(SearchAccess {

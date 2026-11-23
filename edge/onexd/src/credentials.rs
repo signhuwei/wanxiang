@@ -11,6 +11,8 @@
 #[cfg(target_os = "macos")]
 use anyhow::Context;
 use anyhow::Result;
+#[cfg(any(target_os = "macos", windows))]
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 use zeroize::Zeroizing;
@@ -36,11 +38,57 @@ impl std::fmt::Debug for DeviceCredentials {
     }
 }
 
+/// The inactive record contains a device key, never a reusable login bearer.
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq))]
+pub struct HistoryIdentity {
+    pub device_id: String,
+    pub device_key: [u8; 32],
+}
+
+pub struct HistoryScope<'a> {
+    pub server: &'a str,
+    pub tenant_id: &'a str,
+    pub user_id: &'a str,
+}
+
+#[cfg(any(target_os = "macos", windows, test))]
+fn history_service(base: &str, scope: &HistoryScope<'_>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for segment in [base, scope.server, scope.tenant_id, scope.user_id] {
+        digest.update((segment.len() as u64).to_be_bytes());
+        digest.update(segment.as_bytes());
+    }
+    let key = crate::capture::hex(&digest.finalize());
+    format!("OneX Edge History Identity: {key}")
+}
+
 /// 凭据存取的后端。`service` 用来在同一台机器区分多个 `ONEX_HOME`（例如并行跑的测试或多开发环境）。
 pub trait CredentialStore: Send + Sync {
     fn load(&self) -> Result<Option<DeviceCredentials>>;
     fn save(&self, creds: &DeviceCredentials) -> Result<()>;
     fn clear(&self) -> Result<()>;
+    fn load_history(&self, _scope: &HistoryScope<'_>) -> Result<Option<HistoryIdentity>> {
+        Ok(None)
+    }
+    fn save_history(&self, _scope: &HistoryScope<'_>, _identity: &HistoryIdentity) -> Result<()> {
+        Ok(())
+    }
+    fn load_unscoped_history(&self, _server: &str) -> Result<Vec<HistoryIdentity>> {
+        Ok(Vec::new())
+    }
+    fn save_unscoped_history(&self, _server: &str, _history: &[HistoryIdentity]) -> Result<()> {
+        Ok(())
+    }
+}
+
+// Old Edge records only had a device ID and key. When an offline first
+// upgrade is signed out before any welcome, retain the key without an
+// account assignment until a scoped sign-in proves its ownership.
+#[cfg(any(target_os = "macos", windows, test))]
+fn unscoped_history_service(base: &str, server: &str) -> String {
+    history_service(base, &HistoryScope { server, tenant_id: "", user_id: "" })
 }
 
 /// 按 `ONEX_HOME` 路径派生一个稳定、互不冲突的 Keychain service 名。
@@ -48,9 +96,7 @@ pub fn service_name(home: &std::path::Path) -> String {
     format!("OneX Edge Device Credentials: {}", home.display())
 }
 
-/// 设备公钥的 SHA-256，取前 16 字节的十六进制。用作 outbox/lease 的子目录名：
-/// 换了设备身份（新登录、不同 Keychain 记录）就是新目录，旧身份的 outbox 和租约状态原样留在旧目录，
-/// 不会被新身份的 hello/续租误用，也不自动合并或导入。
+/// 用设备公钥 SHA-256 的前 16 字节标识设备目录。原密钥恢复时沿用目录和回流状态。
 pub fn fingerprint(public_key_b64: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -70,17 +116,12 @@ impl KeychainStore {
     pub fn new(service: String) -> Self {
         Self { service, account: "device".into() }
     }
-}
-
-#[cfg(target_os = "macos")]
-impl CredentialStore for KeychainStore {
-    fn load(&self) -> Result<Option<DeviceCredentials>> {
+    fn load_record<T: DeserializeOwned>(&self) -> Result<Option<T>> {
         use security_framework_sys::base::errSecItemNotFound;
         match security_framework::passwords::get_generic_password(&self.service, &self.account) {
             Ok(bytes) => {
                 let bytes = Zeroizing::new(bytes);
-                let c: DeviceCredentials =
-                    serde_json::from_slice(&bytes).context("stored device credentials are not valid JSON")?;
+                let c = serde_json::from_slice(&bytes).context("stored device credentials are not valid JSON")?;
                 Ok(Some(c))
             }
             Err(e) if e.code() == errSecItemNotFound => Ok(None),
@@ -88,13 +129,22 @@ impl CredentialStore for KeychainStore {
         }
     }
 
-    fn save(&self, creds: &DeviceCredentials) -> Result<()> {
+    fn save_record(&self, creds: &(impl Serialize + ?Sized)) -> Result<()> {
         let bytes = Zeroizing::new(serde_json::to_vec(creds).context("serialize device credentials")?);
         security_framework::passwords::set_generic_password(&self.service, &self.account, &bytes)
             .map_err(sec_err)
             .context("write device credentials to Keychain")
     }
+}
 
+#[cfg(target_os = "macos")]
+impl CredentialStore for KeychainStore {
+    fn load(&self) -> Result<Option<DeviceCredentials>> {
+        self.load_record()
+    }
+    fn save(&self, creds: &DeviceCredentials) -> Result<()> {
+        self.save_record(creds)
+    }
     fn clear(&self) -> Result<()> {
         use security_framework_sys::base::errSecItemNotFound;
         match security_framework::passwords::delete_generic_password(&self.service, &self.account) {
@@ -102,6 +152,18 @@ impl CredentialStore for KeychainStore {
             Err(e) if e.code() == errSecItemNotFound => Ok(()),
             Err(e) => Err(sec_err(e)),
         }
+    }
+    fn load_history(&self, scope: &HistoryScope<'_>) -> Result<Option<HistoryIdentity>> {
+        Self::new(history_service(&self.service, scope)).load_record()
+    }
+    fn save_history(&self, scope: &HistoryScope<'_>, identity: &HistoryIdentity) -> Result<()> {
+        Self::new(history_service(&self.service, scope)).save_record(identity)
+    }
+    fn load_unscoped_history(&self, server: &str) -> Result<Vec<HistoryIdentity>> {
+        Ok(Self::new(unscoped_history_service(&self.service, server)).load_record()?.unwrap_or_default())
+    }
+    fn save_unscoped_history(&self, server: &str, history: &[HistoryIdentity]) -> Result<()> {
+        Self::new(unscoped_history_service(&self.service, server)).save_record(history)
     }
 }
 
@@ -137,6 +199,18 @@ impl CredentialStore for KeychainStore {
     fn clear(&self) -> Result<()> {
         windows_credentials::clear(&self.target)
     }
+    fn load_history(&self, scope: &HistoryScope<'_>) -> Result<Option<HistoryIdentity>> {
+        windows_credentials::load(&history_service(&self.target, scope))
+    }
+    fn save_history(&self, scope: &HistoryScope<'_>, identity: &HistoryIdentity) -> Result<()> {
+        windows_credentials::save(&history_service(&self.target, scope), identity)
+    }
+    fn load_unscoped_history(&self, server: &str) -> Result<Vec<HistoryIdentity>> {
+        Ok(windows_credentials::load(&unscoped_history_service(&self.target, server))?.unwrap_or_default())
+    }
+    fn save_unscoped_history(&self, server: &str, history: &[HistoryIdentity]) -> Result<()> {
+        windows_credentials::save(&unscoped_history_service(&self.target, server), history)
+    }
 }
 
 /// 非 macOS、非 Windows：没有等价的系统凭据存储，身份只在内存里（和此前所有平台的行为一致）。
@@ -169,8 +243,9 @@ mod windows_credentials {
     //! 所有宽字符串转换和裸指针操作集中在这里，调用方（`KeychainStore`）只打交道
     //! `DeviceCredentials` 和 `anyhow::Result`。
 
-    use super::DeviceCredentials;
+    use super::DeserializeOwned;
     use anyhow::{Context, Result, bail};
+    use serde::Serialize;
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
@@ -183,7 +258,7 @@ mod windows_credentials {
         OsStr::new(s).encode_wide().chain(Some(0)).collect()
     }
 
-    pub(super) fn load(target: &str) -> Result<Option<DeviceCredentials>> {
+    pub(super) fn load<T: DeserializeOwned>(target: &str) -> Result<Option<T>> {
         let target_w = wide(target);
         let mut p_cred: *mut CREDENTIALW = std::ptr::null_mut();
         // SAFETY: `target_w` 是有效的、以 NUL 结尾的宽字符串；成功时系统分配好一份 `CREDENTIALW`
@@ -198,7 +273,7 @@ mod windows_credentials {
             bail!("CredReadW failed with error {err}");
         }
         anyhow::ensure!(!p_cred.is_null(), "CredReadW returned no credential");
-        let result = (|| -> Result<DeviceCredentials> {
+        let result = (|| -> Result<T> {
             // SAFETY: Windows returned a non-null credential owned by CredFree.
             let cred = unsafe { &*p_cred };
             anyhow::ensure!(
@@ -217,7 +292,7 @@ mod windows_credentials {
         result.map(Some)
     }
 
-    pub(super) fn save(target: &str, creds: &DeviceCredentials) -> Result<()> {
+    pub(super) fn save(target: &str, creds: &(impl Serialize + ?Sized)) -> Result<()> {
         let target_w = wide(target);
         let mut comment_w = wide("OneX Edge device identity");
         let mut blob = Zeroizing::new(serde_json::to_vec(creds).context("serialize device credentials")?);
@@ -263,26 +338,45 @@ mod windows_credentials {
 }
 
 #[cfg(test)]
-pub struct MemoryStore(std::sync::Mutex<Option<DeviceCredentials>>);
+#[derive(Default)]
+pub struct MemoryStore {
+    active: std::sync::Mutex<Option<DeviceCredentials>>,
+    history: std::sync::Mutex<std::collections::HashMap<String, HistoryIdentity>>,
+    unscoped: std::sync::Mutex<std::collections::HashMap<String, Vec<HistoryIdentity>>>,
+}
 
 #[cfg(test)]
 impl MemoryStore {
     pub fn new() -> Self {
-        Self(std::sync::Mutex::new(None))
+        Self::default()
     }
 }
 
 #[cfg(test)]
 impl CredentialStore for MemoryStore {
     fn load(&self) -> Result<Option<DeviceCredentials>> {
-        Ok(self.0.lock().unwrap().clone())
+        Ok(self.active.lock().unwrap().clone())
     }
     fn save(&self, creds: &DeviceCredentials) -> Result<()> {
-        *self.0.lock().unwrap() = Some(creds.clone());
+        *self.active.lock().unwrap() = Some(creds.clone());
         Ok(())
     }
     fn clear(&self) -> Result<()> {
-        *self.0.lock().unwrap() = None;
+        *self.active.lock().unwrap() = None;
+        Ok(())
+    }
+    fn load_history(&self, scope: &HistoryScope<'_>) -> Result<Option<HistoryIdentity>> {
+        Ok(self.history.lock().unwrap().get(&history_service("memory", scope)).cloned())
+    }
+    fn save_history(&self, scope: &HistoryScope<'_>, identity: &HistoryIdentity) -> Result<()> {
+        self.history.lock().unwrap().insert(history_service("memory", scope), identity.clone());
+        Ok(())
+    }
+    fn load_unscoped_history(&self, server: &str) -> Result<Vec<HistoryIdentity>> {
+        Ok(self.unscoped.lock().unwrap().get(&unscoped_history_service("memory", server)).cloned().unwrap_or_default())
+    }
+    fn save_unscoped_history(&self, server: &str, history: &[HistoryIdentity]) -> Result<()> {
+        self.unscoped.lock().unwrap().insert(unscoped_history_service("memory", server), history.to_vec());
         Ok(())
     }
 }
@@ -348,7 +442,7 @@ mod tests {
         #[cfg(any(target_os = "macos", windows))]
         {
             let svc = format!("OneX Edge Device Credentials: test-{}", id_for_test());
-            let store = KeychainStore::new(svc);
+            let store = KeychainStore::new(svc.clone());
             store.clear().unwrap();
             assert_eq!(store.load().unwrap(), None);
             let c = creds("https://test.example");
@@ -357,8 +451,21 @@ mod tests {
             let c2 = creds("https://other.example");
             store.save(&c2).unwrap();
             assert_eq!(store.load().unwrap(), Some(c2));
+            let scope = HistoryScope { server: &c.server, tenant_id: "tenant-1", user_id: "user-1" };
+            let other = HistoryScope { user_id: "user-2", ..scope };
+            let identity = HistoryIdentity { device_id: c.device_id, device_key: c.device_key };
+            store.save_history(&scope, &identity).unwrap();
+            store.save_unscoped_history(scope.server, std::slice::from_ref(&identity)).unwrap();
             store.clear().unwrap();
+            let restored = store.load_history(&scope);
+            let isolated = store.load_history(&other);
+            let unscoped = store.load_unscoped_history(scope.server);
+            KeychainStore::new(history_service(&svc, &scope)).clear().unwrap();
+            KeychainStore::new(unscoped_history_service(&svc, scope.server)).clear().unwrap();
             assert_eq!(store.load().unwrap(), None);
+            assert!(restored.unwrap().as_ref() == Some(&identity));
+            assert!(isolated.unwrap().is_none());
+            assert!(unscoped.unwrap() == [identity]);
         }
     }
 

@@ -748,6 +748,99 @@ test('device credentials are scoped, hashed, repaired on lookup, and renewed onl
   expect(await connect(f, created.device_token).opened).toBe(false);
 });
 
+test('device resume rotates the bearer without resetting the account history or ingest cursor', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const scoped = await f.select(global);
+  const otherSession = await f.select(global);
+  const pair = generateKeyPairSync('x25519');
+  const publicKey = pair.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('base64');
+  const created = await (await f.request('/devices', { ...f.device, public_key: publicKey }, scoped)).json() as DeviceReply;
+  const deviceId = created.device_id;
+  const tenant = f.store.tenant(f.tenantId);
+  await tenant.write((sql) => {
+    sql.run('INSERT INTO ingest_cursors (device_id, ack_seq) VALUES (?, 7)', [deviceId]);
+    sql.run(`INSERT INTO agent_sessions (id, device_id, user_id, agent, agent_version, started_at)
+      VALUES (?, ?, ?, ?, ?, ?)`, ['historical-session', deviceId, f.userId, 'codex', '0.1.0', iso(f.now())]);
+  });
+  const old = connect(f, created.device_token);
+  expect(await old.opened).toBe(true);
+  old.hello(undefined, 7);
+  expect(await old.next()).toMatchObject({ type: 'welcome', device_id: deviceId, ack_seq: 7 });
+
+  const path = `/devices/${deviceId}/resume`;
+  const challenge = `${path}-challenge`;
+  const webSelection = await f.request('/auth/select-tenant', { tenant_id: f.tenantId, kind: 'web' }, global);
+  expect(webSelection.status).toBe(200);
+  const { token: web } = await webSelection.json() as { token: string };
+  const target = 'another-device-owner@example.test';
+  const joined = await f.request('/auth/login', { target, code: await f.code(target), invite_code: f.inviteCode, kind: 'desktop' });
+  expect(joined.status).toBe(200);
+  const foreign = await f.select((await joined.json() as { token: string }).token);
+  expect((await f.request(challenge, {}, global)).status).toBe(403);
+  expect((await f.request(challenge, {}, web)).status).toBe(403);
+  expect((await f.request(challenge, {}, foreign)).status).toBe(404);
+
+  async function receiveProof() {
+    const response = await f.request(challenge, {}, scoped);
+    expect(response.status).toBe(200);
+    const sealed = await response.json() as { key_id: string; nonce: string; ciphertext: string };
+    const der = Buffer.concat([Buffer.from('302a300506032b656e032100', 'hex'), Buffer.from(sealed.key_id, 'base64')]);
+    const sender = createPublicKey({ key: der, format: 'der', type: 'spki' });
+    function decrypt(recipient: typeof pair.privateKey) {
+      const shared = diffieHellman({ privateKey: recipient, publicKey: sender });
+      const key = Buffer.from(hkdfSync('sha256', shared, Buffer.alloc(0), 'onex-edge-secret-v1', 32));
+      return Buffer.from(xchacha20poly1305(key, Buffer.from(sealed.nonce, 'base64'), Buffer.from('onex-device-resume-v1'))
+        .decrypt(Buffer.from(sealed.ciphertext, 'base64'))).toString('utf8');
+    }
+    expect(() => decrypt(generateKeyPairSync('x25519').privateKey)).toThrow();
+    return decrypt(pair.privateKey);
+  }
+
+  const stale = await receiveProof();
+  f.advance(120_001);
+  expect((await f.request(path, { proof: stale }, scoped, 'expired-proof')).status).toBe(401);
+  const proof = await receiveProof();
+  expect((await f.request(path, { proof }, foreign, 'foreign-proof')).status).toBe(404);
+  expect((await f.request(path, { proof }, otherSession, 'other-session')).status).toBe(401);
+  expect((await f.request(path, { proof }, scoped)).status).toBe(422);
+  expect((await f.request(path, { proof: `${proof}\n` }, scoped, 'malformed')).status).toBe(422);
+  await tenant.write((sql) => sql.run('UPDATE devices SET token_expires_at = ? WHERE id = ?', [iso(f.now() - 1), deviceId]));
+  const rotationKeys = ['execute-first', 'execute-second'];
+  const attempts = await Promise.all(rotationKeys.map((key) => f.request(path, { proof }, scoped, key)));
+  expect(attempts.map((res) => res.status).sort()).toEqual([200, 401]);
+  const winner = attempts.findIndex((res) => res.status === 200);
+  const resumed = attempts[winner]!;
+  const retryKey = rotationKeys[winner]!;
+  const result = await resumed.json() as DeviceReply;
+  expect(result.device_id).toBe(deviceId);
+  expect(result.device_token).not.toBe(created.device_token);
+  expect((await old.closed).code).toBe(1008);
+  expect(await connect(f, created.device_token).opened).toBe(false);
+  expect(tenant.all('SELECT id, public_key, token_hash, token_expires_at FROM devices')).toEqual([{
+    id: deviceId, public_key: publicKey, token_hash: hash(result.device_token), token_expires_at: iso(f.now() + 30 * day),
+  }]);
+  expect(tenant.all('SELECT id, device_id, user_id FROM agent_sessions')).toEqual([{
+    id: 'historical-session', device_id: deviceId, user_id: f.userId,
+  }]);
+  await f.store.system.write((sql) => sql.run('DELETE FROM device_directory'));
+  const replay = await f.request(path, { proof }, scoped, retryKey);
+  expect(replay.status).toBe(200);
+  expect(await replay.json()).toEqual(result);
+  expect(f.store.system.get('SELECT token_hash FROM device_directory')).toEqual({ token_hash: hash(result.device_token) });
+  expect((await f.request(path, { proof }, scoped, 'different-key')).status).toBe(401);
+  expect((await f.request(path, { proof: stale }, scoped, retryKey)).status).toBe(409);
+
+  const current = connect(f, result.device_token);
+  expect(await current.opened).toBe(true);
+  current.hello(undefined, 7);
+  expect(await current.next()).toMatchObject({ type: 'welcome', device_id: deviceId, ack_seq: 7 });
+  const nextProof = await receiveProof();
+  await tenant.write((sql) => sql.run("UPDATE devices SET status = 'revoked' WHERE id = ?", [deviceId]));
+  expect((await f.request(challenge, {}, scoped)).status).toBe(404);
+  expect((await f.request(path, { proof: nextProof }, scoped, 'revoked-device')).status).toBe(404);
+});
+
 test('new device connection replaces old; heartbeat is correlated and closes after three misses', async () => {
   const f = await fixture(70);
   const scoped = await f.select(await f.login());

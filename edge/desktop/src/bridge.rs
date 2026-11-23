@@ -30,6 +30,8 @@ const KNOWN_CODES: &[&str] = &[
     "not_found",
     "conflict",
     "invalid",
+    "history_unavailable",
+    "agents_running",
     "seat_limit",
     "balance_exhausted",
     "lease_expired",
@@ -275,7 +277,18 @@ impl Bridge {
     }
 
     async fn state(&self) -> Reply {
+        let device = self.inner.lock().unwrap().device_id.clone();
         let status = self.ipc_call(&Request::Status).await.ok();
+        if let Some(status) = &status {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.phase == Phase::Ready && inner.device_id == device && !same_device(status, &inner) {
+                inner.phase = Phase::SignedOut;
+                inner.device_id = None;
+                inner.user_name = None;
+                inner.tenant = None;
+                inner.launching = None;
+            }
+        }
         self.snapshot(status.as_ref()).await
     }
 
@@ -424,7 +437,30 @@ impl Bridge {
         user_id: Option<&str>,
     ) -> Reply {
         let initial = self.ipc_status().await.map_err(|_| unavailable())?;
-        if !initial.logged_in {
+        if !initial.logged_in || initial.ws == "unauthenticated" {
+            let request = Request::ResumeDevice { server: server.to_owned(), session_token: scoped_token.to_owned() };
+            let reply = tokio::time::timeout(Duration::from_secs(30), ipc_call_with(&self.socket_path, &request))
+                .await
+                .map_err(|_| history_unavailable())?
+                .map_err(|_| history_unavailable())?;
+            if reply["ok"] != true {
+                return Err(match reply["error"]["code"].as_str() {
+                    Some("conflict") => device_session_conflict(),
+                    Some("agents_running") => agents_running(),
+                    _ => history_unavailable(),
+                });
+            }
+            if reply["resumed"] == true {
+                let device_id = str_field(&reply, "device_id")?;
+                if !onex_core::daemon::wait_for_device(&self.socket_path, &device_id).await {
+                    return Err(history_unavailable());
+                }
+                self.persist_login(tenant, user_name, device_id)?;
+                return self.state().await;
+            }
+            if reply["resumed"] != false {
+                return Err(history_unavailable());
+            }
             return self.register_device(server, scoped_token, tenant, user_name).await;
         }
 
@@ -635,18 +671,39 @@ impl Bridge {
     }
 
     async fn logout(&self) -> Reply {
-        let was_logged_in = self.inner.lock().unwrap().phase == Phase::Ready;
-        #[cfg(windows)]
-        let retired_key = if was_logged_in {
-            let info = self.ipc_call(&Request::DeviceInfo).await.map_err(|_| unavailable())?;
-            Some(str_field(&info, "public_key")?)
-        } else {
-            None
+        let device = {
+            let inner = self.inner.lock().unwrap();
+            inner.device_id.clone().filter(|_| inner.phase == Phase::Ready)
         };
-        if was_logged_in {
-            self.ipc_call(&Request::Logout).await.map_err(|_| unavailable())?;
+        #[cfg(windows)]
+        let mut retired_key = None;
+        if let Some(device_id) = &device {
+            #[cfg(windows)]
+            let key = {
+                let info = self.ipc_call(&Request::DeviceInfo).await.map_err(|_| unavailable())?;
+                str_field(&info, "public_key")?
+            };
+            let request = Request::LogoutDevice { device_id: device_id.clone() };
+            let reply = self.ipc_reply(&request).await.map_err(|_| unavailable())?;
+            if reply["error"]["code"] == "agents_running" {
+                return Err(agents_running());
+            }
+            if reply["error"]["code"] == "history_unavailable" {
+                return Err(history_unavailable());
+            }
+            if reply["ok"] != true && reply["error"]["code"] != "conflict" {
+                return Err(unavailable());
+            }
+            #[cfg(windows)]
+            if reply["ok"] == true {
+                retired_key = Some(key);
+            }
         }
-        let _ = profile::clear(&self.socket_path);
+        if let Some(device_id) = device.as_deref()
+            && profile::load(&self.socket_path).is_some_and(|saved| saved.device_id == device_id)
+        {
+            let _ = profile::clear(&self.socket_path);
+        }
         {
             let mut inner = self.inner.lock().unwrap();
             inner.phase = Phase::SignedOut;
@@ -940,6 +997,14 @@ fn device_session_conflict() -> ErrorBody {
         code: "device_already_logged_in".into(),
         message: "本机 OneX 已登录。请用同一租户和账号登录，或先用 OneX 命令行退出。".into(),
     }
+}
+
+fn history_unavailable() -> ErrorBody {
+    ErrorBody { code: "history_unavailable".into(), message: "暂时无法恢复当前账号的本机会话".into() }
+}
+
+fn agents_running() -> ErrorBody {
+    ErrorBody { code: "agents_running".into(), message: "请先关闭已启动的 OneX Agent".into() }
 }
 
 fn unavailable() -> ErrorBody {

@@ -145,9 +145,21 @@ pub(crate) fn seal_route_for_test(
     aad: &[u8],
     plaintext: &str,
 ) -> (String, String, String) {
+    seal_for_test(device_public, sender_secret, nonce, ROUTE_INFO, aad, plaintext)
+}
+
+#[cfg(test)]
+pub(crate) fn seal_for_test(
+    device_public: &[u8; 32],
+    sender_secret: [u8; 32],
+    nonce: [u8; 24],
+    info: &[u8],
+    aad: &[u8],
+    plaintext: &str,
+) -> (String, String, String) {
     let sender = StaticSecret::from(sender_secret);
     let shared = sender.diffie_hellman(&PublicKey::from(*device_public));
-    let key = derive(shared.as_bytes(), ROUTE_INFO);
+    let key = derive(shared.as_bytes(), info);
     let ct = XChaCha20Poly1305::new(key.as_ref().into())
         .encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext.as_bytes(), aad })
         .expect("encrypt");

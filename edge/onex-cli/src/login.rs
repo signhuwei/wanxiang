@@ -2,7 +2,11 @@
 //!
 //! 只有设备公钥离开本机；私钥一直在 onexd 内存里。登录和租户会话令牌只用于注册设备，用完即注销。
 
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
+use onex_core::ipc::Request;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -13,6 +17,7 @@ pub struct LoginArgs {
     pub tenant: Option<String>,
     pub device_name: String,
     pub public_key: String,
+    pub daemon: Option<PathBuf>,
 }
 
 pub struct PasswordLoginArgs<'a> {
@@ -22,6 +27,7 @@ pub struct PasswordLoginArgs<'a> {
     pub password: &'a str,
     pub device_name: &'a str,
     pub public_key: &'a str,
+    pub daemon: Option<&'a Path>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,7 +39,7 @@ struct Tenant {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Registered {
     pub device_id: String,
-    pub device_token: String,
+    pub device_token: Option<String>,
     pub tenant_name: String,
 }
 
@@ -75,7 +81,7 @@ pub async fn login_password(a: &PasswordLoginArgs<'_>) -> Result<Registered> {
     let result = async {
         let tenants: Vec<Tenant> = serde_json::from_value(reply["tenants"].clone()).context("无法读取登录租户")?;
         let [tenant] = tenants.as_slice() else { bail!("登录响应缺少唯一的租户") };
-        register_device(&api, &scoped, tenant, a.device_name, a.public_key).await
+        register_device(&api, &scoped, tenant, a.device_name, a.public_key, a.daemon).await
     }
     .await;
     let _ = api.post("/v1/auth/logout", Some(&scoped), json!({})).await;
@@ -105,7 +111,7 @@ async fn register(
         .await
         .context("选择租户失败")?;
     let scoped = str_field(&v, "token")?;
-    let result = register_device(api, &scoped, tenant, &a.device_name, &a.public_key).await;
+    let result = register_device(api, &scoped, tenant, &a.device_name, &a.public_key, a.daemon.as_deref()).await;
     let _ = api.post("/v1/auth/logout", Some(&scoped), json!({})).await;
     result
 }
@@ -116,7 +122,32 @@ async fn register_device(
     tenant: &Tenant,
     device_name: &str,
     public_key: &str,
+    daemon: Option<&Path>,
 ) -> Result<Registered> {
+    if let Some(path) = daemon {
+        let request = Request::ResumeDevice { server: api.base.to_owned(), session_token: scoped.to_owned() };
+        let result =
+            tokio::time::timeout(Duration::from_secs(30), onex_core::daemon::exchange(path, &request)).await??;
+        if result["ok"] != true {
+            if result["error"]["code"] == "conflict" {
+                bail!("本机 OneX 已有登录，请先退出当前账号");
+            }
+            if result["error"]["code"] == "agents_running" {
+                bail!("请先关闭已启动的 OneX Agent");
+            }
+            bail!("暂时无法恢复当前账号的本机会话");
+        }
+        if result["resumed"] == true {
+            let id = str_field(&result, "device_id")?;
+            if !onex_core::daemon::wait_for_device(path, &id).await {
+                bail!("已验证原设备，但本机 OneX 服务还未恢复，请重启后重试");
+            }
+            return Ok(Registered { device_id: id, device_token: None, tenant_name: tenant.name.clone() });
+        }
+        if result["resumed"] != false {
+            bail!("本机 OneX 历史检查返回无效响应");
+        }
+    }
     let dev = api
         .post(
             "/v1/devices",
@@ -128,7 +159,7 @@ async fn register_device(
         .context("注册设备失败")?;
     Ok(Registered {
         device_id: str_field(&dev, "device_id")?,
-        device_token: str_field(&dev, "device_token")?,
+        device_token: Some(str_field(&dev, "device_token")?),
         tenant_name: tenant.name.clone(),
     })
 }
@@ -282,6 +313,7 @@ mod tests {
             tenant: None,
             device_name: "Mac".into(),
             public_key: "PUB".into(),
+            daemon: None,
         }
     }
 
@@ -295,6 +327,7 @@ mod tests {
             password: "form-password",
             device_name: "Mac",
             public_key: "PUB",
+            daemon: None,
         };
         let registered = login_password(&args).await.unwrap();
         assert_eq!(registered.tenant_name, "甲公司");
@@ -331,7 +364,9 @@ mod tests {
         let r = login(&args(&url), &mut |_| Ok(answers.pop().unwrap())).await.unwrap();
         assert_eq!(
             r,
-            Registered { device_id: "dev_1".into(), device_token: "dtok".into(), tenant_name: "乙公司".into() }
+            Registered {
+                device_id: "dev_1".into(), device_token: Some("dtok".into()), tenant_name: "乙公司".into()
+            }
         );
         let calls = &seen.lock().unwrap().calls;
         let paths: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();

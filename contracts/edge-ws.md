@@ -6,6 +6,7 @@
 
 - 地址：`wss://<server>/v1/edge/ws`。请求头 `Authorization: Bearer <device_token>`，`OneX-Edge-Version: <semver>`，`OneX-Protocol: 0`。
 - `device_token` 在 Desktop 登录后由 `POST /v1/devices` 签发，存系统钥匙串。与用户会话令牌分开，有效期 30 天，滑动续期。
+- 使用同一账号恢复原设备时，Edge 通过[设备恢复接口](http-api.md)更换设备令牌。旧令牌的连接以关闭码 1008 `device unavailable` 结束。新连接沿用设备 ID 和已确认的回流序号。
 - 一台设备同时只能有一条连接。新连接建立后，Server 关闭旧连接（关闭码 4001 `replaced`）。
 - 每条消息是一个 JSON 文本帧：`{"type": "...", "id": "<msg_id>", ...}`。需要应答的消息由对方回 `{"type": "ack", "re": "<msg_id>", "ok": true}` 或带 `error`（见 errors.md）。
 
@@ -80,6 +81,7 @@ v0.15 的 `config` 可携带平台合约和租户配置修订，字段和兼容�
 - 事件带 `source_offset`（在会话文件中的字节偏移），读取游标、事件和 outbox 在一个本地事务里提交。
 - 读到坏行、未知类型、文件被替换或截短时，发一条 `kind: "gap"` 事件，payload 为 `{reason, offset}`，不能把缺口显示为完整。
 - 一个 `session_id` 只属于第一次上报它的那台设备。其他设备用同一个 `session_id` 上报，Server 拒绝整批（`conflict`）并记日志，不记正文。员工换电脑后 resume 会产生新的会话。
+- 原厂配置与会话文件保存在设备目录，受管发行制品按 SHA-256 独立缓存。升级 Edge 或受管发行时继续使用已验证的原设备目录。换账号后由该账号的设备目录提供会话、游标和待回传事件。
 - WorkBuddy 和 DeepSeek 的留存从最后一次确认的结束时间起算。应用退出时，Edge 先补传可见记录，再结束本次实际使用的会话。Edge 本身异常退出后，重新打开受管应用时补记此前未关闭的会话。扫描旧记录不会重开会话。
 - 续聊仍使用原 `session_id`。Edge 先排入 `session_resume`，再排入本次新的可见记录。Server 按设备序号忽略落在恢复之前的迟到结束事件。正文已到期的会话恢复后，只接收从恢复事件开始、原生时间晚于上次结束的可见记录。旧正文和分享不会回填，原用量和审计保留。
 - thinking 内容、签名和凭据不回流。会话文件中的 `api-request`、`api-request-blob` 行含完整模型请求，也不回流。
@@ -157,7 +159,8 @@ S1 起存在的缺陷：续租回 `cutoff` 后，Edge 保留旧租约并重放�
 ## 多 Agent 接入补充（v0.13）
 
 - **OneX session_id**：`session_id` = UUID v5（命名空间为设备 ID 的 UUID v5，名字为 `<agent>:<原生会话 ID>`）。同一原生会话无论第几次启动（Codex `resume`、Kimi `--session`）都得到同一个 `session_id`，只发一次 `session_start`。采集游标按原生会话文件持久保存在设备本地，续接时从旧游标往后读，不重报旧内容。原生会话 ID 未知前产生的模型请求，usage 的 `session_id` 用本次启动的 launch 级 UUID；拿到原生 ID 后，后续 usage 用该会话的 `session_id`。
-- **费用归属**：一次启动里出现多个原生会话时，router 无法区分请求属于哪个会话，usage 记在该次启动最近活跃的原生会话上。S2 接受这个近似，监察页的会话费用以此为准。
+- Codex 与 Kimi 的每次启动仍拥有独立的配置、工具和本机模型凭据。启动时搬入同一设备、同一工作区已经关闭的原厂历史，保留原生会话 ID 和游标。打开列表本身不回流旧内容。Claude Code 从自己的持久化工作区恢复，Edge 用原厂 Messages 请求的会话标识与本地原生文件核对续聊归属。
+- **费用归属**：当前 Codex CLI 的 `x-codex-turn-metadata.thread_id`、Kimi Code 的原生 `metadata.user_id` 均逐笔核对本次启动的工作区与历史来源，续聊或者切换会话后直接记入对应会话。较旧的客户端缺少原生标识时，继续使用该启动的会话发现结果。
 - **payload 公共字段**：`uuid` 取原生记录 ID，没有就填 null；`parentUuid` 同理；`sidechain` 只有子 Agent 为 true；`agent_id` 主会话为 null，子 Agent 填原生子 Agent 名或 ID。Kimi 主 agent 的 `agent_id` 为 null。
 - **系统注入不算发言**：Codex 的 `developer` 消息、`environment_context`、`user_instructions` 等注入，Kimi 的同类注入，不生成 `user_message`，不计入 `turn_count`。
 - **已知忽略清单**：各采集器在代码里显式列出已识别、无需上报的记录类型（如 Codex `session_meta`、`turn_context`、`reasoning`，Kimi 流式分片和 context 重放），列表内的跳过且不生成 `gap`，列表外的未知类型生成 `gap`。清单要有测试。

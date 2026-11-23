@@ -451,8 +451,8 @@ impl DesktopSessions {
 }
 
 #[derive(Deserialize)]
-struct NativeTurn {
-    thread_id: Uuid,
+pub(crate) struct NativeTurn {
+    pub(crate) thread_id: Uuid,
     turn_id: Uuid,
 }
 
@@ -463,7 +463,7 @@ struct TurnChange {
     started: bool,
 }
 
-fn native_turn(headers: &HeaderMap) -> Option<NativeTurn> {
+pub(crate) fn native_turn(headers: &HeaderMap) -> Option<NativeTurn> {
     if headers.get_all("x-codex-turn-metadata").iter().count() != 1 || headers.get_all("thread-id").iter().count() > 1 {
         return None;
     }

@@ -76,48 +76,9 @@ fn show_main(app: &tauri::AppHandle) {
 /// 如果新进程因旧管道尚未关闭而退出，在有界等待期间重试。
 #[cfg(windows)]
 pub(crate) async fn ensure_onexd_running(socket: &std::path::Path, retired_key: Option<&str>) {
-    use std::os::windows::process::CommandExt;
-    use std::time::Duration;
-
-    const MAX_WAIT: u32 = 20;
-    const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-    const RETRY_INTERVAL: Duration = Duration::from_millis(250);
-    const DETACHED_PROCESS: u32 = 0x00000008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-
-    let mut child: Option<std::process::Child> = None;
-    for _ in 0..MAX_WAIT {
-        let probe = bridge::ipc_call_with(socket, &onex_core::ipc::Request::DeviceInfo);
-        if let Ok(Ok(info)) = tokio::time::timeout(PROBE_TIMEOUT, probe).await
-            && info["ok"] == true
-            && let Some(key) = info["public_key"].as_str()
-        {
-            if Some(key) != retired_key {
-                return;
-            }
-        } else if child.as_mut().is_none_or(|child| matches!(child.try_wait(), Ok(Some(_)))) {
-            let Ok(exe) = std::env::current_exe() else { return };
-            let (Some(dir), Some(home)) = (exe.parent(), socket.parent()) else { return };
-            let onexd = dir.join("onexd.exe");
-            if !onexd.is_file() {
-                tracing::warn!(path = %onexd.display(), "onexd.exe sidecar not found next to OneX Desktop.exe");
-                return;
-            }
-            match std::process::Command::new(&onexd)
-                .env("ONEX_HOME", home)
-                .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-                .spawn()
-            {
-                Ok(started) => child = Some(started),
-                Err(error) => {
-                    tracing::warn!(%error, path = %onexd.display(), "failed to start onexd sidecar");
-                    return;
-                }
-            }
-        }
-        tokio::time::sleep(RETRY_INTERVAL).await;
+    if onex_core::daemon::wait_for_device_info(socket, retired_key).await.is_none() {
+        tracing::warn!("onexd sidecar did not become ready");
     }
-    tracing::warn!("onexd sidecar did not become ready");
 }
 
 pub fn run() {

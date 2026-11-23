@@ -49,12 +49,17 @@
 //!
 //! 受管启动层负责验证原生会话的目录、身份和 cwd，并派生 OneX 会话 ID。
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
+use crate::kimi_launch::RestoredHistory;
+use crate::native_capture::{open_private_regular, plain_directory};
 use crate::outbox::Outbox;
 
 /// 单行上限，超过记 gap 跳过
@@ -116,12 +121,32 @@ pub struct Capture {
     s: Session,
     outbox: Arc<Outbox>,
     key: String,
+    history: Option<RestoredHistory>,
 }
 
 impl Capture {
     pub fn new(s: Session, outbox: Arc<Outbox>) -> Self {
         let key = format!("kimi-code:{}", s.session_id);
-        Self { s, outbox, key }
+        Self { s, outbox, key, history: None }
+    }
+
+    pub(crate) fn with_restored_history(mut self, history: Option<RestoredHistory>) -> Self {
+        self.history = history;
+        self
+    }
+
+    pub(crate) fn has_native_activity(&self) -> bool {
+        let Some(history) = &self.history else { return true };
+        self.files().into_iter().any(|(agent, path)| {
+            let Some(file) = open_private_regular(&path, &self.s.session_dir) else { return false };
+            let Ok(meta) = file.metadata() else { return false };
+            match history.wires.get(&agent) {
+                Some(wire) => {
+                    meta.len() > wire.length && wire_identity(&file, &meta).is_ok_and(|id| id == wire.identity)
+                }
+                None => meta.len() > 0,
+            }
+        })
     }
 
     /// 主 Agent 和已发现的子 Agent 各一份 wire.jsonl：`agents/<agent>/wire.jsonl`。
@@ -129,7 +154,7 @@ impl Capture {
     /// `agents/x` 整个指向自己任意目录，让目录内任何名叫 `wire.jsonl` 的文件被读取回流。
     fn files(&self) -> Vec<(String, PathBuf)> {
         let dir = self.s.session_dir.join("agents");
-        if !std::fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
+        if !plain_directory(&dir) {
             return Vec::new();
         }
         let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
@@ -138,8 +163,7 @@ impl Capture {
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
                 let agent_dir = e.path();
-                let meta = std::fs::symlink_metadata(&agent_dir).ok()?;
-                if !meta.is_dir() {
+                if !plain_directory(&agent_dir) {
                     return None;
                 }
                 let wire = agent_dir.join("wire.jsonl");
@@ -157,54 +181,85 @@ impl Capture {
 
     /// 读一次新增内容（所有已发现的 Agent 子目录）。首次调用时补发 session_start。
     pub fn pass(&self) -> Result<Pass> {
-        let mut cur = self.outbox.cursor(&self.key)?.unwrap_or(json!({"started": false, "files": {}}));
-        let mut events = Vec::new();
-        if cur["started"] != true {
-            let cwd_hash = sha256_hex(self.s.cwd.to_string_lossy().as_bytes());
-            events.push(self.base(
-                "session_start",
-                json!({"agent": "kimi-code", "agent_version": self.s.agent_version, "cwd_hash": cwd_hash,
-                    "model": self.s.model, "uuid": null, "parentUuid": null, "sidechain": false, "agent_id": null}),
-                None,
-                None,
-            ));
-            cur["started"] = true.into();
+        if !self.has_native_activity() {
+            return Ok(Pass::default());
         }
+        let saved = self.outbox.cursor(&self.key)?.unwrap_or(json!({"started": false, "files": {}}));
+        let mut cur = saved.clone();
+        let mut events = Vec::new();
         if cur["files"].is_null() {
             cur["files"] = json!({});
         }
         for (agent_id, path) in self.files() {
-            let is_main = agent_id == "main";
-            let agent_tag: Option<&str> = if is_main { None } else { Some(agent_id.as_str()) };
             let mut file_cur = cur["files"][&agent_id].clone();
             if file_cur.is_null() {
                 file_cur = json!({"ino": null, "offset": 0, "protocol": null});
             }
-            self.read_file(&path, agent_tag, &mut file_cur, &mut events)?;
+            self.read_file(&path, &agent_id, &mut file_cur, &mut events)?;
             cur["files"][&agent_id] = file_cur;
+        }
+        if self.history.is_none() || !events.is_empty() {
+            let cwd_hash = sha256_hex(self.s.cwd.to_string_lossy().as_bytes());
+            let details = json!({"agent": "kimi-code", "agent_version": self.s.agent_version, "cwd_hash": cwd_hash,
+                "model": self.s.model, "uuid": null, "parentUuid": null, "sidechain": false, "agent_id": null});
+            let location = self.s.session_dir.to_string_lossy();
+            let new_profile = self.history.is_some() && cur["restored_profile"].as_str() != Some(&location);
+            if cur["started"] != true {
+                events.insert(0, self.base("session_start", details, None, None));
+                cur["started"] = true.into();
+            } else if new_profile || (cur["ended"] == true && !events.is_empty()) {
+                events.insert(0, self.base("session_resume", details, None, None));
+            }
+            if self.history.is_some() {
+                cur["restored_profile"] = location.as_ref().into();
+            }
         }
         let n = events.len();
         if n > 0 {
             cur["ended"] = false.into();
         }
-        if n > 0 || cur != self.outbox.cursor(&self.key)?.unwrap_or(Value::Null) {
+        if n > 0 || cur != saved {
             self.outbox.append_events_with_cursor(events, &self.key, &cur)?;
         }
         Ok(Pass { events: n })
     }
 
-    fn read_file(&self, path: &Path, agent_id: Option<&str>, cur: &mut Value, events: &mut Vec<Value>) -> Result<()> {
-        let meta = std::fs::symlink_metadata(path)?;
-        if !meta.file_type().is_file() || !owned_by_same_principal(path, &self.s.session_dir)? {
-            if cur["refused"] != true {
+    fn read_file(&self, path: &Path, name: &str, cur: &mut Value, events: &mut Vec<Value>) -> Result<()> {
+        let agent_id = (name != "main").then_some(name);
+        let restored_wire = self.history.as_ref().and_then(|history| history.wires.get(name));
+        let Some(mut file) = open_private_regular(path, &self.s.session_dir) else {
+            if cur["refused"] != true && restored_wire.is_none() {
                 events.push(self.gap(agent_id, "not_regular_file", None, 0));
                 cur["refused"] = true.into();
             }
             return Ok(());
-        }
+        };
+        let meta = file.metadata()?;
+        let identity = wire_identity(&file, &meta)?;
+        let prior_identity = cur["ino"].as_u64();
         let mut offset = cur["offset"].as_u64().unwrap_or(0);
-        let identity = file_identity(path, &meta)?;
-        if cur["ino"].as_u64().is_some_and(|i| i != identity) {
+        if let Some(wire) = restored_wire {
+            // An imported prefix is a copy of existing history. Start on its exact new inode,
+            // after the verified prefix, even when this device has no old capture cursor.
+            if identity != wire.identity
+                || meta.len() < wire.length
+                || (prior_identity == Some(identity) && meta.len() < offset)
+            {
+                return Ok(());
+            }
+            let verified = prior_identity == Some(identity)
+                && offset >= wire.length
+                && cur["imported_prefix"].as_str() == Some(&wire.prefix_hash);
+            if !verified {
+                if !matches_prefix(&mut file, wire.length, &wire.prefix_hash)? {
+                    return Ok(());
+                }
+                offset = wire.length;
+                cur["protocol"] = json!(wire.protocol);
+                cur["native_turn"] = Value::Null;
+                cur["imported_prefix"] = wire.prefix_hash.as_str().into();
+            }
+        } else if prior_identity.is_some_and(|i| i != identity) {
             events.push(self.gap(agent_id, "file_replaced", None, offset));
             offset = 0;
             cur["protocol"] = Value::Null;
@@ -220,7 +275,7 @@ impl Capture {
             cur["offset"] = offset.into();
             return Ok(());
         }
-        let buf = read_range(path, offset, READ_CHUNK.min(meta.len() - offset))?;
+        let buf = read_range(&mut file, offset, READ_CHUNK.min(meta.len() - offset))?;
         let mut pos = 0;
         while let Some(nl) = buf[pos..].iter().position(|&b| b == b'\n') {
             let line = &buf[pos..pos + nl];
@@ -229,7 +284,7 @@ impl Capture {
         }
         if pos == 0 && buf.len() > MAX_LINE {
             events.push(self.gap(agent_id, "line_too_large", None, offset));
-            match find_newline(path, offset + buf.len() as u64)? {
+            match find_newline(&mut file, offset + buf.len() as u64)? {
                 Some(next) => pos = (next + 1 - offset) as usize,
                 None => pos = buf.len(),
             }
@@ -524,7 +579,7 @@ impl Capture {
     pub fn end(&self, exit_code: Option<i32>) -> Result<()> {
         self.pass()?;
         let mut cur = self.outbox.cursor(&self.key)?.unwrap_or(json!({}));
-        if cur["ended"] == true {
+        if cur["ended"] == true || cur["started"] != true || !self.has_native_activity() {
             return Ok(());
         }
         let mut events = Vec::new();
@@ -605,18 +660,29 @@ fn sha256_hex(data: &[u8]) -> String {
     Sha256::digest(data).iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn read_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    f.seek(SeekFrom::Start(offset))?;
+fn matches_prefix(file: &mut File, length: u64, expected: &str) -> Result<bool> {
+    let mut hash = Sha256::new();
+    let mut remaining = length;
+    let mut buffer = [0; 16 * 1024];
+    while remaining > 0 {
+        let chunk = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..chunk])?;
+        hash.update(&buffer[..chunk]);
+        remaining -= chunk as u64;
+    }
+    Ok(crate::capture::hex(&hash.finalize()) == expected)
+}
+
+fn read_range(file: &mut File, offset: u64, len: u64) -> Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(offset))?;
     let mut buf = Vec::with_capacity(len as usize);
-    f.take(len).read_to_end(&mut buf)?;
+    file.take(len).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
-fn find_newline(path: &Path, mut from: u64) -> Result<Option<u64>> {
+fn find_newline(file: &mut File, mut from: u64) -> Result<Option<u64>> {
     loop {
-        let buf = read_range(path, from, 1024 * 1024)?;
+        let buf = read_range(file, from, 1024 * 1024)?;
         if buf.is_empty() {
             return Ok(None);
         }
@@ -628,79 +694,15 @@ fn find_newline(path: &Path, mut from: u64) -> Result<Option<u64>> {
 }
 
 #[cfg(unix)]
-fn file_identity(_path: &Path, meta: &std::fs::Metadata) -> Result<u64> {
+pub(crate) fn wire_identity(_file: &File, meta: &std::fs::Metadata) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
     Ok(meta.ino())
 }
 
 #[cfg(windows)]
-fn file_identity(path: &Path, _meta: &std::fs::Metadata) -> Result<u64> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
-    let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: 和 `capture.rs::file_identity` 同样的前提：`f` 句柄在调用期间保持有效，`info`
-    // 是栈上足够大小的缓冲区，系统只在成功时写入它。
-    let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) };
-    anyhow::ensure!(ok != 0, "GetFileInformationByHandle failed for {}", path.display());
+pub(crate) fn wire_identity(file: &File, _meta: &std::fs::Metadata) -> Result<u64> {
+    let info = crate::capture::windows_file_info(file)?;
     Ok(((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
-}
-
-#[cfg(unix)]
-fn owned_by_same_principal(path: &Path, reference_dir: &Path) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-    let owner = std::fs::metadata(reference_dir)?.uid();
-    Ok(std::fs::symlink_metadata(path)?.uid() == owner)
-}
-
-#[cfg(windows)]
-fn owned_by_same_principal(path: &Path, reference_dir: &Path) -> Result<bool> {
-    let a = windows_owner_sid(path)?;
-    let b = windows_owner_sid(reference_dir)?;
-    Ok(a == b)
-}
-
-#[cfg(windows)]
-fn windows_owner_sid(path: &Path) -> Result<String> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSID};
-    let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
-    let mut owner: PSID = std::ptr::null_mut();
-    let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
-    // SAFETY: 和 `capture.rs::windows_owner_sid` 同样的前提，见那里的注释。
-    let status = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            &mut owner,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut sd,
-        )
-    };
-    anyhow::ensure!(status == 0, "GetNamedSecurityInfoW failed for {} (status {status})", path.display());
-    let result = (|| -> Result<String> {
-        let mut sid_str: *mut u16 = std::ptr::null_mut();
-        let ok = unsafe { ConvertSidToStringSidW(owner, &mut sid_str) };
-        anyhow::ensure!(ok != 0, "ConvertSidToStringSidW failed");
-        let len = unsafe {
-            let mut n = 0usize;
-            while *sid_str.add(n) != 0 {
-                n += 1;
-            }
-            n
-        };
-        let s = unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(sid_str, len)) };
-        unsafe { LocalFree(sid_str as *mut std::ffi::c_void) };
-        Ok(s)
-    })();
-    unsafe { LocalFree(sd) };
-    result
 }
 
 #[cfg(test)]

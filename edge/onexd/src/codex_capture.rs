@@ -6,11 +6,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::capture::Session;
+use crate::codex_launch::RestoredHistory;
 use crate::outbox::Outbox;
 
 /// 单行上限，超过记 gap 跳过（和 capture.rs 同一个量级：rollout 的工具输出理论上也可能很大）。
@@ -23,17 +24,33 @@ pub struct Capture {
     key: String,
     path: PathBuf,
     agent: &'static str,
+    restored: Option<RestoredHistory>,
 }
 
 impl Capture {
     pub fn new(s: Session, path: PathBuf, outbox: Arc<Outbox>) -> Self {
         let key = format!("codex:{}", s.session_id);
-        Self { s, path, outbox, key, agent: "codex" }
+        Self { s, path, outbox, key, agent: "codex", restored: None }
     }
 
     pub(crate) fn desktop(mut self) -> Self {
         self.agent = "codex-desktop";
         self
+    }
+
+    pub(crate) fn with_restored_history(mut self, restored: Option<RestoredHistory>) -> Self {
+        self.restored = restored;
+        self
+    }
+
+    pub(crate) fn has_native_activity(&self) -> Result<bool> {
+        let Some(history) = &self.restored else { return Ok(true) };
+        let meta = std::fs::symlink_metadata(&self.path)?;
+        ensure!(
+            meta.is_file() && crate::capture::file_identity(&self.path, &meta)? == history.identity,
+            "restored Codex rollout replaced"
+        );
+        Ok(meta.len() > history.floor)
     }
 
     fn base(&self, kind: &str, payload: Value, offset: Option<u64>) -> Value {
@@ -50,8 +67,26 @@ impl Capture {
     }
 
     pub fn pass(&self) -> Result<()> {
-        let mut cur = self.outbox.cursor(&self.key)?.unwrap_or(json!({"started": false, "ino": null, "offset": 0}));
+        if !self.has_native_activity()? {
+            return Ok(());
+        }
+        let saved = self.outbox.cursor(&self.key)?.unwrap_or(Value::Null);
+        let mut cur = if saved.is_null() { json!({"started": false, "ino": null, "offset": 0}) } else { saved.clone() };
         let mut events = Vec::new();
+        let resumed = self.restored.as_ref().is_some_and(|history| saved["ino"].as_u64() != Some(history.identity));
+        if resumed && let Some(history) = &self.restored {
+            let mut file = crate::native_capture::open_private_regular(&self.path, &self.s.config_dir)
+                .ok_or_else(|| anyhow::anyhow!("invalid restored Codex rollout"))?;
+            ensure!(
+                crate::codex_launch::prefix_digest(&mut file, history.floor)? == history.digest,
+                "restored Codex rollout prefix changed"
+            );
+            // Rebind the verified source cursor to the snapshot. Its known
+            // uncaptured tail still needs delivery. Without that source cursor
+            // the complete copied prefix is historical, so don't replay it.
+            cur["ino"] = history.identity.into();
+            cur["offset"] = history.capture_offset(&saved).into();
+        }
         if cur["started"] != true {
             let cwd_hash = crate::capture::hex(&Sha256::digest(self.s.cwd.to_string_lossy().as_bytes()));
             events.push(self.base(
@@ -61,13 +96,19 @@ impl Capture {
                 None,
             ));
             cur["started"] = true.into();
+        } else if resumed {
+            events.push(self.base("session_resume", json!({}), None));
         }
+        let offset_before = cur["offset"].as_u64();
         self.read_file(&self.path, &mut cur, &mut events)?;
+        if resumed && cur["offset"].as_u64() == offset_before {
+            return Ok(());
+        }
         if !events.is_empty() {
             cur["ended"] = false.into();
         }
-        if !events.is_empty() || cur != self.outbox.cursor(&self.key)?.unwrap_or(Value::Null) {
-            self.outbox.append_events_with_cursor(events, &self.key, &cur)?;
+        if !events.is_empty() || cur != saved {
+            self.outbox.append_if_cursor(events, &self.key, &cur, Some(&saved))?;
         }
         Ok(())
     }
@@ -86,6 +127,9 @@ impl Capture {
         }
         let mut offset = cur["offset"].as_u64().unwrap_or(0);
         let identity = crate::capture::file_identity(path, &meta)?;
+        if let Some(history) = &self.restored {
+            ensure!(identity == history.identity && meta.len() >= offset, "restored Codex rollout changed");
+        }
         if cur["ino"].as_u64().is_some_and(|i| i != identity) {
             events.push(self.gap("file_replaced", offset));
             offset = 0;
@@ -244,11 +288,24 @@ impl Capture {
 
     /// 进程退出：收尾写，然后发 session_end。
     pub fn end(&self, exit_code: Option<i32>) -> Result<()> {
-        self.pass()?;
-        let mut cur = self.outbox.cursor(&self.key)?.unwrap_or(json!({}));
-        if cur["ended"] == true {
+        let end = std::fs::symlink_metadata(&self.path).map_or(0, |meta| meta.len());
+        let mut saved = self.outbox.cursor(&self.key)?.unwrap_or(Value::Null);
+        loop {
+            self.pass()?;
+            let next = self.outbox.cursor(&self.key)?.unwrap_or(Value::Null);
+            let offset = next["offset"].as_u64();
+            let caught_up = offset == saved["offset"].as_u64() || offset.is_some_and(|at| at >= end);
+            saved = next;
+            if caught_up {
+                break;
+            }
+        }
+        if saved["ended"] == true
+            || self.restored.as_ref().is_some_and(|history| saved["ino"].as_u64() != Some(history.identity))
+        {
             return Ok(());
         }
+        let mut cur = saved.clone();
         cur["ended"] = true.into();
         let reason = match exit_code {
             Some(0) => "exited".to_string(),
@@ -260,7 +317,7 @@ impl Capture {
             json!({"reason": reason, "uuid": null, "parentUuid": null, "sidechain": false, "agent_id": null}),
             None,
         );
-        self.outbox.append_events_with_cursor(vec![ev], &self.key, &cur)
+        self.outbox.append_if_cursor(vec![ev], &self.key, &cur, Some(&saved)).map(|_| ())
     }
 }
 

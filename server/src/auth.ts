@@ -7,16 +7,21 @@ import { ApiError, field, invalid, json, operation } from './api';
 import { platformCreateActions, tenantActions } from './actions';
 import { quotaBinding, selfMonthUsage } from './billing';
 import { bearer, day, hash, hmac, iso, normalizedTarget, personalLoginTokenPattern, randomToken } from './credentials';
+import { encryptEdgeSecret } from './edge-secret';
 import { ensureUser, findUser, type User } from './seed';
 import { indexDevice, indexMember, type Member, type Store, type Transaction } from './store';
 import { normalizeLoginName, passwordLoginLimiter, validLoginPassword, verifyLoginPassword } from './tenant-passwords';
 
 const codeCooldown = 60_000;
 const codeTtl = 10 * 60_000;
+const resumeTtl = 2 * 60_000;
+const resumeContext = 'onex-device-resume-v1';
+const deviceIdPattern = /^dev_[0-9A-HJKMNP-TV-Z]{26}$/;
 export const deviceTtl = 30 * day;
 type Kind = 'web' | 'desktop';
 type Session = { user_id: string; tenant_id: string | null; kind: Kind; expires_at: string; login_token_id: string | null; tenant_password_login: number };
 type LoginTokenLink = { id: string; expires_at: string };
+type ResumeDevice = { id: string; public_key: string; token_hash: string };
 type Tenant = { id: string; name: string; status: string; revision: number };
 
 function kind(value: unknown): Kind | undefined {
@@ -52,7 +57,9 @@ function readSession(sql: Pick<Transaction, 'get'>, tokenHash: string, at: numbe
 
 export function authenticate(store: Store, c: Context, at: number) { return readSession(store.system, tokenOf(c), at); }
 
-export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; now: () => number; deliverCode?: (target: string, code: string) => void; onConfigChange?: (tenantId:string)=>void }) {
+export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; now: () => number;
+  deliverCode?: (target: string, code: string) => void; onConfigChange?: (tenantId: string) => void;
+  onDeviceTokenRotated?: (deviceId: string, previousTokenHash: string) => void }) {
   const { now, codeSecret } = opts;
   const pending = new Map<string, Promise<Response>>();
   const limitPasswordLogin = passwordLoginLimiter();
@@ -348,5 +355,83 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
     const issued = await result.clone().json() as { device_id: string; device_token: string };
     await store.system.write((sql) => indexDevice(sql, id, { id: issued.device_id, token_hash: hash(issued.device_token) }));
     return result;
+  });
+
+  function resumeActor(token: string, at: number) {
+    const actor = session(token, at);
+    if (!actor.tenant_id || actor.login_token_id || actor.kind !== 'desktop' || !tenant(actor.tenant_id)) {
+      throw new ApiError('forbidden');
+    }
+    return { tenantId: actor.tenant_id, userId: actor.user_id };
+  }
+
+  function resumeDevice(sql: Pick<Transaction, 'get'>, userId: string, deviceId: string) {
+    const row = sql.get<ResumeDevice>(`SELECT d.id, d.public_key, d.token_hash FROM devices d
+      JOIN members m ON m.user_id = d.user_id
+      WHERE d.id = ? AND d.user_id = ? AND d.status = 'active' AND m.status = 'active' AND d.public_key != ''`, [deviceId, userId]);
+    if (!row) throw new ApiError('not_found');
+    return row;
+  }
+
+  const resumeMac = (token: string, tenantId: string, userId: string, row: ResumeDevice, expires: number) =>
+    hmac(codeSecret, [resumeContext, token, tenantId, userId, row.id, row.public_key, row.token_hash, expires]);
+
+  app.post('/v1/devices/:id/resume-challenge', async (c) => {
+    const deviceId = c.req.param('id');
+    if (!deviceIdPattern.test(deviceId)) invalid('id');
+    if (Object.keys(await json(c)).length !== 0) invalid('body');
+    const at = now();
+    const token = tokenOf(c);
+    const { tenantId, userId } = resumeActor(token, at);
+    const row = resumeDevice(store.tenant(tenantId), userId, deviceId);
+    const expires = at + resumeTtl;
+    const proof = Buffer.from(`${expires}.${resumeMac(token, tenantId, userId, row, expires)}`);
+    try {
+      return c.json(encryptEdgeSecret(row.public_key, resumeContext, proof));
+    } catch {
+      // Legacy registrations permitted a syntactically valid low-order X25519 key.
+      throw new ApiError('not_found');
+    } finally {
+      proof.fill(0);
+    }
+  });
+
+  app.post('/v1/devices/:id/resume', async (c) => {
+    const deviceId = c.req.param('id');
+    if (!deviceIdPattern.test(deviceId)) invalid('id');
+    const body = await json(c);
+    if (Object.keys(body).length !== 1) invalid('body');
+    const proof = field(body.proof, 'proof', 64);
+    const parsed = /^([1-9]\d{0,15})\.([A-Za-z0-9_-]{43})$/.exec(proof);
+    if (!parsed || parsed[0] !== proof) invalid('proof');
+    const expires = Number(parsed[1]);
+    const at = now();
+    const token = tokenOf(c);
+    const { tenantId, userId } = resumeActor(token, at);
+    const op = operation(c, codeSecret, at, token, [deviceId, proof]);
+    if (!op.key) invalid('Idempotency-Key');
+    const result = await store.tenant(tenantId).write((sql) => {
+      const checkedAt = now();
+      resumeActor(token, checkedAt);
+      const row = resumeDevice(sql, userId, deviceId);
+      const cached = op.read(sql);
+      if (cached) return { response: cached };
+      const expected = resumeMac(token, tenantId, userId, row, expires);
+      if (!Number.isSafeInteger(expires) || expires <= checkedAt || expires > checkedAt + resumeTtl ||
+          !timingSafeEqual(Buffer.from(expected), Buffer.from(parsed[2]!))) throw new ApiError('unauthenticated');
+      sql.run('UPDATE devices SET token_hash = ?, token_expires_at = ? WHERE id = ?', [hash(op.token), iso(checkedAt + deviceTtl), deviceId]);
+      return { response: op.complete(sql, { status: 200, credential: 'device_token', payload: { device_id: deviceId } }, resumeTtl),
+        previousTokenHash: row.token_hash };
+    });
+    if (result.previousTokenHash) opts.onDeviceTokenRotated?.(deviceId, result.previousTokenHash);
+    const issued = await result.response.clone().json() as { device_token: string };
+    await store.system.write((sql) => {
+      resumeActor(token, now());
+      // The tenant row is authoritative; a retry repairs an interrupted directory update.
+      const current = resumeDevice(store.tenant(tenantId), userId, deviceId);
+      if (current.token_hash !== hash(issued.device_token)) throw new ApiError('conflict');
+      indexDevice(sql, tenantId, current);
+    });
+    return result.response;
   });
 }
