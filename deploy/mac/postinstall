@@ -6,9 +6,20 @@ set -eu
 user_id=$(/usr/bin/stat -f %u /dev/console)
 domain=gui/$user_id
 label=com.onex.desktop.edge
+service=$domain/$label
 [[ $user_id -gt 0 ]] && /bin/launchctl print "$domain" >/dev/null 2>&1 || exit 0
 
-if /bin/launchctl print "$domain/$label" >/dev/null 2>&1; then
-  /bin/launchctl bootout "$domain/$label"
+if /bin/launchctl print "$service" >/dev/null 2>&1; then
+  /bin/launchctl bootout "$service"
+  # bootout starts shutdown. The old job may still own the label after it returns.
+  remaining=100
+  while /bin/launchctl print "$service" >/dev/null 2>&1; do
+    if [[ $remaining -eq 0 ]]; then
+      echo "Timed out waiting for the previous OneX Edge LaunchAgent to stop ($service)." >&2
+      exit 1
+    fi
+    remaining=$((remaining - 1))
+    /bin/sleep 0.1
+  done
 fi
 /bin/launchctl bootstrap "$domain" "/Library/LaunchAgents/$label.plist"
