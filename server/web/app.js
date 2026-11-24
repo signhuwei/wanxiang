@@ -38,26 +38,36 @@ let checkingAuditPermission = Boolean(restoredTenant)
 let pendingToken = null // 登录流程中、选租户之前的全局令牌
 let openLoginTokenForm
 
+function clearSession() {
+  session = null
+  pendingToken = null
+  restoredTenant = null
+  checkingAuditPermission = false
+  sessionStore.clear()
+  if (location.hash === '#/login') route()
+  else location.replace('#/login')
+}
+
 const api = createApi({
   getToken: () => session?.token || pendingToken,
   onUnauthorized: () => {
     const hadSession = !!session
-    session = null
-    pendingToken = null
-    sessionStore.clear()
-    if (location.hash === '#/login') {
-      route()
-    } else {
-      location.hash = '#/login'
-    }
+    clearSession()
     if (hadSession) showToast('登录已过期，请重新登录', 'error')
   }
 })
 
-const platformApi = createApi({ getToken: () => session?.globalToken, onUnauthorized: () => {
-  sessionStore.clear(); session = null; location.hash = '#/login'
-} })
+const platformApi = createApi({ getToken: () => session?.globalToken, onUnauthorized: clearSession })
 const app = document.getElementById('app')
+
+function signOut() {
+  const tokens = new Set([session?.token, session?.globalToken].filter(Boolean))
+  clearSession()
+  const signal = AbortSignal.timeout(5000)
+  for (const token of tokens) {
+    createApi({ getToken: () => token }).post('/auth/logout', undefined, { signal }).catch(() => {})
+  }
+}
 
 function el(tag, className, text) {
   const n = document.createElement(tag)
@@ -121,7 +131,7 @@ function platformNavLink(path, label, selected) {
   return link
 }
 
-function renderTop(hash) {
+function renderTop(hash, signal) {
   const top = el('div', 'top')
   const loginPage = !session && hash === '#/login'
   const brand = el(loginPage ? 'button' : 'div', loginPage ? 'brand token-login-trigger' : 'brand', 'OneX')
@@ -182,30 +192,19 @@ function renderTop(hash) {
     const tokens = el('a', null, '令牌管理')
     tokens.href = '#/account/tokens'
     const logout = el('button', 'link', '退出')
-    logout.addEventListener('click', async () => {
-      const globalToken = session?.globalToken
-      const scopedToken = session?.token
-      try {
-        await api.post('/auth/logout')
-      } catch {
-        // 登出失败也清本地会话
-      }
-      if (globalToken && globalToken !== scopedToken) {
-        await createApi({ getToken: () => globalToken }).post('/auth/logout').catch(() => {})
-      }
-      session = null
-      sessionStore.clear()
-      location.hash = '#/login'
-    })
+    logout.type = 'button'
+    logout.addEventListener('click', signOut)
     account.addEventListener('keydown', e => {
       if (e.key === 'Escape' && account.open) {
         account.open = false
         summary.focus()
       }
     })
-    account.addEventListener('focusout', e => {
-      if (!account.contains(e.relatedTarget)) account.open = false
-    })
+    const closeOutside = e => {
+      if (account.open && !account.contains(e.target)) account.open = false
+    }
+    document.addEventListener('pointerdown', closeOutside, { capture: true, signal })
+    document.addEventListener('focusin', closeOutside, { signal })
     items.append(download)
     if (!session.tenant_password_login) items.append(tokens)
     items.append(logout)
@@ -269,7 +268,7 @@ function route() {
   openLoginTokenForm = null
   const hash = location.hash || '#/'
   app.textContent = ''
-  renderTop(hash)
+  renderTop(hash, lifecycle.signal)
   const ws = el('div', 'workspace')
   app.appendChild(ws)
 

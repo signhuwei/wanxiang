@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { chromium } from 'playwright'
+import { chromium, webkit } from 'playwright'
 
 const serverSrc = process.env.ONEX_PASSWORD_SERVER_TREE
   ? pathToFileURL(resolve(process.env.ONEX_PASSWORD_SERVER_TREE, 'server/src') + '/')
@@ -11,7 +11,7 @@ const serverSrc = process.env.ONEX_PASSWORD_SERVER_TREE
 const [{ createServer }, { seedTenant }, { MemoryPresence }, { hashLoginPassword, normalizeLoginName }, { hash, day, iso, randomToken }] = await Promise.all(
   ['server.ts', 'seed.ts', 'presence.ts', 'tenant-passwords.ts', 'credentials.ts'].map(file => import(new URL(file, serverSrc).href)))
 const dir = await mkdtemp(join(tmpdir(), 'onex-tenant-password-web-'))
-let app, browser
+let app, browser, releaseLogout
 try {
   app = await createServer({ dataDir: dir, hostname: '127.0.0.1', port: 0, tenantCacheSize: 3,
     heartbeatMs: 15_000, commit: 'password-test', codeSecret: crypto.randomUUID(), presence: new MemoryPresence() })
@@ -31,7 +31,9 @@ try {
       ['fixture-master', oneC.userId, 'Master 测试令牌', hash(masterToken), iso(now), iso(now + day)])
   })
 
-  browser = await chromium.launch({ channel: 'chrome', args: ['--disable-gpu', '--no-proxy-server'] })
+  browser = process.env.ONEX_TEST_BROWSER === 'webkit'
+    ? await webkit.launch()
+    : await chromium.launch({ channel: 'chrome', args: ['--disable-gpu', '--no-proxy-server'] })
   const page = await browser.newPage({ baseURL: app.server.url.href })
   const errors = [], requested = []
   page.on('pageerror', error => errors.push(error.message))
@@ -69,8 +71,28 @@ try {
   await account.click()
   assert.equal(await page.getByRole('link', { name: '进入平台工作台' }).count(), 0)
   assert.equal(await page.getByRole('link', { name: '令牌管理' }).count(), 0)
-  await button('退出').click()
-  await page.getByPlaceholder('租户 ID 或简称').waitFor()
+  // Some browsers blur the summary without focusing the pressed menu button.
+  await account.evaluate(summary => summary.dispatchEvent(new FocusEvent('focusout', { bubbles: true })))
+  assert.equal(await button('退出').isVisible(), true)
+  const revokeGate = new Promise(resolve => { releaseLogout = resolve })
+  await page.route('**/v1/auth/logout', async route => {
+    await revokeGate
+    await route.continue()
+  })
+  const requestedLogout = page.waitForRequest('**/v1/auth/logout', { timeout: 5000 })
+  const revoked = page.waitForResponse('**/v1/auth/logout', { timeout: 5000 })
+  await Promise.all([
+    requestedLogout,
+    revoked.then(response => assert.equal(response.status(), 204)),
+    (async () => {
+      await button('退出').click({ timeout: 3000 })
+      await page.getByPlaceholder('租户 ID 或简称').waitFor({ timeout: 2000 })
+      assert.equal(await page.evaluate(() => localStorage.getItem('onex.session')), null)
+      releaseLogout()
+    })()
+  ])
+  const expired = await fetch(new URL('/v1/me', app.server.url), { headers: { Authorization: 'Bearer ' + session.token } })
+  assert.equal(expired.status, 401)
 
   const oneX = page.locator('.top .brand')
   await oneX.click()
@@ -89,8 +111,9 @@ try {
   await edit.locator('output[data-field="short_name"]').getByText('OneC', { exact: true }).waitFor()
   assert.equal(app.store.system.get('SELECT short_name FROM tenants WHERE id = ?', [sa.tenantId]).short_name, 'OneC')
   assert.deepEqual(errors, [])
-  console.log('tenant-password-check ok: real password and hidden master login, tenant-owned session, duplicate short name saved in the right form')
+  console.log('tenant-password-check ok: password login, immediate logout and revocation, hidden master login, duplicate short name')
 } finally {
+  releaseLogout?.()
   await browser?.close()
   await app?.close()
   await rm(dir, { recursive: true, force: true })

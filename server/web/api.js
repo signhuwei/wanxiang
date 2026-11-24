@@ -53,7 +53,7 @@ export function createApi({ baseUrl = '/v1', getToken = () => null, onUnauthoriz
       if (path === '/auth/password-login') {
         throw new ApiError({ status: 401, code: 'unauthenticated', message: '租户、用户名或密码有误。若多个租户使用同一简称，请改用租户 ID。' })
       }
-      onUnauthorized()
+      if (!signal?.aborted && token === getToken()) onUnauthorized()
       throw new ApiError({ status: 401, code: 'unauthenticated', message: '登录已过期，请重新登录' })
     }
 

@@ -65,6 +65,22 @@ test('401 triggers onUnauthorized and throws unauthenticated', async () => {
   expect(err.message).toBe('登录已过期，请重新登录')
 })
 
+test('a delayed 401 from an old session does not sign out a new session', async () => {
+  let token = 'old'
+  let unauthorized = 0
+  let respond
+  const api = createApi({
+    getToken: () => token,
+    onUnauthorized: () => unauthorized++,
+    fetchImpl: () => new Promise(resolve => { respond = resolve })
+  })
+  const previous = api.get('/me')
+  token = 'new'
+  respond(new Response(null, { status: 401 }))
+  await expect(previous).rejects.toMatchObject({ status: 401 })
+  expect(unauthorized).toBe(0)
+})
+
 test('downloads diagnostic bytes with the session token and rejects redirects', async () => {
   const fetchImpl = async (url, opts) => {
     expect(url).toBe('/v1/diag/dia_1/download')
