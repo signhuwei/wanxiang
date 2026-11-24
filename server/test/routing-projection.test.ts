@@ -257,7 +257,7 @@ test('existing tenant 20 and system 17 databases upgrade with the legacy applica
   const system = new QueuedDatabase(join(dir, 'system.sqlite'), 'system');
   try {
     expect(tenant.get('PRAGMA user_version')).toEqual({ user_version: 24 });
-    expect(system.get('PRAGMA user_version')).toEqual({ user_version: 24 });
+    expect(system.get('PRAGMA user_version')).toEqual({ user_version: 25 });
     expect(tenant.get('SELECT device_id, config_revision, policy_revision, projection_id FROM policy_device_applications'))
       .toEqual({ device_id: 'dev_old', config_revision: 40, policy_revision: 3, projection_id: null });
     for (const db of [tenant, system]) {

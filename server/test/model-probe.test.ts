@@ -20,6 +20,7 @@ test('channel inference tests reserve, charge and replay under one administrator
   const upstream = 'https://probe-relay.example.test';
   const secret = 'fixture-upstream-inference-secret';
   let calls = 0;
+  let noThinkingCalls = 0;
   let blocked: Promise<void> | null = null;
   let arrived = () => {};
   let release = () => {};
@@ -41,10 +42,16 @@ test('channel inference tests reserve, charge and replay under one administrator
       expect(input).toMatchObject({ max_tokens: 16, messages: [{ role: 'user', content: 'Reply OK.' }] });
     }
     expect(input.tools).toBeUndefined();
+    const noThinking = input.chat_template_kwargs !== undefined;
+    if (noThinking) {
+      expect(path).toBe('/v1/chat/completions');
+      expect(input.chat_template_kwargs).toEqual({ enable_thinking: false });
+      noThinkingCalls++;
+    }
     arrived();
     if (blocked) await blocked;
     if (status !== 200) return Response.json({ error: secret }, { status });
-    const output = mode === 'no_text' ? '' : 'OK';
+    const output = mode === 'no_text' && !noThinking ? '' : 'OK';
     const tokens = mode === 'too_many_tokens' ? 400 : 10;
     let body;
     if (path === '/v1/messages') body = {
@@ -114,7 +121,8 @@ test('channel inference tests reserve, charge and replay under one administrator
     await api('/model-test-quotas/' + userId, budget);
     await api('/model-test-quotas/' + secondId, budget);
     expect((await api('/model-test-quotas?q=' + userId)).items).toMatchObject([{ user_id: userId, self: true }]);
-    expect(await api(path + '?catalog_item_id=' + item)).toMatchObject({ actions: ['read', 'run_model_test'], requires_tariff: true, output_token_limit: 16 });
+    expect(await api(path + '?catalog_item_id=' + item)).toMatchObject({ actions: ['read', 'run_model_test'], requires_tariff: true,
+      output_token_limit: 16, test_modes: ['default', 'chat_template_no_thinking'] });
 
     const key = 'one-paid-call';
     const ready = new Promise<void>(resolve => { arrived = resolve; });
@@ -131,9 +139,10 @@ test('channel inference tests reserve, charge and replay under one administrator
     release();
     blocked = null;
     const completed = await initial;
-    expect(completed).toMatchObject({ status: 'succeeded', actor_id: userId, charged_milli: 16, raw_model: 'native/model-001',
+    expect(completed).toMatchObject({ status: 'succeeded', actor_id: userId, test_mode: 'default', charged_milli: 16, raw_model: 'native/model-001',
       usage: { input_tokens: 8, cache_read_tokens: 2, output_tokens: 3 }, tariff: { ...payload.test_tariff, source: 'manual' } });
     expect(await api(path, payload, 202, admin, key)).toEqual(completed);
+    expect(await api(path, { ...payload, test_mode: 'default' }, 202, admin, key)).toEqual(completed);
     expect(await api(path, { ...payload, test_tariff: { ...payload.test_tariff, output_milli_per_mtok: 20 } }, 409, admin, key))
       .toMatchObject({ error: { detail: { reason: 'idempotency_mismatch' } } });
     expect(calls).toBe(1);
@@ -176,10 +185,28 @@ test('channel inference tests reserve, charge and replay under one administrator
     for (const [protocol, cost] of [['openai_responses', 16], ['anthropic', 18]] as const) {
       const source = await api('/providers', { name: protocol, protocol, base_url: upstream + '/v1', secret }, 201);
       const target = await discover(source);
+      expect(await api(target.path + '?catalog_item_id=' + target.item, undefined, 200, second)).toMatchObject({ test_modes: ['default'] });
+      expect(await api(target.path, { ...payload, catalog_item_id: target.item, test_mode: 'chat_template_no_thinking' }, 409, second))
+        .toMatchObject({ error: { detail: { reason: 'model_test_mode_unsupported' } } });
       expect(await api(target.path, { ...payload, catalog_item_id: target.item }, 202, second))
-        .toMatchObject({ status: 'succeeded', charged_milli: cost, actor_id: secondId });
+        .toMatchObject({ status: 'succeeded', charged_milli: cost, actor_id: secondId, test_mode: 'default' });
     }
     expect(calls).toBe(8);
+    expect(noThinkingCalls).toBe(0);
+    mode = 'no_text';
+    const explicit = { ...payload, test_mode: 'chat_template_no_thinking' };
+    const chosen = await api(renewed.path, explicit, 202, admin, 'opt-in-no-thinking');
+    expect(chosen).toMatchObject({ status: 'succeeded', test_mode: explicit.test_mode, charged_milli: 16 });
+    expect(await api(renewed.path, explicit, 202, admin, 'opt-in-no-thinking')).toEqual(chosen);
+    expect(await api(renewed.path, payload, 409, admin, 'opt-in-no-thinking'))
+      .toMatchObject({ error: { detail: { reason: 'idempotency_mismatch' } } });
+    expect(await api(renewed.path, { ...payload, test_mode: 'other' }, 422)).toMatchObject({ error: { detail: { fields: ['test_mode'] } } });
+    expect((await api(renewed.path + '?catalog_item_id=' + item)).items).toContainEqual(chosen);
+    const audit = app.store.system.all<{ detail_json: string }>('SELECT detail_json FROM platform_audit WHERE target=? AND action IN (?,?)',
+      [chosen.id, 'model_test.reserve', 'model_test.finish']);
+    expect(audit.map(row => JSON.parse(row.detail_json).test_mode)).toEqual([explicit.test_mode, explicit.test_mode]);
+    expect(calls).toBe(9);
+    expect(noThinkingCalls).toBe(1);
   } finally {
     release();
     await app?.close();

@@ -33,6 +33,7 @@ const upstreams = settings.map((setting, index) => Bun.serve({ hostname: '127.0.
     assert.equal(probe.model, setting.model)
     assert.equal(probe.max_tokens, 16)
     assert.equal(probe.stream, false)
+    assert.deepEqual(probe.chat_template_kwargs, { enable_thinking: false })
     return Response.json({ model: setting.model, choices: [{ message: { content: 'OK' } }],
       usage: { prompt_tokens: 12, completion_tokens: 2 } })
   }
@@ -128,11 +129,15 @@ try {
       await directory.getByText('z-full-directory-last', { exact: true }).waitFor()
       await label('查询已拉取模型').fill(setting.model)
       await button('实测 ' + setting.model).click()
+      const testMode = label('文本实测模式')
+      assert.equal(await testMode.inputValue(), 'default')
+      await testMode.selectOption('chat_template_no_thinking')
       await label('实测输入计费（块橡皮/百万 Token）').fill('2')
       await label('实测输出计费（块橡皮/百万 Token）').fill('3')
       await label('实测计费依据').fill('测试价表')
       const test = await submit('执行一次文本实测', '/model-tests', 202)
       assert.equal(test.status, 'succeeded')
+      assert.equal(test.test_mode, 'chat_template_no_thinking')
       assert.equal(test.actor_id, tenant.userId)
       assert(test.charged_milli > 0)
       await text('实扣 ' + (test.charged_milli / 1000) + ' 块橡皮').waitFor()

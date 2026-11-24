@@ -17,15 +17,17 @@ const maxInput = 256;
 const maxOutput = 16;
 const maxReserve = 1_000;
 const prompt = 'Reply OK.';
+const noThinking = 'chat_template_no_thinking';
 type Reader = Pick<Transaction, 'get'>;
 type Status = 'running' | 'succeeded' | 'failed' | 'pending_reconciliation';
+type TestMode = 'default' | typeof noThinking;
 type Quota = { user_id: string; name: string; revision: number; limit_milli: number; reserved_milli: number; spent_milli: number };
 type Scope = { discovery_id: string; catalog_item_id: string; raw_model: string; provider_id: string; provider_revision: number;
   account_id: string; endpoint_id: string; endpoint_revision: number };
 type Target = Scope & { protocol: 'openai_chat' | 'openai_responses' | 'anthropic'; auth: 'bearer' | 'x_api_key';
   base_url: string; credential_scope: string; proxy: string | null; secret_ciphertext: Uint8Array };
 type Tariff = RoutingSalesRates & { source_reference: string; source: 'manual' | 'legacy_rate'; effective_from?: string; model_id?: string };
-type Job = Scope & { id: string; actor_id: string; period: string; request_key: string; fingerprint: string; status: Status;
+type Job = Scope & { id: string; actor_id: string; period: string; request_key: string; fingerprint: string; status: Status; test_mode: TestMode;
   created_at: string; completed_at: string | null; reason_code: string | null; reserved_milli: number; charged_milli: number | null;
   usage_json: string | null; tariff_json: string; reconciliation_json: string | null };
 type Outcome = { status: Exclude<Status, 'running'>; reason_code: string | null; charged_milli: number | null; usage: RoutingTokenUsage | null };
@@ -114,7 +116,7 @@ function reserveFor(tariff: Tariff) {
   return amount;
 }
 
-function requestFor(target: Target, secret: string) {
+function requestFor(target: Target, secret: string, mode: TestMode) {
   const url = new URL(target.base_url);
   const base = url.pathname.replace(/\/+$/, '').replace(/\/v1$/, '');
   const headers = new Headers({ Accept: 'application/json', 'Content-Type': 'application/json' });
@@ -131,7 +133,9 @@ function requestFor(target: Target, secret: string) {
     return { url, headers, body: JSON.stringify({ ...common, input: prompt, store: false, max_output_tokens: maxOutput }) };
   }
   url.pathname = base + '/v1/chat/completions';
-  return { url, headers, body: JSON.stringify({ ...common, messages, max_tokens: maxOutput, n: 1 }) };
+  const body = { ...common, messages, max_tokens: maxOutput, n: 1,
+    ...(mode === noThinking && { chat_template_kwargs: { enable_thinking: false } }) };
+  return { url, headers, body: JSON.stringify(body) };
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -173,7 +177,7 @@ function pending(reason_code: string, usage: RoutingTokenUsage | null = null): O
   return { status: 'pending_reconciliation', reason_code, charged_milli: null, usage };
 }
 
-async function execute(target: Target, tariff: Tariff, masterKey: Uint8Array, reserved: number,
+async function execute(target: Target, tariff: Tariff, mode: TestMode, masterKey: Uint8Array, reserved: number,
   send: ProviderModelProbeFetch): Promise<Outcome> {
   const failed = (reason_code: string): Outcome => ({ status: 'failed', reason_code, charged_milli: 0, usage: null });
   let secret: Buffer;
@@ -182,7 +186,7 @@ async function execute(target: Target, tariff: Tariff, masterKey: Uint8Array, re
   try {
     const apiKey = secret.toString().trim();
     if (!/^[\x21-\x7e]+$/.test(apiKey)) return failed('missing_credential');
-    const { url, headers, body } = requestFor(target, apiKey);
+    const { url, headers, body } = requestFor(target, apiKey, mode);
     const signal = AbortSignal.timeout(timeoutMs);
     const response = await send(url, headers, signal, body);
     if (!response.ok) {
@@ -290,11 +294,14 @@ export function modelProbeRoutes(app: Hono, store: Store, opts: ManagementOption
     const records = store.system.all<Job>(`SELECT * FROM platform_model_tests WHERE ${column}=?
       ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`, [...filter, page.limit, page.offset]).map(row => jobView(row, at));
     const actions = ['read'];
+    const test_modes: TestMode[] = [];
     let blocked_reason: string | null = null;
     let requires_tariff = false;
     if (catalogue) {
       try {
         const target = currentTarget(store.system, discovery, catalogue);
+        test_modes.push('default');
+        if (target.protocol === 'openai_chat') test_modes.push(noThinking);
         requires_tariff = !existingTariff(store.system, target, at);
         const quota = store.system.get<Quota>(`SELECT ${quotaColumns} ${quotaJoin} WHERE a.user_id=?`, [periodAt(at), actor])!;
         if (!opts.masterKey) blocked_reason = 'model_test_key_unavailable';
@@ -306,19 +313,22 @@ export function modelProbeRoutes(app: Hono, store: Store, opts: ManagementOption
         blocked_reason = String(error.detail?.reason ?? error.code);
       }
     }
-    return c.json({ ...page.page(records, count, actions), requires_tariff, blocked_reason, output_token_limit: maxOutput });
+    return c.json({ ...page.page(records, count, actions), requires_tariff, blocked_reason, output_token_limit: maxOutput, test_modes });
   });
 
   app.post(testPath, async c => {
     const at = opts.now();
     const actor = platformActor(store, c, at);
     const discovery = routeId(c.req.param('job_id'), 'job_id');
-    const body = strictObject(await json(c), 'body', ['catalog_item_id', 'test_tariff']);
+    const body = strictObject(await json(c), 'body', ['catalog_item_id', 'test_tariff', 'test_mode']);
     const catalogue = routeId(body.catalog_item_id, 'catalog_item_id');
     const custom = parseTariff(body.test_tariff);
+    const mode = body.test_mode === undefined ? 'default' : body.test_mode;
+    if (mode !== 'default' && mode !== noThinking) invalid('test_mode');
     const key = operation(c, opts.codeSecret, at, actor, body).key;
     if (!key) invalid('Idempotency-Key');
-    const fingerprint = digest([discovery, catalogue, custom]);
+    // Match the fingerprint stored before the optional mode was introduced.
+    const fingerprint = digest(mode === 'default' ? [discovery, catalogue, custom] : [discovery, catalogue, custom, mode]);
     const period = periodAt(at);
     const master = opts.masterKey;
     if (!master) throw conflict('model_test_key_unavailable');
@@ -330,6 +340,7 @@ export function modelProbeRoutes(app: Hono, store: Store, opts: ManagementOption
         return { previous } as const;
       }
       const target = currentTarget(db, discovery, catalogue);
+      if (mode === noThinking && target.protocol !== 'openai_chat') throw conflict('model_test_mode_unsupported');
       const tariff = custom ?? existingTariff(db, target, at);
       if (!tariff) throw conflict('model_test_price_required');
       const amount = reserveFor(tariff);
@@ -341,15 +352,15 @@ export function modelProbeRoutes(app: Hono, store: Store, opts: ManagementOption
       const id = `mtest_${ulid()}`;
       db.run('UPDATE platform_model_test_quotas SET reserved_milli=reserved_milli+? WHERE user_id=? AND period=?', [amount, actor, period]);
       db.run(`INSERT INTO platform_model_tests(id,discovery_id,catalog_item_id,raw_model,provider_id,provider_revision,account_id,endpoint_id,endpoint_revision,
-        actor_id,period,request_key,fingerprint,created_at,status,reserved_milli,tariff_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'running',?,?)`,
+        actor_id,period,request_key,fingerprint,created_at,status,reserved_milli,tariff_json,test_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'running',?,?,?)`,
       [id, discovery, catalogue, target.raw_model, target.provider_id, target.provider_revision, target.account_id, target.endpoint_id,
-        target.endpoint_revision, actor, period, key, fingerprint, iso(at), amount, JSON.stringify(tariff)]);
-      audit(db, actor, 'model_test.reserve', id, { period, reserved_milli: amount }, at);
+        target.endpoint_revision, actor, period, key, fingerprint, iso(at), amount, JSON.stringify(tariff), mode]);
+      audit(db, actor, 'model_test.reserve', id, { period, reserved_milli: amount, test_mode: mode }, at);
       return { id, target, tariff, amount } as const;
     });
     if ('previous' in prepared) return c.json(jobView(prepared.previous!, at), 202);
     const { id, target, tariff, amount } = prepared;
-    const outcome = await execute(target, tariff, master, amount, opts.providerModelProbeFetch ?? postModelProbeOverHttp);
+    const outcome = await execute(target, tariff, mode, master, amount, opts.providerModelProbeFetch ?? postModelProbeOverHttp);
     const finished = opts.now();
     const recorded = await store.system.write(db => {
       const latest = db.get<Job>('SELECT * FROM platform_model_tests WHERE id=?', [id])!;
@@ -359,7 +370,7 @@ export function modelProbeRoutes(app: Hono, store: Store, opts: ManagementOption
       db.run(`UPDATE platform_model_tests SET status=?,reason_code=?,completed_at=?,charged_milli=?,usage_json=? WHERE id=?`,
         [outcome.status, outcome.reason_code, iso(finished), outcome.charged_milli, outcome.usage ? JSON.stringify(outcome.usage) : null, id]);
       audit(db, actor, 'model_test.finish', id, { status: outcome.status, charged_milli: outcome.charged_milli,
-        reason_code: outcome.reason_code }, finished);
+        reason_code: outcome.reason_code, test_mode: mode }, finished);
       return db.get<Job>('SELECT * FROM platform_model_tests WHERE id=?', [id])!;
     });
     return c.json(jobView(recorded, finished), 202);

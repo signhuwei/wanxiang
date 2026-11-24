@@ -26,11 +26,14 @@ const modelPath = id => '/platform/models/' + enc(id)
 const modelProbePath = id => '/platform/probe-jobs/' + enc(id) + '/model-tests'
 const modelTestStates = { running: '进行中', succeeded: '通过', failed: '失败', pending_reconciliation: '待核对' }
 const modelTestLabel = test => test ? modelTestStates[test.status] ?? test.status : '待实测'
+const noThinking = 'chat_template_no_thinking'
+const modelTestModes = { default: '渠道默认', [noThinking]: '请求关闭思考（聊天模板）' }
 const modelTestReasons = {
   model_test_requires_current_catalogue: '请拉取当前渠道目录后再实测。', model_test_key_unavailable: '服务端尚未配置渠道密钥。',
   model_test_quota_required: '当前管理员尚未分配实测橡皮配额。', model_test_quota_exhausted: '当前管理员可用配额不足。',
   model_test_cost_limit_exceeded: '此费率下单次预留超过实测成本上限。', model_test_in_progress: '当前管理员已有实测执行中。',
   model_test_price_required: '请填写经核实的实测输入、输出费率。', completion_unknown: '请求结果尚待核对。',
+  model_test_mode_unsupported: '当前渠道协议不支持在实测中请求关闭思考。',
   upstream_model_mismatch: '上游响应型号与测试目标不符。', no_text_returned: '上游未返回文本。',
   reconciled_manually: '已按凭证核对费用。'
 }
@@ -262,12 +265,18 @@ export function modelTestsPanel(pane, api, discovered, writable, signal, back) {
   function draw(data) {
     pane.setTitle('模型文本实测 / ' + discovered.raw_model)
     pane.body.replaceChildren()
-    if (writable && hasAction(data, 'run_model_test')) editForm(pane, { mode: 'edit', label: '执行一次文本实测', fields: data.requires_tariff ? [
+    const fields = []
+    if (data.test_modes?.includes(noThinking)) fields.push({ key: 'test_mode', label: '文本实测模式', type: 'select', allowEmpty: false,
+      options: data.test_modes.map(value => ({ value, label: modelTestModes[value] })),
+      hint: '仅在上游支持聊天模板关闭思考参数时选择，例如使用相应模板的 Qwen 推理服务。' })
+    if (data.requires_tariff) fields.push(
       { key: 'input', label: '实测输入计费（块橡皮/百万 Token）' },
       { key: 'output', label: '实测输出计费（块橡皮/百万 Token）' },
       { key: 'source', label: '实测计费依据', hint: '填写供应商价表或经批准的测试报价。' },
-    ] : [], async submit(form, options) {
-      const payload = { catalog_item_id: discovered.catalog_item_id }
+    )
+    if (writable && hasAction(data, 'run_model_test')) editForm(pane, { mode: 'edit', label: '执行一次文本实测',
+      fields, values: { test_mode: 'default' }, async submit(form, options) {
+      const payload = { catalog_item_id: discovered.catalog_item_id, test_mode: form.test_mode ?? 'default' }
       if (data.requires_tariff) {
         const input = parseEraserMilli(form.input)
         const output = parseEraserMilli(form.output)
@@ -287,6 +296,7 @@ export function modelTestsPanel(pane, api, discovered, writable, signal, back) {
     for (const test of data.items ?? []) {
       const line = el('article', 'deployment-card')
       line.append(el('strong', null, modelTestLabel(test) + ' · ' + formatDateTime(test.completed_at ?? test.created_at)))
+      if (test.test_mode === noThinking) line.append(el('p', 'muted', modelTestModes[noThinking]))
       if (test.usage) line.append(el('p', null,
         '输入 ' + test.usage.input_tokens + ' · 输出 ' + test.usage.output_tokens + ' Token'))
       if (test.charged_milli != null) line.append(el('p', null, '实扣 ' + formatMilli(test.charged_milli) + ' 块橡皮'))
