@@ -134,8 +134,8 @@ export function configPublisher(store: Store, dataDir: string, now: () => number
       sub.send({ type: 'cutoff', id: `msg_${ulid()}`, reason: 'contract' });
       return;
     }
-    const { routes: platformRoutes, rates } = effectiveModelConfig(store, contract || null, now());
-    const agents = allowedAgentReleases(store, dataDir, contract || null, participant.os, participant.arch, sub.agentCache, sub)
+    const { routes: platformRoutes, rates } = effectiveModelConfig(store, policy ?? contract ?? null, now());
+    const agents = allowedAgentReleases(store, dataDir, policy ?? contract ?? null, participant.os, participant.arch, sub.agentCache, sub)
       .map(({ id, agent, version, os, arch, url, sha256, size }) => ({
         id, agent, version, os, arch, url: sub.agentCache ? artifactDownloadPath(id) : url, sha256, size,
       }));
@@ -161,7 +161,9 @@ export function configPublisher(store: Store, dataDir: string, now: () => number
             } finally { upstream.secret.fill(0); }
           }
         }
-        return candidates.filter(item=>routeSecrets.has(item.route.provider_id)).sort(upstreamOrder).map(item=>item.route);
+        // When the device has no public key, secrets cannot be encrypted but routes should
+        // still be delivered so the device can use platform-side forwarding or a later key exchange.
+        return candidates.filter(item=>!participant.public_key || routeSecrets.has(item.route.provider_id)).sort(upstreamOrder).map(item=>item.route);
       });
       const tools = allowedToolReleases(store, dataDir, policy, participant.os, participant.arch);
       const searchTools = allowedSearchTools(store, policy).map(({id,name,agents}) => ({id,name,agents}));
