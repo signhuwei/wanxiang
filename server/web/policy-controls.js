@@ -90,6 +90,17 @@ export function policyValue(definition, value, display) {
   }
 }
 
+function agentPickerHint(definition, prefix) {
+  if (definition.binding?.adapter === 'access.agents') {
+    return '这里按 Agent 类型授权。合约同时固定发行时，设备还需匹配已签发的系统、架构和制品。'
+  }
+  if (definition.binding?.adapter === 'access.releases') {
+    return prefix === platformPolicy
+      ? '固定发行按系统和架构逐个选。租户同时使用 Windows 和 macOS 时，请分别勾选需要的制品。'
+      : '候选制品来自生效合约和平台已启用的发行。缺少某个系统或架构时，请平台管理员核对发行和签发范围。'
+  }
+}
+
 // detail（可选）：{ describe(ids, node) } 为已选与候选项附加只读说明，不改变提交值。
 function catalogField(api, prefix, definition, original, display, signal, detail) {
   const { catalog } = definition.schema
@@ -97,6 +108,8 @@ function catalogField(api, prefix, definition, original, display, signal, detail
   const labels = new Map(Object.entries(display ?? {}))
   const details = el('details', 'policy-picker')
   details.append(el('summary', null, '选择' + definition.title))
+  const hint = agentPickerHint(definition, prefix)
+  if (hint) details.append(el('p', 'muted', hint))
   const saved = el('div', 'actions policy-picked')
   const status = el('p', 'muted')
   const search = el('input')
