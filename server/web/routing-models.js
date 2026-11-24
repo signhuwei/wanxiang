@@ -489,4 +489,7 @@ export function signedModelsPage(host, api, signal) {
       ], AbortSignal.any([signal, pane.signal].filter(Boolean)))
     })
   })
+  const source = el('a', 'link', '从渠道采用型号')
+  source.href = '#/platform/catalog'
+  host.querySelector('.toolbar').append(source)
 }

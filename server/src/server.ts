@@ -22,8 +22,10 @@ import { personalLoginTokenRoutes } from './personal-login-tokens';
 import { platformRoutes } from './platform-management';
 import { modelPoolRoutes } from './model-pool';
 import { providerChannelRoutes } from './provider-channels';
+import { modelReferenceRoutes } from './model-reference';
+import { modelProbeRoutes } from './model-probe';
 import { channelBalanceRoutes } from './channel-balance';
-import type { ProviderChannelFetch } from './channel-catalog-upstream';
+import type { ProviderChannelFetch, ProviderModelProbeFetch } from './channel-catalog-upstream';
 import { procurementRoutes } from './procurement';
 import { inputMultiplierRoutes } from './input-multiplier';
 import { policyDiscountRoutes, settleUnclosedDiscountMonths } from './policy-discounts';
@@ -49,6 +51,7 @@ type Options = {
   codeSecret: string;
   masterKey?: Uint8Array;
   providerChannelFetch?: ProviderChannelFetch;
+  providerModelProbeFetch?: ProviderModelProbeFetch;
   deliverCode?: (target: string, code: string) => void;
   now?: () => number;
   presence: Presence;
@@ -127,6 +130,8 @@ export async function createServer(opts: Options) {
     platformRoutes(app, store, management);
     modelPoolRoutes(app, store, management);
     providerChannelRoutes(app, store, management);
+    modelReferenceRoutes(app, store, management);
+    modelProbeRoutes(app, store, management);
     channelBalanceRoutes(app, store, management);
     procurementRoutes(app, store, management);
     inputMultiplierRoutes(app, store, management);

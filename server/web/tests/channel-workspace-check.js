@@ -16,7 +16,7 @@ const settings = [
   { label: '渠道 B', origin: 'https://channel-b.example.test', model: 'vendor-b/m', key: 'local-fixture-key-b', balanceKey: 'local-management-b', price: '3' }
 ]
 let balanceDenied = false
-const upstreams = settings.map((setting, index) => Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+const upstreams = settings.map((setting, index) => Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
   const url = new URL(request.url)
   if (index === 0 && url.pathname === '/api/user/self' && request.method === 'GET') {
     if (request.headers.get('Authorization') !== setting.balanceKey || request.headers.get('New-Api-User') !== '42') return new Response(null, { status: 401 })
@@ -26,6 +26,15 @@ const upstreams = settings.map((setting, index) => Bun.serve({ hostname: '127.0.
   if (index === 1 && url.pathname === '/api/v1/user/profile' && request.method === 'GET') {
     if (request.headers.get('Authorization') !== 'Bearer ' + setting.balanceKey) return new Response(null, { status: 401 })
     return Response.json({ code: 0, data: { id: 84, balance: '16.1254329' } })
+  }
+  if (url.pathname === '/v1/chat/completions' && request.method === 'POST') {
+    if (request.headers.get('Authorization') !== 'Bearer ' + setting.key) return new Response(null, { status: 401 })
+    const probe = await request.json()
+    assert.equal(probe.model, setting.model)
+    assert.equal(probe.max_tokens, 16)
+    assert.equal(probe.stream, false)
+    return Response.json({ model: setting.model, choices: [{ message: { content: 'OK' } }],
+      usage: { prompt_tokens: 12, completion_tokens: 2 } })
   }
   if (url.pathname !== '/v1/models' || request.method !== 'GET') return new Response(null, { status: 404 })
   if (request.headers.get('Authorization') !== 'Bearer ' + setting.key) return new Response(null, { status: 401 })
@@ -47,6 +56,10 @@ try {
       const fixture = allowed.get(url.origin)
       assert(fixture, 'browser fixture may reach only local fixture providers')
       return fetch(new URL(url.pathname + url.search, fixture), { headers, signal, redirect: 'error', proxy: '' })
+    }, providerModelProbeFetch: (url, headers, signal, body) => {
+      const fixture = allowed.get(url.origin)
+      assert(fixture, 'browser fixture may reach only local fixture providers')
+      return fetch(new URL(url.pathname, fixture), { method: 'POST', body, headers, signal, redirect: 'error', proxy: '' })
     } })
   const tenant = await seedTenant(app.store, { target, name: '单链路联验租户', platformAdmin: true, now })
   browser = await chromium.launch({ channel: 'chrome', args: ['--disable-gpu', '--no-proxy-server'] })
@@ -90,6 +103,7 @@ try {
   }
 
   await link('能力管理').click()
+  await call('/model-test-quotas/' + tenant.userId, { expected_revision: 0, limit_milli: 100, reason: '隔离浏览器样例' })
   const reviewed = []
   const signedName = '跨渠道样例 M'
   let modelId, providerToRotate
@@ -113,9 +127,29 @@ try {
       await button('下一页目录').click()
       await directory.getByText('z-full-directory-last', { exact: true }).waitFor()
       await label('查询已拉取模型').fill(setting.model)
+      await button('实测 ' + setting.model).click()
+      await label('实测输入计费（块橡皮/百万 Token）').fill('2')
+      await label('实测输出计费（块橡皮/百万 Token）').fill('3')
+      await label('实测计费依据').fill('测试价表')
+      const test = await submit('执行一次文本实测', '/model-tests', 202)
+      assert.equal(test.status, 'succeeded')
+      assert.equal(test.actor_id, tenant.userId)
+      assert(test.charged_milli > 0)
+      await text('实扣 ' + (test.charged_milli / 1000) + ' 块橡皮').waitFor()
+      assert.equal((await call('/model-test-quotas')).items.find(row => row.self).spent_milli, test.charged_milli)
+      await button('返回渠道').click()
+      await directory.getByText('文本实测 通过', { exact: true }).waitFor()
     }
     await button('归并 ' + setting.model).click()
     if (index === 0) {
+      await button('采用此渠道型号').click()
+      assert.equal(await label('签约型号名称').inputValue(), setting.model)
+      assert.equal(await label('上下文窗口').inputValue(), '32768')
+      assert.equal(await right().getByRole('group', { name: '确认此渠道提供的能力' })
+        .getByRole('checkbox', { name: '文本', exact: true }).isChecked(), false)
+      await button('返回选择型号').click()
+      assert.equal((await submit('登记待核对', '/adoptions', 201)).status, 'needs_review')
+      await text('已登记 · 待核对').waitFor()
       await button('新建签约型号').click()
       await label('签约型号名称').fill(signedName)
       const model = await submit('建立签约型号', '/platform/models', 201)
@@ -287,6 +321,11 @@ try {
   const refreshed = page.getByRole('region', { name: '上游发现目录' })
   await refreshed.getByRole('button', { name: '归并 ' + source.model }).waitFor()
   assert.equal(await history.count(), 0)
+  await link('型号码表').click()
+  await label('按原厂筛选').selectOption('moonshotai')
+  await page.getByText('共 6 条', { exact: true }).waitFor()
+  await cell('Kimi K3').first().waitFor()
+  assert.equal(await page.getByRole('cell', { name: 'Anthropic', exact: true }).count(), 0)
   assert.deepEqual(errors, [])
   console.log('channel-workspace-check ok', JSON.stringify({ discovered: 28, one_to_many: 2, signed_pool: 1, multiplier: 4, balance_micro: 11150000,
     historical_catalog_read_only: true, balance_adapters: ['new_api', 'sub2api'] }))

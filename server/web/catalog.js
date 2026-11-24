@@ -4,7 +4,7 @@ import { formatMilli } from './format.js'
 import { eraserMilli } from './contract-controls.js'
 import { deploymentCards } from './routing-deployments.js'
 import { quotePanel } from './routing-pricing.js'
-import { channelOperations, reviewDiscoveredModel } from './provider-channel.js'
+import { channelOperations, modelTestsPanel, reviewDiscoveredModel } from './provider-channel.js'
 import { channelFunding, fundingOverview } from './provider-funding.js'
 
 const text = (key, label, extra = {}) => ({ key, label, ...extra })
@@ -65,6 +65,8 @@ export function catalog(host, api, actions, kind = 'provider', parent = null, si
             const openFunding = () => switchView(next => channelFunding(pane, api, row, next, back))
             channelOperations(pane.body, api, row, signal, discovered => {
               switchView(next => reviewDiscoveredModel(pane, api, row, discovered, next, back))
+            }, (discovered, writable) => {
+              switchView(next => modelTestsPanel(pane, api, discovered, writable, next, back))
             })
             deploymentCards(pane.body, api, row, signal, { onQuotes: card => switchView(next => {
               pane.headActions.append(button('返回渠道', back))

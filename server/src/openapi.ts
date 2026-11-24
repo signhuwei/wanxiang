@@ -452,11 +452,39 @@ const channelJob = object({ id: routingId, kind: { enum: ['connectivity', 'disco
   location: text, scope: object({ provider_id: routingId, provider_revision: revision, account_id: routingId, endpoint_id: routingId, endpoint_revision: revision }),
   observed_at: timestamp, summary: object({ model_count: sequence, reason: nullableText }), actions });
 const channelAccount = object({ account_id: routingId, name: text, balance_mode: text, funding_id: nullableText, endpoint_id: nullableText });
-const channelCatalogItem = object({ catalog_item_id: routingId, discovery_id: routingId, raw_model: text, context_tokens: nullable(revision),
-  snapshot_claim: nullableText, variant_claim: nullableText, capabilities_claim: listItems(text) });
+const modelReference = object({ id: text, maker_id: text, model_family: text, model_variant: text, model_snapshot: nullableText,
+  display_name: text, context_tokens: nullable(revision), output_tokens: nullable(revision), capabilities_claim: listItems(text),
+  source: text, source_url: text, aliases: listItems(text), provider_names: listItems(text) });
+const channelAdoption = object({ model_id: routingId, display_name: text, status: text,
+  candidate_id: routingId, deployment_id: routingId, deployment_revision: revision, pool_revision: nullable(revision) });
+const channelIntake = object({ draft_id: routingId, discovery_id: routingId, catalog_item_id: routingId,
+  raw_model: text, status: { const: 'needs_review' } });
 const channelIdentity = { maker_id: text, model_family: text, model_variant: text, identity_mode: { enum: ['family_follow', 'pinned_snapshot'] },
   model_snapshot: nullableText, capability_floor: listItems(text) };
 const channelModelIdentity = object({ model_id: routingId, revision, identity: nullable(object({ ...channelIdentity, identity_revision: revision })), actions });
+const adoptFields = { catalog_item_id: routingId, display_name: text, context_window: revision,
+  maker_id: text, model_family: text, model_variant: text, identity_mode: channelIdentity.identity_mode,
+  model_snapshot: nullableText, capabilities: listItems(text), reason: text, mode: { const: 'adopt' } };
+const adoptionResult = object({ model_id: routingId, display_name: text, identity_revision: revision,
+  deployment_id: routingId, deployment_revision: revision, candidate_id: routingId, status: { const: 'accepted' } });
+const testQuotaFields = { user_id: routingId, name: text, period: text, revision: sequence, limit_milli: sequence,
+  reserved_milli: sequence, spent_milli: sequence, available_milli: sequence };
+const testTariff = { input_milli_per_mtok: sequence, output_milli_per_mtok: sequence, source_reference: text };
+const testReconciliationProof = { reason: text, evidence_reference: text };
+const modelTest = object({ id: routingId, discovery_id: routingId, catalog_item_id: routingId, raw_model: text, provider_id: routingId,
+  provider_revision: revision, account_id: routingId, endpoint_id: routingId, endpoint_revision: revision,
+  actor_id: routingId, period: text, created_at: timestamp,
+  completed_at: nullableTimestamp, status: { enum: ['running','succeeded','failed','pending_reconciliation'] },
+  reason_code: nullableText, reserved_milli: sequence, charged_milli: nullable(sequence), usage: nullable(object({
+    input_tokens: sequence, output_tokens: sequence, cache_read_tokens: sequence, cache_write_tokens: sequence
+  })), tariff: object({ ...testTariff, cache_read_milli_per_mtok: sequence, cache_write_milli_per_mtok: sequence,
+    source: { enum: ['manual', 'legacy_rate'] }, model_id: routingId, effective_from: timestamp },
+  [...Object.keys(testTariff), 'cache_read_milli_per_mtok', 'cache_write_milli_per_mtok', 'source']),
+  reconciliation: nullable(object({ ...testReconciliationProof, actor_id: routingId, reconciled_at: timestamp })), actions });
+const channelCatalogItem = object({ catalog_item_id: routingId, discovery_id: routingId, raw_model: text, context_tokens: nullable(revision),
+  snapshot_claim: nullableText, variant_claim: nullableText, capabilities_claim: listItems(text),
+  reference_suggestions: listItems(modelReference), adoptions: listItems(channelAdoption), intake: nullable(channelIntake),
+  latest_model_test: nullable(modelTest) });
 const channelStart = (input: object) => ({ security: bearer, parameters: [channelProviderId, ...contractIdempotency], requestBody: requestBody(input),
   responses: { 202: { ...response('本次连接检查或目录拉取的已记录结果', channelJob), headers: { Location: { schema: text } } },
     404: error('供应商不存在'), ...status } });
@@ -483,6 +511,26 @@ const routingPaths = {
   [channelProvider + '/discoveries']: { post: channelStart(object({ revision })) },
   [channelJobPath]: { get: policyDetail(channelJob, [channelJobId]) },
   [channelJobPath + '/results']: { get: routingList(channelCatalogItem, [channelJobId, ...listParams], actions) },
+  [channelJobPath + '/adoptions']: { post: policyWrite({ oneOf: [
+    object({ mode: { const: 'draft' }, catalog_item_id: routingId }),
+    object(adoptFields, Object.keys(adoptFields).filter(key => key !== 'mode' && key !== 'model_snapshot'))
+  ] }, { oneOf: [adoptionResult, channelIntake] }, 'create', [channelJobId]) },
+  '/v1/platform/model-references': { get: routingList(modelReference, [...listParams,
+    { name: 'maker_id', in: 'query', schema: text }], actions, { makers: listItems(text) }) },
+  '/v1/platform/model-test-quotas': { get: routingList(object({ ...testQuotaFields, self: boolean, actions }), listParams, actions) },
+  '/v1/platform/model-test-quotas/{user_id}': { post: policyWrite(object({ expected_revision: sequence, limit_milli: sequence, reason: text }),
+    object(testQuotaFields), 'update', [namedPath('user_id', routingId)]) },
+  '/v1/platform/model-test-quotas/{user_id}/tests': { get: routingList(modelTest, [namedPath('user_id', routingId),
+    { name: 'period', in: 'query', schema: { ...text, pattern: '^[0-9]{4}-(0[1-9]|1[0-2])$' } }, ...routingPagination], actions, { period: text }) },
+  [channelJobPath + '/model-tests']: {
+    get: routingList(modelTest, [channelJobId, ...routingPagination, { name: 'catalog_item_id', in: 'query', schema: routingId }], actions,
+      { requires_tariff: boolean, blocked_reason: nullableText, output_token_limit: revision }),
+    post: { security: bearer, parameters: [channelJobId, ...contractIdempotency],
+      requestBody: requestBody(object({ catalog_item_id: routingId, test_tariff: object(testTariff) }, ['catalog_item_id'])),
+      responses: { 202: response('已记录平台管理员的限额推理实测', modelTest), ...status } }
+  },
+  [channelJobPath + '/model-tests/{test_id}/reconcile']: { post: policyWrite(
+    object({ charged_milli: sequence, ...testReconciliationProof }), modelTest, 'update', [channelJobId, namedPath('test_id', routingId)]) },
   [channelIdentityPath]: { get: policyDetail(channelModelIdentity, [routingModelId]),
     post: policyWrite(object({ revision, ...channelIdentity }, ['revision', 'maker_id', 'model_family', 'model_variant', 'identity_mode', 'capability_floor']),
       channelModelIdentity, 'create', [routingModelId]) },

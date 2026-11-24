@@ -8,6 +8,7 @@ export type ChannelCatalogItem = { raw_model: string; context_tokens: number | n
   snapshot_claim: string | null; variant_claim: string | null };
 export type CatalogResult = { status: 'succeeded' | 'partial' | 'failed'; reason: string | null; items: ChannelCatalogItem[] };
 export type ProviderChannelFetch = (target: URL, headers: Headers, signal: AbortSignal) => Promise<Response>;
+export type ProviderModelProbeFetch = (target: URL, headers: Headers, signal: AbortSignal, request: string) => Promise<Response>;
 const timeoutMs = 25_000;
 const maxResponseBytes = 8 * 1024 * 1024;
 const maxPages = 100;
@@ -23,7 +24,7 @@ function usableAddress(address: string) {
 }
 
 /** Keep credentials off argv and pin the DNS answer for the same request which sends the header. */
-export const readOverHttp: ProviderChannelFetch = async (url, headers, signal) => {
+async function requestOverHttp(url: URL, headers: Headers, signal: AbortSignal, bytesLimit: number, request?: string) {
   const host = url.hostname.replace(/^\[|\]$/g, '');
   const family = isIP(host);
   const addresses = family ? [{ address: host, family }] : await lookup(host, { all: true });
@@ -33,8 +34,9 @@ export const readOverHttp: ProviderChannelFetch = async (url, headers, signal) =
   const pinned = address.family === 6 ? '[' + address.address + ']' : address.address;
   const config = ['url = ' + JSON.stringify(url.href), ...Array.from(headers, ([key, value]) => 'header = ' + JSON.stringify(key + ': ' + value))];
   if (!family) config.push('resolve = ' + JSON.stringify(host + ':' + (url.port || (url.protocol === 'https:' ? '443' : '80')) + ':' + pinned));
+  if (request !== undefined) config.push('data-binary = ' + JSON.stringify(request));
   const child = Bun.spawn(['curl', '--disable', '--noproxy', '*', '--proto', '=http,https', '--globoff', '--silent', '--connect-timeout', '5',
-    '--max-time', '12', '--max-filesize', String(maxResponseBytes), '--write-out', '\n%{http_code}', '--config', '-'], {
+    '--max-time', '12', '--max-filesize', String(bytesLimit), '--write-out', '\n%{http_code}', '--config', '-'], {
     stdin: new Blob([config.join('\n') + '\n']), stdout: 'pipe', stderr: 'ignore', signal,
   });
   let size = 0;
@@ -45,7 +47,7 @@ export const readOverHttp: ProviderChannelFetch = async (url, headers, signal) =
       const part = await reader.read();
       if (part.done) break;
       size += part.value.length;
-      if (size > maxResponseBytes + 4) throw new Error('response_limit');
+      if (size > bytesLimit + 4) throw new Error('response_limit');
       chunks.push(part.value);
     }
     const code = await child.exited;
@@ -60,7 +62,11 @@ export const readOverHttp: ProviderChannelFetch = async (url, headers, signal) =
   if (!marker) throw new Error('probe_unreachable');
   const status = Number(marker[1]);
   return new Response([204, 205, 304].includes(status) ? null : bytes.subarray(0, -4), { status });
-};
+}
+
+export const readOverHttp: ProviderChannelFetch = (url, headers, signal) => requestOverHttp(url, headers, signal, maxResponseBytes);
+export const postModelProbeOverHttp: ProviderModelProbeFetch = (url, headers, signal, request) =>
+  requestOverHttp(url, headers, signal, 64 * 1024, request);
 
 function asLabel(value: unknown, cap: number, secret: string): string | null {
   if (typeof value !== 'string' || !value.trim() || value.length > cap || /[\u0000-\u001F\u007F]/u.test(value)

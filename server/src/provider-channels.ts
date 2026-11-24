@@ -4,6 +4,8 @@ import { ApiError, field, invalid, json, operation } from './api';
 import { channelCapabilities, discoverProviderCatalog, type CatalogResult, type CatalogTarget, type ProviderChannelFetch } from './channel-catalog-upstream';
 import { iso } from './credentials';
 import { enumField, int, platformActor, type ManagementOptions } from './management';
+import { latestModelTest } from './model-probe';
+import { modelReferenceSuggestions } from './model-reference';
 import { decryptProviderSecret } from './provider-secret';
 import { boundPage, conflict, digest, replay, requirePlatformAdmin, routeId, strictObject } from './routing-http';
 import type { Store, Transaction } from './store';
@@ -22,6 +24,8 @@ type Identity = { identity_revision: number; maker_id: string; model_family: str
 type Discovery = Job & { catalog_item_id: string; raw_model: string; context_tokens: number | null; snapshot_claim: string | null; variant_claim: string | null };
 type Decision = { discovery_id: string; catalog_item_id: string; decision: 'accept' | 'reject'; capabilities: string[] };
 type Deployment = { deployment_id: string; status: string; current_revision: number; endpoint_revision: number; capabilities_json: string };
+type Adoption = { model_id: string; display_name: string; candidate_id: string; status: 'accepted' | 'rejected';
+  deployment_id: string; deployment_revision: number; pool_revision: number | null };
 
 const root = '/v1/platform';
 const providerPath = `${root}/providers/:provider_id`;
@@ -165,7 +169,7 @@ function saveJob(db: Transaction, job: Job, observation: CatalogResult, actor: s
   }
 }
 
-function discoveryItem(db: Reader, input: Decision) {
+function discoveryItem(db: Reader, input: Pick<Decision, 'discovery_id' | 'catalog_item_id'>) {
   const row = db.get<Discovery>(`SELECT j.*, d.catalog_item_id, c.raw_model, d.context_tokens, d.snapshot_claim, d.variant_claim
     FROM provider_channel_discoveries d JOIN provider_channel_jobs j ON j.id = d.discovery_id
     JOIN provider_channel_catalog c ON c.catalog_item_id = d.catalog_item_id
@@ -173,6 +177,37 @@ function discoveryItem(db: Reader, input: Decision) {
   if (!row) throw new ApiError('not_found');
   if (!reviewable(db, row)) throw conflict('discovery_changed');
   return row;
+}
+
+function adoptionsFor(db: Reader, catalogId: string, endpointRevision: number) {
+  return db.all<Adoption>(`WITH decisions AS (
+    SELECT m.id AS model_id, m.display_name, d.candidate_id, d.status, d.deployment_id, d.deployment_revision,
+      p.pool_revision, row_number() OVER (PARTITION BY m.id ORDER BY d.decided_at DESC, d.rowid DESC) AS ordinal
+    FROM model_discovery_matches d
+    JOIN models m ON m.id = d.model_id AND m.current_identity_revision = d.identity_revision
+    JOIN model_deployment_revisions r ON r.deployment_id = d.deployment_id AND r.deployment_revision = d.deployment_revision
+    LEFT JOIN model_pool_heads h ON h.model_id = m.id
+    LEFT JOIN model_pool_deployments p ON p.model_id = m.id AND p.pool_revision = h.pool_revision
+      AND p.deployment_id = d.deployment_id AND p.deployment_revision = d.deployment_revision
+      AND d.status = 'accepted'
+    WHERE d.catalog_item_id = ? AND r.endpoint_revision = ? AND d.status IN ('accepted','rejected')
+  ) SELECT model_id,display_name,candidate_id,status,deployment_id,deployment_revision,pool_revision
+    FROM decisions WHERE ordinal=1 ORDER BY display_name, model_id`, [catalogId, endpointRevision]);
+}
+
+function intakeFor(db: Reader, catalogId: string, endpointRevision: number) {
+  const row = db.get<{ draft_id: string; catalog_item_id: string; discovery_id: string; raw_model: string }>(`SELECT i.draft_id,i.catalog_item_id,
+    i.discovery_id,c.raw_model FROM provider_model_intakes i
+    JOIN provider_channel_catalog c ON c.catalog_item_id=i.catalog_item_id
+    WHERE i.catalog_item_id=? AND i.endpoint_revision=?`, [catalogId, endpointRevision]);
+  return row ? { ...row, status: 'needs_review' as const } : null;
+}
+
+function verifyMatch(item: Discovery, identity: Identity, confirmed: string[]) {
+  if (identity.identity_mode === 'pinned_snapshot' && identity.model_snapshot !== item.snapshot_claim) throw conflict('snapshot_unverified');
+  if (item.variant_claim && item.variant_claim !== identity.model_variant) throw conflict('model_variant_mismatch');
+  const floor = JSON.parse(identity.capability_floor_json) as string[];
+  if (!floor.every(capability => confirmed.includes(capability))) throw conflict('capability_unverified');
 }
 
 function deploymentFor(db: Transaction, item: Discovery, allowed: string[], actor: string, at: string, accepted: boolean) {
@@ -207,10 +242,7 @@ function reviewedCandidate(db: Transaction, modelId: string, identity: Identity,
     [modelId, identity.identity_revision, item.id, item.catalog_item_id]);
   if (review) throw conflict('candidate_already_reviewed');
   const accepted = decision.decision === 'accept';
-  if (accepted && identity.identity_mode === 'pinned_snapshot' && identity.model_snapshot !== item.snapshot_claim) throw conflict('snapshot_unverified');
-  if (accepted && item.variant_claim && item.variant_claim !== identity.model_variant) throw conflict('model_variant_mismatch');
-  const floor = JSON.parse(identity.capability_floor_json) as string[];
-  if (accepted && !floor.every((capability) => decision.capabilities.includes(capability))) throw conflict('capability_unverified');
+  if (accepted) verifyMatch(item, identity, decision.capabilities);
   const deployment = deploymentFor(db, item, accepted ? decision.capabilities : [], actor, at, accepted);
   const candidate = `mt_${ulid()}`;
   const evidence = accepted ? `ev_${ulid()}` : null;
@@ -318,11 +350,113 @@ export function providerChannelRoutes(app: Hono, store: Store, opts: ManagementO
     const where = `FROM provider_channel_discoveries d JOIN provider_channel_catalog c ON c.catalog_item_id = d.catalog_item_id
       WHERE d.discovery_id = ? AND instr(lower(c.raw_model), lower(?)) > 0`;
     const { total } = store.system.get<{ total: number }>(`SELECT count(*) AS total ${where}`, [row.id, q])!;
+    const provider = store.system.get<{ name: string }>('SELECT name FROM providers WHERE id = ?', [row.provider_id]);
     const items = store.system.all<{ catalog_item_id: string; discovery_id: string; raw_model: string; context_tokens: number | null;
       capabilities_claim_json: string; snapshot_claim: string | null; variant_claim: string | null }>(`SELECT d.catalog_item_id,d.discovery_id,c.raw_model,
       d.context_tokens,d.capabilities_claim_json,d.snapshot_claim,d.variant_claim ${where} ORDER BY c.raw_model COLLATE BINARY,c.catalog_item_id LIMIT ? OFFSET ?`,
-    [row.id, q, page.limit, page.offset]).map(({ capabilities_claim_json, ...fields }) => ({ ...fields, capabilities_claim: JSON.parse(capabilities_claim_json) }));
+    [row.id, q, page.limit, page.offset]).map(({ capabilities_claim_json, ...fields }) => ({
+      ...fields,
+      capabilities_claim: JSON.parse(capabilities_claim_json),
+      reference_suggestions: modelReferenceSuggestions(fields.raw_model, provider?.name),
+      intake: intakeFor(store.system, fields.catalog_item_id, row.endpoint_revision),
+      latest_model_test: latestModelTest(store.system, fields.catalog_item_id, row.endpoint_revision, opts.now()),
+      adoptions: adoptionsFor(store.system, fields.catalog_item_id, row.endpoint_revision)
+        .map(({ candidate_id, ...adoption }) => adoption)
+    }));
     return c.json(page.page(items, total, reviewable(store.system, row) ? ['read', 'review_candidates'] : ['read']));
+  });
+
+  app.post(`${jobPath}/:job_id/adoptions`, async (c) => {
+    const at = opts.now();
+    const actor = platformActor(store, c, at);
+    const jobId = routeId(c.req.param('job_id'), 'job_id');
+    const raw = await json(c);
+    if (raw.mode === 'draft') {
+      const body = strictObject(raw, 'body', ['mode', 'catalog_item_id']);
+      const catalogId = routeId(body.catalog_item_id, 'catalog_item_id');
+      const op = operation(c, opts.codeSecret, at, actor, [jobId, body]);
+      if (!op.key) invalid('Idempotency-Key');
+      return store.system.write(db => {
+        requirePlatformAdmin(db, actor);
+        const cached = replay(op, db);
+        if (cached) return cached;
+        const item = discoveryItem(db, { discovery_id: jobId, catalog_item_id: catalogId });
+        let draft = intakeFor(db, catalogId, item.endpoint_revision);
+        if (!draft) {
+          const draftId = `mif_${ulid()}`;
+          const when = iso(at);
+          db.run(`INSERT INTO provider_model_intakes(draft_id,catalog_item_id,discovery_id,endpoint_revision,created_by,created_at)
+            VALUES(?,?,?,?,?,?)`, [draftId, catalogId, jobId, item.endpoint_revision, actor, when]);
+          draft = { draft_id: draftId, catalog_item_id: catalogId, discovery_id: jobId, raw_model: item.raw_model, status: 'needs_review' };
+          audit(db, actor, 'channel.model.intake', draftId, { discovery_id: jobId, catalog_item_id: catalogId }, when);
+        }
+        return op.complete(db, { status: 201, payload: draft });
+      });
+    }
+    const body = strictObject(raw, 'body', [
+      'mode', 'catalog_item_id', 'display_name', 'context_window', 'maker_id', 'model_family', 'model_variant',
+      'identity_mode', 'model_snapshot', 'capabilities', 'reason'
+    ]);
+    if (body.mode !== undefined && body.mode !== 'adopt') invalid('mode');
+    const catalogId = routeId(body.catalog_item_id, 'catalog_item_id');
+    const displayName = field(body.display_name, 'display_name');
+    const context = int(body.context_window, 'context_window', 1);
+    const maker_id = field(body.maker_id, 'maker_id');
+    const model_family = field(body.model_family, 'model_family');
+    const model_variant = field(body.model_variant, 'model_variant');
+    const identity_mode = enumField(body.identity_mode, 'identity_mode', ['family_follow', 'pinned_snapshot']);
+    const model_snapshot = body.model_snapshot == null ? null : field(body.model_snapshot, 'model_snapshot');
+    if ((identity_mode === 'pinned_snapshot') !== (model_snapshot !== null)) invalid('model_snapshot');
+    const confirmed = capabilities(body.capabilities, 'capabilities');
+    if (!confirmed.includes('text')) invalid('capabilities');
+    const reason = field(body.reason, 'reason', 500);
+    const op = operation(c, opts.codeSecret, at, actor, [jobId, body]);
+    if (!op.key) invalid('Idempotency-Key');
+    return store.system.write(db => {
+      requirePlatformAdmin(db, actor);
+      const cached = replay(op, db);
+      if (cached) return cached;
+      const source = { discovery_id: jobId, catalog_item_id: catalogId };
+      const item = discoveryItem(db, source);
+      if (item.raw_model.includes('*')) invalid('catalog_item_id');
+      if (item.context_tokens !== null && context > item.context_tokens) invalid('context_window');
+      const matches = db.all<{ id: string; status: string; display_name: string }>(`SELECT id,status,display_name FROM models
+        WHERE provider_id=? AND upstream_name=? COLLATE BINARY ORDER BY id LIMIT 2`, [item.provider_id, item.raw_model]);
+      if (matches.length > 1) throw conflict('model_match_ambiguous');
+      const existing = matches[0];
+      if (existing && existing.status !== 'active') throw conflict('model_inactive');
+      const id = existing?.id ?? `mod_${ulid()}`;
+      const name = existing?.display_name ?? displayName;
+      const when = iso(at);
+      const current = existing ? modelIdentity(db, id).identity : null;
+      if (current && (current.maker_id !== maker_id || current.model_family !== model_family ||
+        current.model_variant !== model_variant || current.identity_mode !== identity_mode ||
+        current.model_snapshot !== model_snapshot)) throw conflict('model_identity_conflict');
+      const identity = current ?? { identity_revision: 1, maker_id, model_family, model_variant, identity_mode, model_snapshot,
+        capability_floor_json: JSON.stringify(confirmed) };
+      verifyMatch(item, identity, confirmed);
+      if (!existing) db.run(`INSERT INTO models(id,provider_id,upstream_name,display_name,context_window,status)
+        VALUES (?,?,?,?,?,'active')`, [id, item.provider_id, item.raw_model, name, context]);
+      if (!current) {
+        db.run(`INSERT INTO model_identity_revisions(model_id,identity_revision,maker_id,model_family,model_variant,identity_mode,
+          model_snapshot,capability_floor_json,created_by,created_at) VALUES (?,1,?,?,?,?,?,?,?,?)`,
+        [id, maker_id, model_family, model_variant, identity_mode, model_snapshot, identity.capability_floor_json, actor, when]);
+        db.run('UPDATE models SET current_identity_revision=1, revision=revision+1 WHERE id=?', [id]);
+      }
+      const adopted = adoptionsFor(db, catalogId, item.endpoint_revision)
+        .find(a => a.model_id === id && a.status === 'accepted');
+      let result;
+      if (adopted) {
+        const { pool_revision, ...record } = adopted;
+        result = record;
+      } else {
+        const accepted = reviewedCandidate(db, id, identity, { ...source, decision: 'accept', capabilities: confirmed }, reason, actor, when);
+        result = { model_id: id, display_name: name, candidate_id: accepted.approved_match_id,
+          deployment_id: accepted.deployment_id, deployment_revision: accepted.deployment_revision, status: 'accepted' };
+        audit(db, actor, 'channel.model.adopt', id, { discovery_id: jobId, catalog_item_id: catalogId, deployment_id: accepted.deployment_id }, when);
+      }
+      return op.complete(db, { status: 201, payload: { ...result, identity_revision: identity.identity_revision } });
+    });
   });
 
   app.get(`${modelPath}/identity`, (c) => {

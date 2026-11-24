@@ -73,6 +73,15 @@ test('real HTTP channel actions retain all pages and publish a one-to-many pool 
     expect(first.items.length + last.items.length).toBe(222);
     const exact = await api(`/probe-jobs/${resultA.id}/results?q=Supplier-A%2FM`);
     expect(exact.items).toMatchObject([{ raw_model: 'Supplier-A/M', context_tokens: 128000 }]);
+    const [newSource] = (await api(`/probe-jobs/${resultA.id}/results?q=untouched-page-two`)).items;
+    const newModel = { catalog_item_id: newSource.catalog_item_id, display_name: '原生第二页模型', context_window: 128000,
+      maker_id: 'fixture', model_family: 'page-two', model_variant: 'standard', capabilities: ['text'], reason: '核对原厂目录及样例' };
+    const newPath = `/probe-jobs/${resultA.id}/adoptions`;
+    await api(newPath, { ...newModel, identity_mode: 'pinned_snapshot', model_snapshot: 'not-attested' }, 409);
+    expect((await api('/models?q=untouched-page-two')).items).toEqual([]);
+    const created = await api(newPath, { ...newModel, identity_mode: 'family_follow' }, 201);
+    expect((await api('/models?q=untouched-page-two')).items).toMatchObject([
+      { id: created.model_id, provider_id: a.id, upstream_name: 'untouched-page-two', context_window: 128000 }]);
     const resultB = await api(`/providers/${b.id}/discoveries`, { revision: b.revision }, 202);
     failB = true;
     expect(await api(`/providers/${b.id}/discoveries`, { revision: b.revision }, 202)).toMatchObject({ status: 'failed', summary: { reason: 'permission_denied' } });
@@ -122,6 +131,32 @@ test('real HTTP channel actions retain all pages and publish a one-to-many pool 
     const newerPartial = await pullRefreshed();
     expect(await viewChannel()).toMatchObject({ latest_discovery: { id: newerPartial.id }, latest_catalog: { id: succeeded.id },
       historical_catalog: { id: resultA.id } });
+
+    const adoptionPath = `/probe-jobs/${succeeded.id}/adoptions`;
+    const [incoming] = (await api(`/probe-jobs/${succeeded.id}/results`)).items;
+    const { catalog_item_id } = incoming;
+    const stage = { mode: 'draft', catalog_item_id };
+    await api(adoptionPath, stage, 403, undefined, tenantToken);
+    const intake = await api(adoptionPath, stage, 201);
+    expect(intake).toMatchObject({ status: 'needs_review', raw_model: 'Supplier-A/Refreshed' });
+    expect(await api(adoptionPath, stage, 201)).toEqual(intake);
+    expect((await api('/models?q=Supplier-A%2FRefreshed')).items).toEqual([]);
+    const preserved = await api('/models', { provider_id: a.id, upstream_name: 'Supplier-A/Refreshed',
+      display_name: '已登记的签约型号', context_window: 32000 }, 201);
+    const adoption = { catalog_item_id, display_name: '不会覆写旧名', context_window: 32000, maker_id: 'maker',
+      model_family: 'Refreshed', model_variant: 'standard', identity_mode: 'family_follow', capabilities: ['text'], reason: '已核实的原厂型号' };
+    await api(adoptionPath, { ...adoption, capabilities: [] }, 422);
+    expect((await api(`/models/${preserved.id}/identity`)).identity).toBeNull();
+    const adopted = await api(adoptionPath, adoption, 201, 'adopt-exact');
+    expect(adopted).toMatchObject({ model_id: preserved.id, display_name: preserved.display_name, status: 'accepted', identity_revision: 1 });
+    expect(await api(adoptionPath, adoption, 201, 'adopt-exact')).toEqual(adopted);
+    expect(await api(adoptionPath, adoption, 201)).toEqual(adopted);
+    await api(adoptionPath, { ...adoption, model_variant: 'other' }, 409);
+    refreshedCatalog = 'succeeded';
+    const freshSource = await pullRefreshed();
+    const [latest] = (await api(`/probe-jobs/${freshSource.id}/results`)).items;
+    expect(latest).toMatchObject({ intake, adoptions: [{ model_id: preserved.id, status: 'accepted', pool_revision: null }] });
+    expect(await api(`/probe-jobs/${freshSource.id}/adoptions`, adoption, 201)).toEqual(adopted);
 
     const changed = new URL('/a/v1', upstream.url);
     changed.hostname = '127.0.0.2';
