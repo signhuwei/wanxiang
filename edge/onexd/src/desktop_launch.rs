@@ -7,6 +7,14 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::launch::{self, Launch};
+use crate::router::AgentProtocol;
+
+#[derive(Clone)]
+pub(crate) struct DeepSeekModel {
+    pub(crate) name: String,
+    pub(crate) api: AgentProtocol,
+    pub(crate) image_input: bool,
+}
 
 pub(crate) struct Request<'a> {
     pub(crate) owner: &'a str,
@@ -18,7 +26,7 @@ pub(crate) struct Request<'a> {
     pub(crate) model_bearer: Option<&'a str>,
     pub(crate) router: &'a str,
     pub(crate) model: &'a str,
-    pub(crate) image_input: bool,
+    pub(crate) deepseek_models: &'a [DeepSeekModel],
 }
 
 pub(crate) struct Prepared {
@@ -150,6 +158,8 @@ pub(crate) fn prepare(
                 config
             }
             "deepseek-desktop" => {
+                let (providers, model_permissions, default_provider) =
+                    deepseek_model_config(&origin, request.model, request.deepseek_models)?;
                 #[cfg(windows)]
                 {
                     windows_deepseek_environment(&mut env, &home, &tmp)?;
@@ -181,16 +191,11 @@ pub(crate) fn prepare(
                     { "id":"llm-deepseek-account", "disabled":true },
                     { "id":"plugin-manager", "disabled":true },
                     { "id":"tool-plugin-manager", "disabled":true },
-                    { "id":"llm-pi-ai", "config": { "providers": { "onex": {
-                        "displayName":"OneX", "api":"openai-completions", "baseURL":format!("{origin}/v1"),
-                        "apiKeyEnv":"ONEX_NATIVE_SESSION", "retryPolicy": { "mode":"normal", "maxRetries":0 },
-                        "models":[{"id":request.model, "name":request.model, "contextWindow":32768,
-                            "maxTokens":4096, "input":if request.image_input { vec!["text", "image"] } else { vec!["text"] }, "reasoningEfforts":false}]
-                    } } } },
-                    { "id":"agent-default-model", "config": { "provider":"onex", "model":request.model } },
+                    { "id":"llm-pi-ai", "config": { "providers":providers } },
+                    { "id":"agent-default-model", "config": { "provider":default_provider, "model":request.model } },
                     { "insert": [{ "id":"onex-managed-session", "name":plugin_url.as_str(), "config": {
-                        "origin":origin, "workspace":workspace, "model":request.model, "credential":path_text(&credential)?,
-                        "imageInput":request.image_input,"extractor":path_text(&std::env::current_exe()?)?
+                        "origin":origin, "workspace":workspace, "models":model_permissions, "credential":path_text(&credential)?,
+                        "extractor":path_text(&std::env::current_exe()?)?
                     }}] },
                 ]);
                 publish(&desktop, "cordis.yml", b"[]\n")?;
@@ -222,6 +227,89 @@ pub(crate) fn prepare(
         let _ = launch::finish(request.home, &launch_id);
     }
     result
+}
+
+fn deepseek_model_config(
+    origin: &str,
+    default_model: &str,
+    models: &[DeepSeekModel],
+) -> Result<(serde_json::Value, serde_json::Value, &'static str)> {
+    let mut seen = std::collections::HashSet::new();
+    for model in models {
+        anyhow::ensure!(
+            !model.name.is_empty() && !model.name.contains('*') && seen.insert(model.name.as_str()),
+            "invalid or repeated DeepSeek model"
+        );
+        anyhow::ensure!(
+            matches!(model.api, AgentProtocol::Chat | AgentProtocol::Messages),
+            "unsupported DeepSeek model protocol"
+        );
+    }
+
+    let mut providers = serde_json::Map::new();
+    let mut permissions = Vec::with_capacity(models.len());
+    let mut default_provider = None;
+    // Keep the installed Chat provider ID for saved sessions. The native
+    // Anthropic SDK appends /v1/messages, while the OpenAI client appends /chat/completions.
+    for (protocol, provider, label, api, path) in [
+        (AgentProtocol::Chat, "onex", "OneX", "openai-completions", "/v1"),
+        (AgentProtocol::Messages, "onex-anthropic", "OneX · Anthropic", "anthropic-messages", ""),
+    ] {
+        let native_models: Vec<_> = models
+            .iter()
+            .filter(|model| model.api == protocol)
+            .map(|model| {
+                if model.name == default_model {
+                    default_provider = Some(provider);
+                }
+                permissions.push(json!({"provider":provider,"id":model.name,"imageInput":model.image_input}));
+                json!({"id":model.name,"name":model.name,"contextWindow":32768,"maxTokens":4096,
+                "input":if model.image_input { vec!["text", "image"] } else { vec!["text"] }, "reasoningEfforts":false})
+            })
+            .collect();
+        if !native_models.is_empty() {
+            providers.insert(
+                provider.into(),
+                json!({
+                    "displayName":label,"api":api,"baseURL":format!("{origin}{path}"),"apiKeyEnv":"ONEX_NATIVE_SESSION",
+                    "retryPolicy":{"mode":"normal","maxRetries":0},"models":native_models
+                }),
+            );
+        }
+    }
+    Ok((providers.into(), permissions.into(), default_provider.context("missing default DeepSeek model")?))
+}
+
+#[cfg(test)]
+mod deepseek_model_tests {
+    use super::*;
+
+    #[test]
+    fn deepseek_profile_uses_native_protocol_and_selected_models() {
+        let models = [
+            DeepSeekModel { name: "approved-chat".into(), api: AgentProtocol::Chat, image_input: false },
+            DeepSeekModel { name: "approved-vision".into(), api: AgentProtocol::Chat, image_input: true },
+            DeepSeekModel { name: "approved-messages".into(), api: AgentProtocol::Messages, image_input: true },
+        ];
+        let (providers, permissions, default_provider) =
+            deepseek_model_config("http://127.0.0.1:1234", "approved-chat", &models).unwrap();
+        assert_eq!(default_provider, "onex");
+        assert_eq!(providers["onex"]["baseURL"], "http://127.0.0.1:1234/v1");
+        assert_eq!(providers["onex"]["api"], "openai-completions");
+        assert_eq!(providers["onex"]["models"].as_array().unwrap().len(), 2);
+        assert_eq!(providers["onex"]["models"][0]["input"], json!(["text"]));
+        assert_eq!(providers["onex"]["models"][1]["input"], json!(["text", "image"]));
+        assert_eq!(providers["onex-anthropic"]["baseURL"], "http://127.0.0.1:1234");
+        assert_eq!(providers["onex-anthropic"]["api"], "anthropic-messages");
+        assert_eq!(providers["onex-anthropic"]["models"][0]["id"], "approved-messages");
+        assert_eq!(providers["onex-anthropic"]["apiKeyEnv"], "ONEX_NATIVE_SESSION");
+        assert_eq!(permissions[2], json!({"provider":"onex-anthropic","id":"approved-messages","imageInput":true}));
+        assert_eq!(
+            deepseek_model_config("http://127.0.0.1:1234", "approved-messages", &models[2..]).unwrap().2,
+            "onex-anthropic"
+        );
+        assert!(deepseek_model_config("http://127.0.0.1:1234", "unknown", &models).is_err());
+    }
 }
 
 #[cfg(windows)]
@@ -352,7 +440,11 @@ fn deepseek_uses_private_windows_profile_and_loadable_adapter_urls() {
         model_bearer: None,
         router: "127.0.0.1:19876",
         model: "contract-model",
-        image_input: false,
+        deepseek_models: &[DeepSeekModel {
+            name: "contract-model".into(),
+            api: AgentProtocol::Chat,
+            image_input: false,
+        }],
     };
     let prepared = prepare(&request, None).unwrap();
     let state = &prepared.launch;
@@ -406,7 +498,7 @@ mod tests {
             model_bearer: Some("test-model-only"),
             router: "127.0.0.1:19876",
             model: "contract-model",
-            image_input: false,
+            deepseek_models: &[],
         };
         let prepared = prepare(&request, None).unwrap();
         let launch = &prepared.launch;

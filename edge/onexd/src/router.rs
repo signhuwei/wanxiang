@@ -37,7 +37,7 @@ pub(crate) const MAX_UPSTREAM_BODY: usize = 64 * 1024 * 1024;
 const MVP_LOCAL_QWEN_PROVIDER_ID: &str = "prv_mvp_local_qwen";
 const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentProtocol {
     Messages,
     Responses,
@@ -83,21 +83,33 @@ impl AgentProtocol {
         model: &str,
         agent: Option<&str>,
     ) -> Option<&'a Route> {
-        let Some(desktop @ ("workbuddy" | "codex-desktop" | "claude-desktop")) = agent else {
+        let Some(desktop @ ("workbuddy" | "codex-desktop" | "claude-desktop" | "deepseek-desktop")) = agent else {
             return self.select_config_route(config, model);
         };
-        if Self::for_agent(desktop) != Some(self) || model.contains('*') {
+        let valid_protocol = match desktop {
+            "deepseek-desktop" => matches!(self, Self::Chat | Self::Messages),
+            _ => Self::for_agent(desktop) == Some(self),
+        };
+        if !valid_protocol || model.contains('*') {
             return None;
         }
         let selected = match desktop {
             "workbuddy" => select_workbuddy_route(&config.routes, model),
             "codex-desktop" => select_codex_desktop_route(&config.routes, model),
+            "deepseek-desktop" if self == Self::Chat => {
+                scoped_desktop_route(&config.routes, model, |protocol| protocol == "openai_chat")
+            }
             _ => select_claude_desktop_route(&config.routes, model),
         };
         selected.or_else(|| {
             let routing = config.policy.as_ref()?.balance.as_ref()?;
             let allowed = |protocol: &str| match desktop {
                 "claude-desktop" => protocol == "anthropic",
+                "deepseek-desktop" => match self {
+                    Self::Chat => protocol == "openai_chat",
+                    Self::Messages => protocol == "anthropic",
+                    Self::Responses => false,
+                },
                 _ => self.accepts_upstream(protocol),
             };
             if !routing.aliases.iter().any(|alias| allowed(&alias.protocol) && alias.model == model) {
@@ -599,7 +611,7 @@ impl Router {
         }
         let agent = binding.map(|binding| binding.agent.as_str());
         let route = protocol.select_agent_route(&cfg, model, agent).ok_or_else(|| {
-            if matches!(agent, Some("workbuddy" | "codex-desktop" | "claude-desktop")) {
+            if matches!(agent, Some("workbuddy" | "codex-desktop" | "claude-desktop" | "deepseek-desktop")) {
                 return RouteSelectionError::ModelNotAllowed;
             }
             match select_route(&cfg.routes, model) {
@@ -764,19 +776,31 @@ async fn bind_kimi_session(state: &State, headers: &HeaderMap, native: &Value) -
 async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let started = Instant::now();
     let counts_tokens = uri.path() == COUNT_TOKENS_PATH;
+    let prompt = (!counts_tokens)
+        .then(|| rt.state.desktop_sessions.take_deepseek_prompt(&headers, AgentProtocol::Messages))
+        .flatten();
+    let managed_deepseek_turn = prompt.is_some();
     let claude_window = rt.state.desktop_sessions.is_claude_window(&headers);
-    let Ok(mut binding) = (if claude_window { Ok(None) } else { rt.session_for(&headers) }) else {
+    let (binding, documents) = match prompt {
+        Some((binding, documents)) => (Ok(Some(binding)), documents),
+        None if claude_window => (Ok(None), Vec::new()),
+        None => (rt.session_for(&headers), Vec::new()),
+    };
+    let Ok(mut binding) = binding else {
         return anthropic_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             "OneX 本机令牌无效。请从 OneX Desktop 重新启动这个 Agent。",
         );
     };
-    if binding
-        .as_ref()
-        .and_then(|claim| AgentProtocol::for_agent(&claim.agent))
-        .is_some_and(|protocol| protocol != AgentProtocol::Messages)
-    {
+    let deepseek = binding.as_ref().is_some_and(|claim| claim.agent == "deepseek-desktop");
+    if binding.as_ref().is_some_and(|claim| {
+        if deepseek {
+            !managed_deepseek_turn
+        } else {
+            AgentProtocol::for_agent(&claim.agent).is_some_and(|protocol| protocol != AgentProtocol::Messages)
+        }
+    }) {
         return anthropic_error(
             StatusCode::FORBIDDEN,
             "permission_error",
@@ -787,9 +811,15 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         Ok(v @ Value::Object(_)) => v,
         _ => return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", "请求体不是有效的 JSON 对象。"),
     };
+    if let Err(message) = crate::desktop_sessions::project_prompt_documents(&mut req, &documents) {
+        return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", message);
+    }
     let Some(model) = req.get("model").and_then(Value::as_str).map(str::to_owned) else {
         return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", "请求缺少 model 字段。");
     };
+    if deepseek && binding.as_ref().and_then(|claim| claim.approved_model.as_deref()) != Some(model.as_str()) {
+        return anthropic_error(StatusCode::FORBIDDEN, "permission_error", "该会话本次请求未获准使用此模型。");
+    }
     if claude_window {
         let Some(native) = claude_session_id(&req).filter(|_| !headers.contains_key("x-api-key")) else {
             return anthropic_error(
@@ -875,6 +905,18 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         };
     let first_native_session = binding.and_then(|claim| claim.first_native_session);
     let to_chat = route.protocol == "openai_chat";
+    if deepseek
+        && crate::route_select::required_features("anthropic", &req).contains(crate::route_select::feature::IMAGES)
+    {
+        if !crate::desktop_sessions::accepts_images(&route) {
+            return anthropic_error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "当前签约模型的渠道没有核验图片输入能力。",
+            );
+        }
+        execution.require_verified_images();
+    }
     if counts_tokens && to_chat {
         return anthropic_error(
             StatusCode::NOT_IMPLEMENTED,
@@ -931,7 +973,7 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
             Err(msg) => return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg),
         }
     } else {
-        if upstream_model != model || execution.clamps_output() {
+        if upstream_model != model || execution.clamps_output() || !documents.is_empty() {
             req["model"] = Value::String(upstream_model.clone());
             Bytes::from(serde_json::to_vec(&req).unwrap())
         } else {

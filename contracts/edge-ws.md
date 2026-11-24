@@ -198,7 +198,7 @@ Apple Silicon Edge 在 hello 中声明 `agent_cache: true` 与 `mac_desktop_v1: 
 
 Server 为 Windows x64 的 DeepSeek Harness Desktop 接受独立的 `windows_deepseek_desktop_v1` 能力位。下发要求设备声明此能力及 `agent_cache: true`，并通过同样的合约、精确发行资格和完整缓存校验。
 
-原厂 DeepSeek Cordis 适配器使用 `POST /v1/onex/desktop/ready` 标记本机适配器就绪。每次模型请求由 `POST /v1/onex/desktop/session` 携带本次私有启动凭据以及 `{native_id,bind_model:true,records:[]}` 换取有效期 60 秒、单次使用的会话模型凭据。适配器先按原生历史头核对工作区、真实 SID 及来源。上传公开记录时传 `bind_model:false`，以原生序号推进游标。上游计量与原生消息使用同一 OneX 会话编号，撤销启动立即丢弃其待用凭据。
+原厂 DeepSeek Cordis 适配器使用 `POST /v1/onex/desktop/ready` 标记本机适配器就绪。模型列表来自当前设备获准且有生效费率的 Chat Completions 和 Anthropic Messages 路由。每次模型请求由 `POST /v1/onex/desktop/session` 携带本次私有启动凭据以及 `{native_id,model,bind_model:true,records:[]}` 换取有效期 60 秒、单次使用的会话模型凭据。凭据同时绑定所选模型和协议。适配器先按原生历史头核对工作区、真实 SID 及来源，Edge 转发时复核当前配置。上传公开记录时传 `bind_model:false`，以原生序号推进游标。同一原生会话切换模型继续使用同一 OneX 会话编号，每笔费用归属实际使用的模型。撤销启动立即丢弃其待用凭据。
 
 WorkBuddy 受管窗口创建或恢复任务时，用本次启动的控制凭据向本机 `POST /v1/onex/workbuddy/session` 提交 `{native_id,source:{project,cwd}}`。Edge 校验签名发行对应的私有 profile 和记录来源后返回 `{model_token}`。令牌只属于本次启动的该原生任务，供任务自己的模型客户端使用。原厂窗口的模型列表来自合约授予且原厂允许的模型，自定义模型的新增、编辑及删除由受管策略禁用。
 

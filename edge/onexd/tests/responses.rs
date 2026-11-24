@@ -684,6 +684,7 @@ async fn desktop_chat_uses_launch_binding_and_preserves_chat_tools() {
             ..config.routes[0].clone()
         };
         config.routes[0].model = "codex-*".into();
+        config.routes[0].upstream_model = Some("codex-model".into());
         config.routes.insert(0, responses);
     }
     let chat = env.url.replace("/v1/responses", "/v1/chat/completions");

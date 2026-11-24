@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::credentials::{CredentialStore, DeviceCredentials, HistoryIdentity, HistoryScope};
+use crate::desktop_launch::DeepSeekModel;
 use crate::outbox::Outbox;
 use crate::pricing::format_ms;
 use crate::router::AgentProtocol;
@@ -784,7 +785,7 @@ async fn launch(
             && crate::hosted_search::select(cfg, agent).eq(search_releases.iter())
     };
     // 别名候选：精确名字的路由；通配路由用它固定的上游模型名（server 的 MVP seed 是 `*` → Qwen3.8-27B）
-    let (models, routable) = {
+    let (models, routable, deepseek_models) = {
         let pool = ipc.state.pool_launch_config();
         let cfg = ipc.state.config.read().unwrap();
         let cfg = pool.as_ref().unwrap_or(&cfg);
@@ -802,6 +803,7 @@ async fn launch(
         {
             return err("agent_not_allowed", "受管发行已变化，请重试");
         }
+        let deepseek_models = if agent == "deepseek-desktop" { deepseek_model_choices(&cfg) } else { Vec::new() };
         let compatible = || cfg.routes.iter().filter(|route| protocol.accepts_upstream(&route.protocol));
         let exact = compatible().filter(|route| !route.model.ends_with('*')).map(|route| route.model.as_str());
         let wildcard = compatible().filter_map(|route| {
@@ -809,14 +811,23 @@ async fn launch(
             route.upstream_model.as_deref().filter(|model| model.starts_with(prefix))
         });
         let mut seen = HashSet::new();
-        let models: Vec<_> = exact
-            .chain(wildcard)
-            .filter(|name| !desktop || protocol.select_agent_route(&cfg, name, Some(agent)).is_some())
-            .filter(|name| seen.insert(*name))
-            .map(str::to_owned)
-            .collect();
-        let routable = model.is_some_and(|name| protocol.select_agent_route(&cfg, name, Some(agent)).is_some());
-        (models, routable)
+        let (models, routable) = if agent == "deepseek-desktop" {
+            (
+                deepseek_models.iter().map(|item| item.name.clone()).collect::<Vec<_>>(),
+                model.is_some_and(|name| deepseek_models.iter().any(|item| item.name == name)),
+            )
+        } else {
+            (
+                exact
+                    .chain(wildcard)
+                    .filter(|name| !desktop || protocol.select_agent_route(&cfg, name, Some(agent)).is_some())
+                    .filter(|name| seen.insert(*name))
+                    .map(str::to_owned)
+                    .collect(),
+                model.is_some_and(|name| protocol.select_agent_route(&cfg, name, Some(agent)).is_some()),
+            )
+        };
+        (models, routable, deepseek_models)
     };
     let model = match model {
         Some(m) if routable => m.to_string(),
@@ -846,10 +857,6 @@ async fn launch(
             .or_else(|| ipc.state.expected_device_id.read().unwrap().clone());
         let Some(owner) = owner else { return err("unauthenticated", "请先连接 OneX Server") };
         let model_bearer = (agent == "workbuddy").then(crate::id::token);
-        let image_input = agent == "deepseek-desktop"
-            && protocol
-                .select_agent_route(&ipc.state.config.read().unwrap(), &model, Some(agent))
-                .is_some_and(crate::desktop_sessions::accepts_images);
         return start_desktop(
             ipc,
             ctx,
@@ -863,7 +870,7 @@ async fn launch(
                 model_bearer: model_bearer.as_deref(),
                 router: router_addr,
                 model: &model,
-                image_input,
+                deepseek_models: &deepseek_models,
             },
             approved.as_ref().expect("desktop launch always has an approved release"),
             claude_engine.as_ref().map(|(path, engine)| (path.as_path(), *engine)),
@@ -1013,6 +1020,36 @@ async fn launch(
     }
 }
 
+fn deepseek_model_choices(config: &crate::state::ConfigSnapshot) -> Vec<DeepSeekModel> {
+    let mut names = HashSet::new();
+    let now = crate::outbox::now_ms();
+    config
+        .routes
+        .iter()
+        .filter_map(|route| {
+            if !matches!(route.protocol.as_str(), "openai_chat" | "anthropic") {
+                return None;
+            }
+            let name = match route.model.strip_suffix('*') {
+                Some(prefix) => route.upstream_model.as_deref().filter(|name| name.starts_with(prefix))?,
+                None => &route.model,
+            };
+            if !names.insert(name) {
+                return None;
+            }
+            [AgentProtocol::Chat, AgentProtocol::Messages].into_iter().find_map(|api| {
+                let route = api.select_agent_route(config, name, Some("deepseek-desktop"))?;
+                crate::pricing::pick_rate(&config.rates, &route.model_id, now)?;
+                Some(DeepSeekModel {
+                    name: name.to_owned(),
+                    api,
+                    image_input: crate::desktop_sessions::accepts_images(route),
+                })
+            })
+        })
+        .collect()
+}
+
 async fn start_desktop(
     ipc: &Ipc,
     ctx: &LaunchCtx,
@@ -1084,6 +1121,9 @@ async fn start_desktop(
         workspace,
         ipc.outbox.clone(),
     );
+    if request.agent == "deepseek-desktop" {
+        ipc.state.desktop_sessions.set_deepseek_models(request.token, request.deepseek_models);
+    }
     let claude = claude_profile.is_some();
     if let Some(capture) = &workbuddy_capture {
         ipc.state.desktop_sessions.attach_workbuddy_capture(request.token, capture.clone());
@@ -1101,7 +1141,7 @@ async fn start_desktop(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let spawned = async {
+    let spawned: std::io::Result<_> = async {
         let child = command.spawn()?;
         #[cfg(windows)]
         if let Some(job) = &job

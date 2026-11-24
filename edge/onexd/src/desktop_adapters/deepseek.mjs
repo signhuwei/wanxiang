@@ -54,6 +54,7 @@ function visibleMessage(event, offset) {
 export async function apply(ctx, config) {
   const bearer = readFileSync(config.credential, 'utf8').trim()
   if (!bearer || !/^http:\/\/127\.0\.0\.1:\d+$/.test(config.origin)) throw new Error('Missing OneX session adapter')
+  const models = new Map(config.models.map(model => [model.id, model]))
   const { isAgentLoopRequest } = await ctx.loader.import('@deepseek-ai/dsh-llm')
   const workspace = path(config.workspace)
   if (!workspace) throw new Error('OneX workspace is unavailable')
@@ -65,8 +66,10 @@ export async function apply(ctx, config) {
   const offsets = new Map()
   const bound = new Set()
 
-  async function register(id, records, bindModel = false, documents = []) {
-    const body = JSON.stringify({ native_id:id, records, bind_model:bindModel, ...(documents.length && { documents }) })
+  async function register(id, records, model, documents = []) {
+    const bindModel = model !== undefined
+    const body = JSON.stringify({ native_id:id, records, bind_model:bindModel, ...(bindModel && { model }),
+      ...(documents.length && { documents }) })
     if (!bindModel && records.length > 1 && Buffer.byteLength(body) > 1536 * 1024) {
       const split = Math.floor(records.length / 2)
       if (!await register(id, records.slice(0, split))) return null
@@ -85,13 +88,14 @@ export async function apply(ctx, config) {
   const belongs = header => !header.origin && !header.isSeeded && path(header.cwd) === workspace
   ctx.on('llm/stream', (options, next) => (async function* () {
     const id = options.sessionId
-    if (!isAgentLoopRequest(options) || !id || options.provider !== 'onex' || options.model !== config.model) {
+    const selected = models.get(options.model)
+    if (!isAgentLoopRequest(options) || !id || !selected || options.provider !== selected.provider) {
       throw new Error('OneX requires an approved model and a native workspace session')
     }
     const stat = await ctx.sessionPersistence.stat(id)
     if (!stat || stat.header.id !== id || !belongs(stat.header)) throw new Error('This workspace is outside the OneX launch')
-    const documents = await prepareAttachments(ctx, config, options.messages, options.signal)
-    const token = await register(id, [], true, documents)
+    const documents = await prepareAttachments(ctx, { ...config, imageInput:selected.imageInput }, options.messages, options.signal)
+    const token = await register(id, [], selected.id, documents)
     bound.add(id)
     if (offsets.get(id)?.unbound) offsets.delete(id)
     const source = ctx.credentials.withSession(token, () => next()[Symbol.asyncIterator]())

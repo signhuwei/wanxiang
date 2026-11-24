@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::outbox::{DesktopActivity, Outbox, desktop_launch_key, now_ms};
-use crate::router::Router;
+use crate::router::{AgentProtocol, Router};
 use crate::state::LaunchBinding;
 
 #[derive(Default)]
@@ -35,6 +35,7 @@ struct Grant {
     owner: String,
     expires: std::time::Instant,
     binding: LaunchBinding,
+    protocol: AgentProtocol,
     documents: Vec<PromptDocument>,
 }
 
@@ -46,6 +47,7 @@ pub(crate) struct Launch {
     pub(crate) model: String,
     pub(crate) workspace_hash: String,
     pub(crate) outbox: Arc<Outbox>,
+    deepseek_models: HashMap<String, AgentProtocol>,
     turns: HashMap<Uuid, Uuid>,
     claude_profile: Option<crate::claude_desktop::Profile>,
     claude_transcripts: HashMap<Uuid, (String, std::path::PathBuf)>,
@@ -80,6 +82,11 @@ impl DesktopSessions {
         workspace_hash: String,
         outbox: Arc<Outbox>,
     ) {
+        let deepseek_models = if agent == "deepseek-desktop" {
+            HashMap::from([(model.clone(), AgentProtocol::Chat)])
+        } else {
+            HashMap::new()
+        };
         let launch = Launch {
             device,
             agent,
@@ -88,6 +95,7 @@ impl DesktopSessions {
             model,
             workspace_hash,
             outbox,
+            deepseek_models,
             turns: HashMap::new(),
             claude_profile: None,
             claude_transcripts: HashMap::new(),
@@ -100,6 +108,17 @@ impl DesktopSessions {
             registry.codex_models.insert(codex_model_token(&token), token.clone());
         }
         registry.launches.insert(token, launch);
+    }
+
+    pub(crate) fn set_deepseek_models(&self, control: &str, models: &[crate::desktop_launch::DeepSeekModel]) {
+        let mut registry = self.0.lock().unwrap();
+        if let Some(launch) = registry.launches.get_mut(control).filter(|launch| launch.agent == "deepseek-desktop") {
+            launch.deepseek_models = models
+                .iter()
+                .filter(|model| matches!(model.api, AgentProtocol::Chat | AgentProtocol::Messages))
+                .map(|model| (model.name.clone(), model.api))
+                .collect();
+        }
     }
 
     pub(crate) fn stop(&self, token: &str) {
@@ -121,25 +140,22 @@ impl DesktopSessions {
     }
 
     pub(crate) fn model(&self, token: &str) -> Option<LaunchBinding> {
-        let mut registry = self.0.lock().unwrap();
-        if let Some((_, binding)) = registry.claude_models.get(token) {
-            return Some(binding.clone());
-        }
-        registry
-            .models
-            .remove(token)
-            .filter(|grant| grant.expires > std::time::Instant::now())
-            .map(|grant| grant.binding)
+        self.0.lock().unwrap().claude_models.get(token).map(|(_, binding)| binding.clone())
     }
 
-    pub(crate) fn take_deepseek_prompt(&self, headers: &HeaderMap) -> Option<(LaunchBinding, Vec<PromptDocument>)> {
-        if headers.contains_key("x-api-key") {
+    pub(crate) fn take_deepseek_prompt(
+        &self,
+        headers: &HeaderMap,
+        protocol: AgentProtocol,
+    ) -> Option<(LaunchBinding, Vec<PromptDocument>)> {
+        let token = deepseek_token(headers, protocol)?;
+        let mut registry = self.0.lock().unwrap();
+        let grant = registry.models.get(token)?;
+        if grant.protocol != protocol || grant.expires <= std::time::Instant::now() {
             return None;
         }
-        let token = bearer(headers)?;
-        let grant = self.0.lock().unwrap().models.remove(token)?;
-        (grant.binding.agent == "deepseek-desktop" && grant.expires > std::time::Instant::now())
-            .then_some((grant.binding, grant.documents))
+        let grant = registry.models.remove(token)?;
+        Some((grant.binding, grant.documents))
     }
 
     pub(crate) fn claude_native_id(&self, headers: &HeaderMap) -> Option<Uuid> {
@@ -209,7 +225,13 @@ impl DesktopSessions {
         let token = self
             .receive(
                 &control,
-                Batch { bind_model: true, native_id: native.to_string(), records: vec![], documents: vec![] },
+                Batch {
+                    bind_model: true,
+                    native_id: native.to_string(),
+                    model: None,
+                    records: vec![],
+                    documents: vec![],
+                },
             )
             .ok()???;
         let mut registry = self.0.lock().unwrap();
@@ -252,12 +274,21 @@ impl DesktopSessions {
     fn receive(&self, credential: &str, batch: Batch) -> Result<Option<Option<String>>> {
         let mut registry = self.0.lock().unwrap();
         let Some(launch) = registry.launches.get_mut(credential) else { return Ok(None) };
+        let deepseek = launch.agent == "deepseek-desktop";
         if matches!(launch.agent.as_str(), "codex-desktop" | "workbuddy")
             || (batch.bind_model && !matches!(launch.agent.as_str(), "deepseek-desktop" | "claude-desktop"))
-            || (!batch.documents.is_empty() && launch.agent != "deepseek-desktop")
+            || (!batch.documents.is_empty() && !deepseek)
+            || (batch.model.is_some() && (!deepseek || !batch.bind_model))
         {
             return Ok(None);
         }
+        let chosen_model = batch.model.as_deref().unwrap_or(&launch.model);
+        let deepseek_protocol = if deepseek && batch.bind_model {
+            let Some(protocol) = launch.deepseek_models.get(chosen_model).copied() else { return Ok(None) };
+            Some(protocol)
+        } else {
+            None
+        };
         let claude_native_id = if launch.agent == "claude-desktop" {
             let Some(native) = Uuid::parse_str(&batch.native_id)
                 .ok()
@@ -272,7 +303,6 @@ impl DesktopSessions {
         let session = crate::native_capture::session_id(&launch.device, &launch.agent, &batch.native_id);
         let key = format!("desktop:{session}");
         let cursor = launch.outbox.cursor(&key)?;
-        let deepseek = launch.agent == "deepseek-desktop";
         // The plugin scans the whole managed journal to recover late writes.
         // A scan alone cannot start a previously unbound desktop session.
         if deepseek && cursor.is_none() && !batch.bind_model {
@@ -291,7 +321,7 @@ impl DesktopSessions {
             events.push(event(
                 "session_start",
                 json!({
-                    "agent":launch.agent, "agent_version":launch.version, "model":launch.model,
+                    "agent":launch.agent, "agent_version":launch.version, "model":chosen_model,
                     "cwd_hash":launch.workspace_hash, "uuid":null, "parentUuid":null, "sidechain":false, "agent_id":null
                 }),
                 None,
@@ -359,7 +389,7 @@ impl DesktopSessions {
             session_id: session,
             agent: launch.agent.clone(),
             release_id: Some(launch.release_id.clone()),
-            approved_model: Some(launch.model.clone()),
+            approved_model: Some(chosen_model.to_owned()),
             first_native_session: None,
         };
         if let Some(native) = claude_native_id {
@@ -374,12 +404,14 @@ impl DesktopSessions {
             registry.claude_models.insert(token.clone(), (native, binding));
             return Ok(Some(Some(token)));
         }
+        let Some(protocol) = deepseek_protocol else { return Ok(None) };
         let token = crate::id::token();
         let now = std::time::Instant::now();
         let grant = Grant {
             owner: credential.to_owned(),
             expires: now + std::time::Duration::from_secs(60),
             binding,
+            protocol,
             documents: batch.documents,
         };
         registry.models.retain(|_, grant| grant.expires > now);
@@ -488,6 +520,7 @@ pub(crate) fn native_turn(headers: &HeaderMap) -> Option<NativeTurn> {
 struct Batch {
     bind_model: bool,
     native_id: String,
+    model: Option<String>,
     records: Vec<Record>,
     #[serde(default)]
     documents: Vec<PromptDocument>,
@@ -593,6 +626,12 @@ impl Batch {
         !self.native_id.is_empty()
             && self.native_id.len() <= 128
             && self.native_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            && self.model.as_ref().is_none_or(|model| {
+                self.bind_model
+                    && !model.trim().is_empty()
+                    && model.len() <= 1024
+                    && !model.chars().any(char::is_control)
+            })
             && (self.bind_model || self.documents.is_empty())
             && self.documents.len() <= 8
             && self.documents.iter().map(|file| file.text.len()).sum::<usize>() <= 128 * 1024
@@ -629,6 +668,31 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         return None;
     }
     headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
+}
+
+fn deepseek_token(headers: &HeaderMap, protocol: AgentProtocol) -> Option<&str> {
+    match protocol {
+        AgentProtocol::Chat => {
+            if headers.contains_key("x-api-key") {
+                return None;
+            }
+            bearer(headers)
+        }
+        AgentProtocol::Messages => {
+            let mut keys = headers.get_all("x-api-key").iter();
+            let key = keys.next().map(|value| value.to_str()).transpose().ok()?;
+            if keys.next().is_some() {
+                return None;
+            }
+            if headers.contains_key(header::AUTHORIZATION) {
+                let token = bearer(headers)?;
+                key.is_none_or(|value| value == token).then_some(token)
+            } else {
+                key
+            }
+        }
+        AgentProtocol::Responses => None,
+    }
 }
 
 pub(crate) async fn ready(AxState(rt): AxState<Arc<Router>>, headers: HeaderMap) -> StatusCode {
@@ -690,6 +754,7 @@ mod tests {
         Batch {
             bind_model: true,
             native_id: native_id.into(),
+            model: None,
             documents: vec![],
             records: vec![Record {
                 seq,
@@ -702,6 +767,240 @@ mod tests {
                 truncated: false,
             }],
         }
+    }
+
+    fn chat_binding(registry: &DesktopSessions, token: &str) -> Option<LaunchBinding> {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        registry.take_deepseek_prompt(&headers, AgentProtocol::Chat).map(|(binding, _)| binding)
+    }
+
+    #[test]
+    fn deepseek_binds_each_selected_model_to_its_wire_and_keeps_the_native_session() -> Result<()> {
+        use crate::desktop_launch::DeepSeekModel;
+
+        let root = tempfile::tempdir()?;
+        let outbox = Arc::new(Outbox::open(&root.path().join("events.sqlite"))?);
+        let registry = DesktopSessions::default();
+        start(&registry, "control", "workspace", &outbox);
+        registry.set_deepseek_models(
+            "control",
+            &[
+                DeepSeekModel { name: "managed-model".into(), api: AgentProtocol::Chat, image_input: false },
+                DeepSeekModel { name: "second-chat".into(), api: AgentProtocol::Chat, image_input: false },
+                DeepSeekModel { name: "managed-messages".into(), api: AgentProtocol::Messages, image_input: false },
+            ],
+        );
+        let make = |model: &str| {
+            let mut input = batch("native", 1, Kind::User);
+            input.model = Some(model.into());
+            input
+        };
+        assert!(registry.receive("control", make("outside-contract"))?.is_none());
+        assert!(outbox.pending(0, 10)?.is_empty());
+        let mut unbound = make("managed-messages");
+        unbound.bind_model = false;
+        assert!(!unbound.valid());
+        assert!(registry.receive("control", unbound)?.is_none());
+
+        let first = registry.receive("control", make("second-chat"))?.flatten().unwrap();
+        assert!(registry.model(&first).is_none());
+        let first_binding = chat_binding(&registry, &first).unwrap();
+        assert_eq!(first_binding.approved_model.as_deref(), Some("second-chat"));
+        assert!(chat_binding(&registry, &first).is_none());
+
+        let second = registry.receive("control", make("managed-messages"))?.flatten().unwrap();
+        assert!(registry.model(&second).is_none());
+        assert!(chat_binding(&registry, &second).is_none());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", second.parse()?);
+        assert!(registry.take_deepseek_prompt(&headers, AgentProtocol::Chat).is_none());
+        headers.append("x-api-key", second.parse()?);
+        assert!(registry.take_deepseek_prompt(&headers, AgentProtocol::Messages).is_none());
+        headers.insert("x-api-key", second.parse()?);
+        headers.insert(header::AUTHORIZATION, "Bearer invalid".parse()?);
+        assert!(registry.take_deepseek_prompt(&headers, AgentProtocol::Messages).is_none());
+        headers.insert(header::AUTHORIZATION, format!("Bearer {second}").parse()?);
+        let (second_binding, documents) = registry.take_deepseek_prompt(&headers, AgentProtocol::Messages).unwrap();
+        assert!(documents.is_empty());
+        assert_eq!(second_binding.approved_model.as_deref(), Some("managed-messages"));
+        assert_eq!(first_binding.session_id, second_binding.session_id);
+        assert_eq!(first_binding.release_id, second_binding.release_id);
+        assert!(registry.take_deepseek_prompt(&headers, AgentProtocol::Messages).is_none());
+
+        let rows = outbox.pending(0, 10)?;
+        assert_eq!(rows[0].item["kind"], "session_start");
+        assert_eq!(rows[0].item["payload"]["model"], "second-chat");
+        assert_eq!(rows.iter().filter(|row| row.item["kind"] == "session_start").count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deepseek_routes_chat_and_messages_on_one_native_session_at_the_selected_model_rate() -> Result<()> {
+        use crate::desktop_launch::DeepSeekModel;
+        use axum::{Json, routing::post};
+        use onex_core::ws::{AgentRelease, Lease, Rate, Route, UpstreamAuth};
+        use serde_json::Value;
+        use tokio::net::TcpListener;
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let upstream_url = format!("http://{}", upstream_listener.local_addr()?);
+        let upstream_app = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                    assert_eq!(headers[header::AUTHORIZATION], "Bearer chat-upstream-key");
+                    assert_eq!(body["model"], "managed-model");
+                    Json(json!({
+                        "id":"chat_fixture","object":"chat.completion","model":"managed-model",
+                        "choices":[{"index":0,"message":{"role":"assistant","content":"chat"},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
+                    }))
+                }),
+            )
+            .route(
+                "/v1/messages",
+                post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                    assert_eq!(headers["x-api-key"], "messages-upstream-key");
+                    assert_eq!(body["model"], "messages-model");
+                    assert_eq!(
+                        body["messages"][0]["content"][0]["text"],
+                        "before [附件 notes.txt 的文本]\nfixture contents\n[附件结束] after"
+                    );
+                    Json(json!({
+                        "id":"msg_fixture","type":"message","role":"assistant","model":"messages-model",
+                        "content":[{"type":"text","text":"messages"}],"stop_reason":"end_turn",
+                        "usage":{"input_tokens":2,"output_tokens":1}
+                    }))
+                }),
+            );
+        let upstream_task = tokio::spawn(axum::serve(upstream_listener, upstream_app).into_future());
+        let state = Arc::new(crate::state::State::default());
+        {
+            let mut config = state.config.write().unwrap();
+            config.agents.push(AgentRelease {
+                id: "approved-release".into(),
+                agent: "deepseek-desktop".into(),
+                os: "darwin".into(),
+                arch: "arm64".into(),
+                version: "test".into(),
+                url: "/v1/edge/agent-artifacts/approved-release".into(),
+                sha256: "a".repeat(64),
+                size: 1,
+            });
+            for (model, protocol, provider, auth, rate) in [
+                ("managed-model", "openai_chat", "chat", UpstreamAuth::Bearer, 1_000_000),
+                ("messages-model", "anthropic", "messages", UpstreamAuth::XApiKey, 2_000_000),
+            ] {
+                config.routes.push(Route {
+                    model: model.into(),
+                    model_id: format!("{provider}-model-id"),
+                    provider_id: provider.into(),
+                    protocol: protocol.into(),
+                    base_url: upstream_url.clone(),
+                    upstream_model: Some(model.into()),
+                    auth,
+                    proxy: None,
+                    input_capabilities: None,
+                });
+                config.rates.push(Rate {
+                    model_id: format!("{provider}-model-id"),
+                    input_milli_per_mtok: rate,
+                    output_milli_per_mtok: rate,
+                    cache_read_milli_per_mtok: 0,
+                    cache_write_milli_per_mtok: 0,
+                    effective_from: None,
+                });
+                state.secrets.write().unwrap().insert(provider.into(), format!("{provider}-upstream-key"));
+            }
+        }
+        state.lease.grant(&Lease {
+            id: "grant".into(),
+            re: None,
+            lease_id: "lease".into(),
+            expires_at: crate::pricing::format_ms(now_ms() + 60_000),
+            budget_milli: 10_000,
+            seq: 1,
+            model_budgets: Default::default(),
+            commerce_plan_id: None,
+        })?;
+        let root = tempfile::tempdir()?;
+        let outbox = Arc::new(Outbox::open(&root.path().join("events.sqlite"))?);
+        start(&state.desktop_sessions, "launch", "workspace", &outbox);
+        state.desktop_sessions.set_deepseek_models(
+            "launch",
+            &[
+                DeepSeekModel { name: "managed-model".into(), api: AgentProtocol::Chat, image_input: false },
+                DeepSeekModel { name: "messages-model".into(), api: AgentProtocol::Messages, image_input: false },
+            ],
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let client = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(3)).build()?;
+        let (usage, mut recorded) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new(state.clone(), "daemon".into(), client.clone(), usage).app();
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let grant = |model: &str, documents: Value| {
+            client
+                .post(format!("{base}/v1/onex/desktop/session"))
+                .bearer_auth("launch")
+                .json(&json!({
+                    "native_id":"native", "bind_model":true, "model":model, "records":[], "documents":documents
+                }))
+                .send()
+        };
+        assert_eq!(grant("unapproved", json!([])).await?.status(), StatusCode::FORBIDDEN);
+        let chat_token = grant("managed-model", json!([])).await?.error_for_status()?.json::<Value>().await?;
+        let chat_token = chat_token["model_token"].as_str().unwrap();
+        let messages_token = grant(
+            "messages-model",
+            json!([{
+                "name":"notes.txt","marker":"[[opaque]]","text":"fixture contents"
+            }]),
+        )
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+        let messages_token = messages_token["model_token"].as_str().unwrap();
+        let call_chat = |token: &str| {
+            client
+                .post(format!("{base}/v1/chat/completions"))
+                .bearer_auth(token)
+                .json(&json!({
+                    "model":"managed-model","max_tokens":8,"messages":[{"role":"user","content":"fixture"}]
+                }))
+                .send()
+        };
+        let call_messages = |token: &str| {
+            client
+                .post(format!("{base}/v1/messages"))
+                .header("x-api-key", token)
+                .json(&json!({
+                    "model":"messages-model","max_tokens":8,
+                    "messages":[{"role":"user","content":[{"type":"text","text":"before [[opaque]] after"}]}]
+                }))
+                .send()
+        };
+        assert_eq!(call_chat(messages_token).await?.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(call_messages(chat_token).await?.status(), StatusCode::UNAUTHORIZED);
+        let chat = call_chat(chat_token).await?.error_for_status()?.json::<Value>().await?;
+        assert_eq!(chat["choices"][0]["message"]["content"], "chat");
+        let messages = call_messages(messages_token).await?.error_for_status()?.json::<Value>().await?;
+        assert_eq!(messages["content"][0]["text"], "messages");
+        assert_eq!(call_messages(messages_token).await?.status(), StatusCode::UNAUTHORIZED);
+
+        let chat_usage = recorded.try_recv()?;
+        let messages_usage = recorded.try_recv()?;
+        assert_eq!((chat_usage.model_id.as_str(), chat_usage.cost_milli), ("chat-model-id", 3));
+        assert_eq!((messages_usage.model_id.as_str(), messages_usage.cost_milli), ("messages-model-id", 6));
+        assert!(chat_usage.usage_final && messages_usage.usage_final);
+        assert_eq!(chat_usage.session_id, messages_usage.session_id);
+        assert!(chat_usage.session_id.is_some() && recorded.try_recv().is_err());
+        server.abort();
+        upstream_task.abort();
+        Ok(())
     }
 
     #[test]
@@ -740,23 +1039,23 @@ mod tests {
         let registry = DesktopSessions::default();
         start(&registry, "before", "workspace", &outbox);
         let old = registry.receive("before", batch("native", 1, Kind::User)).unwrap().unwrap().unwrap();
-        let id = registry.model(&old).unwrap().session_id;
-        assert!(registry.model(&old).is_none());
+        let id = chat_binding(&registry, &old).unwrap().session_id;
+        assert!(chat_binding(&registry, &old).is_none());
         let different = registry.receive("before", batch("other", 1, Kind::User)).unwrap().unwrap().unwrap();
-        assert_ne!(registry.model(&different).unwrap().session_id, id);
+        assert_ne!(chat_binding(&registry, &different).unwrap().session_id, id);
         let unspent = registry.receive("before", batch("native", 1, Kind::User)).unwrap().unwrap().unwrap();
         registry.stop("before");
         outbox.close_desktop_sessions(Some(&desktop_launch_key("before")), Some(now_ms())).unwrap();
-        assert!(registry.model(&unspent).is_none());
-        assert!(registry.model(&old).is_none());
-        assert!(registry.model(&different).is_none());
+        assert!(chat_binding(&registry, &unspent).is_none());
+        assert!(chat_binding(&registry, &old).is_none());
+        assert!(chat_binding(&registry, &different).is_none());
 
         start(&registry, "outside", "another-workspace", &outbox);
         assert!(registry.receive("outside", batch("native", 5, Kind::Assistant)).unwrap().is_none());
         start(&registry, "after", "workspace", &outbox);
         let fresh = registry.receive("after", batch("native", 1, Kind::User)).unwrap().unwrap().unwrap();
         assert_ne!(fresh, old);
-        let binding = registry.model(&fresh).unwrap();
+        let binding = chat_binding(&registry, &fresh).unwrap();
         assert_eq!(binding.session_id, id);
         assert_eq!(binding.approved_model.as_deref(), Some("managed-model"));
         registry.receive("after", batch("native", 4, Kind::Assistant)).unwrap();
@@ -779,6 +1078,7 @@ mod tests {
         let make = |native_id: &str, bind_model, seq: Option<u64>, at_ms| Batch {
             native_id: native_id.to_owned(),
             bind_model,
+            model: None,
             documents: vec![],
             records: seq
                 .map(|seq| Record {

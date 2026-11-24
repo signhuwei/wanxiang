@@ -55,7 +55,9 @@ pub async fn chat_completions(AxState(rt): AxState<Arc<Router>>, headers: Header
 
 async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: Wire) -> Response {
     let started = Instant::now();
-    let prompt = if wire == Wire::Chat { rt.state.desktop_sessions.take_deepseek_prompt(&headers) } else { None };
+    let prompt = (wire == Wire::Chat)
+        .then(|| rt.state.desktop_sessions.take_deepseek_prompt(&headers, AgentProtocol::Chat))
+        .flatten();
     let mut documents = Vec::new();
     let binding = if let Some((binding, attached)) = prompt {
         documents = attached;

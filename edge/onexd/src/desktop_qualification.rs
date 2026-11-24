@@ -40,6 +40,12 @@ export function apply(ctx, config) {
         sessionId = result.sessionId
         writeFileSync(config.marker, sessionId, {flag:'wx', mode:0o600})
       }
+      if (config.selected) {
+        const result = await ctx.sessionController.selectModel({sessionId, ...config.selected})
+        if (result.selected?.provider !== config.selected.provider || result.selected?.model !== config.selected.model) {
+          throw new Error('Native session could not select the authorized model')
+        }
+      }
       const content = [{type:'text', text:config.input}]
       if (config.image) content.push({type:'image', name:'one.png', mediaType:'image/png', data:config.image})
       for (const [name, data] of Object.entries(config.files ?? {})) {
@@ -65,6 +71,24 @@ async fn reply(headers: HeaderMap, Json(body): Json<Value>) -> ([(&'static str, 
     ];
     let mut frames = chunks.iter().map(|chunk| format!("data: {chunk}\n\n")).collect::<String>();
     frames.push_str("data: [DONE]\n\n");
+    ([("content-type", "text/event-stream")], frames)
+}
+
+async fn anthropic_reply(headers: HeaderMap, Json(body): Json<Value>) -> ([(&'static str, &'static str); 1], String) {
+    assert_eq!(headers["x-api-key"], "fixture-upstream");
+    assert!(!headers.contains_key("authorization"));
+    assert_eq!(body["model"], "wire-claude");
+    let chunks = [
+        json!({"type":"message_start","message":{"id":"msg_fixture","type":"message","role":"assistant","model":"wire-claude",
+            "content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":0}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"verified reply"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}),
+        json!({"type":"message_stop"}),
+    ];
+    let frames =
+        chunks.iter().map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap())).collect();
     ([("content-type", "text/event-stream")], frames)
 }
 
@@ -111,7 +135,9 @@ async fn router_fixture(
         reply(headers, body).await
     });
     tokio::spawn(async move {
-        axum::serve(upstream, axum::Router::new().route("/v1/chat/completions", route)).await.unwrap();
+        let fixture =
+            axum::Router::new().route("/v1/chat/completions", route).route("/v1/messages", post(anthropic_reply));
+        axum::serve(upstream, fixture).await.unwrap();
     });
 
     let state = Arc::new(State::default());
@@ -236,14 +262,21 @@ fn original_workbuddy_container_and_apple_signature_match_manifest() -> anyhow::
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "opens a signed DeepSeek GUI twice; set ONEX_DEEPSEEK_QA_BUNDLE to its mounted app"]
 async fn original_gui_restores_native_session_and_settles_each_turn() -> anyhow::Result<()> {
-    run_original_deepseek(false, false).await
+    run_original_deepseek(false, false, false).await
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "opens a signed DeepSeek GUI; set ONEX_DEEPSEEK_QA_BUNDLE and ONEX_DEEPSEEK_QA_DAEMON"]
 async fn original_gui_preserves_image_and_document_prompts() -> anyhow::Result<()> {
-    run_original_deepseek(true, false).await
+    run_original_deepseek(true, false, false).await
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opens a signed DeepSeek GUI; set ONEX_DEEPSEEK_QA_BUNDLE to its mounted app"]
+async fn original_gui_switches_between_three_contract_models() -> anyhow::Result<()> {
+    run_original_deepseek(false, false, true).await
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -259,18 +292,19 @@ async fn original_windows_gui_restores_native_session_and_settles_each_turn() ->
         !association.success() || std::env::var("ONEX_DEEPSEEK_QA_PROTOCOL_BACKED_UP").as_deref() == Ok("1"),
         "back up the existing dsh protocol handler before running Windows GUI QA"
     );
-    run_original_deepseek(false, false).await
+    run_original_deepseek(false, false, false).await
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "opens the packaged DeepSeek Host without the GUI or protocol registration"]
 async fn original_windows_host_restores_native_session_and_settles_each_turn() -> anyhow::Result<()> {
-    run_original_deepseek(false, true).await
+    run_original_deepseek(false, true, false).await
 }
 
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
-async fn run_original_deepseek(attachments: bool, host_only: bool) -> anyhow::Result<()> {
+async fn run_original_deepseek(attachments: bool, host_only: bool, mixed_models: bool) -> anyhow::Result<()> {
+    use crate::router::AgentProtocol;
     #[cfg(target_os = "macos")]
     const IMAGE: &str =
         "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGMQL/sPRwzEcQB1UhjB1HLtUgAAAABJRU5ErkJggg==";
@@ -289,11 +323,57 @@ async fn run_original_deepseek(attachments: bool, host_only: bool) -> anyhow::Re
     #[cfg(windows)]
     let observer = None;
     let (state, addr, mut usage) = router_fixture(&release, observer).await?;
+    let mut models = vec![desktop_launch::DeepSeekModel {
+        name: "onex-qa".into(),
+        api: AgentProtocol::Chat,
+        image_input: attachments,
+    }];
+    let mut turns = vec![("onex", "onex-qa", "model"); 2];
+    if mixed_models {
+        let mut config = state.config.write().unwrap();
+        let primary = config.routes[0].clone();
+        let rate = config.rates[0].clone();
+        let extras = [
+            (
+                "onex",
+                "onex-qa-chat-alt",
+                "chat-alt",
+                "openai_chat",
+                AgentProtocol::Chat,
+                "wire-model",
+                UpstreamAuth::Bearer,
+            ),
+            (
+                "onex-anthropic",
+                "onex-qa-claude",
+                "claude",
+                "anthropic",
+                AgentProtocol::Messages,
+                "wire-claude",
+                UpstreamAuth::XApiKey,
+            ),
+        ];
+        turns.truncate(1);
+        for (provider, model, model_id, protocol, api, upstream, auth) in extras {
+            models.push(desktop_launch::DeepSeekModel { name: model.into(), api, image_input: false });
+            turns.push((provider, model, model_id));
+            config.routes.push(Route {
+                model: model.into(),
+                model_id: model_id.into(),
+                protocol: protocol.into(),
+                auth,
+                upstream_model: Some(upstream.into()),
+                ..primary.clone()
+            });
+            config.rates.push(Rate { model_id: model_id.into(), ..rate.clone() });
+        }
+    }
     let outbox = Arc::new(Outbox::open(&root.path().join("outbox.sqlite"))?);
     let marker = root.path().join("native-id");
     let failure = root.path().join("input-error");
     let mut original = None;
-    for turn in 1..=2 {
+    for (index, (provider, selected, model_id)) in turns.into_iter().enumerate() {
+        let turn = index + 1;
         let launch_token = crate::id::token();
         let input = format!("native qualification turn {turn}");
         let desktop_launch::Prepared { launch, workspace, runtime: _runtime, .. } = desktop_launch::prepare(
@@ -307,7 +387,7 @@ async fn run_original_deepseek(attachments: bool, host_only: bool) -> anyhow::Re
                 model_bearer: None,
                 router: &addr,
                 model: "onex-qa",
-                image_input: attachments,
+                deepseek_models: &models,
             },
             None,
         )?;
@@ -315,7 +395,8 @@ async fn run_original_deepseek(attachments: bool, host_only: bool) -> anyhow::Re
         std::fs::write(&plugin, INPUT_PLUGIN)?;
         let patch_file = launch.config_dir.join("profiles/desktop/cordis.patch.yml");
         let mut patch: Vec<Value> = serde_json::from_slice(&std::fs::read(&patch_file)?)?;
-        let test_config = json!({"workspace":cwd,"marker":marker,"failure":failure,"input":input});
+        let test_config = json!({"workspace":cwd,"marker":marker,"failure":failure,"input":input,
+            "selected":mixed_models.then(|| json!({"provider":provider,"model":selected}))});
         #[cfg(target_os = "macos")]
         let mut test_config = test_config;
         #[cfg(target_os = "macos")]
@@ -346,6 +427,9 @@ async fn run_original_deepseek(attachments: bool, host_only: bool) -> anyhow::Re
             workspace,
             outbox.clone(),
         );
+        state.desktop_sessions.set_deepseek_models(&launch_token, &models);
+        let native_log = root.path().join(format!("native-turn-{turn}.log"));
+        let stderr = std::fs::File::create(&native_log)?;
         let mut command = tokio::process::Command::new(&entry);
         command
             .env_clear()
@@ -353,7 +437,7 @@ async fn run_original_deepseek(attachments: bool, host_only: bool) -> anyhow::Re
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(if cfg!(windows) { Stdio::inherit() } else { Stdio::null() })
+            .stderr(if cfg!(windows) { Stdio::inherit() } else { Stdio::from(stderr) })
             .kill_on_drop(true);
         let stop_file = launch.run_dir.join("stop-qualification-host");
         if host_only {
@@ -369,6 +453,7 @@ async fn run_original_deepseek(attachments: bool, host_only: bool) -> anyhow::Re
             command.args(&launch.args);
         }
         let mut child = command.spawn()?;
+        eprintln!("native qualification turn {turn}, {provider}/{selected}");
         let accepted = tokio::time::timeout(Duration::from_secs(120), async {
             loop {
                 if let Some(status) = child.try_wait()? {
@@ -412,6 +497,8 @@ async fn run_original_deepseek(attachments: bool, host_only: bool) -> anyhow::Re
                         assert!(!journal.contains(PDF_TEXT) && !journal.contains(TXT_TEXT) && !journal.contains(IMAGE));
                     }
                     assert!(request.usage_final);
+                    assert_eq!(request.model_id, model_id);
+                    assert_eq!(request.model, selected);
                     assert_eq!(request.cost_milli, 7);
                     assert_eq!((request.tokens.input, request.tokens.output), (3, 2));
                     let ledger = state.lease.snapshot();
@@ -428,6 +515,9 @@ async fn run_original_deepseek(attachments: bool, host_only: bool) -> anyhow::Re
                             request.cost_milli
                         );
                     }
+                    if mixed_models {
+                        eprintln!("verified native model {provider}/{selected}, cost_milli={}", request.cost_milli);
+                    }
                     original = Some(session.to_owned());
                     return Ok::<_, anyhow::Error>(());
                 }
@@ -435,6 +525,18 @@ async fn run_original_deepseek(attachments: bool, host_only: bool) -> anyhow::Re
             }
         })
         .await;
+        if !matches!(accepted, Ok(Ok(()))) {
+            let journal = outbox.pending(0, 128)?;
+            let kinds = journal.iter().map(|row| row.item["kind"].as_str()).collect::<Vec<_>>();
+            let native_log = std::fs::read_to_string(native_log).unwrap_or_default();
+            let last_lines =
+                native_log.lines().rev().take(24).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>();
+            eprintln!(
+                "native turn {turn} diagnostics: ready={}, journal={kinds:?}\n{}",
+                state.desktop_sessions.is_ready(&launch_token),
+                last_lines.join("\n")
+            );
+        }
         let stopped = if host_only {
             stop_qualification_host(&mut child, &stop_file).await
         } else {
@@ -563,7 +665,15 @@ async fn stop_original_desktop(child: &mut tokio::process::Child) -> anyhow::Res
             .await?;
         anyhow::ensure!(stopped.success(), "original desktop did not terminate");
     }
-    tokio::time::timeout(Duration::from_secs(15), child.wait()).await??;
+    match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
+        Ok(result) => {
+            result?;
+        }
+        // A mounted test app may keep its updater or renderer alive after TERM.
+        // The test has already checked the durable native journal before closing.
+        Err(_) if cfg!(target_os = "macos") => child.kill().await?,
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
