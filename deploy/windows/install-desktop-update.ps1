@@ -22,6 +22,8 @@ function Invoke-UpdateCli($program, $arguments) {
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true
+    # The native CLI writes UTF-8 JSON even when PowerShell has no console.
+    $start.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
     $process = [Diagnostics.Process]::Start($start)
     try {
         $output = $process.StandardOutput.ReadToEndAsync()
@@ -50,6 +52,20 @@ function Get-DaemonStatus($cli) {
 
 function Start-Daemon($path) {
     Start-Process -FilePath $path -WorkingDirectory $installDir -WindowStyle Hidden -PassThru
+}
+
+function Get-UpdateFileDigest($path) {
+    $file = [IO.File]::OpenRead($path)
+    try {
+        $hash = [Security.Cryptography.SHA256]::Create()
+        try {
+            return [Convert]::ToBase64String($hash.ComputeHash($file))
+        } finally {
+            $hash.Dispose()
+        }
+    } finally {
+        $file.Dispose()
+    }
 }
 
 function Restore-Sidecar($backup, $path) {
@@ -91,8 +107,8 @@ function Update-Sidecars {
         if ($candidate.Code -ne 0 -or $candidate.Output -cne "onex $version") {
             throw 'The staged CLI version does not match the update.'
         }
-        $cliChanged = (Get-FileHash -LiteralPath $cli).Hash -cne (Get-FileHash -LiteralPath $nextCli).Hash
-        $daemonChanged = (Get-FileHash -LiteralPath $daemon).Hash -cne (Get-FileHash -LiteralPath $nextDaemon).Hash
+        $cliChanged = (Get-UpdateFileDigest $cli) -cne (Get-UpdateFileDigest $nextCli)
+        $daemonChanged = (Get-UpdateFileDigest $daemon) -cne (Get-UpdateFileDigest $nextDaemon)
         if (-not $cliChanged -and -not $daemonChanged -and $oldStatus.version -ceq $version) { return 0 }
         if ($cliChanged) { [IO.File]::Copy($nextCli, $cliStage) }
         if ($daemonChanged) { [IO.File]::Copy($nextDaemon, $daemonStage) }
