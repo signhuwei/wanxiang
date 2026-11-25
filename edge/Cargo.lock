@@ -2360,6 +2360,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "libc",
  "onex-core",
  "onexd",
  "reqwest 0.12.28",

@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, Instant};
 
-use onex_core::daemon::{exchange, macos_managed_processes_alive, macos_shutdown_when_idle};
+use onex_core::daemon::{exchange, macos_managed_processes_alive, macos_shutdown_when_idle, macos_status_for_pid};
 use onex_core::ipc::Request;
 use serde_json::Value;
 use tokio::process::Command;
 
+use crate::macos_legacy_deepseek;
 use crate::updater::{Phase, Updater};
 
 const DESKTOP: &str = "/Applications/OneX Desktop.app/Contents/MacOS/onex-desktop";
@@ -138,6 +139,8 @@ pub(crate) async fn reconcile(socket: &Path, version: &str, updater: &Updater) {
     let mut handoff: Option<(Instant, Option<String>)> = None;
     let mut no_status_since = Instant::now();
     let mut reregistration_attempted = false;
+    let mut previous_hosts = None;
+    let mut attempted_hosts = None;
 
     loop {
         if !tokio::fs::read_to_string(&stamp).await.is_ok_and(|installed| installed.trim() == version) {
@@ -212,6 +215,36 @@ pub(crate) async fn reconcile(socket: &Path, version: &str, updater: &Updater) {
             Ok(false) => {}
             Ok(true) => {
                 updater.component_phase(Some(Phase::WaitingForAgents));
+                let hosts = status
+                    .as_ref()
+                    .filter(|status| macos_legacy_deepseek::daemon_is_idle(status))
+                    .and_then(|_| macos_legacy_deepseek::detached_hosts(&devices, pid));
+                if let Some(current) = hosts.as_ref().filter(|_| hosts == previous_hosts && hosts != attempted_hosts) {
+                    // Wait for the same already detached processes on two consecutive polls, then try once.
+                    attempted_hosts = hosts.clone();
+                    let signed = macos_legacy_deepseek::verify_bundles(current);
+                    if matches!(tokio::time::timeout(Duration::from_secs(10), signed).await, Ok(true))
+                        && installed_target(version).is_some()
+                        && output(LAUNCHCTL, &["print", &service])
+                            .await
+                            .as_deref()
+                            .and_then(|job| installed_daemon_pid(&service, job))
+                            == Some(pid)
+                        && matches!(
+                            tokio::time::timeout(Duration::from_secs(3), macos_status_for_pid(socket, pid)).await,
+                            Ok(Ok(ref status))
+                                if status["version"] == running_version && macos_legacy_deepseek::daemon_is_idle(status)
+                        )
+                    {
+                        let count = macos_legacy_deepseek::terminate(&devices, pid, current);
+                        if count > 0 {
+                            tracing::info!(count, "retired detached DeepSeek Hosts from the previous onexd");
+                            tokio::time::sleep(POLL_STARTING).await;
+                            continue;
+                        }
+                    }
+                }
+                previous_hosts = hosts;
                 tokio::time::sleep(POLL_BUSY).await;
                 continue;
             }

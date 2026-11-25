@@ -12,11 +12,21 @@ pub async fn exchange(path: &Path, request: &Request) -> std::io::Result<Value> 
 
 #[cfg(target_os = "macos")]
 pub async fn macos_shutdown_when_idle(path: &Path, expected_pid: u32) -> std::io::Result<Value> {
+    macos_exchange_with_pid(path, expected_pid, &Request::ShutdownWhenIdle { expected_pid: Some(expected_pid) }).await
+}
+
+#[cfg(target_os = "macos")]
+pub async fn macos_status_for_pid(path: &Path, expected_pid: u32) -> std::io::Result<Value> {
+    macos_exchange_with_pid(path, expected_pid, &Request::Status).await
+}
+
+#[cfg(target_os = "macos")]
+async fn macos_exchange_with_pid(path: &Path, expected_pid: u32, request: &Request) -> std::io::Result<Value> {
     let connection = crate::transport::connect(path).await?;
     if connection.peer_pid()? != expected_pid {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the daemon does not own this socket"));
     }
-    exchange_on(connection, &Request::ShutdownWhenIdle { expected_pid: Some(expected_pid) }).await
+    exchange_on(connection, request).await
 }
 
 async fn exchange_on(connection: crate::transport::Connection, request: &Request) -> std::io::Result<Value> {

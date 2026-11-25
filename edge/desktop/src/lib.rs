@@ -2,6 +2,8 @@
 pub mod bridge;
 #[cfg(target_os = "macos")]
 mod macos_daemon_update;
+#[cfg(target_os = "macos")]
+mod macos_legacy_deepseek;
 mod profile;
 mod tray;
 mod update_platform;

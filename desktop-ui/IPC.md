@@ -27,7 +27,9 @@ UI 是本地静态 HTML/ESM，不直连 Server、daemon socket 或上游。edge 
 
 macOS 桌面一键启动 Codex 的默认工作目录是 `~/OneX Workspace`。通过终端在其他项目目录运行 `onex run codex` 时，保留该终端的工作目录。
 
-`phase`：`signed_out | choose_tenant | ready`。登录前 `user/tenant` 为 null，目录为空。选择态 `tenants:[{id,name}]`、`tenant:null`；包括单租户，用户确认后再进入。`ready` 目录仅含当前身份允许查看的 Agent。`connection: idle | connecting | connected | backoff`；短时失联不是注销。顶层 `version` 是 Desktop 的完整打包版本，所有阶段均返回，设置页展示。原生窗口启动时也会提供同一版本，Logo 下方无需等待 daemon 即可显示。`agents[].status: available | update_available | not_downloaded | downloading | verifying | starting | running | download_failed | policy_pending | failed`；`update_available` 在 S1 仅作提示，`actions:[]`，页面不提供启动或更新。失败可带中文 `message`。仅 `actions` 含 `launch` 才提供启动，不按连接状态猜授权。快照不含验证码、令牌、安装路径、Provider 密钥、对话内容或完整日志；`server_origin` 无用户信息/query/fragment。错误用契约码及可展示中文，桥不可将敏感原始异常转发给 UI。
+`phase`：`signed_out | choose_tenant | ready`。登录前 `user/tenant` 为 null，目录为空。选择态 `tenants:[{id,name}]`、`tenant:null`；包括单租户，用户确认后再进入。`ready` 目录仅含当前身份允许查看的 Agent。`connection: idle | connecting | connected | backoff`；短时失联不是注销。顶层 `version` 是 Desktop 的完整打包版本，所有阶段均返回，设置页展示。原生窗口启动时也会提供同一版本，Logo 下方无需等待 daemon 即可显示。`agents[].status: available | update_available | not_downloaded | downloading | verifying | starting | running | download_failed | policy_pending | failed`；`update_available` 在 S1 仅作提示，`actions:[]`，页面不提供启动或更新。失败可带中文 `message`。快照不含验证码、令牌、安装路径、Provider 密钥、对话内容或完整日志；`server_origin` 无用户信息/query/fragment。错误用契约码及可展示中文，桥不可将敏感原始异常转发给 UI。
+
+`agents[].launch_blocked` 可为 `daemon_update_pending` 或 `launch_in_progress`，只在具备启动条件的 Agent 暂需等待时返回。页面显示禁用的「启动」和等待原因，正在运行的 Agent 仍显示运行状态及实例数。`actions` 含 `launch` 时启动操作才可执行。
 
 能力策略状态仅在登录的设备与租户匹配时返回。`policy` 包含已应用的设备配置修订、策略修订、平台签发修订、租户配置修订与脱敏展示条目。`policy_pending` 表示设备未接受最近一次应执行的快照，等待同步时不提供受管启动。`notices` 是随已应用策略收到的最近消息，按消息 ID 去重。工作台按本机设备展示通知，消息列表不包含其他租户的数据。
 
@@ -39,7 +41,7 @@ macOS 桌面一键启动 Codex 的默认工作目录是 `~/OneX Workspace`。通
 
 `desktop_update` 可省略。存在时包含目标 `version`，以及 `phase: available | downloading | installing | failed`。下载时可附 `downloaded_bytes` 与 `total_bytes`。标题栏只显示已通过签名验证的更新及其进度，用户明确确认后才发送目标版本。Desktop 重启时复用现有 daemon、设备身份与受管任务。Windows 更新制品包含 Desktop、CLI 和 daemon。Desktop 重启后可显示 `waiting_for_agents | updating_components | components_failed`，当前 Agent 和请求结束后才激活新 CLI 和 daemon。
 
-macOS 覆盖安装和自动更新都会在 Desktop 启动后核对实际运行的 onexd 版本。版本不一致期间继续显示现有运行实例，暂停从工作台启动新实例，直到 onexd 切换完成。标题栏可显示 `waiting_for_agents | restarting_daemon | daemon_restart_required | components_failed`。Desktop 只向安装登记的 LaunchAgent 请求安全切换。若该任务退出后因注册配置错误无法启动，Desktop 可重新注册已验证的 OneX LaunchAgent。
+macOS 覆盖安装和自动更新都会在 Desktop 启动后核对实际运行的 onexd 版本。版本不一致期间继续显示现有运行实例，暂停从工作台启动新实例，直到 onexd 切换完成。标题栏可显示 `waiting_for_agents | restarting_daemon | daemon_restart_required | components_failed`。Desktop 只向安装登记的 LaunchAgent 请求安全切换。RC22 至 RC24 停留在旧后台时，Desktop 在确认设备空闲、原厂窗口已退出、残留 Host 属于原 onexd 进程组且签名匹配后，才发送正常退出信号。若 LaunchAgent 退出后因注册配置错误无法启动，Desktop 可重新注册已验证的 OneX LaunchAgent。
 
 ### UI 中文文案（只按枚举选取，不展示自由文本）
 

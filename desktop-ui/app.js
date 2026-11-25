@@ -19,6 +19,7 @@ const messages={unauthenticated:'登录凭据无效或已过期',forbidden:'没�
 const errorText=code=>typeof code==='string' && Object.hasOwn(messages,code) ? messages[code] : '操作失败，请稍后重试'
 const labels={update_available:'有可用更新',available:'可启动',not_downloaded:'待下载',downloading:'下载中',verifying:'校验中',starting:'启动中',running:'运行中',failed:'启动失败',download_failed:'下载失败',policy_pending:'等待配置同步'}
 const agentTones={running:'good',available:'good',update_available:'attention',downloading:'attention',verifying:'attention',starting:'attention',policy_pending:'attention',failed:'error',download_failed:'error'}
+const launchBlockLabels={daemon_update_pending:'等待后台更新',launch_in_progress:'等待当前启动完成'}
 const agentMarks={claude:'C',codex:'›_',kimi:'K',deepseek:'D',workbuddy:'W'}
 const updateLabels={available:'有更新',downloading:'下载更新中',installing:'安装更新中',failed:'重试更新',
   waiting_for_agents:'等待 Agent 退出',updating_components:'正在更新 CLI 和后台服务',components_failed:'组件更新未完成',
@@ -213,6 +214,8 @@ function paintUsage(content,usage) {
 
 function paintAgent(agent) {
   const row=styled('div','row')
+  const launchBlock=Object.hasOwn(launchBlockLabels,agent.launch_blocked)?launchBlockLabels[agent.launch_blocked]:null
+  const canLaunch=agent.status!=='update_available'&&!launchBlock&&agent.actions?.includes('launch')
   const family=agent.id.split('-')[0]
   const mark=styled('span','agent-mark',Object.hasOwn(agentMarks,family)?agentMarks[family]:'AI')
   mark.dataset.mark=family
@@ -220,10 +223,19 @@ function paintAgent(agent) {
   const identity=styled('div','agent-copy'),name=styled('div','agent-name'),meta=styled('div','agent-meta')
   name.append(node('strong',agent.name))
   if (agent.version) name.append(styled('small','agent-version',agent.version))
-  const status=styled('span','agent-status',Object.hasOwn(labels,agent.status)?labels[agent.status]:'状态未知')
-  status.dataset.tone=Object.hasOwn(agentTones,agent.status)?agentTones[agent.status]:'neutral'
+  const waitingToLaunch=agent.status==='available'&&!canLaunch
+  const statusLabel=waitingToLaunch?(launchBlock??'暂不可启动'):Object.hasOwn(labels,agent.status)?labels[agent.status]:'状态未知'
+  const status=styled('span','agent-status',statusLabel)
+  status.dataset.tone=!waitingToLaunch&&Object.hasOwn(agentTones,agent.status)?agentTones[agent.status]:'neutral'
   meta.append(status)
   if (agent.runtime_kind==='cli'&&agent.instance_count>0) meta.append(styled('span','instance-count','运行实例 '+agent.instance_count))
+  const launchBlockId=`agent-launch-block-${agent.id}`
+  if (launchBlock) {
+    const reason=waitingToLaunch?status:styled('span','agent-status',launchBlock)
+    reason.id=launchBlockId
+    reason.dataset.tone='attention'
+    if (!waitingToLaunch) meta.append(reason)
+  }
   identity.append(name,meta)
   row.append(mark,identity)
 
@@ -231,9 +243,13 @@ function paintAgent(agent) {
   if (agent.actions?.includes('download')) {
     actions.append(button(agent.status==='download_failed'?'重试下载':'下载',()=>act({op:'download',agent_id:agent.id})))
   }
-  if (agent.status!=='update_available'&&agent.actions?.includes('launch')) {
-    const launch=button('启动',()=>act({op:'launch',agent_id:agent.id}))
+  if (canLaunch||launchBlock) {
+    const launch=button('启动',canLaunch?()=>act({op:'launch',agent_id:agent.id}):null)
     launch.classList.add('launch-button')
+    if (launchBlock) {
+      launch.disabled=true
+      launch.setAttribute('aria-describedby',launchBlockId)
+    }
     const arrow=styled('span','action-icon','↗')
     arrow.setAttribute('aria-hidden','true')
     launch.append(arrow)

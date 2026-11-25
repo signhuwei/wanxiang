@@ -134,7 +134,16 @@ pub struct Agent {
     pub status: String,
     pub actions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch_blocked: Option<LaunchBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchBlock {
+    DaemonUpdatePending,
+    LaunchInProgress,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -789,12 +798,18 @@ impl Bridge {
                     "policy_pending" => "policy_pending",
                     _ => return None,
                 };
+                let launchable = status == "available" || (status == "running" && !launcher.gui);
+                let launch_blocked = if !launchable {
+                    None
+                } else if !can_launch {
+                    Some(LaunchBlock::DaemonUpdatePending)
+                } else if starting.is_some() {
+                    Some(LaunchBlock::LaunchInProgress)
+                } else {
+                    None
+                };
                 let mut actions = vec![];
-                if can_launch
-                    && starting.is_none()
-                    && (status == "available" || (status == "running" && !launcher.gui))
-                    && (raw_status != "available" || !has_policy)
-                {
+                if launchable && launch_blocked.is_none() {
                     actions.push("launch".into());
                 }
                 if has_policy && starting.is_none() && matches!(raw_status, "available" | "download_failed") {
@@ -810,6 +825,7 @@ impl Bridge {
                     progress: serde_json::from_value(a["progress"].clone()).ok(),
                     status: status.into(),
                     actions,
+                    launch_blocked,
                     message: None,
                 })
             })
@@ -1065,6 +1081,9 @@ mod tests {
             agents.iter().map(|agent| agent.status.as_str()).collect::<Vec<_>>(),
             ["available", "starting", "running"]
         );
+        assert_eq!(agents[0].launch_blocked, Some(LaunchBlock::LaunchInProgress));
+        assert_eq!(agents[1].launch_blocked, None);
+        assert_eq!(agents[2].launch_blocked, Some(LaunchBlock::LaunchInProgress));
 
         status["device_id"] = json!("dev_other");
         assert!(bridge.ready_agents(Some(&status), &inner).is_empty());
@@ -1075,18 +1094,23 @@ mod tests {
         let mut bridge = Bridge::with_version(PathBuf::new(), "0.1.0-rc25".into());
         bridge.require_daemon_version = true;
         let inner = Inner { device_id: Some("dev_a".into()), ..Default::default() };
-        let mut status = json!({"logged_in":true, "ws":"connected", "device_id":"dev_a", "version":"0.1.0-rc24",
+        let mut status = json!({"logged_in":true, "ws":"connected", "device_id":"dev_a", "version":"0.1.0-rc24", "policy":{},
         "managed_agents":[
             {"id":"claude-code", "version":"2.1.311", "status":"running", "instance_count":1},
-            {"id":"codex", "version":"0.164.0", "status":"cached"}
+            {"id":"codex", "version":"0.164.0", "status":"cached"},
+            {"id":"kimi-code", "version":"2.3.0", "status":"available"}
         ]});
         assert!(!bridge.daemon_can_launch(&status));
         let agents = bridge.ready_agents(Some(&status), &inner);
         assert_eq!((agents[0].status.as_str(), agents[0].instance_count), ("running", 1));
-        assert!(agents.iter().all(|agent| agent.actions.is_empty()));
+        assert!(agents[..2].iter().all(|agent| agent.actions.is_empty()
+            && agent.launch_blocked == Some(LaunchBlock::DaemonUpdatePending)));
+        assert_eq!(agents[2].launch_blocked, None);
+        assert_eq!(agents[2].actions, ["download"]);
         status["version"] = json!("0.1.0-rc25");
         assert!(bridge.daemon_can_launch(&status));
-        assert!(bridge.ready_agents(Some(&status), &inner).iter().all(|agent| agent.actions == ["launch"]));
+        let agents = bridge.ready_agents(Some(&status), &inner);
+        assert!(agents[..2].iter().all(|agent| agent.actions == ["launch"] && agent.launch_blocked.is_none()));
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]

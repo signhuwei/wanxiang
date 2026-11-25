@@ -65,8 +65,11 @@ try{
   const workbench=await b.newPage({viewport:{width:360,height:620}})
   await workbench.addInitScript(()=>{
     window.desktopInstallRequests=[]
+    window.desktopLaunchRequests=[]
+    window.desktopDaemonUpgrading=true
     window.__TAURI__={core:{invoke:async (_, {request})=>{
       if(request.op==='download') window.downloadRequested=request.agent_id
+      if(request.op==='launch') window.desktopLaunchRequests.push(request)
       if(request.op==='install_update'){
         window.desktopInstallRequests.push(request)
         window.desktopUpdate={version:request.version,phase:'downloading',downloaded_bytes:25,total_bytes:100}
@@ -82,12 +85,35 @@ try{
         agents:[
           {id:'claude-code',vendor:'Anthropic',name:'Claude Code',status:downloading?'downloading':'not_downloaded',
             actions:downloading?[]:['download'],progress:downloading?{downloaded_bytes:15,total_bytes:30}:null},
-          {id:'codex',vendor:'OpenAI',name:'Codex',status:'running',runtime_kind:'cli',instance_count:2,actions:['launch']},
+          {id:'codex',vendor:'OpenAI',name:'Codex',status:'running',runtime_kind:'cli',instance_count:2,
+            actions:window.desktopDaemonUpgrading?[]:['launch'],
+            launch_blocked:window.desktopDaemonUpgrading?'daemon_update_pending':null},
+          {id:'deepseek-desktop',vendor:'DeepSeek',name:'DeepSeek Harness',status:'available',runtime_kind:'gui',
+            actions:window.desktopDaemonUpgrading?[]:['launch'],
+            launch_blocked:window.desktopDaemonUpgrading?'daemon_update_pending':null},
         ],
       }}
     }}}
   })
   await workbench.goto(server.url.href)
+  const deepseek=workbench.locator('.row').filter({hasText:'DeepSeek Harness'})
+  const deepseekLaunch=deepseek.getByRole('button',{name:'启动',exact:true})
+  await deepseekLaunch.waitFor()
+  assert(await deepseekLaunch.isDisabled())
+  assert.equal(await deepseek.getByText('可启动',{exact:true}).count(),0)
+  const reasonId=await deepseekLaunch.getAttribute('aria-describedby')
+  assert.equal(await deepseek.locator(`#${reasonId}`).innerText(),'等待后台更新')
+  const codex=workbench.locator('.row').filter({hasText:'Codex'})
+  assert(await codex.getByText('运行实例 2',{exact:true}).isVisible())
+  assert(await codex.getByRole('button',{name:'启动',exact:true}).isDisabled())
+  await workbench.evaluate(()=>{
+    window.desktopDaemonUpgrading=false
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  await deepseek.getByText('可启动',{exact:true}).waitFor()
+  assert(await deepseekLaunch.isEnabled())
+  await deepseekLaunch.click()
+  assert.deepEqual(await workbench.evaluate(()=>window.desktopLaunchRequests),[{op:'launch',agent_id:'deepseek-desktop'}])
   await workbench.getByText('运行实例 2').waitFor()
   await workbench.getByText('2.125',{exact:true}).waitFor()
   await workbench.getByText('能力配置 · v7').click()
