@@ -32,9 +32,9 @@ fn display_value(item: &PolicyDisplayItem) -> bool {
         "boolean" => value.is_boolean(),
         "integer" | "money_milli" | "ratio_ppm" => value.as_u64().is_some_and(|n| n <= MAX_SAFE_INTEGER),
         "enum" | "text" => value.as_str().is_some_and(|s| s.len() <= 512 && !s.chars().any(char::is_control)),
-        "resource_set" => value
+        "resource_set" | "id_list" => value
             .as_array()
-            .is_some_and(|items| items.len() <= 64 && items.iter().all(|item| item.as_str().is_some_and(identifier))),
+            .is_some_and(|items| items.len() <= MAX_RESOURCES && items.iter().all(|item| item.as_str().is_some_and(identifier))),
         _ => false,
     }
 }
