@@ -1,5 +1,5 @@
 //! The downloaded and authenticated update is handed to a helper that outlives Desktop.
-//! The helpers address exactly the installed GUI and never send a shutdown to onexd.
+//! Helpers preserve the daemon during the GUI restart and switch sidecars only after the daemon's idle check.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -9,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 #[cfg(target_os = "macos")]
 pub(crate) const ARTIFACT_KIND: &str = "macos-pkg-keep-daemon";
 #[cfg(windows)]
-pub(crate) const ARTIFACT_KIND: &str = "windows-desktop-exe";
+pub(crate) const ARTIFACT_KIND: &str = "windows-edge-bundle";
 
 #[cfg(target_os = "macos")]
 pub(crate) fn install(artifact: &Path, current: &str, target: &str) -> Result<()> {
@@ -103,54 +103,62 @@ fn verify_mac_package(artifact: &Path, target: &str) -> Result<()> {
 
 #[cfg(windows)]
 pub(crate) fn install(artifact: &Path, current: &str, target: &str) -> Result<()> {
-    use std::os::windows::process::CommandExt;
-
-    use base64::Engine;
-
     let installed = std::env::current_exe()?;
     let install_dir = installed.parent().context("Missing Desktop installation directory")?;
     ensure!(
         install_dir.join("onexd.exe").is_file() && install_dir.join("onex.exe").is_file(),
         "Desktop is not installed"
     );
-    ensure!(artifact.extension().is_some_and(|ext| ext == "exe") && artifact.is_file(), "Missing Desktop update");
     ensure!(current != target, "Desktop already has this version");
-    verify_windows_executable(artifact)?;
-
-    let script = include_str!("../../../deploy/windows/install-desktop-update.ps1");
-    let encoded = base64::engine::general_purpose::STANDARD
-        .encode(script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
-    let shell = system_directory()?.join("WindowsPowerShell/v1.0/powershell.exe");
-    Command::new(shell)
-        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"])
-        .arg(encoded)
-        .env("ONEX_DESKTOP_UPDATE_ARTIFACT", artifact)
+    let directory = artifact.parent().context("Missing private staging directory")?;
+    let desktop = crate::windows_update_bundle::desktop(artifact, directory)?;
+    std::fs::remove_file(artifact)?;
+    windows_helper()?
+        .env("ONEX_DESKTOP_UPDATE_MODE", "desktop")
+        .env("ONEX_DESKTOP_UPDATE_ARTIFACT", desktop)
         .env("ONEX_DESKTOP_UPDATE_EXE", installed)
         .env("ONEX_DESKTOP_UPDATE_PID", std::process::id().to_string())
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .spawn()
         .context("Starting Windows Desktop update helper")?;
     Ok(())
 }
 
 #[cfg(windows)]
-fn verify_windows_executable(path: &Path) -> Result<()> {
-    use std::io::{Read, Seek};
+pub(crate) async fn apply_windows_sidecars(
+    cli: &Path,
+    daemon: &Path,
+    home: &Path,
+    version: &str,
+) -> Result<std::process::ExitStatus> {
+    let mut helper = windows_helper()?;
+    helper
+        .env("ONEX_DESKTOP_UPDATE_MODE", "sidecars")
+        .env("ONEX_DESKTOP_UPDATE_EXE", std::env::current_exe()?)
+        .env("ONEX_DESKTOP_UPDATE_CLI", cli)
+        .env("ONEX_DESKTOP_UPDATE_DAEMON", daemon)
+        .env("ONEX_DESKTOP_UPDATE_VERSION", version)
+        .env("ONEX_HOME", home);
+    Ok(tokio::process::Command::from(helper).status().await?)
+}
 
-    let mut file = std::fs::File::open(path)?;
-    let mut dos = [0_u8; 64];
-    file.read_exact(&mut dos)?;
-    ensure!(&dos[..2] == b"MZ", "Incorrect Windows Desktop update format");
-    let offset = u32::from_le_bytes(dos[60..64].try_into()?) as u64;
-    ensure!(offset >= 64, "Invalid Windows Desktop image header");
-    file.seek(std::io::SeekFrom::Start(offset))?;
-    let mut pe = [0_u8; 6];
-    file.read_exact(&mut pe)?;
-    ensure!(&pe[..4] == b"PE\0\0" && pe[4..] == [0x64, 0x86], "Expected a Windows x64 Desktop executable");
-    Ok(())
+#[cfg(windows)]
+fn windows_helper() -> Result<Command> {
+    use std::os::windows::process::CommandExt;
+
+    use base64::Engine;
+    let script = include_str!("../../../deploy/windows/install-desktop-update.ps1");
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
+    let shell = system_directory()?.join("WindowsPowerShell/v1.0/powershell.exe");
+    let mut command = Command::new(shell);
+    command
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"])
+        .arg(encoded)
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(command)
 }
 
 #[cfg(windows)]

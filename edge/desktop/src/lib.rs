@@ -4,6 +4,8 @@ mod profile;
 mod tray;
 mod update_platform;
 mod updater;
+#[cfg(any(windows, test))]
+mod windows_update_bundle;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -114,7 +116,19 @@ pub fn run() {
             tauri::async_runtime::block_on(ensure_onexd_running(&sock, None));
             let version = app.package_info().version.to_string();
             let initial_version = serde_json::to_string(&version)?;
-            app.manage(updater::Updater::new(app.package_info().version.clone()));
+            let updates = updater::Updater::new(app.package_info().version.clone());
+            #[cfg(windows)]
+            if let Some(home) = sock.parent().map(std::path::Path::to_path_buf) {
+                let updates = Arc::clone(&updates);
+                tauri::async_runtime::spawn(async move {
+                    // Let the GUI installer finish its startup and rollback check first.
+                    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                    if let Err(error) = updates.resume_windows_components(&home).await {
+                        tracing::warn!(%error, "pending Windows component update");
+                    }
+                });
+            }
+            app.manage(updates);
             #[cfg(target_os = "macos")]
             tauri::async_runtime::spawn(updater::activate_daemon_update(sock.clone(), version.clone()));
             let bridge = Bridge::with_version(sock, version);

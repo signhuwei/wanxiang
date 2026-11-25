@@ -12,7 +12,7 @@
 
 `-Version` 写入安装器和 Desktop 应用。安装后，在首页 Logo 下核对完整版本号，再把构建输出的同一 `version` 传给 [发布命令](../README.md#平台维护与发布) `publish-edge <Server 地址> windows <版本> <安装包路径>`。本机构建省略 `-Version` 时使用仓库的 Tauri 默认版本。
 
-启用标题栏更新时，将同一次构建输出的 `desktop_update` 文件作为签名更新制品。它只替换 Desktop 程序，已经启动的 Agent 继续由原 daemon 纳管。CLI、daemon 和依赖升级仍由完整的 NSIS 安装器交付。
+启用标题栏更新时，将同一次构建输出的 `desktop_update` 文件作为签名更新制品。该 `.onex-update` 包含同一版本的 Desktop、`onex.exe` 和 `onexd.exe`。确认后 Desktop 先更新并重启。已启动的 Agent 继续由原 daemon 纳管，CLI 和 daemon 在后台空闲后切换。首次启用完整自动更新时需要安装支持该制品的 NSIS 版本。
 
 安装器一起安装 OneX Desktop、`onex.exe` 和 `onexd.exe`，并为当前用户注册 Edge daemon 登录自启和终端命令。安装完成后完全退出并重新打开 Windows Terminal 或 PowerShell，可运行 `(Get-Command onex).Source` 查看命令路径，运行 `onex status` 查看设备状态。CLI 和 Desktop 使用同一 daemon 与设备身份。
 
@@ -22,7 +22,15 @@ Edge 安装器写入应用前会执行 `git --version`，并检查 Git for Windo
 
 Windows 验收记录编译与测试退出状态、安装器及摘要，并在指定的测试用户下验证安装、自启、登录、受管终端、重开后的设备身份和卸载清理。测试只使用内测账号与合成对话。正式签名和外部发布按后续计划处理。 [Tauri NSIS 安装器](https://v2.tauri.app/distribute/windows-installer/)
 
-验收 CLI 时，在重开的 PowerShell 执行 `(Get-Command onex).Source`，确认它指向本次安装的 `onex.exe`，用 `onex status` 核对 Desktop 登录后的设备。原地重装后，本安装新增的 PATH 项应只有一条。卸载后确认仅清除了安装器新增的项，卸载前已有的 PATH 项均保留。
+验收 CLI 时，在重开的 PowerShell 执行 `(Get-Command onex).Source`，确认它指向本次安装的 `onex.exe`。用 `onex --version` 核对本次发行号，再用 `onex status` 核对 Desktop 登录后的设备。测试租户授权后，在测试目录分别启动下列 Agent，确认终端能输入提示词，工作台能看到运行实例，结束后用量正常回流。
+
+```powershell
+onex run claude-code --managed
+onex run codex --managed
+onex run kimi-code --managed
+```
+
+验证标题栏更新时，先在终端保持一个受管 Agent 运行，记录 `onex --version` 和 `onex status` 中的设备 ID。确认更新后，Desktop 应显示新版，工作台仍有原来的运行实例，终端可继续同一会话。退出最后一个 Agent 后，确认 `onex --version` 切换到新版、设备 ID 一致，然后再用命令行启动一次。原地重装后，本安装新增的 PATH 项应只有一条。卸载后确认仅清除了安装器新增的项，卸载前已有的 PATH 项均保留。
 
 Windows x64 的 DeepSeek Harness Desktop 由 OneX 下载并校验原厂制品，随后从 OneX 私有缓存启动原厂 GUI。测试租户的有效合约须授予 DeepSeek 和模型，服务端须缓存并启用符合精确资格的 Windows 发行。验收时记录首次下载进度、原生会话冷恢复、两轮模型回复、回流、租约结算和退出后 `dsh://` 关联恢复。
 

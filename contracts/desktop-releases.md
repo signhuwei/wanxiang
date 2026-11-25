@@ -38,4 +38,6 @@
 
 `GET /v1/desktop-updates/:os/:arch` 返回当前发行的 `{id,version,os,arch,kind,size,sha256,signature}`。`GET /v1/desktop-releases/:id/update-download` 提供对应二进制。清单签名的输入是依次拼接的 UTF-8 行 `onex-desktop-update-v1`、`id`、`version`、`os`、`arch`、`kind`、十进制 `size` 和小写十六进制 `sha256`，每行以 LF 结尾。客户端用构建时固定的公钥验证清单，按 SemVer 判断新版本，按签名字节数和 SHA-256 验证制品，并在交给系统安装前复核该发行仍然有效。
 
-`darwin/arm64` 使用支持保留 daemon 的 PKG（`macos-pkg-keep-daemon`）。Desktop 在用户确认后将安装交给 macOS Installer，完成或取消后重新打开应用。新版应用确认没有受管 Agent、下载或模型请求后，才请求 LaunchAgent 重新加载磁盘上的新版 daemon。`windows/x64` 使用构建输出的原生 Desktop EXE（`windows-desktop-exe`），退出旧窗口进程后替换该文件并重新启动。两端更新窗口期间都继续使用同一个 daemon、设备身份、路由和 Agent 进程。Windows 完整 Sidecar 升级仍走 NSIS 包。
+`darwin/arm64` 使用支持保留 daemon 的 PKG（`macos-pkg-keep-daemon`）。Desktop 在用户确认后将安装交给 macOS Installer，完成或取消后重新打开应用。新版应用确认没有受管 Agent、下载或模型请求后，才请求 LaunchAgent 重新加载磁盘上的新版 daemon。
+
+`windows/x64` 使用签名的 `windows-edge-bundle` 制品（`.onex-update`）。前 8 字节是 ASCII `ONEXWUP1`，随后是三个小端无符号 64 位整数，分别表示 Desktop、CLI 和 daemon 的字节长度。32 字节头部之后按该顺序紧接三个完整的 x64 PE 可执行文件。Desktop 退出旧窗口后立即更新并重开，CLI 和 daemon 等受管 Agent、下载和模型请求结束后切换。两端更新窗口期间都继续使用同一个 daemon、设备身份、路由和 Agent 进程。Windows 员工下载入口仍分发 NSIS 安装器。

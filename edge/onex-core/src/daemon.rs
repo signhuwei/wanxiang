@@ -56,10 +56,20 @@ async fn wait_for(path: &Path, request: &Request, accepts: impl Fn(&Value) -> bo
 
 #[cfg(windows)]
 fn start_windows_sidecar(path: &Path) -> std::io::Result<std::process::Child> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::process::CommandExt;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
     const DETACHED_PROCESS: u32 = 0x00000008;
     let exe = std::env::current_exe()?.with_file_name("onexd.exe");
+    let lock = exe.with_file_name(".onex-engine-update.lock");
+    let result = OpenOptions::new().read(true).write(true).create(true).truncate(false).share_mode(0).open(&lock);
+    let _startup_lock = match result {
+        Ok(file) => Some(file),
+        // A read-only installation supports the normal startup path but cannot stage updates.
+        Err(error) if error.raw_os_error() == Some(5) && !lock.exists() => None,
+        Err(error) => return Err(error),
+    };
     let home = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
     std::process::Command::new(exe)
         .env("ONEX_HOME", home)

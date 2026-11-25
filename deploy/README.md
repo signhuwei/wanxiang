@@ -97,7 +97,7 @@ ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token bun deploy/release.ts
 
 启用 Desktop 自动更新时，在签名环境保管独立的 Ed25519 Edge 更新私钥。更新公钥可通过 `ONEX_EDGE_UPDATE_PRIVATE_KEY=/secure/edge-update.key bun deploy/release.ts edge-update-public-key` 导出。将 JSON 字符串的内容设置为构建环境的 `ONEX_DESKTOP_UPDATE_KEY`，使安装后的 Desktop 能验证未来发行。分发引导包与后续更新制品需要使用同一信任公钥。
 
-macOS 更新制品使用 `deploy/mac/package.sh` 的 `--preserve-daemon` 参数，应用包版本与发布号保持一致。Windows 使用构建输出的 `desktop_update` 指向的 `onex-desktop.exe`。发布时提供手动安装器和可选更新制品两条路径。
+macOS 更新制品使用 `deploy/mac/package.sh` 的 `--preserve-daemon` 参数，应用包版本与发布号保持一致。Windows 使用同次构建输出的 `desktop_update` 指向的 `.onex-update`，其中包含 Desktop、CLI 和 daemon。发布时分别提供手动安装器和可选更新制品两条路径。
 
 ```sh
 ONEX_EDGE_UPDATE_PRIVATE_KEY=/secure/edge-update.key \

@@ -1,4 +1,4 @@
-export const desktopUpdateKind = (os: string) => os === 'darwin' ? 'macos-pkg-keep-daemon' : 'windows-desktop-exe';
+export const desktopUpdateKind = (os: string) => os === 'darwin' ? 'macos-pkg-keep-daemon' : 'windows-edge-bundle';
 
 export function desktopUpdateBytes(update: {
   id: string; version: string; os: string; arch: string; kind: string; size: number; sha256: string;

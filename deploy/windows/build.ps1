@@ -57,6 +57,39 @@ function Assert-X64 {
     }
 }
 
+function Write-EdgeUpdateBundle {
+    param([string] $OutputFile, [string[]] $Executables)
+    $temporary = "$OutputFile.$([Guid]::NewGuid().ToString('N')).tmp"
+    $inputs = [Collections.Generic.List[IO.FileStream]]::new()
+    try {
+        foreach ($executable in $Executables) {
+            $inputs.Add([IO.File]::OpenRead($executable))
+        }
+        $size = 32
+        foreach ($inputFile in $inputs) { $size += $inputFile.Length }
+        if ($size -gt 256MB) { throw 'Windows Edge update bundle exceeds the Server limit of 256 MiB.' }
+
+        $output = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $header = [IO.BinaryWriter]::new($output, [Text.Encoding]::ASCII, $true)
+            try {
+                $header.Write([Text.Encoding]::ASCII.GetBytes('ONEXWUP1'))
+                foreach ($inputFile in $inputs) { $header.Write([UInt64]$inputFile.Length) }
+                $header.Flush()
+            } finally {
+                $header.Dispose()
+            }
+            foreach ($inputFile in $inputs) { $inputFile.CopyTo($output) }
+        } finally {
+            $output.Dispose()
+        }
+        Move-Item -LiteralPath $temporary -Destination $OutputFile -Force
+    } finally {
+        foreach ($inputFile in $inputs) { $inputFile.Dispose() }
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $bunVersion = (Get-Content -Raw -LiteralPath (Join-Path $repo 'deploy\bun-version')).Trim()
 $actualBun = Invoke-Checked 'bun' @('--version')
@@ -77,12 +110,14 @@ $configFile = Join-Path $staging 'windows-bundle.json'
 $oldTargetDir = $env:CARGO_TARGET_DIR
 $oldTauriConfig = $env:TAURI_CONFIG
 $oldServer = $env:ONEX_WINDOWS_DEFAULT_SERVER
+$oldEdgeBuildVersion = $env:ONEX_EDGE_BUILD_VERSION
 $wsScheme = if ($origin.Scheme -eq 'https') { 'wss' } else { 'ws' }
 
 try {
     $env:CARGO_TARGET_DIR = $targetDir
     $env:TAURI_CONFIG = $null
     $env:ONEX_WINDOWS_DEFAULT_SERVER = "${wsScheme}://$($origin.Authority)/v1/edge/ws"
+    $env:ONEX_EDGE_BUILD_VERSION = $appVersion
     New-Item -ItemType Directory -Path $staging -Force | Out-Null
     & (Join-Path $PSScriptRoot 'stage-7zip.ps1') -Staging $staging
     Invoke-Checked 'rustup' @('target', 'add', $target)
@@ -146,6 +181,10 @@ try {
     $installer = $installers[0]
     $sha256 = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     "$sha256  $($installer.Name)" | Set-Content -LiteralPath "$($installer.FullName).sha256" -Encoding Ascii
+    $updateBundle = Join-Path $releaseDir "OneX-$appVersion-windows-x64.onex-update"
+    Write-EdgeUpdateBundle -OutputFile $updateBundle -Executables @(
+        $desktopExecutable, (Join-Path $staging "onex-$target.exe"), (Join-Path $staging "onexd-$target.exe")
+    )
 
     $revision = Invoke-Checked 'git' @('-C', $repo, 'rev-parse', 'HEAD')
     [pscustomobject] @{
@@ -153,7 +192,7 @@ try {
         version = $appVersion
         platform = 'windows/x64'
         installer = $installer.FullName
-        desktop_update = $desktopExecutable
+        desktop_update = $updateBundle
         bytes = $installer.Length
         sha256 = $sha256
     } | ConvertTo-Json
@@ -161,4 +200,5 @@ try {
     $env:CARGO_TARGET_DIR = $oldTargetDir
     $env:TAURI_CONFIG = $oldTauriConfig
     $env:ONEX_WINDOWS_DEFAULT_SERVER = $oldServer
+    $env:ONEX_EDGE_BUILD_VERSION = $oldEdgeBuildVersion
 }

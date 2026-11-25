@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run(home: PathBuf, started_at: time::OffsetDateTime) -> Result<()> {
-    info!(version = env!("CARGO_PKG_VERSION"), home = %home.display(), "onexd starting");
+    info!(version = onexd::BUILD_VERSION, home = %home.display(), "onexd starting");
     let shutdown = CancellationToken::new();
 
     // `ONEX_SERVER` 环境变量始终优先；没设置时，Windows 打包构建回退到编译期写死的默认地址

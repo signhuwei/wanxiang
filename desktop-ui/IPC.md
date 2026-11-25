@@ -37,7 +37,7 @@ macOS 桌面一键启动 Codex 的默认工作目录是 `~/OneX Workspace`。通
 
 工作台的 `local_usage` 记录本次 onexd 运行期间的模型请求计量用量、模型请求累计时长、输入和输出 Token。它可能包含尚未结算的用量，重启后重新累计。`agents` 提供适配器的厂商、运行类别、实际已登记实例数，以及下载期间的已接收字节、目标大小和校验阶段。状态和按钮均由实际授权与本机准备结果驱动。
 
-`desktop_update` 可省略。存在时包含目标 `version`，以及 `phase: available | downloading | installing | failed`。下载时可附 `downloaded_bytes` 与 `total_bytes`。标题栏只显示已通过签名验证的更新及其进度，用户明确确认后才发送目标版本。Desktop 重启时复用现有 daemon、设备身份与受管任务。macOS 另在 Agent 和请求结束后加载新版 daemon。Windows 自动更新制品包含 Desktop 应用。
+`desktop_update` 可省略。存在时包含目标 `version`，以及 `phase: available | downloading | installing | failed`。下载时可附 `downloaded_bytes` 与 `total_bytes`。标题栏只显示已通过签名验证的更新及其进度，用户明确确认后才发送目标版本。Desktop 重启时复用现有 daemon、设备身份与受管任务。Windows 更新制品包含 Desktop、CLI 和 daemon。Desktop 重启后可显示 `waiting_for_agents | updating_components | components_failed`，当前 Agent 和请求结束后才激活新 CLI 和 daemon。
 
 ### UI 中文文案（只按枚举选取，不展示自由文本）
 

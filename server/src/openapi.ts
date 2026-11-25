@@ -73,7 +73,7 @@ const desktopOs = { type: 'string', enum: ['darwin', 'windows'] };
 const desktopArch = { type: 'string', enum: ['arm64', 'x64'] };
 const desktopUpdate = object({ id: text, version: text, os: desktopOs, arch: desktopArch, size: releaseSize,
   sha256: releaseDigest, signature: { type: 'string', pattern: '^[A-Za-z0-9_-]{86}$' },
-  kind: { type: 'string', enum: ['macos-pkg-keep-daemon', 'windows-desktop-exe'] } });
+  kind: { type: 'string', enum: ['macos-pkg-keep-daemon', 'windows-edge-bundle'] } });
 const desktopRelease = managed({ id: text, version: text, os: desktopOs, arch: desktopArch,
   status: { type: 'string', enum: ['draft', 'published', 'unlisted'] }, size: { type: ['integer', 'null'], minimum: 0 },
   sha256: nullableText, published_at: nullableText });

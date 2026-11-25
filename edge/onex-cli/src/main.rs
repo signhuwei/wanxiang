@@ -3,19 +3,22 @@
 //! ```text
 //! onex login --tenant <租户 ID 或简称> --username <用户名> [--server <https://...>] [--name <设备名>]
 //! onex run <claude-code|codex|kimi-code|deepseek-desktop|workbuddy|codex-desktop|claude-desktop> [--model <模型>] [--managed]   在当前目录启动指定 Agent
-//!   不带 --managed：用 PATH 里已安装的可执行文件（claude-code → claude，codex → codex，kimi-code → kimi）
-//!   带 --managed：由 onexd 按 Server 下发的发行目录自己选型、下载、校验、缓存后启动
+//!   受管 Agent 由 onexd 按 Server 下发的发行目录选型、下载、校验、缓存后启动
 //! onex status
 //! onex token <device_token>    调试用：直接交给 onexd 一个已有的 device_token，不落 Keychain
 //! onex logout    注销并让 onexd 退出；重新拉起后用新身份登录
 //! onex shutdown
+//! onex shutdown-when-idle [PID]    更新器专用
+//! onex --version
 //! ```
 
 mod login;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use onex_core::ipc::{Request, SOCKET_NAME};
@@ -40,12 +43,22 @@ const USAGE: &str = "usage:
   onex status
   onex token <device_token>
   onex logout
-  onex shutdown";
+  onex shutdown
+  onex shutdown-when-idle [PID]
+  onex --version";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("--help" | "-h") if args.len() == 1 => {
+            println!("{USAGE}");
+            Ok(())
+        }
+        Some("--version" | "-V") if args.len() == 1 => {
+            println!("onex {}", option_env!("ONEX_EDGE_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")));
+            Ok(())
+        }
         Some("login") => cmd_login(&args[1..]).await,
         Some("status") if args.len() == 1 => print_reply(call(&Request::Status).await?),
         Some("token") if args.len() == 2 => {
@@ -53,9 +66,25 @@ async fn main() -> Result<()> {
         }
         Some("logout") if args.len() == 1 => print_reply(call(&Request::Logout).await?),
         Some("shutdown") if args.len() == 1 => print_reply(call(&Request::Shutdown).await?),
+        Some("shutdown-when-idle") if args.len() <= 2 => cmd_shutdown_when_idle(args.get(1).map(String::as_str)).await,
         Some("run") if args.len() >= 2 => cmd_run(&args[1], &args[2..]).await,
         _ => bail!("{USAGE}"),
     }
+}
+
+async fn cmd_shutdown_when_idle(pid: Option<&str>) -> Result<()> {
+    let expected_pid = pid
+        .map(|pid| pid.parse::<NonZeroU32>().context("PID must be a positive integer"))
+        .transpose()?
+        .map(NonZeroU32::get);
+    let reply = tokio::time::timeout(Duration::from_secs(5), call(&Request::ShutdownWhenIdle { expected_pid }))
+        .await
+        .context("timed out waiting for onexd to report whether updates can proceed")??;
+    if reply["ok"] == false && reply["error"]["code"] == "agents_running" {
+        println!("{}", serde_json::to_string_pretty(&reply)?);
+        std::process::exit(3);
+    }
+    print_reply(reply)
 }
 
 async fn cmd_login(args: &[String]) -> Result<()> {

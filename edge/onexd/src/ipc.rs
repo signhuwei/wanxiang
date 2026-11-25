@@ -226,7 +226,7 @@ async fn handle(stream: Connection, ipc: &Arc<Ipc>, socket: &Path) -> Result<()>
                 | Request::ResumeDevice { .. }
                 | Request::Logout
                 | Request::LogoutDevice { .. }
-                | Request::ShutdownWhenIdle
+                | Request::ShutdownWhenIdle { .. }
                 | Request::Shutdown)
         ) {
             Some(ipc.identity_transition.lock().await)
@@ -317,7 +317,10 @@ async fn dispatch(req: Request, ipc: &Arc<Ipc>, socket: &Path) -> (Value, bool) 
                 Err(e) => (err("invalid", &format!("{e:#}")), false),
             }
         }
-        Request::ShutdownWhenIdle => {
+        Request::ShutdownWhenIdle { expected_pid } => {
+            if expected_pid.is_some_and(|pid| pid != std::process::id()) {
+                return (err("conflict", "后台进程已改变"), false);
+            }
             if ipc.state.upstream.lock().unwrap().inflight != 0
                 || ipc.state.lease.has_active_requests()
                 || !ipc.launch.as_ref().is_none_or(LaunchCtx::stop_preparations_when_idle)
@@ -1368,7 +1371,7 @@ fn status(ipc: &Ipc) -> Status {
             "last": entry(up.last),
             "last_error": entry(up.last_error),
         }),
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: crate::BUILD_VERSION.into(),
         logged_in: ipc.state.token.borrow().is_some(),
         ws: conn.phase.as_str().into(),
         device_id: conn.device_id.or_else(|| ipc.state.expected_device_id.read().unwrap().clone()),
@@ -1425,7 +1428,10 @@ mod upgrade_tests {
         let ctx = service.launch.as_ref().unwrap();
         let listener = bind(&socket).await.unwrap();
         let daemon = tokio::spawn(serve(listener, socket.clone(), service.clone()));
-        let request = || onex_core::daemon::exchange(&socket, &Request::ShutdownWhenIdle);
+        let request = || onex_core::daemon::exchange(&socket, &Request::ShutdownWhenIdle { expected_pid: None });
+        let wrong_pid = Request::ShutdownWhenIdle { expected_pid: Some(0) };
+        assert_eq!(onex_core::daemon::exchange(&socket, &wrong_pid).await.unwrap()["error"]["code"], "conflict");
+        assert!(!shutdown.is_cancelled());
 
         for agent in ["claude-code", "deepseek-desktop"] {
             let stop = shutdown.child_token();

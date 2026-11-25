@@ -71,6 +71,7 @@ function artifactDir(dataDir: string) {
 // 两种格式的关键头部都在文件最开头几十字节内；64 KiB 足够覆盖任何真实的 DOS stub 长度，又远小于
 // 整份安装包，所以校验阶段只读这一段，不把 256 MiB 的文件整个读回内存。
 const HEADER_PROBE_BYTES = 64 * 1024;
+const WINDOWS_UPDATE_HEADER_BYTES = 32;
 
 async function readHeader(path: string, length: number) {
   const handle = await open(path, 'r');
@@ -91,7 +92,7 @@ async function readHeader(path: string, length: number) {
  * NSIS's own stub is commonly 32-bit even when the packaged app is x64 — the contract is explicit that
  * this doesn't make the upload wrong, so this only checks the bytes are a well-formed PE, never that the
  * stub's machine type matches `arch`. */
-function checkFormat(os: string, header: Uint8Array, size: number) {
+function checkFormat(os: string, header: Uint8Array, size: number, x64 = false) {
   if (os === 'darwin') {
     if (header.length < 28 || header[0] !== 0x78 || header[1] !== 0x61 || header[2] !== 0x72 || header[3] !== 0x21) invalid('artifact');
     const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
@@ -106,6 +107,31 @@ function checkFormat(os: string, header: Uint8Array, size: number) {
   // e_lfanew 本身也可能被伪造成巨大的数字；+24 (COFF 头大小) 要留在声明的文件长度内才算数。
   if (peOffset < 0x40 || peOffset + 24 > size || peOffset + 24 > header.length
     || header[peOffset] !== 0x50 || header[peOffset + 1] !== 0x45 || header[peOffset + 2] !== 0 || header[peOffset + 3] !== 0) invalid('artifact');
+  if (x64 && view.getUint16(peOffset + 4, true) !== 0x8664) invalid('artifact');
+}
+
+async function checkWindowsUpdateBundle(path: string, size: number) {
+  const file = await open(path, 'r');
+  try {
+    const header = Buffer.alloc(WINDOWS_UPDATE_HEADER_BYTES);
+    const { bytesRead } = await file.read(header, 0, header.length, 0);
+    if (bytesRead !== header.length || !header.subarray(0, 8).equals(Buffer.from('ONEXWUP1'))) invalid('artifact');
+    const lengths = [8, 16, 24].map(offset => header.readBigUInt64LE(offset));
+    // Check exact frame length before converting attacker-controlled u64 values to numbers.
+    if (lengths.some(length => length < 88n)
+      || lengths.reduce((sum, length) => sum + length, BigInt(header.length)) !== BigInt(size)) invalid('artifact');
+
+    let position = header.length;
+    for (const length of lengths) {
+      const memberSize = Number(length);
+      const member = Buffer.alloc(Math.min(HEADER_PROBE_BYTES, memberSize));
+      const { bytesRead } = await file.read(member, 0, member.length, position);
+      checkFormat('windows', member.subarray(0, bytesRead), memberSize, true);
+      position += memberSize;
+    }
+  } finally {
+    await file.close();
+  }
 }
 
 export function desktopReleaseRoutes(app: Hono, store: Store, opts: ManagementOptions) {
@@ -181,11 +207,11 @@ export function desktopReleaseRoutes(app: Hono, store: Store, opts: ManagementOp
     const finalPath = `${uploadPath}.bin`;
     const { size, sha256 } = await receiveArtifact(c.req.raw, tempPath, DESKTOP_ARTIFACT_MAX_BYTES);
     try {
-      const header = await readHeader(tempPath, Math.min(HEADER_PROBE_BYTES, size));
-      checkFormat(claimed.os, header, size);
       if (isUpdate && claimed.os === 'windows') {
-        const pe = new DataView(header.buffer, header.byteOffset, header.byteLength);
-        if (pe.getUint16(pe.getUint32(0x3c, true) + 4, true) !== 0x8664) invalid('artifact');
+        await checkWindowsUpdateBundle(tempPath, size);
+      } else {
+        const header = await readHeader(tempPath, Math.min(HEADER_PROBE_BYTES, size));
+        checkFormat(claimed.os, header, size);
       }
       renameSync(tempPath, finalPath);
     } catch (error) {

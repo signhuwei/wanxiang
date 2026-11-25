@@ -112,7 +112,10 @@ pub enum Request {
     },
     /// Upgrade the daemon only after active launches, artifact work and inference have finished.
     /// A rejected request leaves the process and its children untouched.
-    ShutdownWhenIdle,
+    ShutdownWhenIdle {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_pid: Option<u32>,
+    },
     Shutdown,
 }
 

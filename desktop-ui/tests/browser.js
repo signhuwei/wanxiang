@@ -139,5 +139,18 @@ try{
   })
   await workbench.getByRole('button',{name:'重试更新',exact:true}).waitFor()
   assert.equal(await updateButton.isEnabled(),true)
+  for(const [phase,label] of [
+    ['waiting_for_agents','等待 Agent 退出'],
+    ['updating_components','正在更新 CLI 和后台服务'],
+    ['components_failed','组件更新未完成']
+  ]){
+    await workbench.evaluate(phase=>{
+      window.desktopUpdate={version:'0.1.0-rc22',phase}
+      document.dispatchEvent(new Event('visibilitychange'))
+    },phase)
+    await workbench.getByRole('button',{name:label,exact:true}).waitFor()
+    assert(await updateButton.isDisabled())
+    assert.equal(await workbench.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true)
+  }
   console.log('Desktop：登录、设置、桥错误、配置消息、实例计数、下载进度及更新确认通过')
 }finally{await b.close();server.stop(true)}

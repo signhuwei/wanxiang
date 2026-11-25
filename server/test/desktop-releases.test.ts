@@ -104,13 +104,13 @@ function xarBytes(extra = 16) {
 // A minimal, structurally valid PE: "MZ" stub, e_lfanew pointing right after the stub, and a `PE\0\0`
 // signature there. The NSIS stub this emulates is routinely 32-bit even for an x64 payload, which is
 // exactly why checkFormat never inspects the COFF machine type.
-function peBytes(extra = 64) {
+function peBytes(extra = 64, machine = 0x14c) {
   const stubSize = 0x80;
   const buf = Buffer.alloc(stubSize + 24 + extra);
   buf.write('MZ', 0, 'ascii');
   buf.writeUInt32LE(stubSize, 0x3c); // e_lfanew
   buf.write('PE\0\0', stubSize, 'ascii');
-  buf.writeUInt16LE(0x14c, stubSize + 4); // machine = i386, deliberately not x64
+  buf.writeUInt16LE(machine, stubSize + 4);
   buf.fill(0xcd, stubSize + 24);
   return new Uint8Array(buf);
 }
@@ -211,6 +211,52 @@ test('a signed update is served only for its published release and leaves the no
   expect((await f.request('/platform' + filename + '/unpublish', { revision: normal.revision + 2 }, a.token, 'remove-update')).status).toBe(200);
   expect((await f.request(manifestPath)).status).toBe(404);
   expect((await f.request(filename + '/update-download')).status).toBe(404);
+});
+
+test('Windows publishes a signed Desktop, CLI and daemon bundle separately from the NSIS installer', async () => {
+  const f = await fixture();
+  const admin = await f.admin('windows-updates@example.test');
+  const release = { version: '1.2.0-rc4', os: 'windows', arch: 'x64' };
+  const draft = await (await f.request('/platform/desktop-releases', release, admin.token, 'windows-draft')).json() as Release;
+  const installer = peBytes();
+  const normalResponse = await f.putArtifact(draft.id, draft.revision, installer, admin.token);
+  expect(normalResponse.status).toBe(200);
+  const normal = await normalResponse.json() as Release;
+  const updatePath = new URL('/v1/platform/desktop-releases/' + draft.id + '/update-artifact?revision=' + normal.revision, f.server.url);
+  const desktop = peBytes(50, 0x8664);
+  const cli = peBytes(60, 0x8664);
+  const daemon = peBytes(70, 0x8664);
+  const header = Buffer.alloc(32);
+  header.write('ONEXWUP1', 0, 'ascii');
+  header.writeBigUInt64LE(BigInt(desktop.length), 8);
+  header.writeBigUInt64LE(BigInt(cli.length), 16);
+  header.writeBigUInt64LE(BigInt(daemon.length), 24);
+  const binary = Buffer.concat([header, desktop, cli, daemon]);
+  const entry = { ...release, id: draft.id, kind: 'windows-edge-bundle', size: binary.length,
+    sha256: new Bun.CryptoHasher('sha256').update(binary).digest('hex') };
+  const { privateKey } = generateKeyPairSync('ed25519');
+  const signature = sign(null, desktopUpdateBytes(entry), privateKey).toString('base64url');
+  const upload = (body: Uint8Array) => fetch(updatePath, { method: 'PUT',
+    headers: { authorization: 'Bearer ' + admin.token, 'content-type': 'application/octet-stream', 'x-onex-update-signature': signature },
+    body });
+
+  const wrongMagic = Buffer.from(binary);
+  wrongMagic[0] = wrongMagic[0]! | 0x80;
+  const hugeMember = Buffer.from(binary);
+  hugeMember.writeBigUInt64LE((1n << 64n) - 1n, 16);
+  const x86Cli = Buffer.concat([header, desktop, peBytes(60), daemon]);
+  for (const malformed of [desktop, wrongMagic, hugeMember, x86Cli, binary.subarray(0, -1), Buffer.concat([binary, Buffer.alloc(1)])]) {
+    expect((await upload(malformed)).status).toBe(422);
+  }
+
+  const uploaded = await upload(binary);
+  expect(uploaded.status).toBe(200);
+  expect(await uploaded.json()).toMatchObject({ revision: normal.revision + 1, sha256: normal.sha256, update: { ...entry, signature } });
+  const path = '/desktop-releases/' + draft.id;
+  expect((await f.request('/platform' + path + '/publish', { revision: normal.revision + 1 }, admin.token, 'windows-publish')).status).toBe(200);
+  expect(await (await f.request('/desktop-updates/windows/x64')).json()).toEqual({ ...entry, signature });
+  expect(new Uint8Array(await (await f.request(path + '/update-download')).arrayBuffer())).toEqual(new Uint8Array(binary));
+  expect(new Uint8Array(await (await f.request(path + '/download')).arrayBuffer())).toEqual(installer);
 });
 
 test('rejects a connection that is cut short of its declared Content-Length, leaving the draft untouched', async () => {

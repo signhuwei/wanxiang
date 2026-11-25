@@ -54,3 +54,8 @@ mod workbuddy_capture;
 pub mod workbuddy_hook;
 mod workbuddy_turns;
 pub mod ws;
+
+pub const BUILD_VERSION: &str = match option_env!("ONEX_EDGE_BUILD_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
