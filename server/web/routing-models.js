@@ -3,8 +3,8 @@
 // 候选直接使用服务端的 approved_match_id/evidence_ids；409 保留草稿并提供重新预览。
 
 import { createLedger } from './ledger.js'
-import { catalog } from './catalog.js'
-import { button, detailPanel, el } from './panel.js'
+import { catalog, modelTokenFields } from './catalog.js'
+import { button, detailPanel, editForm, el } from './panel.js'
 import { createPager } from './pager.js'
 import { formatDateTime } from './format.js'
 import { idempotencyKey } from './idempotency.js'
@@ -464,6 +464,30 @@ function poolPanel(host, api, model, signal, onChanged) {
   })
 }
 
+function modelParametersTab(host, api, model, signal, changed) {
+  const body = el('div')
+  const foot = el('div', 'inline-foot')
+  host.append(body, foot)
+  const pane = { body, foot, changed }
+  function show(mode = 'view') {
+    editForm(pane, { fields: modelTokenFields, values: model, mode,
+      submit(values, options) {
+        const { context_window, max_output_tokens } = values
+        if (!Number.isSafeInteger(context_window) || context_window < 1) throw Error('上下文窗口须为正整数')
+        if (max_output_tokens !== null && (!Number.isSafeInteger(max_output_tokens) || max_output_tokens < 1 || max_output_tokens > context_window)) {
+          throw Error('最大输出 Token 须为正整数，且不得超过上下文窗口')
+        }
+        return api.post(modelPath(model.id), { ...values, revision: model.revision }, { ...options, signal })
+      }, done(updated) {
+        Object.assign(model, { context_window: updated.context_window, max_output_tokens: updated.max_output_tokens, revision: updated.revision })
+        show()
+      } })
+    if (mode === 'edit') foot.prepend(button('取消', () => show()))
+    else if (hasAction(model, 'update')) foot.append(button('编辑模型参数', () => show('edit'), 'primary'))
+  }
+  show()
+}
+
 export function signedModelsPage(host, api, signal) {
   let ledger
   const open = detailPanel(host, () => ledger)
@@ -485,7 +509,8 @@ export function signedModelsPage(host, api, signal) {
       mountTabs(pane.body, [
         ['pool', '模型池版本', (area, s) => poolPanel(area, api, row, s, () => pane.changed())],
         ['multiplier', '输入倍率', (area, s) => multiplierTab(area, api, row, s, () => pane.changed())],
-        ['sales', '基础销售费率', (area, s) => catalog(area, api, null, 'rate', row, s)]
+        ['sales', '基础销售费率', (area, s) => catalog(area, api, null, 'rate', row, s)],
+        ['parameters', '模型参数', (area, s) => modelParametersTab(area, api, row, s, () => pane.changed())]
       ], AbortSignal.any([signal, pane.signal].filter(Boolean)))
     })
   })

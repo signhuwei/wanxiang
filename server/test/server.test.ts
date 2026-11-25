@@ -658,7 +658,8 @@ test('platform privileges are independent and provider secrets are never returne
   expect(() => decryptProviderSecret(Buffer.alloc(32, 41), 'different-provider', stored.secret_ciphertext)).toThrow();
   const model = await f.request('/platform/models', { provider_id: id, upstream_name: 'fake', display_name: 'Fake', context_window: 1024 }, global);
   expect(model.status).toBe(201);
-  const { id: model_id } = await model.json() as { id: string };
+  const { id: model_id, max_output_tokens } = await model.json() as { id: string; max_output_tokens: number | null };
+  expect(max_output_tokens).toBeNull();
   const rate = { model_id, effective_from: '2026-11-19T00:00:00Z', input_milli_per_mtok: 1, output_milli_per_mtok: 2, cache_read_milli_per_mtok: 0, cache_write_milli_per_mtok: 0 };
   expect((await f.request('/platform/rates', rate, global)).status).toBe(201);
   expect((await f.request('/platform/rates', rate, global)).status).toBe(409);
@@ -680,6 +681,33 @@ test('platform privileges are independent and provider secrets are never returne
   expect(f.store.tenant(second.id).get('SELECT revision FROM contract')).toBeNull();
   expect(await (await f.request('/platform/policy/contracts/' + second.id, undefined, global)).json())
     .toMatchObject({ platform_revision: 0, policy_revision: 0, actions: ['read', 'sign'] });
+});
+
+test('signed model output limit persists across partial edits and can be explicitly cleared', async () => {
+  const f = await fixture();
+  const admin = await f.login();
+  await f.store.system.write((sql) => sql.run('INSERT INTO platform_admins (user_id) VALUES (?)', [f.userId]));
+  const provider = await f.request('/platform/providers', {
+    name: 'Upstream', protocol: 'anthropic', base_url: 'http://127.0.0.1:3333', secret: 'secret',
+  }, admin);
+  const { id: provider_id } = await provider.json() as { id: string };
+  const create = await f.request('/platform/models', { provider_id, upstream_name: 'test-model', display_name: 'Test model',
+    context_window: 128000, max_output_tokens: 8192 }, admin);
+  expect(create.status).toBe(201);
+  const model = await create.json() as { id: string; revision: number; max_output_tokens: number };
+  expect(model.max_output_tokens).toBe(8192);
+  const pathname = `/platform/models/${model.id}`;
+  const updated = await f.request(pathname, { revision: model.revision, display_name: 'Updated' }, admin, undefined, 'PATCH');
+  expect(updated.status).toBe(200);
+  expect(await updated.json()).toMatchObject({ revision: 2, max_output_tokens: 8192 });
+  for (const changes of [{ context_window: 4096 }, ...[0, 3.5, 128001, '8192'].map(max_output_tokens => ({ max_output_tokens }))]) {
+    expect((await f.request(pathname, { revision: 2, ...changes }, admin)).status).toBe(422);
+  }
+  const cleared = await f.request(pathname, { revision: 2, max_output_tokens: null, context_window: 4096 }, admin);
+  expect(cleared.status).toBe(200);
+  expect(await cleared.json()).toMatchObject({ revision: 3, context_window: 4096, max_output_tokens: null });
+  expect(await (await f.request(`/platform/models?provider_id=${provider_id}`, undefined, admin)).json())
+    .toMatchObject({ items: [{ id: model.id, context_window: 4096, max_output_tokens: null }] });
 });
 
 async function until(predicate: () => boolean | Promise<boolean>) {
@@ -1483,8 +1511,8 @@ test('policy v2 ties generic signing, exact recharge, profile revisions and devi
     sql.run(`INSERT INTO providers (id,name,protocol,base_url,secret_ciphertext,status)
       VALUES (?,?,'openai_chat','https://one.invalid/v1',?,'active')`,
     [providerId,'Fixture Provider',encryptProviderSecret(Buffer.alloc(32, 41), providerId, providerSecret)]);
-    sql.run(`INSERT INTO models (id,provider_id,upstream_name,display_name,context_window,status)
-      VALUES (?,?,'example-a','Fixture Model',2048,'active')`, [modelId,providerId]);
+    sql.run(`INSERT INTO models (id,provider_id,upstream_name,display_name,context_window,max_output_tokens,status)
+      VALUES (?,?,'example-a','Fixture Model',262144,16384,'active')`, [modelId,providerId]);
     sql.run(`INSERT INTO rates (model_id,input_milli_per_mtok,output_milli_per_mtok,cache_read_milli_per_mtok,cache_write_milli_per_mtok,effective_from)
       VALUES (?,1,1,1,1,?)`, [modelId,iso(f.now())]);
   });
@@ -1532,6 +1560,7 @@ test('policy v2 ties generic signing, exact recharge, profile revisions and devi
   expect(await edge.nextOf('lease')).toMatchObject({ budget_milli: 2125 });
   const configuration = await edge.nextOf('config');
   expect(configuration).toMatchObject({ routes: [{ model_id: modelId }], rates: [{ model_id: modelId }],
+    model_limits: { [modelId]: { context_window: 262_144, max_output_tokens: 16_384 } },
     policy: { abi: 1, tenant_id: f.tenantId, user_id: f.userId, device_id: token.device_id, policy_revision: 1,
       platform_revision: 1, tenant_revision: null, groups: [], member: null, secrets: [{ provider_id: providerId }],
       display: expect.arrayContaining([expect.objectContaining({ id: 'customer.device-balance', value: 2125 })]) } });
@@ -1557,7 +1586,7 @@ test('policy v2 ties generic signing, exact recharge, profile revisions and devi
   expect(updated.status).toBe(200);
   expect(await updated.json()).toMatchObject({ scope: 'group', subject_id: group, policy_revision: 2 });
   expect((await f.request(groupConfig, narrow, owner, 'stale-narrow', 'PUT')).status).toBe(409);
-  expect(await edge.nextOf('config')).toMatchObject({ routes: [], rates: [], policy: {
+  expect(await edge.nextOf('config')).toMatchObject({ routes: [], rates: [], model_limits: {}, policy: {
     policy_revision: 2, platform_revision: 1, groups: [{ id: group, revision: 1 }], secrets: [],
     notices: expect.arrayContaining([expect.objectContaining({ kind: 'policy_changed', policy_revision: 2 })]),
   } });

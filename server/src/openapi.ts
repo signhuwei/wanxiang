@@ -51,7 +51,9 @@ const write = (input: object, output: object, mode: 'create' | 'update' | 'upser
     404: error('对象不存在'), ...status,
   },
 });
-const models = { id: text, provider_id: text, upstream_name: text, route_model: nullableText, display_name: text, context_window: sequence, status: text };
+const models = { id: text, provider_id: text, upstream_name: text, route_model: nullableText, display_name: text,
+  context_window: revision, max_output_tokens: { type: ['integer', 'null'], minimum: 1,
+    description: '签约型号的最大输出 Token，不得超过上下文窗口。更新时省略保留原值，传 null 清空。' }, status: text };
 const providers = { id: text, name: text, protocol: { type: 'string', enum: ['anthropic', 'openai_chat', 'openai_responses'] }, base_url: text,
   status: text, auth: { enum: ['x_api_key', 'bearer', null] }, proxy: nullableText };
 const releases = { id: text, agent: text, version: text, os: text, arch: text, url: text, sha256: text, size: sequence, status: text };

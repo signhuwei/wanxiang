@@ -22,6 +22,7 @@ type Subscription = DesktopCapabilities & { tenant: string; agentCache: boolean;
   live: () => boolean; send: (value: Record<string, unknown>) => void };
 type RouteRow = { model_id: string; route_model: string | null; upstream_model: string; provider_id: string; protocol: string;
   base_url: string; auth: string | null; proxy: string | null; name: string;
+  context_window: number; max_output_tokens: number | null;
   input_milli_per_mtok: number; output_milli_per_mtok: number; cache_read_milli_per_mtok: number;
   cache_write_milli_per_mtok: number; effective_from: string };
 type Participant = { user_id: string; os: string; arch: string; public_key: string | null };
@@ -65,7 +66,7 @@ export function effectiveModelConfig(store: Store, contract: { allowed_models_js
   const allowed = contract && contract.lease_budget_milli > 0 ? contract.allowed_models_json : '[]';
   const at = iso(now);
   const rows = store.system.all<RouteRow>(`SELECT m.id AS model_id, m.route_model, m.upstream_name AS upstream_model,
-    m.display_name AS name, p.id AS provider_id, p.protocol, p.base_url, p.auth, p.proxy,
+    m.display_name AS name, m.context_window, m.max_output_tokens, p.id AS provider_id, p.protocol, p.base_url, p.auth, p.proxy,
     r.input_milli_per_mtok, r.output_milli_per_mtok, r.cache_read_milli_per_mtok, r.cache_write_milli_per_mtok, r.effective_from
     FROM models m JOIN providers p ON p.id = m.provider_id
     JOIN rates r ON r.model_id = m.id AND r.effective_from = (
@@ -84,7 +85,10 @@ export function effectiveModelConfig(store: Store, contract: { allowed_models_js
     ({ model_id, input_milli_per_mtok, output_milli_per_mtok, cache_read_milli_per_mtok, cache_write_milli_per_mtok, effective_from })));
   const models = rows.map((row, i) => ({ model_id: row.model_id, name: row.name, model: routes[i]!.model,
     provider_id: row.provider_id, protocol: row.protocol, rate: rates[i]! }));
-  return { routes, rates, models };
+  const modelLimits = Object.fromEntries(rows.filter(row => Number.isSafeInteger(row.context_window) && row.context_window > 0)
+    .map(({ model_id, context_window, max_output_tokens }) => [model_id, { context_window,
+      ...(max_output_tokens !== null && { max_output_tokens }) }]));
+  return { routes, rates, models, modelLimits };
 }
 
 export function configPublisher(store: Store, dataDir: string, now: () => number, masterKey?: Uint8Array) {
@@ -134,7 +138,7 @@ export function configPublisher(store: Store, dataDir: string, now: () => number
       sub.send({ type: 'cutoff', id: `msg_${ulid()}`, reason: 'contract' });
       return;
     }
-    const { routes: platformRoutes, rates } = effectiveModelConfig(store, policy ?? contract ?? null, now());
+    const { routes: platformRoutes, rates, modelLimits } = effectiveModelConfig(store, policy ?? contract ?? null, now());
     const agents = allowedAgentReleases(store, dataDir, policy ?? contract ?? null, participant.os, participant.arch, sub.agentCache, sub)
       .map(({ id, agent, version, os, arch, url, sha256, size }) => ({
         id, agent, version, os, arch, url: sub.agentCache ? artifactDownloadPath(id) : url, sha256, size,
@@ -171,6 +175,7 @@ export function configPublisher(store: Store, dataDir: string, now: () => number
       const eligible = mode === 'restricted' ? new Set(balanceFallbackModels(policy)) : null;
       const availableRoutes = mode === 'stopped' ? [] : eligible ? routes.filter(route => eligible.has(route.model_id)) : routes;
       const availableModels = new Set(availableRoutes.map(route => route.model_id));
+      const availableLimits = Object.fromEntries(Object.entries(modelLimits).filter(([modelId]) => availableModels.has(modelId)));
       const availableProviders = new Set(availableRoutes.map(route => route.provider_id));
       const secrets = [...routeSecrets.values()].filter(secret => availableProviders.has(secret.provider_id));
       const aliases = mode === 'restricted' && availableRoutes.length > 0
@@ -187,6 +192,7 @@ export function configPublisher(store: Store, dataDir: string, now: () => number
         .sort((a, b) => a.at.localeCompare(b.at) || a.policy_revision - b.policy_revision).slice(-20);
       sub.send({ type: 'config', id: `msg_${ulid()}`, revision, agent_cache: sub.agentCache, agents, tools,
         routes: availableRoutes, rates: rates.filter(rate => availableModels.has(rate.model_id)),
+        model_limits: availableLimits,
         policy: { abi: runtimeRequired ? 2 : 1, ...(runtimeRequired && {runtime}), ...(policy.commerce_plan_id && {commerce_plan_id:policy.commerce_plan_id}), tenant_id: sub.tenant, user_id: participant.user_id, device_id: device,
           platform_revision: policy.platform_revision, policy_revision: policy.policy_revision,
           tenant_revision: policy.tenant_revision, groups: policy.groups.slice(-maxPolicyScopeRefs), member: policy.member,
@@ -197,7 +203,8 @@ export function configPublisher(store: Store, dataDir: string, now: () => number
       return;
     }
     const routes=platformRoutes;
-    sub.send({ type: 'config', id: `msg_${ulid()}`, revision, routes, rates, agents, ...capability, ...(sub.agentCache && { agent_cache: true }) });
+    sub.send({ type: 'config', id: `msg_${ulid()}`, revision, routes, rates, agents, model_limits: modelLimits,
+      ...capability, ...(sub.agentCache && { agent_cache: true }) });
     if (!contract || contract.lease_budget_milli <= 0) sub.send({ type: 'cutoff', id: `msg_${ulid()}`, reason: 'contract' });
     if (!participant.public_key || !masterKey) return;
     for (const providerId of new Set(routes.map((route) => route.provider_id))) {

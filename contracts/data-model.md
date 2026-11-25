@@ -13,7 +13,7 @@ v0.15 的合约模板、平台合约、租户配置和有效投影见[能力合�
 | `login_codes` | target、code_hash、expires_at、attempts |
 | `sessions` | token_hash、user_id、tenant_id、kind（`web`、`desktop`）、expires_at |
 | `providers` | id、name、protocol（`anthropic`、`openai_chat`、`openai_responses`）、base_url、secret_ciphertext、status |
-| `models` | id、provider_id、upstream_name、display_name、context_window、status |
+| `models` | id、provider_id、upstream_name、display_name、context_window、max_output_tokens（可空）、status |
 | `rates` | model_id、input_milli_per_mtok、output_milli_per_mtok、cache_read_milli_per_mtok、cache_write_milli_per_mtok、effective_from |
 | `agent_releases` | id、agent、version、os、arch、url、sha256、size、status |
 | `platform_audit` | id、actor、action、target、detail_json、at |

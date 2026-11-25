@@ -794,6 +794,7 @@ fn apply_config(state: &State, welcome: &Welcome, mut c: Config) -> Result<Optio
         policy,
         policy_blocked: false,
         routes: c.routes,
+        model_limits: c.model_limits,
         rates: c.rates,
         agents: c.agents,
         tools,
@@ -1549,6 +1550,26 @@ fn ack_err(re: String, code: &str, message: &str) -> Msg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_updates_replace_the_model_limits() {
+        let state = State::default();
+        let welcome = serde_json::from_value(json!({
+            "re":"m1","device_id":"dev","user_id":"usr","tenant_id":"ten",
+            "server_time":"2026-11-19T08:00:00Z","ack_seq":0,"heartbeat_ms":15000
+        }))
+        .unwrap();
+        let cfg = serde_json::from_value(json!({
+            "id":"s1","revision":1,"model_limits":{"mdl_qwen":{"context_window":262144,"max_output_tokens":16384}}
+        }))
+        .unwrap();
+        apply_config(&state, &welcome, cfg).unwrap();
+        assert_eq!(state.config.read().unwrap().model_limits["mdl_qwen"].context_window.get(), 262144);
+
+        let cfg = serde_json::from_value(json!({"id":"s2","revision":2})).unwrap();
+        apply_config(&state, &welcome, cfg).unwrap();
+        assert!(state.config.read().unwrap().model_limits.is_empty());
+    }
 
     #[test]
     fn metered_pool_opt_in_needs_tls_and_accepts_only_a_clean_legacy_cutover() {

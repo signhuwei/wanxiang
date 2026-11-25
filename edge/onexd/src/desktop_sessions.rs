@@ -786,9 +786,9 @@ mod tests {
         registry.set_deepseek_models(
             "control",
             &[
-                DeepSeekModel { name: "managed-model".into(), api: AgentProtocol::Chat, image_input: false },
-                DeepSeekModel { name: "second-chat".into(), api: AgentProtocol::Chat, image_input: false },
-                DeepSeekModel { name: "managed-messages".into(), api: AgentProtocol::Messages, image_input: false },
+                DeepSeekModel::new("managed-model".into(), AgentProtocol::Chat, false, None, None),
+                DeepSeekModel::new("second-chat".into(), AgentProtocol::Chat, false, None, None),
+                DeepSeekModel::new("managed-messages".into(), AgentProtocol::Messages, false, None, None),
             ],
         );
         let make = |model: &str| {
@@ -930,8 +930,8 @@ mod tests {
         state.desktop_sessions.set_deepseek_models(
             "launch",
             &[
-                DeepSeekModel { name: "managed-model".into(), api: AgentProtocol::Chat, image_input: false },
-                DeepSeekModel { name: "messages-model".into(), api: AgentProtocol::Messages, image_input: false },
+                DeepSeekModel::new("managed-model".into(), AgentProtocol::Chat, false, None, None),
+                DeepSeekModel::new("messages-model".into(), AgentProtocol::Messages, false, None, None),
             ],
         );
 

@@ -107,7 +107,7 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
         proxy: proxy == null || proxy === 'none' ? proxy ?? null : urlField(proxy, 'proxy') };
     } });
   register({ path: 'models', table: 'models', columns: '*', search: "display_name || ' ' || upstream_name", prefix: 'mod', action: 'create_model',
-    // Pool fields are read-only additions; legacy writes and responses keep their shape.
+    // Pool fields are read-only and only included in the ledger.
     listProject: (row) => {
       const base = view(row);
       const pricing = modelPricingSummary(store.system, String(row.id), row.status === 'active', iso(opts.now()));
@@ -122,8 +122,11 @@ export function platformRoutes(app: Hono, store: Store, opts: ManagementOptions)
       const rawPattern = value(body, row, 'route_model');
       const route_model = rawPattern == null ? null : field(rawPattern, 'route_model');
       if (route_model && !/^[^*]*\*?$/.test(route_model)) invalid('route_model');
+      const context_window = number(body, row, 'context_window', 1);
+      const output = value(body, row, 'max_output_tokens');
+      const max_output_tokens = output == null ? null : int(output, 'max_output_tokens', 1, context_window);
       return { provider_id, upstream_name, route_model, display_name: text(body, row, 'display_name'),
-        context_window: number(body, row, 'context_window', 1), status: status(body, row) };
+        context_window, max_output_tokens, status: status(body, row) };
     } });
   register({ path: 'agent-releases', table: 'agent_releases', columns: '*',
     search: "agent || ' ' || version || ' ' || os || ' ' || arch", prefix: 'rel', action: 'create_agent_release',

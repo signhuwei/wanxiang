@@ -250,6 +250,17 @@ try {
   }
 
   await cell(signedName).click()
+  await button('模型参数').click()
+  await right().locator('output[data-field="max_output_tokens"]').filter({ hasText: /^未设置$/ }).waitFor()
+  await button('编辑模型参数').click()
+  await label('最大输出 Token').fill('8192')
+  const parameters = await submit('保存', '/models/' + modelId, 200, right())
+  assert.equal(parameters.max_output_tokens, 8192)
+  await button('编辑模型参数').click()
+  await label('最大输出 Token').fill('')
+  const clearedParameters = await submit('保存', '/models/' + modelId, 200, right())
+  assert.equal(clearedParameters.max_output_tokens, null)
+  await button('模型池版本').click()
   await button('起草新版本').click()
   for (const candidate of reviewed) await label('选择 ' + candidate.deployment_id + ' ' + candidate.raw_model).check()
   await label('发布原因').fill('签约型号有两条已复核供货渠道')

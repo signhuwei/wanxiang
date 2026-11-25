@@ -304,7 +304,6 @@ async fn original_windows_host_restores_native_session_and_settles_each_turn() -
 
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 async fn run_original_deepseek(attachments: bool, host_only: bool, mixed_models: bool) -> anyhow::Result<()> {
-    use crate::router::AgentProtocol;
     #[cfg(target_os = "macos")]
     const IMAGE: &str =
         "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGMQL/sPRwzEcQB1UhjB1HLtUgAAAABJRU5ErkJggg==";
@@ -323,12 +322,13 @@ async fn run_original_deepseek(attachments: bool, host_only: bool, mixed_models:
     #[cfg(windows)]
     let observer = None;
     let (state, addr, mut usage) = router_fixture(&release, observer).await?;
-    let mut models = vec![desktop_launch::DeepSeekModel {
-        name: "onex-qa".into(),
-        api: AgentProtocol::Chat,
-        image_input: attachments,
-    }];
     let mut turns = vec![("onex", "onex-qa", "model"); 2];
+    state
+        .config
+        .write()
+        .unwrap()
+        .model_limits
+        .insert("model".into(), serde_json::from_value(json!({"context_window":262144,"max_output_tokens":16384}))?);
     if mixed_models {
         let mut config = state.config.write().unwrap();
         let primary = config.routes[0].clone();
@@ -339,23 +339,22 @@ async fn run_original_deepseek(attachments: bool, host_only: bool, mixed_models:
                 "onex-qa-chat-alt",
                 "chat-alt",
                 "openai_chat",
-                AgentProtocol::Chat,
                 "wire-model",
                 UpstreamAuth::Bearer,
+                json!({"context_window":131072,"max_output_tokens":8192}),
             ),
             (
                 "onex-anthropic",
                 "onex-qa-claude",
                 "claude",
                 "anthropic",
-                AgentProtocol::Messages,
                 "wire-claude",
                 UpstreamAuth::XApiKey,
+                json!({"context_window":200000,"max_output_tokens":12288}),
             ),
         ];
         turns.truncate(1);
-        for (provider, model, model_id, protocol, api, upstream, auth) in extras {
-            models.push(desktop_launch::DeepSeekModel { name: model.into(), api, image_input: false });
+        for (provider, model, model_id, protocol, upstream, auth, limits) in extras {
             turns.push((provider, model, model_id));
             config.routes.push(Route {
                 model: model.into(),
@@ -366,8 +365,10 @@ async fn run_original_deepseek(attachments: bool, host_only: bool, mixed_models:
                 ..primary.clone()
             });
             config.rates.push(Rate { model_id: model_id.into(), ..rate.clone() });
+            config.model_limits.insert(model_id.into(), serde_json::from_value(limits)?);
         }
     }
+    let models = crate::ipc::deepseek_model_choices(&state.config.read().unwrap());
     let outbox = Arc::new(Outbox::open(&root.path().join("outbox.sqlite"))?);
     let marker = root.path().join("native-id");
     let failure = root.path().join("input-error");
@@ -395,6 +396,24 @@ async fn run_original_deepseek(attachments: bool, host_only: bool, mixed_models:
         std::fs::write(&plugin, INPUT_PLUGIN)?;
         let patch_file = launch.config_dir.join("profiles/desktop/cordis.patch.yml");
         let mut patch: Vec<Value> = serde_json::from_slice(&std::fs::read(&patch_file)?)?;
+        let providers = &patch.iter().find(|row| row["id"] == "llm-pi-ai").unwrap()["config"]["providers"];
+        let qwen = &providers["onex"]["models"][0];
+        assert_eq!(
+            (qwen["id"].as_str(), qwen["contextWindow"].as_u64(), qwen["maxTokens"].as_u64()),
+            (Some("onex-qa"), Some(262144), Some(16384))
+        );
+        if mixed_models {
+            let chat = &providers["onex"]["models"][1];
+            assert_eq!(
+                (chat["id"].as_str(), chat["contextWindow"].as_u64(), chat["maxTokens"].as_u64()),
+                (Some("onex-qa-chat-alt"), Some(131072), Some(8192))
+            );
+            let claude = &providers["onex-anthropic"]["models"][0];
+            assert_eq!(
+                (claude["id"].as_str(), claude["contextWindow"].as_u64(), claude["maxTokens"].as_u64()),
+                (Some("onex-qa-claude"), Some(200000), Some(12288))
+            );
+        }
         let test_config = json!({"workspace":cwd,"marker":marker,"failure":failure,"input":input,
             "selected":mixed_models.then(|| json!({"provider":provider,"model":selected}))});
         #[cfg(target_os = "macos")]

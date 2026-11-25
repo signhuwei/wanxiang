@@ -8,8 +8,8 @@ use std::time::Instant;
 use onex_core::ipc::LocalUsage;
 use onex_core::route_pool::{CredentialRef, PoolConfig};
 use onex_core::ws::{
-    AgentRelease, BalanceMode, BalanceRouting, CapabilityContract, PolicyNotice, PolicySummary, Rate, Route,
-    ToolRelease,
+    AgentRelease, BalanceMode, BalanceRouting, CapabilityContract, ModelLimits, PolicyNotice, PolicySummary, Rate,
+    Route, ToolRelease,
 };
 use tokio::sync::watch;
 use zeroize::Zeroizing;
@@ -72,6 +72,7 @@ pub struct ConfigSnapshot {
     pub policy: Option<AppliedPolicy>,
     pub policy_blocked: bool,
     pub routes: Vec<Route>,
+    pub model_limits: HashMap<String, ModelLimits>,
     pub rates: Vec<Rate>,
     pub agents: Vec<AgentRelease>,
     pub tools: Vec<ToolRelease>,
@@ -378,6 +379,7 @@ impl State {
             policy: Some(policy),
             policy_blocked: false,
             routes,
+            model_limits: HashMap::new(),
             rates: Vec::new(),
             agents,
             tools: Vec::new(),

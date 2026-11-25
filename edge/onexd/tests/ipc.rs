@@ -370,6 +370,7 @@ async fn launch_without_program_downloads_the_managed_release() {
         size: body.len() as u64,
     };
     *state.config.write().unwrap() = onexd::state::ConfigSnapshot {
+        model_limits: Default::default(),
         tools: vec![],
         agent_cache: false,
         revision: 1,

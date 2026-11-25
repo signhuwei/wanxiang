@@ -1020,9 +1020,10 @@ async fn launch(
     }
 }
 
-fn deepseek_model_choices(config: &crate::state::ConfigSnapshot) -> Vec<DeepSeekModel> {
+pub(crate) fn deepseek_model_choices(config: &crate::state::ConfigSnapshot) -> Vec<DeepSeekModel> {
     let mut names = HashSet::new();
     let now = crate::outbox::now_ms();
+    let policy_max_output = config.policy.as_ref().and_then(|policy| policy.runtime.max_output);
     config
         .routes
         .iter()
@@ -1040,11 +1041,13 @@ fn deepseek_model_choices(config: &crate::state::ConfigSnapshot) -> Vec<DeepSeek
             [AgentProtocol::Chat, AgentProtocol::Messages].into_iter().find_map(|api| {
                 let route = api.select_agent_route(config, name, Some("deepseek-desktop"))?;
                 crate::pricing::pick_rate(&config.rates, &route.model_id, now)?;
-                Some(DeepSeekModel {
-                    name: name.to_owned(),
+                Some(DeepSeekModel::new(
+                    name.to_owned(),
                     api,
-                    image_input: crate::desktop_sessions::accepts_images(route),
-                })
+                    crate::desktop_sessions::accepts_images(route),
+                    config.model_limits.get(&route.model_id),
+                    policy_max_output,
+                ))
             })
         })
         .collect()

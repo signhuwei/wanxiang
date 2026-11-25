@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use onex_core::ws::ModelLimits;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -14,6 +15,24 @@ pub(crate) struct DeepSeekModel {
     pub(crate) name: String,
     pub(crate) api: AgentProtocol,
     pub(crate) image_input: bool,
+    context_window: u64,
+    max_output_tokens: u64,
+}
+
+impl DeepSeekModel {
+    pub(crate) fn new(
+        name: String,
+        api: AgentProtocol,
+        image_input: bool,
+        limits: Option<&ModelLimits>,
+        policy_max_output: Option<u64>,
+    ) -> Self {
+        let context_window = limits.map_or(32768, |limits| limits.context_window.get());
+        let model_max_output = limits.and_then(|limits| limits.max_output_tokens).map(|max| max.get());
+        let max_output_tokens =
+            [model_max_output, policy_max_output].into_iter().flatten().min().unwrap_or(4096).min(context_window);
+        Self { name, api, image_input, context_window, max_output_tokens }
+    }
 }
 
 pub(crate) struct Request<'a> {
@@ -263,7 +282,8 @@ fn deepseek_model_config(
                     default_provider = Some(provider);
                 }
                 permissions.push(json!({"provider":provider,"id":model.name,"imageInput":model.image_input}));
-                json!({"id":model.name,"name":model.name,"contextWindow":32768,"maxTokens":4096,
+                json!({"id":model.name,"name":model.name,"contextWindow":model.context_window,
+                "maxTokens":model.max_output_tokens,
                 "input":if model.image_input { vec!["text", "image"] } else { vec!["text"] }, "reasoningEfforts":false})
             })
             .collect();
@@ -287,9 +307,9 @@ mod deepseek_model_tests {
     #[test]
     fn deepseek_profile_uses_native_protocol_and_selected_models() {
         let models = [
-            DeepSeekModel { name: "approved-chat".into(), api: AgentProtocol::Chat, image_input: false },
-            DeepSeekModel { name: "approved-vision".into(), api: AgentProtocol::Chat, image_input: true },
-            DeepSeekModel { name: "approved-messages".into(), api: AgentProtocol::Messages, image_input: true },
+            DeepSeekModel::new("approved-chat".into(), AgentProtocol::Chat, false, None, None),
+            DeepSeekModel::new("approved-vision".into(), AgentProtocol::Chat, true, None, None),
+            DeepSeekModel::new("approved-messages".into(), AgentProtocol::Messages, true, None, None),
         ];
         let (providers, permissions, default_provider) =
             deepseek_model_config("http://127.0.0.1:1234", "approved-chat", &models).unwrap();
@@ -297,6 +317,8 @@ mod deepseek_model_tests {
         assert_eq!(providers["onex"]["baseURL"], "http://127.0.0.1:1234/v1");
         assert_eq!(providers["onex"]["api"], "openai-completions");
         assert_eq!(providers["onex"]["models"].as_array().unwrap().len(), 2);
+        assert_eq!(providers["onex"]["models"][0]["contextWindow"], 32768);
+        assert_eq!(providers["onex"]["models"][0]["maxTokens"], 4096);
         assert_eq!(providers["onex"]["models"][0]["input"], json!(["text"]));
         assert_eq!(providers["onex"]["models"][1]["input"], json!(["text", "image"]));
         assert_eq!(providers["onex-anthropic"]["baseURL"], "http://127.0.0.1:1234");
@@ -309,6 +331,31 @@ mod deepseek_model_tests {
             "onex-anthropic"
         );
         assert!(deepseek_model_config("http://127.0.0.1:1234", "unknown", &models).is_err());
+    }
+
+    #[test]
+    fn deepseek_profile_advertises_each_configured_model_limit() {
+        let large_window = serde_json::from_value(json!({"context_window":262144,"max_output_tokens":65536})).unwrap();
+        let context_only = serde_json::from_value(json!({"context_window":200000})).unwrap();
+        let small_window = serde_json::from_value(json!({"context_window":1024})).unwrap();
+        let models = [
+            DeepSeekModel::new("qwen".into(), AgentProtocol::Chat, false, Some(&large_window), None),
+            DeepSeekModel::new("signed-cap".into(), AgentProtocol::Chat, true, Some(&large_window), Some(16384)),
+            DeepSeekModel::new("small-context".into(), AgentProtocol::Chat, false, Some(&small_window), None),
+            DeepSeekModel::new("messages".into(), AgentProtocol::Messages, true, Some(&context_only), Some(32768)),
+        ];
+        let (providers, _, _) = deepseek_model_config("http://127.0.0.1:1234", "qwen", &models).unwrap();
+        let chats = &providers["onex"]["models"];
+        assert_eq!(chats[0]["contextWindow"], 262144);
+        assert_eq!(chats[0]["maxTokens"], 65536);
+        assert_eq!(chats[1]["contextWindow"], 262144);
+        assert_eq!(chats[1]["maxTokens"], 16384);
+        assert_eq!(chats[2]["contextWindow"], 1024);
+        assert_eq!(chats[2]["maxTokens"], 1024);
+        let messages = &providers["onex-anthropic"]["models"][0];
+        assert_eq!(messages["contextWindow"], 200000);
+        assert_eq!(messages["maxTokens"], 32768);
+        assert_eq!(messages["input"], json!(["text", "image"]));
     }
 }
 
@@ -440,11 +487,7 @@ fn deepseek_uses_private_windows_profile_and_loadable_adapter_urls() {
         model_bearer: None,
         router: "127.0.0.1:19876",
         model: "contract-model",
-        deepseek_models: &[DeepSeekModel {
-            name: "contract-model".into(),
-            api: AgentProtocol::Chat,
-            image_input: false,
-        }],
+        deepseek_models: &[DeepSeekModel::new("contract-model".into(), AgentProtocol::Chat, false, None, None)],
     };
     let prepared = prepare(&request, None).unwrap();
     let state = &prepared.launch;

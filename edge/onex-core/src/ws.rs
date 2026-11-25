@@ -1,5 +1,7 @@
 //! Edge ↔ Server WebSocket 消息，对应 `contracts/edge-ws.md` v0。
 
+use std::{collections::HashMap, num::NonZeroU64};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -115,12 +117,22 @@ pub struct Config {
     pub policy: Option<Policy>,
     #[serde(default)]
     pub routes: Vec<Route>,
+    /// Per-model limits for the authorized routes, keyed by `Route::model_id`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_limits: HashMap<String, ModelLimits>,
     #[serde(default)]
     pub agents: Vec<AgentRelease>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolRelease>,
     #[serde(default)]
     pub rates: Vec<Rate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelLimits {
+    pub context_window: NonZeroU64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<NonZeroU64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -542,6 +554,29 @@ mod tests {
     fn unknown_type_does_not_fail() {
         let m: Msg = serde_json::from_value(json!({"type":"from_the_future","id":"x","n":1})).unwrap();
         assert_eq!(m, Msg::Unknown);
+    }
+
+    #[test]
+    fn config_model_limits_are_optional_and_positive() {
+        let mut wire = json!({"type":"config","id":"s1","revision":1});
+        let Msg::Config(legacy) = serde_json::from_value(wire.clone()).unwrap() else { panic!() };
+        assert!(legacy.model_limits.is_empty());
+        assert!(serde_json::to_value(legacy).unwrap().get("model_limits").is_none());
+
+        wire["model_limits"] = json!({
+            "mdl_qwen":{"context_window":262144,"max_output_tokens":65536},
+            "mdl_other":{"context_window":200000}
+        });
+        let Msg::Config(config) = serde_json::from_value(wire.clone()).unwrap() else { panic!() };
+        assert_eq!(config.model_limits["mdl_qwen"].context_window.get(), 262144);
+        assert_eq!(config.model_limits["mdl_qwen"].max_output_tokens.unwrap().get(), 65536);
+        assert_eq!(config.model_limits["mdl_other"].max_output_tokens, None);
+        assert_eq!(serde_json::to_value(config).unwrap()["model_limits"], wire["model_limits"]);
+
+        wire["model_limits"]["mdl_qwen"]["max_output_tokens"] = json!(0);
+        assert!(serde_json::from_value::<Msg>(wire.clone()).is_err());
+        wire["model_limits"]["mdl_qwen"] = json!({"context_window":0});
+        assert!(serde_json::from_value::<Msg>(wire).is_err());
     }
 
     #[test]

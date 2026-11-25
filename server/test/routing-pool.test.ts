@@ -8,14 +8,14 @@ import { body, clock, minutes, setup, type Json } from './routing-fixture';
 test('routing migrations keep legacy tables readable and foreign keys consistent', async () => {
   const f = await setup();
   try {
-    expect(f.store.system.get<{ user_version: number }>('PRAGMA user_version')!.user_version).toBe(25);
+    expect(f.store.system.get<{ user_version: number }>('PRAGMA user_version')!.user_version).toBe(26);
     expect(f.store.system.all('PRAGMA foreign_key_check')).toEqual([]);
     expect(f.store.system.get('PRAGMA integrity_check')).toEqual({ integrity_check: 'ok' });
     const models = await body(await f.call(f.platform, '/models'));
     const byId = Object.fromEntries(models.items.map((row: Json) => [row.id, row]));
     expect(byId.mdl_m).toMatchObject({ provider_id: 'prv_a', upstream_name: 'vendor-a/m-20261121', revision: 1,
       actions: ['read', 'update', 'preview_input_multiplier'], current_pool_revision: 6, channel_count: 1 });
-    expect(byId.mdl_legacy).toMatchObject({ current_pool_revision: 0, channel_count: 0 });
+    expect(byId.mdl_legacy).toMatchObject({ current_pool_revision: 0, channel_count: 0, max_output_tokens: null });
     expect(models.actions).toEqual(['create_model']);
     expect((await f.call(f.platform, '/models?provider_id=prv_b')).status).toBe(200);
   } finally { await f.close(); }
