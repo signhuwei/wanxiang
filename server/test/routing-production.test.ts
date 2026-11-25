@@ -31,8 +31,10 @@ test('the runtime cohort parses only explicit tenant and device IDs and boots fr
       public_key: x25519PublicKey(Buffer.alloc(32, 8)) }, undefined, info.owner_session);
     const outside = socket(ordinary.device_token);
     expect(await outside.hello({ capabilities })).not.toHaveProperty('capabilities');
+    expect(await outside.nextOf('lease')).toMatchObject({ budget_milli: 20_375 });
     outside.close();
 
+    await api(`/platform/policy/contracts/${info.tenant_id}/recharges`, { amount_milli: 20_375 }, 'projected-device-funds');
     const edge = socket();
     expect(await edge.hello({ capabilities })).toMatchObject({ capabilities });
     const config = await edge.nextOf('config');
@@ -49,7 +51,7 @@ test('the runtime cohort parses only explicit tenant and device IDs and boots fr
       error: { detail: { reason: 'projection_not_applied' } } });
     expect(await edge.call({ ...applied('applied', info.config_revision, info.projection_id), policy_revision: config.policy.policy_revision })).toMatchObject({ ok: true });
     const lease = await edge.call({ type: 'lease_request', id: 'request', op_id: 'request' });
-    expect(lease).toMatchObject({ type: 'lease', config_revision: info.config_revision, projection_id: info.projection_id });
+    expect(lease).toMatchObject({ type: 'lease', budget_milli: 20_375, config_revision: info.config_revision, projection_id: info.projection_id });
     const route = config.routes.find((item: { deployment_id: string }) => item.deployment_id === info.backup_deployment_id);
     const item = { seq: 1, request_id: 'req_fixture', session_id: null, lease_id: lease.lease_id, provider_id: route.provider_id,
       model: info.model_id, model_id: info.model_id, deployment_id: route.deployment_id, deployment_revision: route.deployment_revision,

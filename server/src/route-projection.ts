@@ -1,6 +1,6 @@
 import { ulid } from 'ulid';
 import { artifactDownloadPath } from './agent-catalog';
-import { balance } from './billing';
+import { balance, leaseBudget, quotaBinding } from './billing';
 import { iso } from './credentials';
 import { deviceRuntime } from './edge-config';
 import { assessMember, currentIdentity, headRevision, poolMembers } from './model-pool';
@@ -106,7 +106,8 @@ export function buildProjection(store: Store, db: Reader, inputs: RoutingProject
   let mode = balancePolicyEnabled(policy) ? readBalanceMode(db) : null;
   if (mode !== null && inputs.productionExecution) {
     const wallet = balance(db, at);
-    const reserve = Math.min(wallet.balance_milli, policy.lease_budget_milli, Math.max(1, Math.floor(wallet.balance_milli / 20)));
+    const quota = quotaBinding(db, device.user_id, at);
+    const reserve = leaseBudget(wallet.balance_milli, policy.lease_budget_milli, quota?.remaining_milli);
     mode = balancePolicyMode(policy, wallet);
     // Project the fallback set before issuing a reservation that could cross the configured threshold.
     if ((mode === 'normal' || mode === 'warn') && reserve > 0 && balancePolicyMode(policy, {

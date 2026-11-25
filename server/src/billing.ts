@@ -117,6 +117,10 @@ export function quotaBinding(sql: Reader, userId: string, at: number): QuotaLeve
   return quotaLevels(sql, userId, at)[0] ?? null;
 }
 
+export function leaseBudget(available: number, contractLimit: number, quotaRemaining = available): number {
+  return Math.max(0, Math.min(available, contractLimit, quotaRemaining));
+}
+
 /** 本人本月已用（供 /me.quota 在不限时也能展示用量），不区分是否被某一级配额限制。 */
 export function selfMonthUsage(sql: Reader, userId: string, at: number) {
   const [from, to] = monthBounds(at);
@@ -209,8 +213,8 @@ function issue(store:Store, sql: Transaction, deviceId: string, userId: string, 
   if (available <= 0) return cutoff('balance', settledLeaseId);
   const binding = quotaBinding(sql, userId, at);
   if (binding && binding.remaining_milli <= 0) return cutoff('quota', settledLeaseId);
-  const budget = Math.min(available, contract.lease_budget_milli, Math.max(1, Math.floor(available / 20)),
-    ...(binding ? [binding.remaining_milli] : []));
+  const walletLimit = policy ? available : Math.max(1, Math.floor(available / 20));
+  const budget = leaseBudget(walletLimit, contract.lease_budget_milli, binding?.remaining_milli);
   // The reservation itself can cross the threshold. Avoid reserving money for a member with no permitted fallback.
   if (policy && balancePolicyMode(policy, { balance_milli: available - budget, reserved_milli: wallet.reserved_milli + budget }) === 'restricted') {
     const allowed = new Set<string>(JSON.parse(policy.allowed_models_json));

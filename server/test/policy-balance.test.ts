@@ -83,7 +83,7 @@ test('low-balance transitions publish an authorized floor, retain the final rese
     const term = (id: string, adjustment: number | string[]) => ({ clause_ref: { id, version: 1 }, template_ref: null, adjustment });
     const signature = (warn: number) => ({
       expected_platform_revision: 0, expected_policy_revision: 0, base_revision: null, reason: '低余额策略',
-      entries: [term('access.models', ['model_full', 'model_floor', 'model_unpriced']), term('lease.budget', 100),
+      entries: [term('access.models', ['model_full', 'model_floor', 'model_unpriced']), term('lease.budget', 1),
         term('fixture.balance.warn', warn), term('fixture.balance.restrict', 10), term('fixture.balance.fallback_models', ['model_floor'])],
     });
     expect((await send(contract + '/preview', platform, signature(9), 'bad-sign')).status).toBe(422);

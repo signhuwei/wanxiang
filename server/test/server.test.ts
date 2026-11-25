@@ -1529,7 +1529,7 @@ test('policy v2 ties generic signing, exact recharge, profile revisions and devi
   expect(await edge.opened).toBe(true);
   edge.hello(undefined, 0, 0, true, true);
   expect(await edge.next()).toMatchObject({ type: 'welcome' });
-  expect(await edge.nextOf('lease')).toMatchObject({ budget_milli: 1256 }); // 5% of available balance caps the 2125-milli policy limit.
+  expect(await edge.nextOf('lease')).toMatchObject({ budget_milli: 2125 });
   const configuration = await edge.nextOf('config');
   expect(configuration).toMatchObject({ routes: [{ model_id: modelId }], rates: [{ model_id: modelId }],
     policy: { abi: 1, tenant_id: f.tenantId, user_id: f.userId, device_id: token.device_id, policy_revision: 1,
@@ -1583,6 +1583,68 @@ test('policy v2 ties generic signing, exact recharge, profile revisions and devi
   } });
   const old = await linkedEdge(f, owner);
   expect(await old.nextOf('cutoff')).toMatchObject({ reason: 'contract' });
+});
+
+test('signed policy leases use the agreed cap and share wallet and quota remainders across devices', async () => {
+  const f = await fixture();
+  const global = await f.login();
+  const owner = await f.select(global);
+  const { encryptProviderSecret } = await import('../src/provider-secret');
+  await f.store.system.write(sql => {
+    sql.run('INSERT OR IGNORE INTO platform_admins VALUES (?)', [f.userId]);
+    sql.run(`INSERT INTO providers (id,name,protocol,base_url,secret_ciphertext,status)
+      VALUES ('provider_lease','Lease fixture','openai_chat','https://lease.invalid/v1',?,'active')`,
+      [encryptProviderSecret(Buffer.alloc(32, 41), 'provider_lease', 'fixture-only-key')]);
+    sql.run(`INSERT INTO models (id,provider_id,upstream_name,display_name,context_window,status)
+      VALUES ('model_lease','provider_lease','model','Lease fixture',2048,'active')`);
+  });
+  const contract = `/platform/policy/contracts/${f.tenantId}`;
+  const entry = (id: string, adjustment: number | string[]) => ({ clause_ref: { id, version: 1 }, template_ref: null, adjustment });
+  async function sign(revision: number, budget: number, quota?: number) {
+    const response = await f.request(contract + '/signatures', {
+      expected_platform_revision: revision, expected_policy_revision: revision, base_revision: revision || null,
+      reason: 'Fixture lease limits',
+      entries: [entry('access.models', ['model_lease']), entry('lease.budget', budget),
+        ...(quota === undefined ? [] : [entry('quota.monthly', quota)])],
+    }, global, 'lease-sign-' + revision);
+    expect(response.status).toBe(201);
+  }
+  async function open() {
+    const registered = await f.request('/devices', f.device, owner);
+    expect(registered.status).toBe(201);
+    const { device_token } = await registered.json() as DeviceReply;
+    const edge = connect(f, device_token);
+    expect(await edge.opened).toBe(true);
+    edge.hello(undefined, 0, 0, true, true);
+    expect(await edge.next()).toMatchObject({ type: 'welcome' });
+    return edge;
+  }
+  async function nextBalanceReply(edge: Awaited<ReturnType<typeof open>>) {
+    let reply = await edge.next();
+    while (reply.type === 'config' || reply.type === 'secret') reply = await edge.next();
+    return reply;
+  }
+  const wallet = async () => (await f.request('/balance', undefined, owner)).json();
+
+  await sign(0, 1000);
+  expect((await f.request(contract + '/recharges', { amount_milli: 7533 }, global, 'lease-funds')).status).toBe(201);
+  const first = await open();
+  expect(await first.nextOf('lease')).toMatchObject({ budget_milli: 1000 });
+  expect(await wallet()).toMatchObject({ balance_milli: 6533, reserved_milli: 1000 });
+
+  await sign(1, 1000, 1500);
+  const edges = await Promise.all([open(), open()]);
+  const replies = await Promise.all(edges.map(nextBalanceReply));
+  expect(replies).toContainEqual(expect.objectContaining({ type: 'lease', budget_milli: 500 }));
+  expect(replies).toContainEqual(expect.objectContaining({ type: 'cutoff', reason: 'quota' }));
+  expect(await wallet()).toMatchObject({ balance_milli: 6033, reserved_milli: 1500 });
+
+  await sign(2, 8000);
+  const blocked = edges[replies.findIndex(reply => reply.type === 'cutoff')]!;
+  blocked.send({ type: 'lease_request', id: 'now-allowed', op_id: 'now-allowed' });
+  expect(await nextBalanceReply(blocked)).toMatchObject({ type: 'lease', budget_milli: 6033 });
+  expect(await wallet()).toMatchObject({ balance_milli: 0, reserved_milli: 7533 });
+  expect(await nextBalanceReply(await open())).toMatchObject({ type: 'cutoff', reason: 'balance' });
 });
 
 test('platform stages Claude Desktop and Codex Desktop as separate unqualified Mac releases', async () => {
