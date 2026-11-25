@@ -39,7 +39,7 @@ macOS 桌面一键启动 Codex 的默认工作目录是 `~/OneX Workspace`。通
 
 `desktop_update` 可省略。存在时包含目标 `version`，以及 `phase: available | downloading | installing | failed`。下载时可附 `downloaded_bytes` 与 `total_bytes`。标题栏只显示已通过签名验证的更新及其进度，用户明确确认后才发送目标版本。Desktop 重启时复用现有 daemon、设备身份与受管任务。Windows 更新制品包含 Desktop、CLI 和 daemon。Desktop 重启后可显示 `waiting_for_agents | updating_components | components_failed`，当前 Agent 和请求结束后才激活新 CLI 和 daemon。
 
-macOS 覆盖安装和自动更新都会在 Desktop 启动后核对实际运行的 onexd 版本。版本不同可显示 `waiting_for_agents | restarting_daemon | daemon_restart_required | components_failed`。只向安装登记的 LaunchAgent 进程请求安全切换。
+macOS 覆盖安装和自动更新都会在 Desktop 启动后核对实际运行的 onexd 版本。版本不一致期间继续显示现有运行实例，暂停从工作台启动新实例，直到 onexd 切换完成。标题栏可显示 `waiting_for_agents | restarting_daemon | daemon_restart_required | components_failed`。Desktop 只向安装登记的 LaunchAgent 请求安全切换。若该任务退出后因注册配置错误无法启动，Desktop 可重新注册已验证的 OneX LaunchAgent。
 
 ### UI 中文文案（只按枚举选取，不展示自由文本）
 

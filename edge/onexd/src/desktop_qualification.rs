@@ -534,6 +534,8 @@ async fn run_original_deepseek(scenario: Scenario, host_only: bool) -> anyhow::R
             .stdout(Stdio::null())
             .stderr(if cfg!(windows) { Stdio::inherit() } else { Stdio::from(stderr) })
             .kill_on_drop(true);
+        #[cfg(target_os = "macos")]
+        command.process_group(0);
         let stop_file = launch.run_dir.join("stop-qualification-host");
         if host_only {
             let wrapper = launch.run_dir.join("qualification-host.cjs");
@@ -646,7 +648,11 @@ async fn run_original_deepseek(scenario: Scenario, host_only: bool) -> anyhow::R
         let stopped = if host_only {
             stop_qualification_host(&mut child, &stop_file).await
         } else {
-            stop_original_desktop(&mut child).await
+            #[cfg(target_os = "macos")]
+            let stopped = stop_original_macos_desktop(&mut child, &launch.config_dir.join("profiles/desktop")).await;
+            #[cfg(windows)]
+            let stopped = stop_original_windows_desktop(&mut child).await;
+            stopped
         };
         state.desktop_sessions.stop(&launch_token);
         crate::launch::finish(root.path(), &launch.launch_id)?;
@@ -757,12 +763,61 @@ fn original_deepseek_entry() -> anyhow::Result<(AgentRelease, std::path::PathBuf
     ))
 }
 
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
-async fn stop_original_desktop(child: &mut tokio::process::Child) -> anyhow::Result<()> {
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+async fn original_macos_host_groups(profile: &Path) -> anyhow::Result<Vec<u32>> {
+    let profile_text = desktop_launch::path_text(profile)?;
+    let canonical_text = desktop_launch::path_text(&profile.canonicalize()?)?;
+    let process_list = tokio::process::Command::new("/bin/ps")
+        .args(["-axww", "-o", "pgid=", "-o", "state=", "-o", "command="])
+        .output()
+        .await?;
+    anyhow::ensure!(process_list.status.success(), "could not read macOS process groups");
+    let output = String::from_utf8_lossy(&process_list.stdout);
+    Ok(output
+        .lines()
+        .filter(|line| {
+            line.contains("/@deepseek-ai/dsh-desktop-host/lib/index.js")
+                && (line.contains(&profile_text) || line.contains(&canonical_text))
+        })
+        .filter_map(|line| {
+            let mut columns = line.split_whitespace();
+            let group = columns.next()?.parse().ok()?;
+            (!columns.next()?.starts_with('Z')).then_some(group)
+        })
+        .collect())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+async fn stop_original_macos_desktop(child: &mut tokio::process::Child, profile: &Path) -> anyhow::Result<()> {
+    let Some(id) = child.id() else {
+        anyhow::bail!("original macOS desktop already reaped before shutdown");
+    };
+    let groups = original_macos_host_groups(profile).await;
+    let status = tokio::process::Command::new("/bin/kill").args(["-TERM", &id.to_string()]).status().await?;
+    let stop = tokio_util::sync::CancellationToken::new();
+    if let Ok(result) =
+        tokio::time::timeout(Duration::from_secs(20), crate::macos_desktop_job::wait(child, &stop)).await
+    {
+        result?;
+    } else {
+        stop.cancel();
+        crate::macos_desktop_job::wait(child, &stop).await?;
+        anyhow::bail!("original macOS GUI did not quit after SIGTERM");
+    }
+    anyhow::ensure!(status.success(), "could not terminate original macOS desktop");
+    let groups = groups?;
+    assert_eq!(groups, [id], "original DeepSeek Host was not in its fixture GUI group");
+    assert!(
+        original_macos_host_groups(profile).await?.is_empty(),
+        "original DeepSeek Host survived its fixture GUI exit"
+    );
+    eprintln!("verified original macOS GUI and its native Host stopped after workspace capture");
+    Ok(())
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+async fn stop_original_windows_desktop(child: &mut tokio::process::Child) -> anyhow::Result<()> {
     if let Some(id) = child.id() {
-        #[cfg(target_os = "macos")]
-        let stopped = tokio::process::Command::new("/bin/kill").args(["-TERM", &id.to_string()]).status().await?;
-        #[cfg(windows)]
         let stopped = tokio::process::Command::new("taskkill.exe")
             .args(["/PID", &id.to_string(), "/T", "/F"])
             .stdout(Stdio::null())
@@ -771,15 +826,7 @@ async fn stop_original_desktop(child: &mut tokio::process::Child) -> anyhow::Res
             .await?;
         anyhow::ensure!(stopped.success(), "original desktop did not terminate");
     }
-    match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
-        Ok(result) => {
-            result?;
-        }
-        // A mounted test app may keep its updater or renderer alive after TERM.
-        // The test has already checked the durable native journal before closing.
-        Err(_) if cfg!(target_os = "macos") => child.kill().await?,
-        Err(error) => return Err(error.into()),
-    }
+    tokio::time::timeout(Duration::from_secs(15), child.wait()).await??;
     Ok(())
 }
 

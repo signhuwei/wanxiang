@@ -160,6 +160,7 @@ struct PendingLogin {
 pub struct Bridge {
     socket_path: PathBuf,
     version: String,
+    require_daemon_version: bool,
     http: reqwest::Client,
     inner: Mutex<Inner>,
     mutation: tokio::sync::Mutex<()>,
@@ -246,9 +247,14 @@ impl Bridge {
     }
 
     pub(crate) fn with_version(socket_path: PathBuf, version: String) -> Self {
+        #[cfg(target_os = "macos")]
+        let require_daemon_version = crate::macos_daemon_update::installed_target(&version).is_some();
+        #[cfg(not(target_os = "macos"))]
+        let require_daemon_version = false;
         Self {
             socket_path,
             version,
+            require_daemon_version,
             http: reqwest::Client::builder()
                 .no_proxy()
                 .connect_timeout(Duration::from_secs(5))
@@ -595,6 +601,12 @@ impl Bridge {
             if inner.phase != Phase::Ready || !same_device(&status, &inner) {
                 return Err(forbidden());
             }
+            if !self.daemon_can_launch(&status) {
+                return Err(ErrorBody {
+                    code: "conflict".into(),
+                    message: "OneX 后台正在切换版本，完成后即可启动 Agent".into(),
+                });
+            }
             let invalid_agent =
                 || ErrorBody { code: "agent_not_allowed".into(), message: "OneX 暂不支持启动该 Agent".into() };
             let launcher = agent_launcher(&agent_id).ok_or_else(invalid_agent)?;
@@ -747,9 +759,14 @@ impl Bridge {
         Ok(serde_json::from_value(v)?)
     }
 
+    fn daemon_can_launch(&self, status: &Value) -> bool {
+        !self.require_daemon_version || status["version"].as_str() == Some(self.version.as_str())
+    }
+
     fn ready_agents(&self, status: Option<&Value>, inner: &Inner) -> Vec<Agent> {
         let starting = inner.launching.filter(|(_, until)| *until > Instant::now()).map(|(id, _)| id);
         let has_policy = status.is_some_and(|state| !state["policy"].is_null());
+        let can_launch = status.is_some_and(|state| self.daemon_can_launch(state));
         status
             .filter(|s| same_device(s, inner))
             .and_then(|s| s["managed_agents"].as_array())
@@ -773,7 +790,8 @@ impl Bridge {
                     _ => return None,
                 };
                 let mut actions = vec![];
-                if starting.is_none()
+                if can_launch
+                    && starting.is_none()
                     && (status == "available" || (status == "running" && !launcher.gui))
                     && (raw_status != "available" || !has_policy)
                 {
@@ -1050,6 +1068,25 @@ mod tests {
 
         status["device_id"] = json!("dev_other");
         assert!(bridge.ready_agents(Some(&status), &inner).is_empty());
+    }
+
+    #[test]
+    fn desktop_with_pending_daemon_update_keeps_running_agents_and_blocks_new_launches() {
+        let mut bridge = Bridge::with_version(PathBuf::new(), "0.1.0-rc25".into());
+        bridge.require_daemon_version = true;
+        let inner = Inner { device_id: Some("dev_a".into()), ..Default::default() };
+        let mut status = json!({"logged_in":true, "ws":"connected", "device_id":"dev_a", "version":"0.1.0-rc24",
+        "managed_agents":[
+            {"id":"claude-code", "version":"2.1.311", "status":"running", "instance_count":1},
+            {"id":"codex", "version":"0.164.0", "status":"cached"}
+        ]});
+        assert!(!bridge.daemon_can_launch(&status));
+        let agents = bridge.ready_agents(Some(&status), &inner);
+        assert_eq!((agents[0].status.as_str(), agents[0].instance_count), ("running", 1));
+        assert!(agents.iter().all(|agent| agent.actions.is_empty()));
+        status["version"] = json!("0.1.0-rc25");
+        assert!(bridge.daemon_can_launch(&status));
+        assert!(bridge.ready_agents(Some(&status), &inner).iter().all(|agent| agent.actions == ["launch"]));
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]

@@ -24,6 +24,8 @@ mod kimi_launch;
 pub mod lastgood;
 pub mod launch;
 pub mod lease;
+#[cfg(target_os = "macos")]
+mod macos_desktop_job;
 pub mod managed_runtime;
 mod native_capture;
 pub mod outbox;

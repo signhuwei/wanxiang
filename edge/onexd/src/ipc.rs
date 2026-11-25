@@ -1187,6 +1187,12 @@ async fn start_desktop(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    #[cfg(target_os = "macos")]
+    let manage_process_group = request.agent == "deepseek-desktop";
+    #[cfg(target_os = "macos")]
+    if manage_process_group {
+        command.process_group(0);
+    }
     let spawned: std::io::Result<_> = async {
         let child = command.spawn()?;
         #[cfg(windows)]
@@ -1262,9 +1268,19 @@ async fn start_desktop(
                 }
             })
         };
-        tokio::select! {
-            _ = child.wait() => {}
-            _ = stop.cancelled() => { let _ = child.kill().await; }
+        #[cfg(not(target_os = "macos"))]
+        let manage_process_group = false;
+        if manage_process_group {
+            #[cfg(target_os = "macos")]
+            if let Err(error) = crate::macos_desktop_job::wait(&mut child, &stop).await {
+                warn!(%error, "macOS DeepSeek process group cleanup did not finish");
+                let _ = child.kill().await;
+            }
+        } else {
+            tokio::select! {
+                _ = child.wait() => {}
+                _ = stop.cancelled() => { let _ = child.kill().await; }
+            }
         }
         #[cfg(windows)]
         {

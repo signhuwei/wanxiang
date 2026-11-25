@@ -2387,6 +2387,7 @@ dependencies = [
  "chacha20poly1305",
  "futures-util",
  "hkdf",
+ "libc",
  "objc2",
  "objc2-foundation",
  "onex-core",
