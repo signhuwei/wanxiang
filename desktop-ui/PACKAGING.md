@@ -13,7 +13,8 @@
       "../../desktop-ui/index.html",
       "../../desktop-ui/app.css",
       "../../desktop-ui/app.js",
-      "../../desktop-ui/logo.png"
+      "../../server/web/theme.css",
+      "../../server/web/logo.png"
     ]
   },
   "app": {

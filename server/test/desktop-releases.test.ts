@@ -87,6 +87,17 @@ async function fixture() {
   return { ...service, dataDir, request, putArtifact, admin, codeFor, advance: (ms: number) => { time += ms; }, now: () => time };
 }
 
+test('serves the shared logo and theme before login', async () => {
+  const { server } = await fixture();
+  for (const [name, contentType] of [['logo.png', 'image/png'], ['theme.css', 'text/css']]) {
+    const response = await fetch(new URL(`/${name}`, server.url));
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toStartWith(contentType);
+    const source = await Bun.file(new URL(`../web/${name}`, import.meta.url)).arrayBuffer();
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array(source));
+  }
+});
+
 // A minimal, structurally valid XAR header: magic + 28-byte fixed header whose toc_length_compressed
 // leaves exactly `extra` bytes of "body" after the header, matching the file's actual total length.
 function xarBytes(extra = 16) {

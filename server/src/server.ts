@@ -79,6 +79,7 @@ export async function createServer(opts: Options) {
     const app = new Hono();
     const web = serveStatic({ root: `${import.meta.dir}/../web`, rewriteRequestPath: (path) => path === '/' ? '/index.html' : path });
     app.get('/', web);
+    app.get('/logo.png', web);
     app.get('/:asset{[a-zA-Z0-9_-]+\\.(js|css)}', web);
     app.get('/mock/:asset{[a-zA-Z0-9_-]+\\.(js|txt)}', web);
     app.use('/v1/*', async (c, next) => {

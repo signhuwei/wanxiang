@@ -3,6 +3,7 @@ import { commercePage,commerceAccountPage } from './commerce.js'
 // 路由最多两层：#/login、#/tenant/members、#/platform、#/platform/releases。钻取状态留在内存里，不进 URL。
 
 import { createApi } from './api.js'
+import { createBrand } from './brand.js'
 import { createSessionStore } from './session.js'
 import { showToast } from './toast.js'
 import { devicesPage } from './devices.js'
@@ -136,9 +137,11 @@ function platformNavLink(path, label, selected) {
 function renderTop(hash, signal) {
   const top = el('div', 'top')
   const loginPage = !session && hash === '#/login'
-  const brand = el(loginPage ? 'button' : 'div', loginPage ? 'brand token-login-trigger' : 'brand', 'OneX')
-  brand.appendChild(el('small', null, '万象'))
-  if (loginPage) bindTokenLoginTrigger(brand, 'OneX 万象，令牌登录', () => openLoginTokenForm())
+  const brand = createBrand(loginPage ? 'button' : 'div')
+  if (loginPage) {
+    brand.classList.add('token-login-trigger')
+    bindTokenLoginTrigger(brand, 'OneX 万象，令牌登录', () => openLoginTokenForm())
+  }
   top.appendChild(brand)
 
   if (session) {

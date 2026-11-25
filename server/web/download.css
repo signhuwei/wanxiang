@@ -1,14 +1,37 @@
-/* 员工下载页：独立于管理端外壳，复用 app.css 的基础 token 与按钮样式。 */
+/* 员工下载页使用与管理端相同的标志、控件和主题。 */
 
-body { background: #f5f7fa; }
 .download-panel {
-  max-width: 480px; margin: 48px auto; padding: 0 20px;
+  max-width: 512px;
+  margin: 0 auto;
+  padding: clamp(24px, 6vw, 64px) 20px;
 }
-.download-os-row { display: flex; gap: 8px; margin: 14px 0; }
+.download-heading {
+  display: grid;
+  gap: 18px;
+  margin-bottom: 12px;
+}
+.download-heading h1 {
+  font-size: 20px;
+  font-weight: 680;
+  letter-spacing: -.3px;
+}
+.download-os-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 10px;
+}
 .download-card {
-  border: 1px solid var(--line); border-radius: 6px; padding: 16px;
-  background: #fff; display: flex; flex-direction: column; gap: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
 }
+.download-version { font-family: var(--mono); font-size: 14px; }
 .download-card .button-like {
   display: inline-block; width: fit-content; margin-top: 4px;
 }
+.download-panel > p:last-child { margin-top: 8px; }

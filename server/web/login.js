@@ -1,5 +1,7 @@
 // 租户密码登录直接进入租户，个人令牌和验证码登录沿用原有租户选择。
 
+import { createBrand } from './brand.js'
+
 function el(tag, className, text) {
   const n = document.createElement(tag)
   if (className) n.className = className
@@ -46,8 +48,9 @@ export function renderLogin(host, { api, mockOn, signal, setPendingToken, onSess
   wrap.appendChild(panel)
   host.appendChild(wrap)
 
-  const heading = el('h1')
-  const title = el('button', 'token-login-trigger', '万象 OneX')
+  const heading = el('h1', 'login-identity')
+  const title = createBrand('button', '管理端')
+  title.classList.add('token-login-trigger')
   bindTokenLoginTrigger(title, '万象 OneX，令牌登录', () => switchTab('token'))
   heading.appendChild(title)
   panel.appendChild(heading)

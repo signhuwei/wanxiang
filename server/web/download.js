@@ -2,6 +2,7 @@
 // 页面本身只拿摘要（id、版本、大小、sha256、published_at、download_url），点击下载走浏览器原生跳转，
 // 脚本不持有安装包字节。契约见 contracts/desktop-releases.md「员工入口」。
 
+import { createBrand } from './brand.js'
 import { formatBytes, DESKTOP_OS_LABELS } from './format.js'
 
 function el(tag, className, text) {
@@ -39,8 +40,10 @@ export function sameOriginDownloadUrl(value, id, base) {
 
 export async function render(host, { fetchImpl = globalThis.fetch, userAgent = globalThis.navigator?.userAgent } = {}) {
   host.textContent = ''
-  const panel = el('div', 'download-panel')
-  panel.append(el('h1', null, '万象 OneX 桌面安装包'))
+  const panel = el('main', 'download-panel')
+  const heading = el('header', 'download-heading')
+  heading.append(createBrand('div', 'Desktop'), el('h1', null, '桌面安装包'))
+  panel.append(heading)
   const status = el('p', 'muted', '正在加载可用版本…')
   panel.appendChild(status)
   host.appendChild(panel)
@@ -95,7 +98,7 @@ export async function render(host, { fetchImpl = globalThis.fetch, userAgent = g
     }
     const item = candidates[0]
     const href = sameOriginDownloadUrl(item.download_url, item.id, location.href)
-    card.appendChild(el('div', 'row-title', item.version + ' · ' + (item.arch || '')))
+    card.appendChild(el('div', 'row-title download-version', item.version + ' · ' + (item.arch || '')))
     card.appendChild(el('p', 'muted', formatBytes(item.size) + ' · SHA-256 ' + (item.sha256 ? item.sha256.slice(0, 16) + '…' : '—')))
     if (!href) {
       card.appendChild(el('p', 'error-row', '下载地址无效，请刷新页面重试'))
