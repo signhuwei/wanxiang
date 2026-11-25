@@ -1,8 +1,20 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'"><title>OneX Desktop</title><link rel="stylesheet" href="./app.css"><script type="module" src="./app.js"></script></head>
 <body>
-  <header><div class="brand"><b>OneX <small>Desktop</small></b><span id="desktop-version" hidden></span></div><span id="badge" hidden>模拟模式</span><nav aria-label="工作区"><button id="home">工作台</button><button id="messages" hidden>消息列表</button><button id="prefs">设置</button><button id="desktop-update" class="primary" type="button" hidden>有更新</button></nav></header>
-  <main><p id="scope"></p><h1 id="title">正在连接本机服务</h1><section id="content"></section><p id="notice" role="status" aria-live="polite"></p></main>
+  <header class="app-header">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">X</span><div><b>OneX <small>Desktop</small></b><span id="desktop-version" hidden></span></div></div>
+    <div class="header-actions"><span id="badge" hidden>模拟模式</span><button id="desktop-update" class="primary" type="button" hidden>有更新</button></div>
+    <nav aria-label="工作区">
+      <button id="home" type="button" aria-current="page"><span class="nav-icon nav-workbench" aria-hidden="true"></span>工作台</button>
+      <button id="messages" type="button" hidden><span class="nav-icon nav-messages" aria-hidden="true"></span><span id="messages-label">消息列表</span></button>
+      <button id="prefs" type="button"><span class="nav-icon nav-settings" aria-hidden="true">⚙</span>设置</button>
+    </nav>
+  </header>
+  <main>
+    <div class="page-heading"><div><h1 id="title">正在连接本机服务</h1><p id="scope" hidden></p></div><span id="connection" class="connection" hidden></span></div>
+    <p id="notice" role="status" aria-live="polite"></p>
+    <div id="content"></div>
+  </main>
   <dialog id="desktop-update-dialog" aria-labelledby="desktop-update-title" aria-describedby="desktop-update-description">
     <h2 id="desktop-update-title">重启更新 OneX Desktop</h2>
     <p id="desktop-update-description">将更新到 <strong id="desktop-update-version"></strong>，然后重新打开 OneX Desktop。已启动的 Agent 会继续运行，重启后仍可在工作台管理。</p>
