@@ -75,11 +75,13 @@ payload=$stage/payload
 bundle="$payload/Applications/OneX Desktop.app"
 resources=$bundle/Contents/Resources
 launch_agents=$payload/Library/LaunchAgents
-mkdir -p "$payload/Applications" "$launch_agents" "$stage/scripts"
+cli_entries=$payload/usr/local/bin
+mkdir -p "$payload/Applications" "$launch_agents" "$cli_entries" "$stage/scripts"
 /usr/bin/ditto "$app" "$bundle"
 mkdir -p "$resources/onex/bin"
 install -m 0755 "$cli" "$resources/onex/bin/onex"
 install -m 0755 "$daemon" "$resources/onex/bin/onexd"
+/bin/ln -s '../../../Applications/OneX Desktop.app/Contents/Resources/onex/bin/onex' "$cli_entries/onex"
 for launcher in onex-run-claude.command onex-run-codex.command onex-run-kimi.command; do
   install -m 0755 "$scripts/$launcher" "$resources/$launcher"
 done

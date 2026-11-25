@@ -43,6 +43,17 @@ request_apple_installation() {
 
 main() {
   local target=${3:-/}
+  local entry="${target%/}/usr/local/bin/onex" destination
+  if [[ -e $entry || -L $entry ]]; then
+    destination=$(/usr/bin/readlink "$entry") || destination=
+    case "$destination" in
+      '../../../Applications/OneX Desktop.app/Contents/Resources/onex/bin/onex'|'/Applications/OneX Desktop.app/Contents/Resources/onex/bin/onex') ;;
+      *)
+        echo "OneX 无法安装命令行入口：$entry 已由其他程序占用。请先迁移该文件，再重新运行安装包。" >&2
+        return 1
+        ;;
+    esac
+  fi
   if [[ $target != / ]]; then
     # Do not open an install prompt or modify the host for an offline volume.
     if [[ -x $target/Library/Developer/CommandLineTools/usr/bin/git ||
