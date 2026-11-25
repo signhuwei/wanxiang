@@ -2,6 +2,7 @@
 //! credential for it. Native event sequence and the outbox advance together.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -228,6 +229,7 @@ impl DesktopSessions {
                 Batch {
                     bind_model: true,
                     native_id: native.to_string(),
+                    workspace: None,
                     model: None,
                     records: vec![],
                     documents: vec![],
@@ -272,6 +274,24 @@ impl DesktopSessions {
     }
 
     fn receive(&self, credential: &str, batch: Batch) -> Result<Option<Option<String>>> {
+        let reported_workspace_hash = if let Some(path) = &batch.workspace {
+            // Only the active DeepSeek adapter can attest to a native workspace. Resolve it
+            // without holding the registry lock, since the directory can be on a network drive.
+            let active_deepseek = self
+                .0
+                .lock()
+                .unwrap()
+                .launches
+                .get(credential)
+                .is_some_and(|launch| launch.agent == "deepseek-desktop");
+            if !active_deepseek {
+                return Ok(None);
+            }
+            let Some(hash) = canonical_workspace_hash(Path::new(path)) else { return Ok(None) };
+            Some(hash)
+        } else {
+            None
+        };
         let mut registry = self.0.lock().unwrap();
         let Some(launch) = registry.launches.get_mut(credential) else { return Ok(None) };
         let deepseek = launch.agent == "deepseek-desktop";
@@ -279,9 +299,11 @@ impl DesktopSessions {
             || (batch.bind_model && !matches!(launch.agent.as_str(), "deepseek-desktop" | "claude-desktop"))
             || (!batch.documents.is_empty() && !deepseek)
             || (batch.model.is_some() && (!deepseek || !batch.bind_model))
+            || (reported_workspace_hash.is_some() && !deepseek)
         {
             return Ok(None);
         }
+        let workspace_hash = reported_workspace_hash.as_deref().unwrap_or(&launch.workspace_hash);
         let chosen_model = batch.model.as_deref().unwrap_or(&launch.model);
         let deepseek_protocol = if deepseek && batch.bind_model {
             let Some(protocol) = launch.deepseek_models.get(chosen_model).copied() else { return Ok(None) };
@@ -314,7 +336,7 @@ impl DesktopSessions {
         let mut events = Vec::new();
         let event = |kind, payload, offset: Option<u64>| json!({"session_id":session, "kind":kind, "payload":payload, "source_offset":offset, "at":at});
         if let Some(saved) = &cursor {
-            if saved["workspace_hash"] != launch.workspace_hash {
+            if saved["workspace_hash"] != workspace_hash {
                 return Ok(None);
             }
         } else {
@@ -322,7 +344,7 @@ impl DesktopSessions {
                 "session_start",
                 json!({
                     "agent":launch.agent, "agent_version":launch.version, "model":chosen_model,
-                    "cwd_hash":launch.workspace_hash, "uuid":null, "parentUuid":null, "sidechain":false, "agent_id":null
+                    "cwd_hash":workspace_hash, "uuid":null, "parentUuid":null, "sidechain":false, "agent_id":null
                 }),
                 None,
             ));
@@ -363,7 +385,7 @@ impl DesktopSessions {
             }
             events.push(item);
         }
-        let next = json!({"seq":seq, "workspace_hash":launch.workspace_hash});
+        let next = json!({"seq":seq, "workspace_hash":workspace_hash});
         if deepseek && (!events.is_empty() || batch.bind_model) {
             if !launch.outbox.append_desktop_events(
                 events,
@@ -520,6 +542,7 @@ pub(crate) fn native_turn(headers: &HeaderMap) -> Option<NativeTurn> {
 struct Batch {
     bind_model: bool,
     native_id: String,
+    workspace: Option<String>,
     model: Option<String>,
     records: Vec<Record>,
     #[serde(default)]
@@ -663,6 +686,18 @@ impl Batch {
     }
 }
 
+fn canonical_workspace_hash(path: &Path) -> Option<String> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.is_dir() {
+        return None;
+    }
+    let path = crate::desktop_launch::path_text(&canonical).ok()?;
+    Some(crate::desktop_launch::workspace_hash(&path))
+}
+
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     if headers.get_all(header::AUTHORIZATION).iter().count() != 1 {
         return None;
@@ -754,6 +789,7 @@ mod tests {
         Batch {
             bind_model: true,
             native_id: native_id.into(),
+            workspace: None,
             model: None,
             documents: vec![],
             records: vec![Record {
@@ -925,6 +961,9 @@ mod tests {
             commerce_plan_id: None,
         })?;
         let root = tempfile::tempdir()?;
+        let workspace = root.path().join("other project");
+        std::fs::create_dir(&workspace)?;
+        let workspace = crate::desktop_launch::path_text(&workspace.canonicalize()?)?;
         let outbox = Arc::new(Outbox::open(&root.path().join("events.sqlite"))?);
         start(&state.desktop_sessions, "launch", "workspace", &outbox);
         state.desktop_sessions.set_deepseek_models(
@@ -946,7 +985,8 @@ mod tests {
                 .post(format!("{base}/v1/onex/desktop/session"))
                 .bearer_auth("launch")
                 .json(&json!({
-                    "native_id":"native", "bind_model":true, "model":model, "records":[], "documents":documents
+                    "native_id":"native", "workspace":workspace, "bind_model":true,
+                    "model":model, "records":[], "documents":documents
                 }))
                 .send()
         };
@@ -998,6 +1038,9 @@ mod tests {
         assert!(chat_usage.usage_final && messages_usage.usage_final);
         assert_eq!(chat_usage.session_id, messages_usage.session_id);
         assert!(chat_usage.session_id.is_some() && recorded.try_recv().is_err());
+        let rows = outbox.pending(0, 10)?;
+        assert_eq!(rows[0].item["session_id"], chat_usage.session_id.unwrap());
+        assert_eq!(rows[0].item["payload"]["cwd_hash"], crate::desktop_launch::workspace_hash(&workspace));
         server.abort();
         upstream_task.abort();
         Ok(())
@@ -1070,6 +1113,85 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_binds_each_native_workspace_once_and_keeps_it_on_reopen() -> Result<()> {
+        use crate::desktop_launch::{path_text, workspace_hash};
+
+        let root = tempfile::tempdir()?;
+        let initial = root.path().join("initial");
+        let project = root.path().join("另一个 project");
+        std::fs::create_dir(&initial)?;
+        std::fs::create_dir_all(project.join("child"))?;
+        let initial_hash = workspace_hash(&path_text(&initial.canonicalize()?)?);
+        let project_hash = workspace_hash(&path_text(&project.canonicalize()?)?);
+        let alias = project.join("child").join("..");
+        assert_eq!(canonical_workspace_hash(&alias).as_deref(), Some(project_hash.as_str()));
+        #[cfg(unix)]
+        {
+            let symlink = root.path().join("project link");
+            std::os::unix::fs::symlink(&project, &symlink)?;
+            assert_eq!(canonical_workspace_hash(&symlink).as_deref(), Some(project_hash.as_str()));
+        }
+        #[cfg(windows)]
+        {
+            let mixed = path_text(&project.canonicalize()?)?.replace('\\', "/");
+            assert_eq!(canonical_workspace_hash(Path::new(&mixed)).as_deref(), Some(project_hash.as_str()));
+        }
+
+        let outbox_file = root.path().join("events.sqlite");
+        let outbox = Arc::new(Outbox::open(&outbox_file)?);
+        let sessions = DesktopSessions::default();
+        start(&sessions, "before", &initial_hash, &outbox);
+        let from_workspace = |native_id, workspace: &Path, seq, bind_model| {
+            let mut input = batch(native_id, seq, Kind::User);
+            input.workspace = Some(path_text(workspace).unwrap());
+            input.bind_model = bind_model;
+            input
+        };
+        assert!(sessions.receive("before", from_workspace("new", &project, 1, false))?.is_none());
+        assert!(sessions.receive("before", from_workspace("new", &outbox_file, 1, true))?.is_none());
+        assert!(sessions.receive("before", from_workspace("new", Path::new("."), 1, true))?.is_none());
+        assert!(sessions.receive("wrong token", from_workspace("new", &project, 1, true))?.is_none());
+        assert!(outbox.pending(0, 10)?.is_empty());
+
+        let old = sessions.receive("before", batch("old", 1, Kind::User))?.flatten().unwrap();
+        let old_id = chat_binding(&sessions, &old).unwrap().session_id;
+        let new = sessions.receive("before", from_workspace("new", &project, 1, true))?.flatten().unwrap();
+        let new_id = chat_binding(&sessions, &new).unwrap().session_id;
+        assert_ne!(new_id, old_id);
+        assert!(sessions.receive("before", from_workspace("new", &initial, 2, true))?.is_none());
+        assert!(sessions.receive("before", from_workspace("new", &initial, 2, false))?.is_none());
+        assert_eq!(sessions.receive("before", from_workspace("new", &alias, 2, false))?, Some(None));
+        assert_eq!(outbox.cursor(&format!("desktop:{new_id}"))?, Some(json!({"seq":2,"workspace_hash":project_hash})));
+        let rows = outbox.pending(0, 20)?;
+        assert_eq!(rows[0].item["payload"]["cwd_hash"], initial_hash);
+        assert_eq!(rows[2].item["payload"]["cwd_hash"], project_hash);
+        assert_eq!(rows[4].item["source_offset"], 2);
+
+        sessions.stop("before");
+        outbox.close_desktop_sessions(Some(&desktop_launch_key("before")), Some(now_ms()))?;
+        start(&sessions, "after", &initial_hash, &outbox);
+        let resumed = sessions.receive("after", from_workspace("new", &alias, 2, true))?.flatten().unwrap();
+        assert_eq!(chat_binding(&sessions, &resumed).unwrap().session_id, new_id);
+        let legacy = sessions.receive("after", from_workspace("old", &initial, 1, true))?.flatten().unwrap();
+        assert_eq!(chat_binding(&sessions, &legacy).unwrap().session_id, old_id);
+
+        sessions.start(
+            "other account".into(),
+            "other device".into(),
+            "deepseek-desktop".into(),
+            "test".into(),
+            "approved-release".into(),
+            "managed-model".into(),
+            initial_hash,
+            outbox.clone(),
+        );
+        assert!(sessions.receive("other account", from_workspace("new", &project, 3, false))?.is_none());
+        let other = sessions.receive("other account", from_workspace("new", &project, 1, true))?.flatten().unwrap();
+        assert_ne!(chat_binding(&sessions, &other).unwrap().session_id, new_id);
+        Ok(())
+    }
+
+    #[test]
     fn deepseek_scan_preserves_the_first_new_prompt_until_the_native_turn_binds() -> Result<()> {
         let root = tempfile::tempdir()?;
         let outbox = Arc::new(Outbox::open(&root.path().join("events.sqlite"))?);
@@ -1078,6 +1200,7 @@ mod tests {
         let make = |native_id: &str, bind_model, seq: Option<u64>, at_ms| Batch {
             native_id: native_id.to_owned(),
             bind_model,
+            workspace: None,
             model: None,
             documents: vec![],
             records: seq

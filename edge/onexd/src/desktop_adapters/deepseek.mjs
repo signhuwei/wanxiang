@@ -1,13 +1,19 @@
-import { realpathSync, readFileSync } from 'node:fs'
+import { realpathSync, readFileSync, statSync } from 'node:fs'
+import { isAbsolute, parse } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { prepareAttachments } from './onex-attachments.mjs'
 
 export const name = 'onex-managed-session'
 export const inject = ['llm', 'sessionPersistence', 'workspaceRegistry', 'credentials', 'attachments']
 
-function path(value) {
-  try { return realpathSync(value.startsWith('file:') ? fileURLToPath(value) : value) }
-  catch { return null }
+function directoryPath(value) {
+  try {
+    const local = value.startsWith('file:') ? fileURLToPath(value) : value
+    const { root } = parse(local)
+    if (!isAbsolute(local) || (process.platform === 'win32' && (root === '\\' || root === '/'))) return null
+    const canonical = realpathSync.native(local)
+    return statSync(canonical).isDirectory() ? canonical : null
+  } catch { return null }
 }
 
 function publicText(blocks) {
@@ -56,24 +62,34 @@ export async function apply(ctx, config) {
   if (!bearer || !/^http:\/\/127\.0\.0\.1:\d+$/.test(config.origin)) throw new Error('Missing OneX session adapter')
   const models = new Map(config.models.map(model => [model.id, model]))
   const { isAgentLoopRequest } = await ctx.loader.import('@deepseek-ai/dsh-llm')
-  const workspace = path(config.workspace)
+  const workspace = directoryPath(config.workspace)
   if (!workspace) throw new Error('OneX workspace is unavailable')
   const nativeWorkspace = await ctx.workspaceRegistry.create(workspace)
-  if (path(nativeWorkspace.path) !== workspace) throw new Error('OneX workspace did not bind')
+  if (directoryPath(nativeWorkspace.path) !== workspace) throw new Error('OneX workspace did not bind')
   const binding = new URL('/v1/onex/desktop/session', config.origin)
   if (typeof ctx.credentials.withSession !== 'function') throw new Error('OneX session credentials are unavailable')
   let disposed = false
   const offsets = new Map()
   const bound = new Set()
 
-  async function register(id, records, model, documents = []) {
+  async function sessionWorkspace(header) {
+    if (!header || header.origin || header.isSeeded) return null
+    const cwd = directoryPath(header.cwd)
+    if (!cwd || cwd === workspace) return cwd
+    try {
+      const registered = await ctx.workspaceRegistry.resolveByPath(cwd)
+      return registered?.path === cwd && registered.sessionIds.includes(header.id) ? cwd : null
+    } catch { return null }
+  }
+
+  async function register(id, cwd, records, model, documents = []) {
     const bindModel = model !== undefined
-    const body = JSON.stringify({ native_id:id, records, bind_model:bindModel, ...(bindModel && { model }),
+    const body = JSON.stringify({ native_id:id, workspace:cwd, records, bind_model:bindModel, ...(bindModel && { model }),
       ...(documents.length && { documents }) })
     if (!bindModel && records.length > 1 && Buffer.byteLength(body) > 1536 * 1024) {
       const split = Math.floor(records.length / 2)
-      if (!await register(id, records.slice(0, split))) return null
-      return register(id, records.slice(split))
+      if (!await register(id, cwd, records.slice(0, split))) return null
+      return register(id, cwd, records.slice(split))
     }
     const response = await fetch(binding, {
       method:'POST', redirect:'error', signal:AbortSignal.timeout(5000),
@@ -85,7 +101,6 @@ export async function apply(ctx, config) {
     return bindModel ? (await response.json()).model_token : true
   }
 
-  const belongs = header => !header.origin && !header.isSeeded && path(header.cwd) === workspace
   ctx.on('llm/stream', (options, next) => (async function* () {
     const id = options.sessionId
     const selected = models.get(options.model)
@@ -93,9 +108,10 @@ export async function apply(ctx, config) {
       throw new Error('OneX requires an approved model and a native workspace session')
     }
     const stat = await ctx.sessionPersistence.stat(id)
-    if (!stat || stat.header.id !== id || !belongs(stat.header)) throw new Error('This workspace is outside the OneX launch')
+    const cwd = stat?.header?.id === id ? await sessionWorkspace(stat.header) : null
+    if (!cwd) throw new Error('OneX requires a registered native workspace session')
     const documents = await prepareAttachments(ctx, { ...config, imageInput:selected.imageInput }, options.messages, options.signal)
-    const token = await register(id, [], selected.id, documents)
+    const token = await register(id, cwd, [], selected.id, documents)
     bound.add(id)
     if (offsets.get(id)?.unbound) offsets.delete(id)
     const source = ctx.credentials.withSession(token, () => next()[Symbol.asyncIterator]())
@@ -114,16 +130,18 @@ export async function apply(ctx, config) {
     scanning = true
     try {
       for (const {header, revision} of await ctx.sessionPersistence.list()) {
-        if (disposed || !belongs(header)) continue
+        if (disposed) break
         const cursor = offsets.get(header.id)
         if (cursor?.revision === revision) continue
+        const cwd = await sessionWorkspace(header)
+        if (!cwd || disposed) continue
         const handle = await ctx.sessionPersistence.open(header.id, 'read')
         try {
           let offset = cursor?.offset ?? 0
           for (let page = 0; page < 32 && !disposed; page++) {
             const {events} = await handle.read(offset, 32)
             const records = events.map((event,i) => visibleMessage(event, offset + i)).filter(Boolean)
-            if (records.length && !await register(header.id, records)) {
+            if (records.length && !await register(header.id, cwd, records)) {
               offsets.set(header.id, {offset, revision:bound.has(header.id) ? undefined : revision, unbound:true})
               break
             }

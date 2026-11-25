@@ -1,6 +1,6 @@
 //! Explicit native qualification. The GUI opens against a temporary profile
 //! and both model calls terminate at the loopback fixture.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 use std::path::Path;
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 use std::process::Stdio;
@@ -25,34 +25,40 @@ use crate::{
 
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 const INPUT_PLUGIN: &str = r#"
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { setTimeout as sleep } from 'node:timers/promises'
 export const name = 'onex-qualification-input'
 export const inject = ['sessionController','workspaceRegistry','fileUploads']
 export function apply(ctx, config) {
   const timer = setTimeout(async () => {
     try {
-      const signal = AbortSignal.timeout(60000)
-      let sessionId
-      if (existsSync(config.marker)) sessionId = readFileSync(config.marker, 'utf8')
-      else {
-        const workspace = await ctx.workspaceRegistry.create(config.workspace)
-        const result = await ctx.sessionController.create({workspaceId:workspace.id}, signal)
-        sessionId = result.sessionId
-        writeFileSync(config.marker, sessionId, {flag:'wx', mode:0o600})
-      }
-      if (config.selected) {
-        const result = await ctx.sessionController.selectModel({sessionId, ...config.selected})
-        if (result.selected?.provider !== config.selected.provider || result.selected?.model !== config.selected.model) {
-          throw new Error('Native session could not select the authorized model')
+      for (const prompt of config.prompts) {
+        const signal = AbortSignal.timeout(60000)
+        let sessionId
+        if (existsSync(prompt.marker)) sessionId = readFileSync(prompt.marker, 'utf8')
+        else {
+          if (prompt.createDirectory) mkdirSync(prompt.workspace)
+          const workspace = await ctx.workspaceRegistry.create(prompt.workspace)
+          const result = await ctx.sessionController.create({workspaceId:workspace.id}, signal)
+          sessionId = result.sessionId
+          writeFileSync(prompt.marker, sessionId, {flag:'wx', mode:0o600})
         }
+        if (prompt.selected) {
+          const result = await ctx.sessionController.selectModel({sessionId, ...prompt.selected})
+          if (result.selected?.provider !== prompt.selected.provider || result.selected?.model !== prompt.selected.model) {
+            throw new Error('Native session could not select the authorized model')
+          }
+        }
+        const content = [{type:'text', text:prompt.input}]
+        if (prompt.image) content.push({type:'image', name:'one.png', mediaType:'image/png', data:prompt.image})
+        for (const [name, data] of Object.entries(prompt.files ?? {})) {
+          const staged = await ctx.fileUploads.uploadStream({sessionId,name,signal,data:(async function* () { yield Buffer.from(data,'base64') })()})
+          content.push({type:'file', receiptId:staged.receiptId})
+        }
+        await ctx.sessionController.prompt({ sessionId, requestId:crypto.randomUUID(), mode:'followup', content }, signal)
+        // The native prompt API can return before the assistant response. Wait for the fixture to observe capture and billing.
+        while (!existsSync(prompt.accepted)) await sleep(100, undefined, { signal })
       }
-      const content = [{type:'text', text:config.input}]
-      if (config.image) content.push({type:'image', name:'one.png', mediaType:'image/png', data:config.image})
-      for (const [name, data] of Object.entries(config.files ?? {})) {
-        const staged = await ctx.fileUploads.uploadStream({sessionId,name,signal,data:(async function* () { yield Buffer.from(data,'base64') })()})
-        content.push({type:'file', receiptId:staged.receiptId})
-      }
-      await ctx.sessionController.prompt({ sessionId, requestId:crypto.randomUUID(), mode:'followup', content }, signal)
     } catch (error) { writeFileSync(config.failure, error.message, {mode:0o600}) }
   }, 4000)
   ctx.on('dispose', () => clearTimeout(timer))
@@ -262,27 +268,48 @@ fn original_workbuddy_container_and_apple_signature_match_manifest() -> anyhow::
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "opens a signed DeepSeek GUI twice; set ONEX_DEEPSEEK_QA_BUNDLE to its mounted app"]
 async fn original_gui_restores_native_session_and_settles_each_turn() -> anyhow::Result<()> {
-    run_original_deepseek(false, false, false).await
+    run_original_deepseek(Scenario::Resume, false).await
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "opens a signed DeepSeek GUI; set ONEX_DEEPSEEK_QA_BUNDLE and ONEX_DEEPSEEK_QA_DAEMON"]
 async fn original_gui_preserves_image_and_document_prompts() -> anyhow::Result<()> {
-    run_original_deepseek(true, false, false).await
+    run_original_deepseek(Scenario::Attachments, false).await
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "opens a signed DeepSeek GUI; set ONEX_DEEPSEEK_QA_BUNDLE to its mounted app"]
 async fn original_gui_switches_between_three_contract_models() -> anyhow::Result<()> {
-    run_original_deepseek(false, false, true).await
+    run_original_deepseek(Scenario::Models, false).await
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opens a signed DeepSeek GUI; set ONEX_DEEPSEEK_QA_BUNDLE to its mounted app"]
+async fn original_gui_switches_native_workspaces() -> anyhow::Result<()> {
+    run_original_deepseek(Scenario::Workspaces, false).await
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "opens the original DeepSeek Windows GUI; set ONEX_DEEPSEEK_QA_INSTALLER and ONEX_DEEPSEEK_QA_BUNDLE"]
 async fn original_windows_gui_restores_native_session_and_settles_each_turn() -> anyhow::Result<()> {
+    verify_windows_protocol_backup()?;
+    run_original_deepseek(Scenario::Resume, false).await
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opens the original DeepSeek Windows GUI; set ONEX_DEEPSEEK_QA_INSTALLER and ONEX_DEEPSEEK_QA_BUNDLE"]
+async fn original_windows_gui_switches_native_workspaces() -> anyhow::Result<()> {
+    verify_windows_protocol_backup()?;
+    run_original_deepseek(Scenario::Workspaces, false).await
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn verify_windows_protocol_backup() -> anyhow::Result<()> {
     let association = std::process::Command::new("reg.exe")
         .args(["query", r"HKCU\Software\Classes\dsh\shell\open\command", "/ve"])
         .stdout(Stdio::null())
@@ -292,18 +319,43 @@ async fn original_windows_gui_restores_native_session_and_settles_each_turn() ->
         !association.success() || std::env::var("ONEX_DEEPSEEK_QA_PROTOCOL_BACKED_UP").as_deref() == Ok("1"),
         "back up the existing dsh protocol handler before running Windows GUI QA"
     );
-    run_original_deepseek(false, false, false).await
+    Ok(())
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "opens the packaged DeepSeek Host without the GUI or protocol registration"]
 async fn original_windows_host_restores_native_session_and_settles_each_turn() -> anyhow::Result<()> {
-    run_original_deepseek(false, true, false).await
+    run_original_deepseek(Scenario::Resume, true).await
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opens the packaged DeepSeek Host without the GUI or protocol registration"]
+async fn original_windows_host_switches_native_workspaces() -> anyhow::Result<()> {
+    run_original_deepseek(Scenario::Workspaces, true).await
 }
 
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
-async fn run_original_deepseek(attachments: bool, host_only: bool, mixed_models: bool) -> anyhow::Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scenario {
+    Resume,
+    #[cfg(target_os = "macos")]
+    Attachments,
+    Models,
+    Workspaces,
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+struct NativePrompt<'a> {
+    workspace: &'a Path,
+    marker: &'a Path,
+    input: String,
+    accepted: std::path::PathBuf,
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+async fn run_original_deepseek(scenario: Scenario, host_only: bool) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     const IMAGE: &str =
         "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGMQL/sPRwzEcQB1UhjB1HLtUgAAAABJRU5ErkJggg==";
@@ -311,9 +363,13 @@ async fn run_original_deepseek(attachments: bool, host_only: bool, mixed_models:
     const PDF_TEXT: &str = "Onex fixture PDF has cobalt seven";
     #[cfg(target_os = "macos")]
     const TXT_TEXT: &str = "Onex fixture text has amber eleven";
+    #[cfg(target_os = "macos")]
+    let attachments = scenario == Scenario::Attachments;
+    let mixed_models = scenario == Scenario::Models;
     let (release, entry) = original_deepseek_entry()?;
     let root = tempfile::tempdir()?;
     let cwd = root.path().join("workspace");
+    let other_cwd = root.path().join("合同 项目");
     std::fs::create_dir(&cwd)?;
     #[cfg(target_os = "macos")]
     let (observed, mut incoming) = tokio::sync::mpsc::unbounded_channel();
@@ -371,12 +427,28 @@ async fn run_original_deepseek(attachments: bool, host_only: bool, mixed_models:
     let models = crate::ipc::deepseek_model_choices(&state.config.read().unwrap());
     let outbox = Arc::new(Outbox::open(&root.path().join("outbox.sqlite"))?);
     let marker = root.path().join("native-id");
+    let other_marker = root.path().join("native-id-other");
     let failure = root.path().join("input-error");
-    let mut original = None;
+    let mut sessions = std::collections::HashMap::<&Path, (String, usize)>::new();
+    let mut settled_turns = 0;
     for (index, (provider, selected, model_id)) in turns.into_iter().enumerate() {
         let turn = index + 1;
         let launch_token = crate::id::token();
-        let input = format!("native qualification turn {turn}");
+        let paths = match (scenario, index) {
+            (Scenario::Workspaces, 0) => vec![(&cwd, &marker), (&other_cwd, &other_marker), (&cwd, &marker)],
+            (Scenario::Workspaces, _) => vec![(&other_cwd, &other_marker)],
+            _ => vec![(&cwd, &marker)],
+        };
+        let prompts = paths
+            .into_iter()
+            .enumerate()
+            .map(|(step, (workspace, marker))| NativePrompt {
+                workspace,
+                marker,
+                input: format!("native qualification launch {turn} prompt {}", step + 1),
+                accepted: root.path().join(format!("accepted-{turn}-{step}")),
+            })
+            .collect::<Vec<_>>();
         let desktop_launch::Prepared { launch, workspace, runtime: _runtime, .. } = desktop_launch::prepare(
             &desktop_launch::Request {
                 owner: "qa-device",
@@ -414,8 +486,11 @@ async fn run_original_deepseek(attachments: bool, host_only: bool, mixed_models:
                 (Some("onex-qa-claude"), Some(200000), Some(12288))
             );
         }
-        let test_config = json!({"workspace":cwd,"marker":marker,"failure":failure,"input":input,
-            "selected":mixed_models.then(|| json!({"provider":provider,"model":selected}))});
+        let test_config = json!({"failure":failure,"prompts":prompts.iter().map(|prompt| json!({
+            "workspace":prompt.workspace,"marker":prompt.marker,"input":prompt.input,"accepted":prompt.accepted,
+            "createDirectory":prompt.workspace == other_cwd && turn == 1,
+            "selected":mixed_models.then(|| json!({"provider":provider,"model":selected}))
+        })).collect::<Vec<_>>()});
         #[cfg(target_os = "macos")]
         let mut test_config = test_config;
         #[cfg(target_os = "macos")]
@@ -428,9 +503,10 @@ async fn run_original_deepseek(attachments: bool, host_only: bool, mixed_models:
                 }
             }
             if turn == 1 {
-                test_config["image"] = IMAGE.into();
+                test_config["prompts"][0]["image"] = IMAGE.into();
                 let pdf = crate::attachment_pdf::fixture_pdf(1, &format!("BT /F1 16 Tf 20 200 Td ({PDF_TEXT}) Tj ET"));
-                test_config["files"] = json!({"one.pdf":STANDARD.encode(pdf), "two.txt":STANDARD.encode(TXT_TEXT)});
+                test_config["prompts"][0]["files"] =
+                    json!({"one.pdf":STANDARD.encode(pdf), "two.txt":STANDARD.encode(TXT_TEXT)});
             }
         }
         patch.push(json!({"insert":[{"id":"onex-qualification-input","name":reqwest::Url::from_file_path(plugin).unwrap().as_str(),
@@ -474,74 +550,85 @@ async fn run_original_deepseek(attachments: bool, host_only: bool, mixed_models:
         let mut child = command.spawn()?;
         eprintln!("native qualification turn {turn}, {provider}/{selected}");
         let accepted = tokio::time::timeout(Duration::from_secs(120), async {
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    anyhow::bail!("original desktop exited before QA finished: {status}");
+            for prompt in prompts {
+                let rows = loop {
+                    if let Some(status) = child.try_wait()? {
+                        anyhow::bail!("original desktop exited before QA finished: {status}");
+                    }
+                    if let Ok(message) = std::fs::read_to_string(&failure) {
+                        anyhow::bail!("native prompt failed: {message}")
+                    }
+                    let rows = outbox.pending(0, 128)?;
+                    let replies = rows
+                        .iter()
+                        .filter(|row| {
+                            row.item["kind"] == "assistant_message" && row.item["payload"]["content"] == "verified reply"
+                        })
+                        .count();
+                    if replies > settled_turns {
+                        assert_eq!(replies, settled_turns + 1);
+                        break rows;
+                    }
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                };
+                let request = usage.recv().await.unwrap();
+                let session = request.session_id.as_deref().unwrap();
+                let native_id = std::fs::read_to_string(prompt.marker)?;
+                assert_eq!(session, crate::native_capture::session_id("qa-device", &release.agent, &native_id));
+                assert!(state.desktop_sessions.is_ready(&launch_token));
+                assert!(sessions.iter().all(|(path, (id, _))| (*path == prompt.workspace) == (id == session)));
+                let session_turns = {
+                    let entry = sessions.entry(prompt.workspace).or_insert((session.to_owned(), 0));
+                    entry.1 += 1;
+                    entry.1
+                };
+                settled_turns += 1;
+                assert!(rows.iter().all(|row| sessions.values().any(|(id, _)| row.item["session_id"] == id.as_str())));
+                let session_rows = rows.iter().filter(|row| row.item["session_id"] == session).collect::<Vec<_>>();
+                let start = session_rows.iter().filter(|row| row.item["kind"] == "session_start").collect::<Vec<_>>();
+                assert_eq!(start.len(), 1);
+                let workspace = desktop_launch::path_text(&prompt.workspace.canonicalize()?)?;
+                assert_eq!(start[0].item["payload"]["cwd_hash"], desktop_launch::workspace_hash(&workspace));
+                assert_eq!(session_rows.iter().filter(|row| row.item["kind"] == "user_message").count(), session_turns);
+                assert!(session_rows.iter().any(|row| row.item["payload"]["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(&prompt.input))));
+                #[cfg(target_os = "macos")]
+                if attachments {
+                    let body = incoming.try_recv()?;
+                    let messages = body["messages"].to_string();
+                    assert!(messages.contains(PDF_TEXT), "PDF text missing at the upstream");
+                    assert!(messages.contains(TXT_TEXT), "TXT text missing at the upstream");
+                    assert!(messages.contains("\"type\":\"image_url\""));
+                    assert!(messages.contains("data:image/"));
+                    assert!(!messages.contains("verbatim read-only copy saved at"));
+                    let journal = rows.iter().map(|row| row.item.to_string()).collect::<String>();
+                    assert!(journal.contains("文件附件 one.pdf") && journal.contains("图片附件"));
+                    assert!(!journal.contains(PDF_TEXT) && !journal.contains(TXT_TEXT) && !journal.contains(IMAGE));
                 }
-                if let Ok(message) = std::fs::read_to_string(&failure) {
-                    anyhow::bail!("native prompt failed: {message}")
-                }
-                let rows = outbox.pending(0, 128)?;
-                let replies = rows
-                    .iter()
-                    .filter(|row| {
-                        row.item["kind"] == "assistant_message" && row.item["payload"]["content"] == "verified reply"
-                    })
-                    .count();
-                if replies == turn {
-                    let request = usage.recv().await.unwrap();
-                    let session = request.session_id.as_deref().unwrap();
-                    let native_id = std::fs::read_to_string(&marker)?;
-                    assert_eq!(session, crate::native_capture::session_id("qa-device", &release.agent, &native_id));
-                    assert!(state.desktop_sessions.is_ready(&launch_token));
-                    assert!(rows.iter().all(|row| row.item["session_id"] == session));
-                    assert_eq!(rows.iter().filter(|row| row.item["kind"] == "session_start").count(), 1);
-                    assert_eq!(rows.iter().filter(|row| row.item["kind"] == "user_message").count(), turn);
-                    assert!(
-                        rows.iter().any(|row| row.item["payload"]["content"]
-                            .as_str()
-                            .is_some_and(|text| text.contains(&input)))
+                assert!(request.usage_final);
+                assert_eq!(request.model_id, model_id);
+                assert_eq!(request.model, selected);
+                assert_eq!(request.cost_milli, 7);
+                assert_eq!((request.tokens.input, request.tokens.output), (3, 2));
+                let ledger = state.lease.snapshot();
+                assert_eq!(ledger.used_milli, settled_turns as i64 * 7);
+                assert_eq!(ledger.inflight_milli, 0);
+                assert_eq!(request.lease_id.as_deref(), Some("qa-lease"));
+                if cfg!(windows) || scenario == Scenario::Workspaces {
+                    let runtime = if host_only { "Host" } else { "GUI" };
+                    let project = prompt.workspace.file_name().unwrap().to_string_lossy();
+                    eprintln!(
+                        "verified native {runtime} turn {settled_turns}: workspace={project}, session={session}, cost_milli={}",
+                        request.cost_milli
                     );
-                    #[cfg(target_os = "macos")]
-                    if attachments {
-                        let body = incoming.try_recv()?;
-                        let messages = body["messages"].to_string();
-                        assert!(messages.contains(PDF_TEXT), "PDF text missing at the upstream");
-                        assert!(messages.contains(TXT_TEXT), "TXT text missing at the upstream");
-                        assert!(messages.contains("\"type\":\"image_url\""));
-                        assert!(messages.contains("data:image/"));
-                        assert!(!messages.contains("verbatim read-only copy saved at"));
-                        let journal = rows.iter().map(|row| row.item.to_string()).collect::<String>();
-                        assert!(journal.contains("文件附件 one.pdf") && journal.contains("图片附件"));
-                        assert!(!journal.contains(PDF_TEXT) && !journal.contains(TXT_TEXT) && !journal.contains(IMAGE));
-                    }
-                    assert!(request.usage_final);
-                    assert_eq!(request.model_id, model_id);
-                    assert_eq!(request.model, selected);
-                    assert_eq!(request.cost_milli, 7);
-                    assert_eq!((request.tokens.input, request.tokens.output), (3, 2));
-                    let ledger = state.lease.snapshot();
-                    assert_eq!(ledger.used_milli, turn as i64 * 7);
-                    assert_eq!(ledger.inflight_milli, 0);
-                    assert_eq!(request.lease_id.as_deref(), Some("qa-lease"));
-                    if let Some(id) = &original {
-                        assert_eq!(id, session)
-                    }
-                    if cfg!(windows) {
-                        let runtime = if host_only { "Host" } else { "GUI" };
-                        eprintln!(
-                            "verified Windows {runtime} turn {turn}: session={session}, cost_milli={}",
-                            request.cost_milli
-                        );
-                    }
-                    if mixed_models {
-                        eprintln!("verified native model {provider}/{selected}, cost_milli={}", request.cost_milli);
-                    }
-                    original = Some(session.to_owned());
-                    return Ok::<_, anyhow::Error>(());
                 }
-                tokio::time::sleep(Duration::from_millis(400)).await;
+                if mixed_models {
+                    eprintln!("verified native model {provider}/{selected}, cost_milli={}", request.cost_milli);
+                }
+                std::fs::write(&prompt.accepted, [])?;
             }
+            Ok::<_, anyhow::Error>(())
         })
         .await;
         if !matches!(accepted, Ok(Ok(()))) {

@@ -73,7 +73,7 @@ pub(crate) fn prepare(
         bail!("workspace unavailable");
     }
     let workspace = path_text(&cwd)?;
-    let hash = crate::capture::hex(&Sha256::digest(workspace.as_bytes()));
+    let hash = workspace_hash(&workspace);
     let profile_root = request.home.join("agents").join(request.agent).join("profiles");
     #[cfg(not(windows))]
     let profile = profile_root.join(owner).join(&hash);
@@ -464,6 +464,10 @@ pub(crate) fn path_text(path: &Path) -> Result<String> {
         }
     }
     Ok(path.into())
+}
+
+pub(crate) fn workspace_hash(path: &str) -> String {
+    crate::capture::hex(&Sha256::digest(path.as_bytes()))
 }
 
 #[cfg(all(test, windows))]
