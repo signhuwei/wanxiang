@@ -965,38 +965,6 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
             }
         };
     let max_tokens = req.get("max_tokens").and_then(Value::as_u64).unwrap_or(0);
-    let mut reduced_output = false;
-    let deepseek_admission = if deepseek {
-        if max_tokens == 0 {
-            return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", "max_tokens 必须为正整数。");
-        }
-        let rate = rate.as_ref().expect("a message requires a rate");
-        let mut output = max_tokens;
-        let mut meter = None;
-        let admission = rt.state.lease.admit_model_with(&route.model_id, |remaining| {
-            output = crate::pricing::affordable_output_tokens(rate, input, max_tokens, remaining);
-            let fitted = Meter::new(rate.clone(), output, input);
-            let reservation = fitted.reservation;
-            meter = Some(fitted);
-            reservation
-        });
-        let meter = meter.expect("lease calculated the reservation");
-        let ticket = match admission {
-            Ok(ticket) => ticket,
-            Err(block) => {
-                info!(model = %model, reason = ?block, reservation_milli = meter.reservation, "request blocked by lease");
-                return block_response(block);
-            }
-        };
-        if output < max_tokens {
-            reduced_output = true;
-            req["max_tokens"] = output.into();
-            info!(model = %model, requested_output = max_tokens, allowed_output = output, "capped DeepSeek output to lease");
-        }
-        Some((meter, ticket))
-    } else {
-        None
-    };
     let upstream_model = route.upstream_model.clone().unwrap_or_else(|| model.clone());
     let body = if to_chat {
         // `?beta=true` 之类的查询参数属于 Anthropic，不带给 Chat 上游。
@@ -1005,7 +973,7 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
             Err(msg) => return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg),
         }
     } else {
-        if upstream_model != model || execution.clamps_output() || !documents.is_empty() || reduced_output {
+        if upstream_model != model || execution.clamps_output() || !documents.is_empty() {
             req["model"] = Value::String(upstream_model.clone());
             Bytes::from(serde_json::to_vec(&req).unwrap())
         } else {
@@ -1034,17 +1002,12 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
         return forward_count_tokens(&rt, &mut execution, &mut permit, &mut out, path, &model).await;
     }
 
-    let (meter, ticket) = match deepseek_admission {
-        Some(admitted) => admitted,
-        None => {
-            let meter = Meter::new(rate.expect("a message requires a rate"), max_tokens, input);
-            match rt.state.lease.admit_model(&route.model_id, meter.reservation) {
-                Ok(ticket) => (meter, ticket),
-                Err(b) => {
-                    info!(model = %model, reason = ?b, reservation_milli = meter.reservation, "request blocked by lease");
-                    return block_response(b);
-                }
-            }
+    let meter = Meter::new(rate.expect("a message requires a rate"), max_tokens, input);
+    let ticket = match rt.state.lease.admit_model(&route.model_id, meter.reservation) {
+        Ok(t) => t,
+        Err(b) => {
+            info!(model = %model, reason = ?b, reservation_milli = meter.reservation, "request blocked by lease");
+            return block_response(b);
         }
     };
     rt.state.upstream.lock().unwrap().inflight += 1;

@@ -25,18 +25,6 @@ pub fn cost_milli(rate: &Rate, t: &Tokens) -> i64 {
     micro.div_ceil(MTOK).min(i64::MAX as u128) as i64
 }
 
-/// Cap an output ceiling to the remainder after reserving the input estimate.
-/// At least one token is reserved so the ledger can reject an unaffordable request.
-pub(crate) fn affordable_output_tokens(rate: &Rate, input: u64, requested: u64, remaining: i64) -> u64 {
-    if rate.output_milli_per_mtok == 0 || requested == 0 {
-        return requested;
-    }
-    let balance = (remaining.max(0) as u128) * MTOK;
-    let input_cost = u128::from(input) * u128::from(rate.input_milli_per_mtok);
-    let output = balance.saturating_sub(input_cost) / u128::from(rate.output_milli_per_mtok);
-    output.clamp(1, u128::from(requested)) as u64
-}
-
 /// 选 `model_id` 的单价：`effective_from` 不晚于 `now_ms` 的条目里取最新的一条；没写生效时间的视为一直有效。
 pub fn pick_rate<'a>(rates: &'a [Rate], model_id: &str, now_ms: i64) -> Option<&'a Rate> {
     rates
