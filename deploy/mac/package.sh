@@ -72,6 +72,22 @@ for bin in "$app/Contents/MacOS/$executable" "$cli" "$daemon"; do
   [[ -x $bin ]] && /usr/bin/lipo "$bin" -verify_arch arm64 || { echo "Missing arm64 executable: $bin" >&2; exit 2; }
 done
 
+check_component_version() {
+  local bin=$1 name=$2 reported
+  [[ $bin == /* ]] || bin=$PWD/$bin
+  # If an older daemon doesn't recognize --version, it must fail before it can open normal Edge data.
+  if ! reported=$(/usr/bin/env -i ONEX_HOME=/dev/null/onex-version-probe "$bin" --version) ||
+     [[ $reported != "$name $version" ]]; then
+    echo "Build $name with ONEX_EDGE_BUILD_VERSION=$version before packaging with --preserve-daemon." >&2
+    exit 2
+  fi
+}
+
+if [[ $preserve_daemon == 1 ]]; then
+  check_component_version "$cli" onex
+  check_component_version "$daemon" onexd
+fi
+
 # Stage on the output filesystem so publishing does not require a copy.
 out_dir=$(cd "$(dirname "$output")" && pwd) || { echo "No such directory: $(dirname "$output")" >&2; exit 2; }
 stage=$(mktemp -d "$out_dir/.onex-pkg.XXXXXX")
@@ -86,6 +102,11 @@ mkdir -p "$payload/Applications" "$launch_agents" "$cli_entries" "$stage/scripts
 mkdir -p "$resources/onex/bin"
 install -m 0755 "$cli" "$resources/onex/bin/onex"
 install -m 0755 "$daemon" "$resources/onex/bin/onexd"
+/bin/rm -f "$resources/onex/daemon-version"
+if [[ $preserve_daemon == 1 ]]; then
+  printf '%s\n' "$version" > "$resources/onex/daemon-version"
+  chmod 0644 "$resources/onex/daemon-version"
+fi
 /bin/ln -s '../../../Applications/OneX Desktop.app/Contents/Resources/onex/bin/onex' "$cli_entries/onex"
 for launcher in onex-run-claude.command onex-run-codex.command onex-run-kimi.command; do
   install -m 0755 "$scripts/$launcher" "$resources/$launcher"

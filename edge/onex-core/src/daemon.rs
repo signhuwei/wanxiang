@@ -7,13 +7,80 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::ipc::Request;
 
 pub async fn exchange(path: &Path, request: &Request) -> std::io::Result<Value> {
-    let (reader, mut writer) = crate::transport::connect(path).await?.into_split();
+    exchange_on(crate::transport::connect(path).await?, request).await
+}
+
+#[cfg(target_os = "macos")]
+pub async fn macos_shutdown_when_idle(path: &Path, expected_pid: u32) -> std::io::Result<Value> {
+    let connection = crate::transport::connect(path).await?;
+    if connection.peer_pid()? != expected_pid {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the daemon does not own this socket"));
+    }
+    exchange_on(connection, &Request::ShutdownWhenIdle { expected_pid: Some(expected_pid) }).await
+}
+
+async fn exchange_on(connection: crate::transport::Connection, request: &Request) -> std::io::Result<Value> {
+    let (reader, mut writer) = connection.into_split();
     let mut line = serde_json::to_vec(request)?;
     line.push(b'\n');
     writer.write_all(&line).await?;
     let mut reply = String::new();
     BufReader::new(reader).read_line(&mut reply).await?;
     Ok(serde_json::from_str(&reply)?)
+}
+
+/// An agent can leave a native backend running after its window and launcher have exited.
+/// Check the actual executable paths, including processes reparented to launchd.
+#[cfg(target_os = "macos")]
+pub fn macos_managed_processes_alive(devices_root: &Path) -> std::io::Result<bool> {
+    use std::ffi::{CStr, OsStr};
+    use std::io::{self, ErrorKind};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let devices_root = match devices_root.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    const PROC_UID_ONLY: u32 = 4; // <sys/proc_info.h>
+    // This query takes no buffer and returns the estimated size in bytes.
+    let uid = unsafe { libc::geteuid() };
+    let estimate = unsafe { libc::proc_listpids(PROC_UID_ONLY, uid, std::ptr::null_mut(), 0) };
+    if estimate <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let pid_bytes = size_of::<libc::pid_t>();
+    let mut pids = vec![0; estimate as usize / pid_bytes + 32];
+    let buffer_bytes = i32::try_from(pids.len() * pid_bytes).map_err(io::Error::other)?;
+    // The allocation is writable for the entire length supplied to libproc.
+    let count = unsafe { libc::proc_listpids(PROC_UID_ONLY, uid, pids.as_mut_ptr().cast(), buffer_bytes) };
+    if count <= 0 || count >= buffer_bytes || count as usize % pid_bytes != 0 {
+        return Err(io::Error::other("could not read a complete macOS process list"));
+    }
+    for &pid in &pids[..count as usize / pid_bytes] {
+        let mut buffer = [0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // The kernel writes at most the supplied buffer length. A process may exit between calls.
+        let length = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+        if length <= 0 {
+            let error = io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) {
+                continue;
+            }
+            return Err(error);
+        }
+        let path = CStr::from_bytes_until_nul(&buffer).map_err(io::Error::other)?;
+        let executable = Path::new(OsStr::from_bytes(path.to_bytes()));
+        let Ok(relative) = executable.strip_prefix(&devices_root) else { continue };
+        let mut parts = relative.components();
+        if let Some(Component::Normal(device)) = parts.next()
+            && device.to_str().is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            && parts.next() == Some(Component::Normal(OsStr::new("agents")))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// A retained device reopens its original data directory in a fresh daemon.

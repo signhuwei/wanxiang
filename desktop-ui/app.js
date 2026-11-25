@@ -19,7 +19,8 @@ const messages={unauthenticated:'登录凭据无效或已过期',forbidden:'没�
 const errorText=code=>typeof code==='string' && Object.hasOwn(messages,code) ? messages[code] : '操作失败，请稍后重试'
 const labels={update_available:'有可用更新',available:'可启动',not_downloaded:'待下载',downloading:'下载中',verifying:'校验中',starting:'启动中',running:'运行中',failed:'启动失败',download_failed:'下载失败',policy_pending:'等待配置同步'}
 const updateLabels={available:'有更新',downloading:'下载更新中',installing:'安装更新中',failed:'重试更新',
-  waiting_for_agents:'等待 Agent 退出',updating_components:'正在更新 CLI 和后台服务',components_failed:'组件更新未完成'}
+  waiting_for_agents:'等待 Agent 退出',updating_components:'正在更新 CLI 和后台服务',components_failed:'组件更新未完成',
+  restarting_daemon:'正在切换后台服务',daemon_restart_required:'后台服务待重启'}
 const updateButton=$('desktop-update')
 const updateDialog=$('desktop-update-dialog')
 let confirmedVersion
@@ -95,7 +96,10 @@ function paintUpdate() {
   updateButton.hidden=!update?.version||!Object.hasOwn(updateLabels,update.phase)
   if (updateButton.hidden) return
   updateButton.disabled=!canInstallUpdate(update)
-  updateButton.title=update.phase==='components_failed'?'重新打开 Desktop 后重试 CLI 和后台服务更新':`目标版本 ${update.version}`
+  updateButton.title={
+    components_failed:'重新打开 Desktop 后重试组件切换',
+    daemon_restart_required:'现有后台版本需要手动切换，请先结束运行中的 Agent'
+  }[update.phase]??`目标版本 ${update.version}`
   updateButton.textContent=updateLabels[update.phase]
   if (update.phase==='downloading'&&update.total_bytes>0&&Number.isFinite(update.downloaded_bytes)) {
     updateButton.textContent+=` ${Math.min(100,Math.floor(100*update.downloaded_bytes/update.total_bytes))}%`

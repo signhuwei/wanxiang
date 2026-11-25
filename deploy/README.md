@@ -74,6 +74,8 @@ OneX 的 Mac `.pkg` 在写入安装文件前会实际检查 Git，支持 Apple �
 
 安装完成后可从「应用程序」打开 OneX Desktop，也可以在终端运行 `onex status`、`onex login --tenant <租户简称> --username <用户名>` 或 `onex run codex --managed`。`/usr/local/bin/onex` 指向同一安装包内的 CLI。Desktop 和 CLI 使用当前 macOS 用户的同一个 `onexd`，由 LaunchAgent 在图形登录时启动。已有 Desktop 登录的用户可以直接使用 CLI。
 
+用 `--preserve-daemon` 覆盖安装时，安装器保留运行中的 `onexd` 和 Agent。重新打开 Desktop 后，客户端按应用包内记录的后台版本检查运行中的服务，并在 Agent 和模型请求结束后通过空闲切换协议请求 LaunchAgent 启动新版本。早于空闲切换协议的后台在正常退出后由 LaunchAgent 重新载入。`onex --version` 显示 CLI 版本，`onex status` 的 `version` 显示正在运行的后台版本。
+
 ## 平台维护与发布
 
 平台管理员在「平台 → 维护与发布」上传已签名的 Server 清单和制品，查看部署状态。Edge 安装包也可以在该入口发布。接口以运行环境的 `/v1/openapi.json` 为准。
@@ -87,7 +89,7 @@ Agent 在已提交且通过回归的源码目录运行：
 ```sh
 ONEX_RELEASE_PRIVATE_KEY=/secure/onex-server-release.key bun deploy/release.ts pack-server /secure/output
 ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token bun deploy/release.ts publish-server https://onex.example /secure/output/COMMIT.json /secure/output/COMMIT.tar.gz
-ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token bun deploy/release.ts publish-edge https://onex.example darwin 1.2.3 /secure/output/OneX.pkg
+ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token bun deploy/release.ts publish-edge https://onex.example darwin 1.2.3 /secure/OneX-preserve-daemon.pkg
 ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token bun deploy/release.ts rollout https://onex.example roll_ID
 ```
 
@@ -97,12 +99,22 @@ ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token bun deploy/release.ts
 
 启用 Desktop 自动更新时，在签名环境保管独立的 Ed25519 Edge 更新私钥。更新公钥可通过 `ONEX_EDGE_UPDATE_PRIVATE_KEY=/secure/edge-update.key bun deploy/release.ts edge-update-public-key` 导出。将 JSON 字符串的内容设置为构建环境的 `ONEX_DESKTOP_UPDATE_KEY`，使安装后的 Desktop 能验证未来发行。分发引导包与后续更新制品需要使用同一信任公钥。
 
-macOS 更新制品使用 `deploy/mac/package.sh` 的 `--preserve-daemon` 参数，应用包版本与发布号保持一致。Windows 使用同次构建输出的 `desktop_update` 指向的 `.onex-update`，其中包含 Desktop、CLI 和 daemon。发布时分别提供手动安装器和可选更新制品两条路径。
+macOS 更新制品使用 `deploy/mac/package.sh` 的 `--preserve-daemon` 参数。使用该参数时，CLI 和后台的 `ONEX_EDGE_BUILD_VERSION` 必须与 Tauri 应用版本相同。打包脚本核验这两个版本后，将后台版本写入签名应用包。
+
+```sh
+ONEX_EDGE_BUILD_VERSION=1.2.3 cargo build --manifest-path edge/Cargo.toml --locked --release -p onex-cli -p onexd
+(cd edge/desktop && cargo tauri build --config '{"version":"1.2.3"}' --bundles app)
+deploy/mac/package.sh 'edge/target/release/bundle/macos/OneX Desktop.app' \
+  edge/target/release/onex edge/target/release/onexd https://onex.example \
+  /secure/OneX-preserve-daemon.pkg --preserve-daemon
+```
+
+Windows 使用同次构建输出的 `desktop_update` 指向的 `.onex-update`，其中包含 Desktop、CLI 和 daemon。发布时分别提供手动安装器和可选更新制品两条路径。macOS 的两个入口可以使用同一个保留后台的 PKG。
 
 ```sh
 ONEX_EDGE_UPDATE_PRIVATE_KEY=/secure/edge-update.key \
 ONEX_RELEASE_TOKEN_FILE=/secure/platform-session.token \
-  bun deploy/release.ts publish-edge https://onex.example darwin 1.2.3 /secure/OneX.pkg /secure/OneX-preserve-daemon.pkg
+  bun deploy/release.ts publish-edge https://onex.example darwin 1.2.3 /secure/OneX-preserve-daemon.pkg /secure/OneX-preserve-daemon.pkg
 ```
 
 主机日志可按任务 ID 查 `journalctl -u onex-release-worker.service`。业务库备份在 OneX 的 `backups/`。如果候选迁移使上一版无法启动，按备份恢复流程评估恢复时间点。发布制品密钥与 macOS 签名公证独立。

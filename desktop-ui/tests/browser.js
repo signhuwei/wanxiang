@@ -142,7 +142,9 @@ try{
   for(const [phase,label] of [
     ['waiting_for_agents','等待 Agent 退出'],
     ['updating_components','正在更新 CLI 和后台服务'],
-    ['components_failed','组件更新未完成']
+    ['components_failed','组件更新未完成'],
+    ['restarting_daemon','正在切换后台服务'],
+    ['daemon_restart_required','后台服务待重启']
   ]){
     await workbench.evaluate(phase=>{
       window.desktopUpdate={version:'0.1.0-rc22',phase}

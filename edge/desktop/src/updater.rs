@@ -18,45 +18,6 @@ const MAX_MANIFEST_BYTES: usize = 4096;
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const PLATFORM: (&str, &str) = if cfg!(target_os = "macos") { ("darwin", "arm64") } else { ("windows", "x64") };
 
-#[cfg(target_os = "macos")]
-const DAEMON_UPDATE_MARKER: &str = "daemon-update-pending";
-
-#[cfg(target_os = "macos")]
-pub(crate) async fn activate_daemon_update(socket: std::path::PathBuf, version: String) {
-    use onex_core::{daemon::exchange, ipc::Request};
-
-    let Some(home) = socket.parent() else { return };
-    let marker = home.join(DAEMON_UPDATE_MARKER);
-    while tokio::fs::read_to_string(&marker).await.as_deref().ok() == Some(&version) {
-        if let Ok(Ok(reply)) = tokio::time::timeout(
-            Duration::from_secs(3),
-            exchange(&socket, &Request::ShutdownWhenIdle { expected_pid: None }),
-        )
-        .await
-        {
-            if reply["ok"] == true {
-                let _ = tokio::fs::remove_file(&marker).await;
-                return;
-            }
-            if reply["error"]["code"] == "invalid" {
-                // Older daemons adopt the installed binary at their next normal restart.
-                return;
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(15)).await;
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn stage_daemon_update(version: &str) -> Result<()> {
-    use std::io::Write;
-    let home = onex_core::ipc::default_home().map_err(anyhow::Error::msg)?;
-    let mut marker = tempfile::NamedTempFile::new_in(&home)?;
-    marker.write_all(version.as_bytes())?;
-    marker.persist(home.join(DAEMON_UPDATE_MARKER))?;
-    Ok(())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct Manifest {
     id: String,
@@ -102,17 +63,19 @@ impl Manifest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Phase {
+pub(crate) enum Phase {
     Available,
     Downloading,
     Installing,
     Failed,
-    #[cfg(windows)]
     WaitingForAgents,
     #[cfg(windows)]
     UpdatingComponents,
-    #[cfg(windows)]
     ComponentsFailed,
+    #[cfg(target_os = "macos")]
+    RestartingDaemon,
+    #[cfg(target_os = "macos")]
+    DaemonRestartRequired,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -142,7 +105,6 @@ pub(crate) struct Updater {
     key: Option<[u8; 32]>,
     client: Client,
     state: Mutex<State>,
-    #[cfg(windows)]
     pending_components: Mutex<Option<UpdateView>>,
 }
 
@@ -161,13 +123,14 @@ impl Updater {
                 .build()
                 .expect("build Desktop update HTTP client"),
             state: Mutex::new(State::default()),
-            #[cfg(windows)]
             pending_components: Mutex::new(None),
         })
     }
 
     pub(crate) fn observe(self: &Arc<Self>, origin: &str) -> Option<UpdateView> {
-        self.key?;
+        if self.key.is_none() {
+            return self.pending_components.lock().unwrap().clone();
+        }
         let origin = Url::parse(origin).ok().filter(|url| matches!(url.scheme(), "http" | "https"));
         let mut state = self.state.lock().unwrap();
         if state.in_progress() {
@@ -199,7 +162,6 @@ impl Updater {
                 }
             });
         }
-        #[cfg(windows)]
         if state.view.is_none() {
             return self.pending_components.lock().unwrap().clone();
         }
@@ -291,12 +253,17 @@ impl Updater {
         #[cfg(windows)]
         stage_windows_bundle(&artifact, manifest).await?;
         update_platform::install(&artifact, &self.current.to_string(), &manifest.version)?;
-        #[cfg(target_os = "macos")]
-        if let Err(error) = stage_daemon_update(&manifest.version) {
-            tracing::warn!(%error, "could not schedule background daemon replacement");
-        }
         let _ = directory.keep();
         Ok(())
+    }
+
+    pub(crate) fn component_phase(&self, phase: Option<Phase>) {
+        *self.pending_components.lock().unwrap() = phase.map(|phase| UpdateView {
+            version: self.current.to_string(),
+            phase,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+        });
     }
 
     #[cfg(windows)]
@@ -322,25 +289,21 @@ impl Updater {
         ensure!(valid_windows_bundle(&artifact, &manifest).await?, "pending Windows update bytes changed");
         let scratch = tempfile::Builder::new().prefix("onex-components-").tempdir()?;
         let (cli, daemon) = crate::windows_update_bundle::sidecars(&artifact, scratch.path())?;
-        let phase = |phase| {
-            *self.pending_components.lock().unwrap() =
-                Some(UpdateView { version: version.clone(), phase, downloaded_bytes: 0, total_bytes: 0 });
-        };
         loop {
-            phase(Phase::UpdatingComponents);
+            self.component_phase(Some(Phase::UpdatingComponents));
             match update_platform::apply_windows_sidecars(&cli, &daemon, home, &version).await {
                 Ok(status) if status.success() => {
-                    *self.pending_components.lock().unwrap() = None;
+                    self.component_phase(None);
                     // The helper has released its files; the signed staged package can now be removed.
                     let _ = tokio::fs::remove_dir_all(&directory).await;
                     return Ok(());
                 }
                 Ok(status) if status.code() == Some(3) => {
-                    phase(Phase::WaitingForAgents);
+                    self.component_phase(Some(Phase::WaitingForAgents));
                     tokio::time::sleep(Duration::from_secs(15)).await;
                 }
                 result => {
-                    phase(Phase::ComponentsFailed);
+                    self.component_phase(Some(Phase::ComponentsFailed));
                     anyhow::bail!("Windows component update did not complete: {result:?}");
                 }
             }

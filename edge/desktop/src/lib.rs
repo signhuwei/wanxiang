@@ -1,5 +1,7 @@
 //! OneX Desktop 原生桥：Tauri 2 应用的业务逻辑，独立于 `tauri::Builder` 便于测试。
 pub mod bridge;
+#[cfg(target_os = "macos")]
+mod macos_daemon_update;
 mod profile;
 mod tray;
 mod update_platform;
@@ -130,7 +132,7 @@ pub fn run() {
             }
             app.manage(updates);
             #[cfg(target_os = "macos")]
-            tauri::async_runtime::spawn(updater::activate_daemon_update(sock.clone(), version.clone()));
+            let daemon_target = (sock.clone(), version.clone());
             let bridge = Bridge::with_version(sock, version);
             app.manage(bridge);
             let config = &app.config().app.windows[0];
@@ -146,6 +148,12 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let bridge = handle.state::<Bridge>();
                 bridge.restore_session().await;
+                #[cfg(target_os = "macos")]
+                {
+                    let (socket, version) = daemon_target;
+                    let updates = handle.state::<Arc<updater::Updater>>();
+                    macos_daemon_update::reconcile(&socket, &version, &updates).await;
+                }
             });
             Ok(())
         })

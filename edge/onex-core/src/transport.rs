@@ -26,6 +26,31 @@ mod unix_impl {
         pub fn into_split(self) -> (ReadHalf, WriteHalf) {
             self.0.into_split()
         }
+
+        #[cfg(target_os = "macos")]
+        pub(crate) fn peer_pid(&self) -> io::Result<u32> {
+            use std::os::fd::AsRawFd;
+
+            let mut pid: libc::pid_t = 0;
+            let mut len = size_of::<libc::pid_t>() as libc::socklen_t;
+            // The output pointer is writable for the exact size advertised to the kernel.
+            let result = unsafe {
+                libc::getsockopt(
+                    self.0.as_raw_fd(),
+                    libc::SOL_LOCAL,
+                    libc::LOCAL_PEERPID,
+                    (&mut pid as *mut libc::pid_t).cast(),
+                    &mut len,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if pid <= 0 || len as usize != size_of::<libc::pid_t>() {
+                return Err(io::Error::other("could not identify the local socket peer"));
+            }
+            Ok(pid as u32)
+        }
     }
 
     /// 绑定 socket，权限 0600。已有 socket 能连上说明另一个 onexd 在跑，报错退出；

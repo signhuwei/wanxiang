@@ -78,6 +78,15 @@ fn verify_mac_package(artifact: &Path, target: &str) -> Result<()> {
             && bundle.contains(&format!(" CFBundleShortVersionString=\"{target}\"")),
         "Incorrect Desktop update package version"
     );
+    let stamp = Command::new("/usr/bin/tar")
+        .arg("-xOf")
+        .arg(expanded.join("Payload"))
+        .arg("./Applications/OneX Desktop.app/Contents/Resources/onex/daemon-version")
+        .output()?;
+    ensure!(
+        stamp.status.success() && std::str::from_utf8(&stamp.stdout)?.trim() == target,
+        "The update does not declare the bundled daemon version"
+    );
     let next_agent = Command::new("/usr/bin/tar")
         .arg("-xOf")
         .arg(expanded.join("Payload"))

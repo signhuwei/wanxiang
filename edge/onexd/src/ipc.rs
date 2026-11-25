@@ -156,6 +156,17 @@ impl LaunchCtx {
         {
             return false;
         }
+        #[cfg(target_os = "macos")]
+        if let Some(devices) = self.home.parent().filter(|path| path.ends_with("devices")) {
+            match onex_core::daemon::macos_managed_processes_alive(devices) {
+                Ok(false) => {}
+                Ok(true) => return false,
+                Err(error) => {
+                    warn!(%error, "cannot verify that macOS managed agents have exited");
+                    return false;
+                }
+            }
+        }
         preparing.stopping = true;
         true
     }
@@ -1414,7 +1425,9 @@ mod upgrade_tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("onexd.sock");
         let shutdown = CancellationToken::new();
-        let launch = LaunchCtx::new(dir.path().into(), reqwest::Client::new());
+        let home = dir.path().join("devices").join("a".repeat(32));
+        std::fs::create_dir_all(&home).unwrap();
+        let launch = LaunchCtx::new(home.clone(), reqwest::Client::new());
         let service = Arc::new(Ipc {
             state: Arc::new(State::default()),
             outbox: Arc::new(Outbox::open(&dir.path().join("outbox.sqlite")).unwrap()),
@@ -1431,6 +1444,11 @@ mod upgrade_tests {
         let request = || onex_core::daemon::exchange(&socket, &Request::ShutdownWhenIdle { expected_pid: None });
         let wrong_pid = Request::ShutdownWhenIdle { expected_pid: Some(0) };
         assert_eq!(onex_core::daemon::exchange(&socket, &wrong_pid).await.unwrap()["error"]["code"], "conflict");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            onex_core::daemon::macos_shutdown_when_idle(&socket, 0).await.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
         assert!(!shutdown.is_cancelled());
 
         for agent in ["claude-code", "deepseek-desktop"] {
@@ -1452,7 +1470,7 @@ mod upgrade_tests {
             assert!(ctx.running.lock().unwrap().remove(agent).is_some());
         }
 
-        let run = dir.path().join("run").join(crate::id::new("lch"));
+        let run = home.join("run").join(crate::id::new("lch"));
         std::fs::create_dir_all(&run).unwrap();
         let previous_cli = onex_core::run_lock::claim(&run).unwrap();
         assert_eq!(request().await.unwrap()["error"]["code"], "agents_running");
@@ -1491,7 +1509,24 @@ mod upgrade_tests {
         assert_eq!(request().await.unwrap()["error"]["code"], "agents_running");
         service.state.upstream.lock().unwrap().inflight = 0;
 
-        assert_eq!(request().await.unwrap()["ok"], true);
+        #[cfg(target_os = "macos")]
+        {
+            let bundle = home.join("agents/deepseek-desktop/releases/test/DeepSeek Harness.app/Contents/MacOS");
+            std::fs::create_dir_all(&bundle).unwrap();
+            let executable = bundle.join("DeepSeek Harness");
+            std::fs::copy("/bin/sleep", &executable).unwrap();
+            let mut backend = tokio::process::Command::new(&executable).arg("60").kill_on_drop(true).spawn().unwrap();
+            assert_eq!(request().await.unwrap()["error"]["code"], "agents_running");
+            assert!(!shutdown.is_cancelled());
+            assert!(backend.try_wait().unwrap().is_none());
+            backend.kill().await.unwrap();
+        }
+
+        #[cfg(target_os = "macos")]
+        let acknowledgement = onex_core::daemon::macos_shutdown_when_idle(&socket, std::process::id()).await.unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let acknowledgement = request().await.unwrap();
+        assert_eq!(acknowledgement["ok"], true);
         assert!(ctx.try_prepare("codex").is_none());
         daemon.await.unwrap();
         assert!(shutdown.is_cancelled());

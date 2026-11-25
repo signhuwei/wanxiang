@@ -38,6 +38,11 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let operation = args.next();
+    if operation.as_deref() == Some(std::ffi::OsStr::new("--version")) {
+        anyhow::ensure!(args.next().is_none(), "--version takes no arguments");
+        println!("onexd {}", onexd::BUILD_VERSION);
+        return Ok(());
+    }
     if operation.as_deref() == Some(std::ffi::OsStr::new("deepseek-pdf-text")) {
         anyhow::ensure!(args.next().is_none(), "deepseek-pdf-text takes no arguments");
         #[cfg(target_os = "macos")]
