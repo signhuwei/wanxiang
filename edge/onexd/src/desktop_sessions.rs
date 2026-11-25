@@ -867,6 +867,10 @@ mod tests {
                         body["messages"][0]["content"][0]["text"],
                         "before [附件 notes.txt 的文本]\nfixture contents\n[附件结束] after"
                     );
+                    let input = crate::router::estimate_request_fields(&body, &["system", "messages", "tools"]);
+                    let affordable = 500 - input;
+                    assert!((1..4096).contains(&affordable));
+                    assert_eq!(body["max_tokens"], affordable);
                     Json(json!({
                         "id":"msg_fixture","type":"message","role":"assistant","model":"messages-model",
                         "content":[{"type":"text","text":"messages"}],"stop_reason":"end_turn",
@@ -921,7 +925,7 @@ mod tests {
             expires_at: crate::pricing::format_ms(now_ms() + 60_000),
             budget_milli: 10_000,
             seq: 1,
-            model_budgets: Default::default(),
+            model_budgets: [("messages-model-id".into(), 1000)].into(),
             commerce_plan_id: None,
         })?;
         let root = tempfile::tempdir()?;
@@ -978,7 +982,7 @@ mod tests {
                 .post(format!("{base}/v1/messages"))
                 .header("x-api-key", token)
                 .json(&json!({
-                    "model":"messages-model","max_tokens":8,
+                    "model":"messages-model","max_tokens":4096,
                     "messages":[{"role":"user","content":[{"type":"text","text":"before [[opaque]] after"}]}]
                 }))
                 .send()
@@ -998,6 +1002,26 @@ mod tests {
         assert!(chat_usage.usage_final && messages_usage.usage_final);
         assert_eq!(chat_usage.session_id, messages_usage.session_id);
         assert!(chat_usage.session_id.is_some() && recorded.try_recv().is_err());
+        let spent = state.lease.snapshot();
+        assert_eq!(spent.used_milli, 9);
+        assert_eq!(spent.inflight_milli, 0);
+        assert_eq!(state.lease.status()["model_used_milli"]["messages-model-id"], 6);
+
+        let unusable = grant("messages-model", json!([])).await?.error_for_status()?.json::<Value>().await?;
+        let reply = client
+            .post(format!("{base}/v1/messages"))
+            .header("x-api-key", unusable["model_token"].as_str().unwrap())
+            .json(&json!({
+                "model":"messages-model","max_tokens":1,
+                "messages":[{"role":"user","content":"fixture text ".repeat(600)}]
+            }))
+            .send()
+            .await?;
+        assert_eq!(reply.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(recorded.try_recv().is_err());
+        let after = state.lease.snapshot();
+        assert_eq!(after.used_milli, spent.used_milli);
+        assert_eq!(after.inflight_milli, 0);
         server.abort();
         upstream_task.abort();
         Ok(())

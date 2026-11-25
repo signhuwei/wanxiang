@@ -296,7 +296,8 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
         }
     }
     let ticket = match rt.state.lease.admit_model_with(&route.model_id, |remaining| {
-        let output = max_output.unwrap_or_else(|| output_reservation(&rate, est_input, remaining));
+        let output =
+            max_output.unwrap_or_else(|| crate::pricing::affordable_output_tokens(&rate, est_input, 4096, remaining));
         Meter::new(rate.clone(), output, est_input).reservation
     }) {
         Ok(ticket) => ticket,
@@ -463,15 +464,6 @@ impl Drop for ReqCtx {
             self.finish();
         }
     }
-}
-
-fn output_reservation(rate: &onex_core::ws::Rate, input: u64, remaining: i64) -> u64 {
-    if rate.output_milli_per_mtok == 0 {
-        return 4096;
-    }
-    let available =
-        i128::from(remaining.max(0)) * 1_000_000 - i128::from(input) * i128::from(rate.input_milli_per_mtok);
-    (available / i128::from(rate.output_milli_per_mtok)).clamp(1, 4096) as u64
 }
 
 /// Responses 的 `usage` → 计费 token。`input_tokens` 本身含缓存命中，扣掉
