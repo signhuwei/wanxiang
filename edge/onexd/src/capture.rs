@@ -537,19 +537,27 @@ pub(crate) fn owned_by_same_principal(path: &Path, reference_dir: &Path) -> Resu
 
 #[cfg(windows)]
 fn windows_owner_sid(path: &Path) -> Result<String> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSID};
-    let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL,
+    };
+    // Rust's Windows file opening normalizes ordinary paths and handles long paths.
+    // Read only the security descriptor and do not follow a final reparse point.
+    let file = std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("open for Windows ownership check: {}", path.display()))?;
     let mut owner: PSID = std::ptr::null_mut();
     let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
-    // SAFETY: `wide` 是有效的、以 NUL 结尾的宽字符串；成功时系统分配一份安全描述符到 `sd`，
-    // `owner` 指向该描述符内部的数据（生命周期绑定在 `sd` 上，`sd` 释放前不能丢弃 `owner`）。
+    // SAFETY: the handle remains open through the call. On success, owner
+    // references the security descriptor in sd and remains valid until LocalFree.
     let status = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr(),
+        GetSecurityInfo(
+            file.as_raw_handle(),
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION,
             &mut owner,
@@ -559,7 +567,7 @@ fn windows_owner_sid(path: &Path) -> Result<String> {
             &mut sd,
         )
     };
-    anyhow::ensure!(status == 0, "GetNamedSecurityInfoW failed for {} (status {status})", path.display());
+    anyhow::ensure!(status == 0, "GetSecurityInfo failed for {} (status {status})", path.display());
     let result = (|| -> Result<String> {
         let mut sid_str: *mut u16 = std::ptr::null_mut();
         // SAFETY: `owner` 是上面成功调用返回的有效 SID 指针；成功时系统分配一个以 NUL 结尾的
@@ -578,7 +586,7 @@ fn windows_owner_sid(path: &Path) -> Result<String> {
         unsafe { LocalFree(sid_str as *mut std::ffi::c_void) };
         Ok(s)
     })();
-    // SAFETY: `sd` 是 `GetNamedSecurityInfoW` 成功时分配的、尚未释放的安全描述符。
+    // SAFETY: GetSecurityInfo allocated sd and it has not been freed.
     unsafe { LocalFree(sd) };
     result
 }
@@ -586,6 +594,19 @@ fn windows_owner_sid(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_check_accepts_long_managed_paths_with_mixed_separators() {
+        use std::os::windows::ffi::OsStrExt;
+        let device = tempfile::tempdir().unwrap();
+        let config = device.path().join("workstation-".repeat(18)).join("agents/claude-code").join("claude");
+        std::fs::create_dir_all(&config).unwrap();
+        let transcript = config.join("session.jsonl");
+        assert!(transcript.as_os_str().encode_wide().count() > 260);
+        std::fs::write(&transcript, b"{}\n").unwrap();
+        assert!(owned_by_same_principal(&transcript, &config).unwrap());
+    }
 
     #[test]
     fn claude_cli_reopens_the_native_cursor_in_its_own_workspace() {
