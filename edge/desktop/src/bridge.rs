@@ -72,6 +72,9 @@ pub enum Op {
     Settings {
         hide_on_close: bool,
     },
+    InstallUpdate {
+        version: String,
+    },
     Logout,
 }
 
@@ -278,6 +281,9 @@ impl Bridge {
             Op::Launch { agent_id } => self.launch(agent_id).await,
             Op::Download { agent_id } => self.download(agent_id).await,
             Op::Settings { hide_on_close } => self.settings(hide_on_close).await,
+            Op::InstallUpdate { .. } => {
+                Err(ErrorBody { code: "update_unavailable".into(), message: "更新已变更或暂不可用".into() })
+            }
             Op::Logout => self.logout().await,
         }
     }

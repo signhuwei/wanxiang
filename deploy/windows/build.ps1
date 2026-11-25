@@ -138,7 +138,8 @@ try {
         Pop-Location
     }
 
-    Assert-X64 (Join-Path $releaseDir 'onex-desktop.exe')
+    $desktopExecutable = Join-Path $releaseDir 'onex-desktop.exe'
+    Assert-X64 $desktopExecutable
     $installers = @(Get-ChildItem -LiteralPath (Join-Path $releaseDir 'bundle\nsis') -Filter '*-setup.exe' -File |
         Where-Object { $_.LastWriteTimeUtc -ge $buildStarted })
     if ($installers.Count -ne 1) { throw "Expected exactly one fresh NSIS installer, got $($installers.Count)." }
@@ -152,6 +153,7 @@ try {
         version = $appVersion
         platform = 'windows/x64'
         installer = $installer.FullName
+        desktop_update = $desktopExecutable
         bytes = $installer.Length
         sha256 = $sha256
     } | ConvertTo-Json

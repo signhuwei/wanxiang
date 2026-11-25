@@ -1,7 +1,8 @@
-import { createHash, createPrivateKey } from 'node:crypto';
+import { createHash, createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import { createReadStream, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { commitPattern, isManifest, signManifest, type ServerManifest } from '../server/src/release-package';
+import { desktopUpdateBytes, desktopUpdateKind } from '../server/src/desktop-update-signature';
 
 process.umask(0o077);
 const repo = resolve(import.meta.dir, '..');
@@ -71,8 +72,9 @@ async function connect(origin: string) {
     throw new Error('Use the OneX base URL');
   }
   let session = '';
-  const request = async (path: string, method = 'GET', body?: object | Blob, key?: string) => {
-    const headers = new Headers({ Accept: 'application/json' });
+  const request = async (path: string, method = 'GET', body?: object | Blob, key?: string, extraHeaders?: HeadersInit) => {
+    const headers = new Headers(extraHeaders);
+    headers.set('Accept', 'application/json');
     if (session) headers.set('Authorization', `Bearer ${session}`);
     if (body) headers.set('Content-Type', body instanceof Blob ? 'application/octet-stream' : 'application/json');
     if (key) headers.set('Idempotency-Key', key);
@@ -133,10 +135,18 @@ async function publishServer(origin: string, manifestPath: string, archive: stri
   return waitForRollout(api, job.id);
 }
 
-async function publishEdge(origin: string, os: string, version: string, archive: string) {
+function edgeUpdateSigningKey() {
+  const key = createPrivateKey(readFileSync(setting('ONEX_EDGE_UPDATE_PRIVATE_KEY')));
+  if (key.asymmetricKeyType !== 'ed25519') throw new Error('Use an Ed25519 Edge update signing key');
+  return key;
+}
+
+async function publishEdge(origin: string, os: string, version: string, archive: string, updateArchive?: string) {
   const arch = os === 'darwin' ? 'arm64' : os === 'windows' ? 'x64' : null;
   if (!arch) throw new Error('Choose darwin or windows');
   const file = await digest(archive);
+  const updateFile = updateArchive ? await digest(updateArchive) : null;
+  const updateKey = updateFile ? edgeUpdateSigningKey() : null;
   const api = await connect(origin);
   const base = '/platform/desktop-releases';
   const query = new URLSearchParams({ q: `${version} ${os} ${arch}` });
@@ -150,6 +160,18 @@ async function publishEdge(origin: string, os: string, version: string, archive:
     release = await api(path + '/artifact?revision=' + release.revision, 'PUT', Bun.file(archive));
   }
   if (release.sha256 !== file.sha256 || release.size !== file.size) throw new Error('Release already has a different artifact');
+  if (updateArchive && updateFile && updateKey) {
+    const manifest = { ...identity, ...updateFile, id: release.id, kind: desktopUpdateKind(os) };
+    const signature = sign(null, desktopUpdateBytes(manifest), updateKey).toString('base64url');
+    release = await api(path);
+    if (release.status === 'draft' && (release.update?.sha256 !== updateFile.sha256 || release.update?.signature !== signature)) {
+      release = await api(path + '/update-artifact?revision=' + release.revision, 'PUT', Bun.file(updateArchive), undefined,
+        { 'X-OneX-Update-Signature': signature });
+    }
+    if (release.update?.sha256 !== updateFile.sha256 || release.update?.size !== updateFile.size || release.update?.signature !== signature) {
+      throw new Error('Release already has a different signed update or was published without one');
+    }
+  }
   if (release.status === 'draft') return api(path + '/publish', 'POST', { revision: release.revision }, 'edge-publish-' + key + '-' + release.revision);
   if (release.status !== 'published') throw new Error('Choose a new version for an unlisted installer');
   return release;
@@ -161,9 +183,10 @@ try {
   let result;
   if (command === 'pack-server' && (args.length === 1 || args.length === 2)) result = await packServer(args[0], args[1]);
   else if (command === 'publish-server' && args.length === 3) result = await publishServer(args[0], args[1], args[2]);
-  else if (command === 'publish-edge' && args.length === 4) result = await publishEdge(args[0], args[1], args[2], args[3]);
+  else if (command === 'publish-edge' && (args.length === 4 || args.length === 5)) result = await publishEdge(args[0], args[1], args[2], args[3], args[4]);
+  else if (command === 'edge-update-public-key' && args.length === 0) result = createPublicKey(edgeUpdateSigningKey()).export({ format: 'jwk' }).x;
   else if (command === 'rollout' && args.length === 2) result = await waitForRollout(await connect(args[0]), args[1]);
-  else throw new Error('Usage: release.ts pack-server DIR [COMMIT] | publish-server URL MANIFEST ARCHIVE | publish-edge URL OS VERSION INSTALLER | rollout URL ID');
+  else throw new Error('Usage: release.ts pack-server DIR [COMMIT] | publish-server URL MANIFEST ARCHIVE | publish-edge URL OS VERSION INSTALLER [UPDATE] | edge-update-public-key | rollout URL ID');
   console.log(JSON.stringify(result));
 } catch (error) {
   console.error(JSON.stringify({ status: 'failed', error: error instanceof Error ? error.message : 'release_failed' }));

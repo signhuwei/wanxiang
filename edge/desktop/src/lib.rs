@@ -2,8 +2,11 @@
 pub mod bridge;
 mod profile;
 mod tray;
+mod update_platform;
+mod updater;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::Value;
 use tauri::{Manager, State, WebviewWindow, WebviewWindowBuilder};
@@ -14,7 +17,12 @@ use bridge::{Bridge, Op};
 /// 返回类型固定 `Ok`：前端始终按 `{ok, state|error}` 这一种成功的 IPC 外形解析，区分「本次操作被拒绝
 /// （ok:false）」和「IPC 本身失败（Tauri reject）」没有意义，也避免 reject 路径携带原始错误文本。
 #[tauri::command]
-async fn desktop_call(window: WebviewWindow, bridge: State<'_, Bridge>, request: Value) -> Result<Value, ()> {
+async fn desktop_call(
+    window: WebviewWindow,
+    bridge: State<'_, Bridge>,
+    updates: State<'_, Arc<updater::Updater>>,
+    request: Value,
+) -> Result<Value, ()> {
     if window.label() != "main" || !window.url().is_ok_and(|url| local_page(&url)) {
         return Ok(reply_err("forbidden", "没有权限执行此操作"));
     }
@@ -22,8 +30,25 @@ async fn desktop_call(window: WebviewWindow, bridge: State<'_, Bridge>, request:
         Ok(op) => op,
         Err(_) => return Ok(reply_err("invalid", "请检查输入内容")),
     };
+    let (op, requested_update) =
+        if let Op::InstallUpdate { version } = op { (Op::State, Some(version)) } else { (op, None) };
     Ok(match bridge.call(op).await {
-        Ok(state) => serde_json::json!({"ok": true, "state": state}),
+        Ok(state) => {
+            let origin = &state.settings.server_origin;
+            let update = if let Some(version) = requested_update {
+                let Some(update) = updates.install(&version, origin, window.app_handle().clone()) else {
+                    return Ok(reply_err("update_unavailable", "更新已变更或暂不可用"));
+                };
+                Some(update)
+            } else {
+                updates.observe(origin)
+            };
+            let mut state = serde_json::json!(state);
+            if let Some(update) = update {
+                state["desktop_update"] = serde_json::json!(update);
+            }
+            serde_json::json!({"ok": true, "state": state})
+        }
         Err(e) => reply_err(&e.code, &e.message),
     })
 }
@@ -89,6 +114,9 @@ pub fn run() {
             tauri::async_runtime::block_on(ensure_onexd_running(&sock, None));
             let version = app.package_info().version.to_string();
             let initial_version = serde_json::to_string(&version)?;
+            app.manage(updater::Updater::new(app.package_info().version.clone()));
+            #[cfg(target_os = "macos")]
+            tauri::async_runtime::spawn(updater::activate_daemon_update(sock.clone(), version.clone()));
             let bridge = Bridge::with_version(sock, version);
             app.manage(bridge);
             let config = &app.config().app.windows[0];

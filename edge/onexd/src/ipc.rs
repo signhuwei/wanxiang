@@ -50,7 +50,7 @@ pub struct LaunchCtx {
     pub http: reqwest::Client,
     /// launch_id → 进行中的启动
     running: Arc<std::sync::Mutex<std::collections::HashMap<String, Running>>>,
-    preparing: std::sync::Mutex<Option<Preparation>>,
+    preparing: std::sync::Mutex<PreparationSlot>,
     download_failed: std::sync::Mutex<HashMap<String, String>>,
     desktop_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -78,11 +78,17 @@ struct Preparation {
     progress: Option<ArtifactProgress>,
 }
 
-struct Preparing<'a>(&'a std::sync::Mutex<Option<Preparation>>);
+#[derive(Default)]
+struct PreparationSlot {
+    current: Option<Preparation>,
+    stopping: bool,
+}
+
+struct Preparing<'a>(&'a std::sync::Mutex<PreparationSlot>);
 
 impl Drop for Preparing<'_> {
     fn drop(&mut self) {
-        self.0.lock().unwrap().take();
+        self.0.lock().unwrap().current = None;
     }
 }
 
@@ -100,10 +106,10 @@ impl LaunchCtx {
 
     fn reserve_preparation(&self, agent: &str) -> bool {
         let mut preparing = self.preparing.lock().unwrap();
-        if preparing.is_some() {
+        if preparing.stopping || preparing.current.is_some() {
             return false;
         }
-        *preparing = Some(Preparation { agent: agent.to_owned(), release_id: None, progress: None });
+        preparing.current = Some(Preparation { agent: agent.to_owned(), release_id: None, progress: None });
         true
     }
 
@@ -112,13 +118,13 @@ impl LaunchCtx {
     }
 
     fn progress(&self, update: ArtifactProgress) {
-        if let Some(preparation) = self.preparing.lock().unwrap().as_mut() {
+        if let Some(preparation) = self.preparing.lock().unwrap().current.as_mut() {
             preparation.progress = Some(update);
         }
     }
 
     fn bind_preparation(&self, release: &str) {
-        if let Some(preparation) = self.preparing.lock().unwrap().as_mut() {
+        if let Some(preparation) = self.preparing.lock().unwrap().current.as_mut() {
             preparation.release_id = Some(release.to_owned());
         }
     }
@@ -140,6 +146,18 @@ impl LaunchCtx {
             return true;
         }
         self.has_previous_cli()
+    }
+
+    fn stop_preparations_when_idle(&self) -> bool {
+        let mut preparing = self.preparing.lock().unwrap();
+        if preparing.current.is_some()
+            || self.has_open_agents()
+            || self.desktop_tasks.lock().unwrap().iter().any(|task| !task.is_finished())
+        {
+            return false;
+        }
+        preparing.stopping = true;
+        true
     }
 }
 
@@ -208,6 +226,7 @@ async fn handle(stream: Connection, ipc: &Arc<Ipc>, socket: &Path) -> Result<()>
                 | Request::ResumeDevice { .. }
                 | Request::Logout
                 | Request::LogoutDevice { .. }
+                | Request::ShutdownWhenIdle
                 | Request::Shutdown)
         ) {
             Some(ipc.identity_transition.lock().await)
@@ -297,6 +316,16 @@ async fn dispatch(req: Request, ipc: &Arc<Ipc>, socket: &Path) -> (Value, bool) 
                 Ok(()) => (json!({"ok": true}), false),
                 Err(e) => (err("invalid", &format!("{e:#}")), false),
             }
+        }
+        Request::ShutdownWhenIdle => {
+            if ipc.state.upstream.lock().unwrap().inflight != 0
+                || ipc.state.lease.has_active_requests()
+                || !ipc.launch.as_ref().is_none_or(LaunchCtx::stop_preparations_when_idle)
+            {
+                return (err("agents_running", "等待受管 Agent、下载及请求结束后再更新后台服务"), false);
+            }
+            info!("idle upgrade shutdown requested via ipc");
+            (json!({"ok": true}), true)
         }
         Request::Shutdown => {
             info!("shutdown requested via ipc");
@@ -1283,7 +1312,7 @@ fn status(ipc: &Ipc) -> Status {
         .as_ref()
         .map(|ctx| {
             let (os, arch) = (onex_core::ipc::os_name(), onex_core::ipc::arch_name());
-            let preparing = ctx.preparing.lock().unwrap().clone();
+            let preparing = ctx.preparing.lock().unwrap().current.clone();
             let running = ctx.running.lock().unwrap();
             let download_failed = ctx.download_failed.lock().unwrap();
             LAUNCHABLE_AGENTS
@@ -1371,6 +1400,96 @@ async fn write_line(w: &mut (impl AsyncWriteExt + Unpin), v: &Value) -> Result<(
     s.push('\n');
     w.write_all(s.as_bytes()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn upgrade_shutdown_keeps_live_agents_and_waits_for_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("onexd.sock");
+        let shutdown = CancellationToken::new();
+        let launch = LaunchCtx::new(dir.path().into(), reqwest::Client::new());
+        let service = Arc::new(Ipc {
+            state: Arc::new(State::default()),
+            outbox: Arc::new(Outbox::open(&dir.path().join("outbox.sqlite")).unwrap()),
+            router_addr: None,
+            server_url: None,
+            launch: Some(launch),
+            credentials: None,
+            identity_transition: Default::default(),
+            shutdown: shutdown.clone(),
+        });
+        let ctx = service.launch.as_ref().unwrap();
+        let listener = bind(&socket).await.unwrap();
+        let daemon = tokio::spawn(serve(listener, socket.clone(), service.clone()));
+        let request = || onex_core::daemon::exchange(&socket, &Request::ShutdownWhenIdle);
+
+        for agent in ["claude-code", "deepseek-desktop"] {
+            let stop = shutdown.child_token();
+            ctx.running.lock().unwrap().insert(
+                agent.into(),
+                Running {
+                    agent: agent.into(),
+                    stop: stop.clone(),
+                    code: Default::default(),
+                    capture: None,
+                    session_id: format!("session-{agent}"),
+                    token: format!("token-{agent}"),
+                    search: None,
+                },
+            );
+            assert_eq!(request().await.unwrap()["error"]["code"], "agents_running");
+            assert!(!stop.is_cancelled());
+            assert!(ctx.running.lock().unwrap().remove(agent).is_some());
+        }
+
+        let run = dir.path().join("run").join(crate::id::new("lch"));
+        std::fs::create_dir_all(&run).unwrap();
+        let previous_cli = onex_core::run_lock::claim(&run).unwrap();
+        assert_eq!(request().await.unwrap()["error"]["code"], "agents_running");
+        drop(previous_cli);
+
+        {
+            let _download = ctx.try_prepare("codex").unwrap();
+            assert_eq!(request().await.unwrap()["error"]["code"], "agents_running");
+        }
+        let finishing = CancellationToken::new();
+        ctx.desktop_tasks.lock().unwrap().push(tokio::spawn(finishing.clone().cancelled_owned()));
+        assert_eq!(request().await.unwrap()["error"]["code"], "agents_running");
+        finishing.cancel();
+        let capture = ctx.desktop_tasks.lock().unwrap().pop().unwrap();
+        capture.await.unwrap();
+
+        service
+            .state
+            .lease
+            .grant(&onex_core::ws::Lease {
+                id: "lease-message".into(),
+                re: None,
+                lease_id: "lease-in-flight".into(),
+                expires_at: format_ms(crate::outbox::now_ms() + 180_000),
+                budget_milli: 100,
+                model_budgets: Default::default(),
+                commerce_plan_id: None,
+                seq: 1,
+            })
+            .unwrap();
+        let ticket = service.state.lease.admit(0).unwrap();
+        assert_eq!(request().await.unwrap()["error"]["code"], "agents_running");
+        drop(ticket);
+
+        service.state.upstream.lock().unwrap().inflight = 1;
+        assert_eq!(request().await.unwrap()["error"]["code"], "agents_running");
+        service.state.upstream.lock().unwrap().inflight = 0;
+
+        assert_eq!(request().await.unwrap()["ok"], true);
+        assert!(ctx.try_prepare("codex").is_none());
+        daemon.await.unwrap();
+        assert!(shutdown.is_cancelled());
+    }
 }
 
 #[cfg(test)]

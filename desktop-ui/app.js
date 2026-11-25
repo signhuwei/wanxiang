@@ -15,9 +15,13 @@ const call=invoke ? request=>invoke('desktop_call',{request}) : demo ? (await im
 $('badge').hidden=!demo
 let state,busy=false,activeTab='workbench',last='',serial=0
 const seenNotices=new Set()
-const messages={unauthenticated:'登录凭据无效或已过期',forbidden:'没有权限执行此操作',not_found:'对象不存在',conflict:'状态已变化，请刷新后重试',device_already_logged_in:'本机 OneX 已登录。请用同一租户和账号登录，或先用 OneX 命令行退出。',agents_running:'请先关闭已启动的 OneX Agent',history_unavailable:'暂时无法恢复当前账号的本机会话',invalid:'请检查输入内容',seat_limit:'租户人数已达合约上限',balance_exhausted:'橡皮余额不足',lease_expired:'额度租约已过期',agent_not_allowed:'合约不允许该 Agent',model_not_allowed:'合约不允许该模型',rate_limited:'请求过快，请稍后重试',upstream_error:'上游服务出错',internal:'服务内部错误'}
+const messages={unauthenticated:'登录凭据无效或已过期',forbidden:'没有权限执行此操作',not_found:'对象不存在',conflict:'状态已变化，请刷新后重试',device_already_logged_in:'本机 OneX 已登录。请用同一租户和账号登录，或先用 OneX 命令行退出。',agents_running:'请先关闭已启动的 OneX Agent',history_unavailable:'暂时无法恢复当前账号的本机会话',invalid:'请检查输入内容',seat_limit:'租户人数已达合约上限',balance_exhausted:'橡皮余额不足',lease_expired:'额度租约已过期',agent_not_allowed:'合约不允许该 Agent',model_not_allowed:'合约不允许该模型',rate_limited:'请求过快，请稍后重试',upstream_error:'上游服务出错',update_unavailable:'当前更新已不可用，请稍后重试',update_failed:'Desktop 更新失败，请重试',internal:'服务内部错误'}
 const errorText=code=>typeof code==='string' && Object.hasOwn(messages,code) ? messages[code] : '操作失败，请稍后重试'
 const labels={update_available:'有可用更新',available:'可启动',not_downloaded:'待下载',downloading:'下载中',verifying:'校验中',starting:'启动中',running:'运行中',failed:'启动失败',download_failed:'下载失败',policy_pending:'等待配置同步'}
+const updateLabels={available:'有更新',downloading:'下载更新中',installing:'安装更新中',failed:'重试更新'}
+const updateButton=$('desktop-update')
+const updateDialog=$('desktop-update-dialog')
+let confirmedVersion
 const metricFormat=new Intl.NumberFormat('zh-CN',{maximumFractionDigits:3})
 function node(tag,text){const n=document.createElement(tag);if(text!=null)n.textContent=text;return n}
 function button(text,click,primary=false){const b=node('button',text);b.type='button';b.onclick=click;if(primary)b.className='primary';return b}
@@ -60,6 +64,7 @@ function paintLogin(content) {
 
 function paint(){
   if (!installedVersion) showVersion(state.version)
+  paintUpdate()
   const c=$('content');c.replaceChildren();$('notice').textContent='';$('scope').textContent=state.tenant ? `${state.tenant.name} · ${state.user?.name||''} · `+({connected:'已连接',connecting:'连接中',backoff:'断线重连中',idle:'未连接'}[state.connection]||state.connection) : '员工工作区'
   $('messages').hidden=state.phase!=='ready'
   const unread=(state.notices??[]).filter(notice=>!seenNotices.has(notice.id)).length
@@ -77,6 +82,59 @@ function paint(){
     paintMessages(c)
   } else {
     paintWorkbench(c)
+  }
+}
+
+function canInstallUpdate(update) {
+  return update?.phase==='available'||update?.phase==='failed'
+}
+
+function paintUpdate() {
+  const update=state?.desktop_update
+  updateButton.hidden=!update?.version||!Object.hasOwn(updateLabels,update.phase)
+  if (updateButton.hidden) return
+  updateButton.disabled=!canInstallUpdate(update)
+  updateButton.title=`目标版本 ${update.version}`
+  updateButton.textContent=updateLabels[update.phase]
+  if (update.phase==='downloading'&&update.total_bytes>0&&Number.isFinite(update.downloaded_bytes)) {
+    updateButton.textContent+=` ${Math.min(100,Math.floor(100*update.downloaded_bytes/update.total_bytes))}%`
+  }
+}
+
+function openUpdateDialog() {
+  const update=state?.desktop_update
+  if (busy||!canInstallUpdate(update)||!update.version) return
+  confirmedVersion=update.version
+  $('desktop-update-version').textContent=confirmedVersion
+  if (typeof updateDialog.showModal==='function') updateDialog.showModal()
+  else {
+    updateDialog.classList.add('dialog-fallback')
+    updateDialog.setAttribute('open','')
+  }
+  $('cancel-desktop-update').focus()
+}
+
+function closeUpdateDialog() {
+  confirmedVersion=undefined
+  if (typeof updateDialog.close==='function') updateDialog.close()
+  else updateDialog.removeAttribute('open')
+  updateButton.focus()
+}
+
+async function installUpdate() {
+  const version=confirmedVersion
+  closeUpdateDialog()
+  const update=state?.desktop_update
+  if (!version||busy) return
+  if (update?.version!==version||!canInstallUpdate(update)) {
+    $('notice').textContent=errorText('update_unavailable')
+    return
+  }
+  updateButton.disabled=true
+  try {
+    await act({op:'install_update',version})
+  } finally {
+    paintUpdate()
   }
 }
 
@@ -212,4 +270,13 @@ function openTab(tab) {
 $('home').onclick=()=>openTab('workbench')
 $('messages').onclick=()=>openTab('messages')
 $('prefs').onclick=()=>openTab('settings')
+updateButton.onclick=openUpdateDialog
+$('cancel-desktop-update').onclick=closeUpdateDialog
+$('confirm-desktop-update').onclick=installUpdate
+updateDialog.onkeydown=event=>{
+  if (event.key==='Escape') {
+    event.preventDefault()
+    closeUpdateDialog()
+  }
+}
 if(!call){$('title').textContent='未连接桌面服务';$('content').textContent='请从 OneX Desktop 打开；浏览器演示请显式使用 ?mock=1。'}else{await refresh();setInterval(refresh,2000);document.addEventListener('visibilitychange',refresh)}

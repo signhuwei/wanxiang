@@ -2,6 +2,14 @@
 
 .brand{display:grid;flex:none;gap:2px}
 #desktop-version{color:#556675;font-size:13px;font-variant-numeric:tabular-nums;white-space:nowrap}
+#desktop-update{white-space:nowrap}
+#desktop-update-dialog{width:min(390px,calc(100% - 32px));padding:18px;border:1px solid #bdcad8;border-radius:8px;color:inherit;background:#fff}
+#desktop-update-dialog:not([open]){display:none}
+#desktop-update-dialog::backdrop{background:rgba(32,48,71,.36)}
+#desktop-update-dialog.dialog-fallback{position:fixed;z-index:1;inset:0;margin:auto;height:fit-content;box-shadow:0 0 0 100vmax rgba(32,48,71,.36)}
+#desktop-update-dialog h2{margin:0;font-size:18px}
+#desktop-update-dialog p{margin:10px 0 16px}
+.dialog-actions{display:flex;justify-content:flex-end;gap:8px}
 .workbench-totals{display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:10px;margin:0 0 16px}
 .workbench-totals dt,.notice-list small,.agent-vendor h3{color:#556675;font-size:13px}
 .workbench-totals dd{font-weight:600;margin:2px 0}
@@ -15,4 +23,4 @@
 .notice-list{list-style:none;padding:0;margin:0}
 .notice-list li{padding:8px 0;border-bottom:1px solid #d9e1eb}
 .notice-list small{display:block}
-header nav{flex-wrap:wrap}
+header nav{flex-wrap:wrap;justify-content:flex-end}

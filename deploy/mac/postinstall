@@ -10,6 +10,8 @@ service=$domain/$label
 [[ $user_id -gt 0 ]] && /bin/launchctl print "$domain" >/dev/null 2>&1 || exit 0
 
 if /bin/launchctl print "$service" >/dev/null 2>&1; then
+  # Desktop updates leave the registered daemon and all its Agent sessions running.
+  [[ ! -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/preserve-daemon" ]] || exit 0
   /bin/launchctl bootout "$service"
   # bootout starts shutdown. The old job may still own the label after it returns.
   remaining=100

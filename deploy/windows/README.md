@@ -12,6 +12,8 @@
 
 `-Version` 写入安装器和 Desktop 应用。安装后，在首页 Logo 下核对完整版本号，再把构建输出的同一 `version` 传给 [发布命令](../README.md#平台维护与发布) `publish-edge <Server 地址> windows <版本> <安装包路径>`。本机构建省略 `-Version` 时使用仓库的 Tauri 默认版本。
 
+启用标题栏更新时，将同一次构建输出的 `desktop_update` 文件作为签名更新制品。它只替换 Desktop 程序，已经启动的 Agent 继续由原 daemon 纳管。CLI、daemon 和依赖升级仍由完整的 NSIS 安装器交付。
+
 安装器一起安装 OneX Desktop、`onex.exe` 和 `onexd.exe`，并为当前用户注册 Edge daemon 登录自启和终端命令。安装完成后完全退出并重新打开 Windows Terminal 或 PowerShell，可运行 `(Get-Command onex).Source` 查看命令路径，运行 `onex status` 查看设备状态。CLI 和 Desktop 使用同一 daemon 与设备身份。
 
 Edge 安装器写入应用前会执行 `git --version`，并检查 Git for Windows 的注册表安装路径。缺失时优先用当前用户的 WinGet 安装官方 `Git.Git`。没有 WinGet 的设备从 Git for Windows 官方发行下载固定的 x64 安装器，按微软清单核对 SHA-256 后执行。Git 仍不可用时，安装器显示错误并退出。Edge 会从注册表找到新装的 Git，安装器启动的首个 Agent 也可直接使用。 [Git for Windows 安装](https://git-scm.com/install/windows) · [WinGet 安装命令](https://learn.microsoft.com/en-us/windows/package-manager/winget/install)

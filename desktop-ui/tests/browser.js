@@ -64,14 +64,20 @@ try{
   }
   const workbench=await b.newPage({viewport:{width:360,height:620}})
   await workbench.addInitScript(()=>{
+    window.desktopInstallRequests=[]
     window.__TAURI__={core:{invoke:async (_, {request})=>{
       if(request.op==='download') window.downloadRequested=request.agent_id
+      if(request.op==='install_update'){
+        window.desktopInstallRequests.push(request)
+        window.desktopUpdate={version:request.version,phase:'downloading',downloaded_bytes:25,total_bytes:100}
+      }
       const downloading=!!window.downloadRequested
       return {ok:true,state:{
         version:'test',phase:'ready',tenant:{id:'ten_demo',name:'示例租户'},connection:'connected',
         settings:{server_origin:'https://example.invalid',hide_on_close:true},
         local_usage:{cost_milli:2125,model_duration_ms:2000,input_tokens:12,output_tokens:34},
         policy:{policy_revision:7,display:[{id:'lease.budget',title:'租约额度',kind:'money_milli',value:2125}]},
+        desktop_update:window.desktopUpdate,
         notices:[{id:'pch_test',title:'能力配置已变更',at:'2026-11-21T05:44:00Z',policy_revision:7}],
         agents:[
           {id:'claude-code',vendor:'Anthropic',name:'Claude Code',status:downloading?'downloading':'not_downloaded',
@@ -93,5 +99,45 @@ try{
   await workbench.getByRole('button',{name:'消息列表（1）'}).click()
   await workbench.getByText('能力配置已变更',{exact:true}).first().waitFor()
   await workbench.getByRole('button',{name:'消息列表',exact:true}).waitFor()
-  console.log('Desktop：登录、设置、桥错误、配置消息、实例计数及下载进度通过')
+  const updateButton=workbench.locator('header #desktop-update')
+  assert.equal(await updateButton.isVisible(),false)
+  await workbench.evaluate(()=>{
+    window.desktopUpdate={version:'0.1.0-rc21',phase:'available'}
+  })
+  await updateButton.waitFor()
+  assert.equal(await updateButton.innerText(),'有更新')
+  assert.equal(await workbench.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true)
+  await workbench.getByText('版本 test',{exact:true}).waitFor()
+  await updateButton.click()
+  const updateDialog=workbench.getByRole('dialog',{name:'重启更新 OneX Desktop'})
+  await updateDialog.getByText('0.1.0-rc21',{exact:true}).waitFor()
+  await updateDialog.getByText(/已启动的 Agent 会继续运行，重启后仍可在工作台管理/).waitFor()
+  assert.deepEqual(await workbench.evaluate(()=>window.desktopInstallRequests),[])
+  await workbench.keyboard.press('Escape')
+  await updateDialog.waitFor({state:'hidden'})
+  await updateButton.click()
+  await updateDialog.getByRole('button',{name:'取消',exact:true}).click()
+  assert.deepEqual(await workbench.evaluate(()=>window.desktopInstallRequests),[])
+  await updateButton.click()
+  await workbench.evaluate(()=>{
+    window.desktopUpdate={version:'0.1.0-rc22',phase:'available'}
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  await workbench.waitForFunction(()=>document.getElementById('desktop-update').title==='目标版本 0.1.0-rc22')
+  await updateDialog.getByRole('button',{name:'重启更新',exact:true}).click()
+  await workbench.getByRole('status').getByText('当前更新已不可用，请稍后重试',{exact:true}).waitFor()
+  assert.deepEqual(await workbench.evaluate(()=>window.desktopInstallRequests),[])
+  await updateButton.click()
+  await updateDialog.getByText('0.1.0-rc22',{exact:true}).waitFor()
+  await updateDialog.getByRole('button',{name:'重启更新',exact:true}).click()
+  await workbench.getByRole('button',{name:'下载更新中 25%',exact:true}).waitFor()
+  assert(await updateButton.isDisabled())
+  assert.deepEqual(await workbench.evaluate(()=>window.desktopInstallRequests),[{op:'install_update',version:'0.1.0-rc22'}])
+  await workbench.evaluate(()=>{
+    window.desktopUpdate={version:'0.1.0-rc22',phase:'failed'}
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  await workbench.getByRole('button',{name:'重试更新',exact:true}).waitFor()
+  assert.equal(await updateButton.isEnabled(),true)
+  console.log('Desktop：登录、设置、桥错误、配置消息、实例计数、下载进度及更新确认通过')
 }finally{await b.close();server.stop(true)}

@@ -409,6 +409,10 @@ impl Ledger {
         self.inner.lock().unwrap().saved.lease.as_ref().map(|g| g.lease_id.clone())
     }
 
+    pub(crate) fn has_active_requests(&self) -> bool {
+        !self.inner.lock().unwrap().inflight.is_empty()
+    }
+
     /// 检查当前租约是否允许访问，不预留额度或创建计费请求。
     pub(crate) fn check_access(&self) -> Result<(), Block> {
         self.inner.lock().unwrap().block(Instant::now()).map_or(Ok(()), Err)

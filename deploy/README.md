@@ -95,4 +95,14 @@ ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token bun deploy/release.ts
 
 `publish-edge` 的 Windows 对应参数为 `windows VERSION installer.exe`。如已有全局管理会话，使用 `ONEX_RELEASE_TOKEN_FILE`。命令将凭据从文件读入，标准输出返回一条 JSON。Server 发布可通过 `ONEX_EXPECTED_COMMIT` 固定当前版本，`ONEX_RELEASE_REQUEST_ID` 固定幂等键。完成后根据返回的任务状态和 `observed_commit` 验证运行版本。失败任务保留，确认原因后用新幂等键发起重试。
 
+启用 Desktop 自动更新时，在签名环境保管独立的 Ed25519 Edge 更新私钥。更新公钥可通过 `ONEX_EDGE_UPDATE_PRIVATE_KEY=/secure/edge-update.key bun deploy/release.ts edge-update-public-key` 导出。将 JSON 字符串的内容设置为构建环境的 `ONEX_DESKTOP_UPDATE_KEY`，使安装后的 Desktop 能验证未来发行。分发引导包与后续更新制品需要使用同一信任公钥。
+
+macOS 更新制品使用 `deploy/mac/package.sh` 的 `--preserve-daemon` 参数，应用包版本与发布号保持一致。Windows 使用构建输出的 `desktop_update` 指向的 `onex-desktop.exe`。发布时提供手动安装器和可选更新制品两条路径。
+
+```sh
+ONEX_EDGE_UPDATE_PRIVATE_KEY=/secure/edge-update.key \
+ONEX_RELEASE_TOKEN_FILE=/secure/platform-session.token \
+  bun deploy/release.ts publish-edge https://onex.example darwin 1.2.3 /secure/OneX.pkg /secure/OneX-preserve-daemon.pkg
+```
+
 主机日志可按任务 ID 查 `journalctl -u onex-release-worker.service`。业务库备份在 OneX 的 `backups/`。如果候选迁移使上一版无法启动，按备份恢复流程评估恢复时间点。发布制品密钥与 macOS 签名公证独立。

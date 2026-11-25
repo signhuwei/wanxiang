@@ -1,10 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-if [[ $# != 5 && $# != 6 ]]; then
-  echo 'Usage: package.sh <OneX Desktop.app> <onex> <onexd> <server-origin> <output.pkg> [--release]' >&2
+usage() {
+  echo 'Usage: package.sh <OneX Desktop.app> <onex> <onexd> <server-origin> <output.pkg> [--release] [--preserve-daemon]' >&2
   exit 2
-fi
+}
+[[ $# -ge 5 && $# -le 7 ]] || usage
 
 [[ $(uname -m) == arm64 ]] || { echo 'Build this package on an Apple Silicon Mac.' >&2; exit 2; }
 
@@ -14,10 +15,14 @@ daemon=$3
 origin=${4%/}
 output=$5
 release=0
-if [[ $# == 6 ]]; then
-  [[ $6 == --release ]] || { echo 'Usage: package.sh <OneX Desktop.app> <onex> <onexd> <server-origin> <output.pkg> [--release]' >&2; exit 2; }
-  release=1
-fi
+preserve_daemon=0
+for flag in "${@:6}"; do
+  case "$flag" in
+    --release) release=1 ;;
+    --preserve-daemon) preserve_daemon=1 ;;
+    *) usage ;;
+  esac
+done
 scripts=$(cd "$(dirname "$0")" && pwd)
 identifier=com.onex.desktop
 agent=$identifier.edge
@@ -88,6 +93,9 @@ done
 for hook in preinstall postinstall; do
   install -m 0755 "$scripts/$hook" "$stage/scripts/$hook"
 done
+if [[ $preserve_daemon == 1 ]]; then
+  touch "$stage/scripts/preserve-daemon"
+fi
 
 cat > "$launch_agents/$agent.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -120,6 +128,10 @@ fi
 
 "$pkgbuild_bin" --analyze --root "$payload" "$stage/components.plist"
 "$plutil_bin" -replace 0.BundleIsRelocatable -bool NO "$stage/components.plist"
+if [[ $preserve_daemon == 1 ]]; then
+  # The old daemon still executes the previous signed binary. Replace the app bundle atomically.
+  "$plutil_bin" -replace 0.BundleOverwriteAction -string upgrade "$stage/components.plist"
+fi
 echo "==> Building the installer package" >&2
 # Always non-empty for the same bash 3.2 unbound-variable reason as codesign_args above: start
 # from the base flags every build needs, then append the release-only --sign/--timestamp pair.

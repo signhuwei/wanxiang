@@ -10,6 +10,7 @@ import { serveStatic } from 'hono/bun';
 import { ulid } from 'ulid';
 import { ApiError, field, invalid, json, operation } from './api';
 import { iso } from './credentials';
+import { desktopUpdateKind } from './desktop-update-signature';
 import { receiveArtifact } from './artifact-upload';
 import { expectRevision, pagination, platformActor, type ManagementOptions } from './management';
 import type { Store, Transaction } from './store';
@@ -19,8 +20,8 @@ import type { Store, Transaction } from './store';
 const platforms = [['darwin', 'arm64'], ['windows', 'x64']] as const;
 const semver = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 export const DESKTOP_ARTIFACT_MAX_BYTES = 256 * 1024 * 1024;
-export const DESKTOP_ARTIFACT_UPLOAD_PATH = /^\/v1\/platform\/desktop-releases\/[^/]+\/artifact$/;
-export const DESKTOP_ARTIFACT_DOWNLOAD_PATH = /^\/v1\/desktop-releases\/[^/]+\/download$/;
+export const DESKTOP_ARTIFACT_UPLOAD_PATH = /^\/v1\/platform\/desktop-releases\/[^/]+\/(?:update-)?artifact$/;
+export const DESKTOP_ARTIFACT_DOWNLOAD_PATH = /^\/v1\/desktop-releases\/[^/]+\/(?:update-)?download$/;
 
 function platform(body: Record<string, unknown>) {
   const os = field(body.os, 'os', 16);
@@ -37,6 +38,12 @@ function version(body: Record<string, unknown>) {
 
 type ReleaseRow = { id: string; version: string; os: string; arch: string; status: string; size: number | null;
   sha256: string | null; artifact_path: string | null; published_at: string | null; revision: number };
+type DesktopUpdateRow = { size: number; sha256: string; signature: string; artifact_path: string };
+type PublishedUpdate = DesktopUpdateRow & Pick<ReleaseRow, 'id' | 'version' | 'os' | 'arch'>;
+const publishedUpdates = `SELECT r.id, r.version, r.os, r.arch, u.size, u.sha256, u.signature, u.artifact_path
+  FROM desktop_releases r JOIN desktop_release_updates u ON u.release_id = r.id WHERE r.status = 'published'`;
+const updateView = ({ id, version, os, arch, size, sha256, signature }: PublishedUpdate) =>
+  ({ id, version, os, arch, kind: desktopUpdateKind(os), size, sha256, signature });
 
 function auditRelease(sql: Transaction, actor: string, action: 'publish' | 'unpublish', row: ReleaseRow, at: string, supersededBy?: string) {
   const { os, arch, version } = row;
@@ -123,7 +130,8 @@ export function desktopReleaseRoutes(app: Hono, store: Store, opts: ManagementOp
     const id = field(c.req.param('id'), 'id');
     const row = store.system.get<ReleaseRow>('SELECT * FROM desktop_releases WHERE id = ?', [id]);
     if (!row) throw new ApiError('not_found');
-    return c.json(view(row));
+    const update = store.system.get<DesktopUpdateRow>('SELECT * FROM desktop_release_updates WHERE release_id = ?', [id]);
+    return c.json({ ...view(row), ...(update && { update: updateView({ ...row, ...update }) }) });
   });
 
   app.post('/v1/platform/desktop-releases', async (c) => {
@@ -148,13 +156,16 @@ export function desktopReleaseRoutes(app: Hono, store: Store, opts: ManagementOp
   });
 
   // 原始字节走 PUT，客户端以当前草稿修订重传。并发尝试各自拥有一个文件，落败的请求只能清理自己的文件。
-  app.put('/v1/platform/desktop-releases/:id/artifact', async (c) => {
+  app.put('/v1/platform/desktop-releases/:id/:artifact{(?:update-)?artifact}', async (c) => {
     const at = opts.now();
     const id = field(c.req.param('id'), 'id');
     const actor = platformActor(store, c, at);
     const rawRevision = c.req.query('revision');
     if (rawRevision === undefined || !/^\d+$/.test(rawRevision)) invalid('revision');
     const revision = Number(rawRevision);
+    const isUpdate = c.req.param('artifact') === 'update-artifact';
+    const signature = c.req.header('x-onex-update-signature');
+    if (isUpdate && (!signature || !/^[A-Za-z0-9_-]{86}$/.test(signature))) invalid('signature');
     // Fail fast on a doomed upload (wrong draft, wrong state, stale revision) before spending the time
     // and disk to stream up to 256 MiB; the final write below re-checks the same things for real.
     const claimed = await store.system.write((sql) => {
@@ -170,7 +181,12 @@ export function desktopReleaseRoutes(app: Hono, store: Store, opts: ManagementOp
     const finalPath = `${uploadPath}.bin`;
     const { size, sha256 } = await receiveArtifact(c.req.raw, tempPath, DESKTOP_ARTIFACT_MAX_BYTES);
     try {
-      checkFormat(claimed.os, await readHeader(tempPath, Math.min(HEADER_PROBE_BYTES, size)), size);
+      const header = await readHeader(tempPath, Math.min(HEADER_PROBE_BYTES, size));
+      checkFormat(claimed.os, header, size);
+      if (isUpdate && claimed.os === 'windows') {
+        const pe = new DataView(header.buffer, header.byteOffset, header.byteLength);
+        if (pe.getUint16(pe.getUint32(0x3c, true) + 4, true) !== 0x8664) invalid('artifact');
+      }
       renameSync(tempPath, finalPath);
     } catch (error) {
       try { unlinkSync(tempPath); } catch {}
@@ -181,6 +197,15 @@ export function desktopReleaseRoutes(app: Hono, store: Store, opts: ManagementOp
       const row = sql.get<ReleaseRow>('SELECT * FROM desktop_releases WHERE id = ?', [id]);
       if (!row || row.status !== 'draft') throw new ApiError('conflict');
       expectRevision(revision, row.revision);
+      if (isUpdate) {
+        const previous = sql.get<DesktopUpdateRow>('SELECT * FROM desktop_release_updates WHERE release_id = ?', [id]);
+        sql.run(`INSERT INTO desktop_release_updates (release_id, size, sha256, signature, artifact_path) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(release_id) DO UPDATE SET size=excluded.size, sha256=excluded.sha256, signature=excluded.signature,
+            artifact_path=excluded.artifact_path`, [id, size, sha256, signature!, finalPath]);
+        sql.run('UPDATE desktop_releases SET revision = revision + 1 WHERE id = ?', [id]);
+        return { previousPath: previous?.artifact_path, payload: { ...view({ ...row, revision: row.revision + 1 }),
+          update: updateView({ ...row, size, sha256, signature: signature!, artifact_path: finalPath }) } };
+      }
       const updated: ReleaseRow = { ...row, size, sha256, artifact_path: finalPath, revision: row.revision + 1 };
       sql.run('UPDATE desktop_releases SET size = ?, sha256 = ?, artifact_path = ?, revision = ? WHERE id = ?',
         [updated.size, updated.sha256, updated.artifact_path, updated.revision, id]);
@@ -256,6 +281,22 @@ export function desktopReleaseRoutes(app: Hono, store: Store, opts: ManagementOp
     c.header('X-Content-Type-Options', 'nosniff');
     const rows = store.system.all<ReleaseRow>(`SELECT * FROM desktop_releases WHERE status = 'published' ORDER BY os, arch`);
     return c.json({ items: rows.map(publicRow) });
+  });
+  app.get('/v1/desktop-updates/:os/:arch', (c) => {
+    const { os, arch } = platform(c.req.param());
+    const row = store.system.get<PublishedUpdate>(`${publishedUpdates} AND r.os = ? AND r.arch = ?`, [os, arch]);
+    if (!row) throw new ApiError('not_found');
+    return c.json(updateView(row));
+  });
+  app.get('/v1/desktop-releases/:id/update-download', async (c) => {
+    const id = field(c.req.param('id'), 'id');
+    const row = store.system.get<PublishedUpdate>(`${publishedUpdates} AND r.id = ?`, [id]);
+    if (!row) throw new ApiError('not_found');
+    const file = Bun.file(row.artifact_path);
+    const stat = await file.stat().catch(() => null);
+    if (!stat || stat.size !== row.size) throw new ApiError('not_found');
+    return new Response(file, { headers: { 'content-type': 'application/octet-stream', 'content-length': String(row.size),
+      'cache-control': 'no-store', 'x-content-type-options': 'nosniff' } });
   });
   app.get('/v1/desktop-releases/:id/download', async (c) => {
     const id = field(c.req.param('id'), 'id');

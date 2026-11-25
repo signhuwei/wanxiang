@@ -154,7 +154,7 @@ async fn run(home: PathBuf, started_at: time::OffsetDateTime) -> Result<()> {
             async move { axum::serve(tcp, app).with_graceful_shutdown(async move { sd.cancelled().await }).await },
         );
     let ob = outbox.clone();
-    tokio::spawn(async move {
+    let usage_task = tokio::spawn(async move {
         while let Some(rec) = usage_rx.recv().await {
             let ob = ob.clone();
             let r = tokio::task::spawn_blocking(move || ob.append(Kind::Usage, rec.to_item())).await;
@@ -209,6 +209,8 @@ async fn run(home: PathBuf, started_at: time::OffsetDateTime) -> Result<()> {
     }
     let _ = ipc_task.await;
     router_task.await??;
+    // Wait for completed requests and delayed first-session usage records to reach the outbox.
+    usage_task.await?;
     info!("onexd stopped");
     Ok(())
 }

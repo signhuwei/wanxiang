@@ -71,6 +71,9 @@ const serverRelease = object({ id: commitId, commit: commitId, size: releaseSize
   uploaded_at: nullableTimestamp, active: { type: 'boolean' }, last_rollout: optionalRollout, actions });
 const desktopOs = { type: 'string', enum: ['darwin', 'windows'] };
 const desktopArch = { type: 'string', enum: ['arm64', 'x64'] };
+const desktopUpdate = object({ id: text, version: text, os: desktopOs, arch: desktopArch, size: releaseSize,
+  sha256: releaseDigest, signature: { type: 'string', pattern: '^[A-Za-z0-9_-]{86}$' },
+  kind: { type: 'string', enum: ['macos-pkg-keep-daemon', 'windows-desktop-exe'] } });
 const desktopRelease = managed({ id: text, version: text, os: desktopOs, arch: desktopArch,
   status: { type: 'string', enum: ['draft', 'published', 'unlisted'] }, size: { type: ['integer', 'null'], minimum: 0 },
   sha256: nullableText, published_at: nullableText });
@@ -977,13 +980,21 @@ export const openapi = {
     '/v1/platform/server-rollouts/{id}': { get: { ...detailOf(rollout), summary: '查询部署任务及实际生效版本' } },
     '/v1/platform/desktop-releases': { get: listOf(desktopRelease), post: { ...write(object({ version: text, os: desktopOs, arch: desktopArch }, ['version', 'os', 'arch']), desktopRelease, 'create'),
       description: '新建草稿；同一 os/arch/version 已存在时返回 409。' } },
-    '/v1/platform/desktop-releases/{id}': { get: { ...detailOf(desktopRelease), description: '上传结果未知时用来重新确认当前修订与摘要。' } },
+    '/v1/platform/desktop-releases/{id}': { get: { ...detailOf({ ...desktopRelease, properties: { ...desktopRelease.properties, update: desktopUpdate } }),
+      description: '上传结果未知时用来重新确认当前修订、摘要及可选的已签名更新制品。' } },
     '/v1/platform/desktop-releases/{id}/artifact': { put: { summary: '上传安装包原始字节', security: bearer,
       parameters: [idPath, { name: 'revision', in: 'query', required: true, schema: revision }],
       requestBody: { required: true, content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
       responses: { ...status, 200: response('校验通过的草稿，带字节数和摘要', desktopRelease), 404: error('对象不存在'),
         409: error('不是草稿状态或 revision 已过期'), 413: error('超出单包大小上限'), 422: error('格式或参数无效') },
       description: '仅平台管理员；S2 单包上限 256 MiB，校验实际字节数和 XAR/PE 格式后才改草稿元数据。' } },
+    '/v1/platform/desktop-releases/{id}/update-artifact': { put: { summary: '上传已签名的客户端更新制品', security: bearer,
+      parameters: [idPath, { name: 'revision', in: 'query', required: true, schema: revision },
+        { name: 'X-OneX-Update-Signature', in: 'header', required: true, schema: { type: 'string', pattern: '^[A-Za-z0-9_-]{86}$' } }],
+      requestBody: { required: true, content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
+      responses: { ...status, 200: response('带更新制品摘要的草稿', { ...desktopRelease,
+        properties: { ...desktopRelease.properties, update: desktopUpdate } }), 409: error('草稿修订或状态已变更'),
+        413: error('超出单包大小上限'), 422: error('格式或参数无效') } } },
     '/v1/platform/desktop-releases/{id}/publish': { post: { summary: '发布草稿为当前版本', security: bearer, parameters: [idPath, ...headers],
       requestBody: requestBody(object({ revision })), responses: { 200: response('已发布', desktopRelease), 404: error('对象不存在'), ...status },
       description: '要求草稿已校验（size/sha256 非空）；同一 os/arch 原来的当前版本在同一事务内转为 unlisted。' } },
@@ -994,6 +1005,13 @@ export const openapi = {
     '/v1/desktop-releases/{id}/download': { get: { summary: '员工入口：下载安装包', parameters: [idPath],
       responses: { 200: { description: '安装包二进制', content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
         404: error('未发布或不存在') }, description: '无需登录；同源附件下载，固定文件名。' } },
+    '/v1/desktop-updates/{os}/{arch}': { get: { summary: '当前可自动安装的签名更新',
+      parameters: [{ name: 'os', in: 'path', required: true, schema: desktopOs },
+        { name: 'arch', in: 'path', required: true, schema: desktopArch }],
+      responses: { 200: response('平台当前签名更新清单', desktopUpdate), 404: error('当前发行未提供自动更新') } } },
+    '/v1/desktop-releases/{id}/update-download': { get: { summary: '下载当前签名更新的制品', parameters: [idPath],
+      responses: { 200: { description: '更新制品二进制', content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
+        404: error('更新未发布、已下架或不存在') } } },
     '/v1/platform/rates': { get: listOf(managed(rates), [{ name: 'model_id', in: 'query', schema: text }]), post: write(object({ ...rates, revision }, Object.keys(rates)), managed(rates), 'upsert') },
     '/v1/edge/ws': { get: { summary: 'Edge WebSocket 握手', description: '升级后先发送 hello，收到 welcome 后进行 ping/pong。',
       security: [{ DeviceToken: [] }], parameters: [

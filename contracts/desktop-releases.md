@@ -32,4 +32,10 @@
 - `GET /v1/desktop-releases/:id/download` 按同源附件下载。返回固定格式文件名及正确的字节数。无有效发布返回 `404`。列表和文件响应使用 `Cache-Control: no-store`。
 - 员工页面在 Windows 或 macOS 上推荐对应当前版本，并提供平台切换、版本和摘要。平台识别不明确时展示可用选项。页面直接下载，绕过浏览器脚本持有安装包全量字节。
 
-正式签名公证、外部发布、客户端升级和回退在 S4 或以后处理。
+## Desktop 自动更新
+
+同一草稿可选配一个自动更新制品。平台管理员用 `PUT /v1/platform/desktop-releases/:id/update-artifact?revision=N` 上传原始字节，并在 `X-OneX-Update-Signature` 传入不带填充的 base64url Ed25519 签名。上传会提升草稿修订。发布或下架时，安装包和更新制品同时对外生效或撤回。未上传自动更新制品的发行只提供手动下载。
+
+`GET /v1/desktop-updates/:os/:arch` 返回当前发行的 `{id,version,os,arch,kind,size,sha256,signature}`。`GET /v1/desktop-releases/:id/update-download` 提供对应二进制。清单签名的输入是依次拼接的 UTF-8 行 `onex-desktop-update-v1`、`id`、`version`、`os`、`arch`、`kind`、十进制 `size` 和小写十六进制 `sha256`，每行以 LF 结尾。客户端用构建时固定的公钥验证清单，按 SemVer 判断新版本，按签名字节数和 SHA-256 验证制品，并在交给系统安装前复核该发行仍然有效。
+
+`darwin/arm64` 使用支持保留 daemon 的 PKG（`macos-pkg-keep-daemon`）。Desktop 在用户确认后将安装交给 macOS Installer，完成或取消后重新打开应用。新版应用确认没有受管 Agent、下载或模型请求后，才请求 LaunchAgent 重新加载磁盘上的新版 daemon。`windows/x64` 使用构建输出的原生 Desktop EXE（`windows-desktop-exe`），退出旧窗口进程后替换该文件并重新启动。两端更新窗口期间都继续使用同一个 daemon、设备身份、路由和 Agent 进程。Windows 完整 Sidecar 升级仍走 NSIS 包。

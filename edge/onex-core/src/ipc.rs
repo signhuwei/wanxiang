@@ -110,6 +110,9 @@ pub enum Request {
         limit: u8,
         call_key: String,
     },
+    /// Upgrade the daemon only after active launches, artifact work and inference have finished.
+    /// A rejected request leaves the process and its children untouched.
+    ShutdownWhenIdle,
     Shutdown,
 }
 

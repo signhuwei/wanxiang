@@ -9,6 +9,7 @@ UI 是本地静态 HTML/ESM，不直连 Server、daemon socket 或上游。edge 
 | op | 入参 | 行为 |
 |---|---|---|
 | `state` | 无 | 返回当前安全快照，不触发网络写操作 |
+| `install_update` | `version` | 用户确认标题栏当前显示的目标版本后请求更新。原生层复核发行并启动更新，保持正在运行的 Agent 纳管 |
 | `send_code` | `target` | 向配置好的 Server 请求验证码；限流错误原样分类 |
 | `login` | `target,code,invite_code?` | `kind:desktop`；邀请码仅用于入租。返回选租户快照，不返回令牌 |
 | `password_login` | `tenant,username,password` | 接受租户 ID 或简称。以 `kind:desktop` 验证账号，沿用当前设备、恢复该账号的原设备或注册新设备，完成后注销该用户会话。快照只含公开显示信息 |
@@ -36,6 +37,8 @@ macOS 桌面一键启动 Codex 的默认工作目录是 `~/OneX Workspace`。通
 
 工作台的 `local_usage` 记录本次 onexd 运行期间的模型请求计量用量、模型请求累计时长、输入和输出 Token。它可能包含尚未结算的用量，重启后重新累计。`agents` 提供适配器的厂商、运行类别、实际已登记实例数，以及下载期间的已接收字节、目标大小和校验阶段。状态和按钮均由实际授权与本机准备结果驱动。
 
+`desktop_update` 可省略。存在时包含目标 `version`，以及 `phase: available | downloading | installing | failed`。下载时可附 `downloaded_bytes` 与 `total_bytes`。标题栏只显示已通过签名验证的更新及其进度，用户明确确认后才发送目标版本。Desktop 重启时复用现有 daemon、设备身份与受管任务。macOS 另在 Agent 和请求结束后加载新版 daemon。Windows 自动更新制品包含 Desktop 应用。
+
 ### UI 中文文案（只按枚举选取，不展示自由文本）
 
 | error.code | 显示 | error.code | 显示 |
@@ -48,6 +51,7 @@ macOS 桌面一键启动 Codex 的默认工作目录是 `~/OneX Workspace`。通
 | balance_exhausted | 橡皮余额不足 | lease_expired | 额度租约已过期 |
 | agent_not_allowed | 合约不允许该 Agent | model_not_allowed | 合约不允许该模型 |
 | rate_limited | 请求过快，请稍后重试 | upstream_error | 上游服务出错 |
+| update_unavailable | 当前更新已不可用，请稍后重试 | update_failed | Desktop 更新失败，请重试 |
 | internal | 服务内部错误 | 未知/缺失 | 操作失败，请稍后重试 |
 
 拒绝的 invoke 不显示异常字符串；变更请求提示「本机服务暂不可用，请稍后重试」，读取提示「无法读取本机状态，请检查 OneX 服务。」。Agent `failed` 显示「启动失败」，若桥附 `message` 仅补固定提示「请稍后重试或联系管理员」；未知 Agent 状态显示「状态未知」。UI 不展示 `message/detail` 原文。原生返回前仍须裁剪，不能靠隐藏文本来保护 WebView 内存。

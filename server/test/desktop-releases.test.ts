@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
+import { generateKeyPairSync, sign, verify } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -6,6 +7,7 @@ import { join } from 'node:path';
 import { createServer } from '../src/server';
 import { receiveArtifact } from '../src/artifact-upload';
 import { DESKTOP_ARTIFACT_MAX_BYTES } from '../src/desktop-releases';
+import { desktopUpdateBytes } from '../src/desktop-update-signature';
 import { seedTenant } from '../src/seed';
 import { MemoryPresence } from '../src/presence';
 
@@ -170,6 +172,45 @@ test('full lifecycle: draft, upload, publish swaps the old current to unlisted, 
   const replaced = f.store.system.get<{ detail_json: string }>(
     "SELECT detail_json FROM platform_audit WHERE action = 'desktop_release.unpublish' AND target = ?", [draft.id]);
   expect(JSON.parse(replaced!.detail_json)).toMatchObject({ superseded_by: draft2.id });
+});
+
+test('a signed update is served only for its published release and leaves the normal installer intact', async () => {
+  const f = await fixture();
+  const a = await f.admin('updates@example.com');
+  const release = { version: '1.2.0-rc3', os: 'darwin', arch: 'arm64' };
+  const draft = await (await f.request('/platform/desktop-releases', release, a.token, 'draft-update')).json() as Release;
+  const pkg = xarBytes();
+  const normal = await (await f.putArtifact(draft.id, draft.revision, pkg, a.token)).json() as Release;
+  const updatePath = new URL('/v1/platform/desktop-releases/' + draft.id + '/update-artifact?revision=' + normal.revision, f.server.url);
+  const filename = '/desktop-releases/' + draft.id;
+  const manifestPath = '/desktop-updates/darwin/arm64';
+  const manifest = { ...release, id: draft.id, kind: 'macos-pkg-keep-daemon', size: pkg.length,
+    sha256: new Bun.CryptoHasher('sha256').update(pkg).digest('hex') };
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  const signature = sign(null, desktopUpdateBytes(manifest), privateKey).toString('base64url');
+  const upload = (sig: string) => fetch(updatePath, { method: 'PUT',
+    headers: { authorization: 'Bearer ' + a.token, 'content-type': 'application/octet-stream', 'x-onex-update-signature': sig },
+    body: pkg });
+  expect((await upload('invalid')).status).toBe(422);
+  const uploaded = await upload(signature);
+  expect(uploaded.status).toBe(200);
+  expect(await uploaded.json()).toMatchObject({ revision: normal.revision + 1, sha256: normal.sha256, update: { ...manifest, signature } });
+  expect((await f.request(manifestPath)).status).toBe(404);
+  expect((await f.request(filename + '/update-download')).status).toBe(404);
+  expect((await f.request('/platform' + filename + '/publish', { revision: normal.revision + 1 }, a.token, 'publish-update')).status).toBe(200);
+  const feed = await f.request(manifestPath);
+  expect(feed.status).toBe(200);
+  expect(feed.headers.get('cache-control')).toBe('no-store');
+  const entry = await feed.json() as typeof manifest & { signature: string };
+  expect(entry).toEqual({ ...manifest, signature });
+  expect(verify(null, desktopUpdateBytes(entry), publicKey, Buffer.from(entry.signature, 'base64url'))).toBe(true);
+  const download = await f.request(filename + '/update-download');
+  expect(download.status).toBe(200);
+  expect(new Uint8Array(await download.arrayBuffer())).toEqual(pkg);
+  expect((await f.request(filename + '/download')).status).toBe(200);
+  expect((await f.request('/platform' + filename + '/unpublish', { revision: normal.revision + 2 }, a.token, 'remove-update')).status).toBe(200);
+  expect((await f.request(manifestPath)).status).toBe(404);
+  expect((await f.request(filename + '/update-download')).status).toBe(404);
 });
 
 test('rejects a connection that is cut short of its declared Content-Length, leaving the draft untouched', async () => {
