@@ -73,7 +73,7 @@ export async function seedProjection(store: Store, dir: string, now: () => numbe
     terms: { model_prices: [{ model_id: 'mdl_m', source_rate_key: 'prate_m_12' }], monthly_grant_milli: 500 } });
   ok(plan.status === 201, `commerce plan failed: ${plan.status}`);
   const planId = (await plan.json() as { id: string }).id;
-  const entries = [['access.models', ['mdl_m']], ['access.agents', ['codex']], ['billing.plan', [planId]], ['lease.budget', 100000]]
+  const entries = [['access.models', ['mdl_m']], ['access.agents', ['codex']], ['billing.plan', [planId]], ['lease.budget', 250]]
     .map(([id, adjustment]) => ({ template_ref: null, clause_ref: { id, version: 1 }, adjustment }));
   const signed = await call(`/platform/policy/contracts/${tenantId}/signatures`, { expected_platform_revision: 0, expected_policy_revision: 0,
     base_revision: null, reason: 'routing projection', entries });
