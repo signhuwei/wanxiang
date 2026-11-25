@@ -104,7 +104,7 @@ export function readPolicyDevice(sql:PolicyReader,userId:string) {
     WHERE EXISTS (SELECT 1 FROM json_each(user_ids_json) j WHERE j.value = ?)
     ORDER BY policy_revision DESC LIMIT 20`,[userId]).reverse();
   const display=(effective?.entries??[]).flatMap(({definition,effective_value}):{id:string;title:string;kind:Kind;value:Value}[]=>
-    devicePrefixes.some(prefix=>definition.binding?.adapter.startsWith(prefix))?
+    (definition.schema?.kind&&definition.binding?.adapter&&devicePrefixes.some(prefix=>definition.binding!.adapter.startsWith(prefix)))?
       [{id:definition.id,title:definition.title,kind:definition.schema.kind,value:effective_value}]:[]);
   return {...head,...defaultHot,...effective?.hot,tenant_revision:effective?.tenant_revision??null,groups:effective?.groups??[],
     member:effective?.member??null,display,notices};
@@ -113,8 +113,8 @@ export function readPolicyDevice(sql:PolicyReader,userId:string) {
 function profileKey(scope:Scope,id:string) { return scope+':'+id; }
 function conservativeValue(entry:EffectiveEntry):Value {
   switch (entry.definition.merge) {
-    case 'min': return entry.definition.schema.min??0;
-    case 'max': return entry.definition.schema.max??Number.MAX_SAFE_INTEGER;
+    case 'min': return entry.definition.schema?.min??0;
+    case 'max': return entry.definition.schema?.max??Number.MAX_SAFE_INTEGER;
     case 'and': return false;
     case 'intersection': return [];
     case 'fixed': return entry.effective_value;
