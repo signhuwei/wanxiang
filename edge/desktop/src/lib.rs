@@ -87,12 +87,15 @@ pub fn run() {
             let sock = socket_path();
             #[cfg(windows)]
             tauri::async_runtime::block_on(ensure_onexd_running(&sock, None));
-            let bridge = Bridge::new(sock);
+            let version = app.package_info().version.to_string();
+            let initial_version = serde_json::to_string(&version)?;
+            let bridge = Bridge::with_version(sock, version);
             app.manage(bridge);
             let config = &app.config().app.windows[0];
             WebviewWindowBuilder::from_config(app, config)?
                 .on_navigation(local_page)
                 .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+                .initialization_script(format!("window.__ONEX_DESKTOP_VERSION__ = {initial_version};"))
                 .build()?;
             if let Err(e) = tray::build(app.handle()) {
                 tracing::warn!(error = %e, "failed to create the tray icon");

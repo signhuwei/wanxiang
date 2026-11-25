@@ -1,7 +1,17 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [string] $ServerOrigin
+    [string] $ServerOrigin,
+
+    [ValidateLength(1, 64)]
+    [ValidateScript({
+        $parsed = [regex]::Match($_, '\A(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z')
+        if (-not $parsed.Success -or ($parsed.Groups[1].Value -split '\.' -match '^0[0-9]+$')) {
+            throw 'Version must be a semantic version such as 0.1.0-rc20.'
+        }
+        return $true
+    })]
+    [string] $Version
 )
 
 Set-StrictMode -Version Latest
@@ -55,7 +65,9 @@ if ($actualBun -ne $bunVersion) {
 }
 $edge = Join-Path $repo 'edge'
 $desktop = Join-Path $edge 'desktop'
-$appVersion = (Get-Content -Raw -LiteralPath (Join-Path $desktop 'tauri.conf.json') | ConvertFrom-Json).version
+$appVersion = if ($Version) { $Version } else {
+    (Get-Content -Raw -LiteralPath (Join-Path $desktop 'tauri.conf.json') | ConvertFrom-Json).version
+}
 $target = 'x86_64-pc-windows-msvc'
 $targetDir = Join-Path $edge 'target\onex-windows'
 $releaseDir = Join-Path $targetDir "$target\release"
@@ -94,6 +106,7 @@ try {
         if (-not (Test-Path -LiteralPath $icon -PathType Leaf)) { throw 'Tauri did not generate icon.ico.' }
 
         $buildConfig = @{
+            version = $appVersion
             bundle = @{
                 targets = @('nsis')
                 icon = @('../target/onex-windows/inputs/icons/icon.ico')

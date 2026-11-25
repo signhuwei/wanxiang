@@ -156,6 +156,7 @@ struct PendingLogin {
 /// 原生桥持有的全部可变状态；一个进程一份，构造时固定 daemon socket 路径。
 pub struct Bridge {
     socket_path: PathBuf,
+    version: String,
     http: reqwest::Client,
     inner: Mutex<Inner>,
     mutation: tokio::sync::Mutex<()>,
@@ -241,8 +242,13 @@ enum Phase {
 
 impl Bridge {
     pub fn new(socket_path: PathBuf) -> Self {
+        Self::with_version(socket_path, env!("CARGO_PKG_VERSION").into())
+    }
+
+    pub(crate) fn with_version(socket_path: PathBuf, version: String) -> Self {
         Self {
             socket_path,
+            version,
             http: reqwest::Client::builder()
                 .no_proxy()
                 .connect_timeout(Duration::from_secs(5))
@@ -845,7 +851,7 @@ impl Bridge {
             .unwrap_or_default();
         let local_usage = status.and_then(|status| serde_json::from_value(status["local_usage"].clone()).ok());
         Ok(Snapshot {
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: self.version.clone(),
             phase,
             user: inner.user_name.clone().map(|name| User { name }),
             tenant: inner.tenant.clone(),

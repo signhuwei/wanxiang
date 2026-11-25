@@ -2,6 +2,14 @@ const $=id=>document.getElementById(id)
 const mock=new URL(location.href).searchParams.get('mock')==='1'
 // 原生窗口只接受宿主桥，不使用 URL 参数切换到模拟账户。
 const invoke=window.__TAURI__?.core?.invoke
+const installedVersion=window.__ONEX_DESKTOP_VERSION__
+const versionLabel=$('desktop-version')
+function showVersion(version) {
+  if (!version) return
+  versionLabel.textContent='版本 '+version
+  versionLabel.hidden=false
+}
+showVersion(installedVersion)
 const demo=mock&&!invoke
 const call=invoke ? request=>invoke('desktop_call',{request}) : demo ? (await import('./mock.js')).makeMock() : null
 $('badge').hidden=!demo
@@ -51,6 +59,7 @@ function paintLogin(content) {
 }
 
 function paint(){
+  if (!installedVersion) showVersion(state.version)
   const c=$('content');c.replaceChildren();$('notice').textContent='';$('scope').textContent=state.tenant ? `${state.tenant.name} · ${state.user?.name||''} · `+({connected:'已连接',connecting:'连接中',backoff:'断线重连中',idle:'未连接'}[state.connection]||state.connection) : '员工工作区'
   $('messages').hidden=state.phase!=='ready'
   const unread=(state.notices??[]).filter(notice=>!seenNotices.has(notice.id)).length

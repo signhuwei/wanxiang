@@ -26,7 +26,7 @@ UI 是本地静态 HTML/ESM，不直连 Server、daemon socket 或上游。edge 
 
 macOS 桌面一键启动 Codex 的默认工作目录是 `~/OneX Workspace`。通过终端在其他项目目录运行 `onex run codex` 时，保留该终端的工作目录。
 
-`phase`：`signed_out | choose_tenant | ready`。登录前 `user/tenant` 为 null，目录为空。选择态 `tenants:[{id,name}]`、`tenant:null`；包括单租户，用户确认后再进入。`ready` 目录仅含当前身份允许查看的 Agent。`connection: idle | connecting | connected | backoff`；短时失联不是注销。顶层 `version` 是 Desktop 应用版本（不是 daemon 或 Agent 版本），所有阶段均返回，设置页展示。`agents[].status: available | update_available | not_downloaded | downloading | verifying | starting | running | download_failed | policy_pending | failed`；`update_available` 在 S1 仅作提示，`actions:[]`，页面不提供启动或更新。失败可带中文 `message`。仅 `actions` 含 `launch` 才提供启动，不按连接状态猜授权。快照不含验证码、令牌、安装路径、Provider 密钥、对话内容或完整日志；`server_origin` 无用户信息/query/fragment。错误用契约码及可展示中文，桥不可将敏感原始异常转发给 UI。
+`phase`：`signed_out | choose_tenant | ready`。登录前 `user/tenant` 为 null，目录为空。选择态 `tenants:[{id,name}]`、`tenant:null`；包括单租户，用户确认后再进入。`ready` 目录仅含当前身份允许查看的 Agent。`connection: idle | connecting | connected | backoff`；短时失联不是注销。顶层 `version` 是 Desktop 的完整打包版本，所有阶段均返回，设置页展示。原生窗口启动时也会提供同一版本，Logo 下方无需等待 daemon 即可显示。`agents[].status: available | update_available | not_downloaded | downloading | verifying | starting | running | download_failed | policy_pending | failed`；`update_available` 在 S1 仅作提示，`actions:[]`，页面不提供启动或更新。失败可带中文 `message`。仅 `actions` 含 `launch` 才提供启动，不按连接状态猜授权。快照不含验证码、令牌、安装路径、Provider 密钥、对话内容或完整日志；`server_origin` 无用户信息/query/fragment。错误用契约码及可展示中文，桥不可将敏感原始异常转发给 UI。
 
 能力策略状态仅在登录的设备与租户匹配时返回。`policy` 包含已应用的设备配置修订、策略修订、平台签发修订、租户配置修订与脱敏展示条目。`policy_pending` 表示设备未接受最近一次应执行的快照，等待同步时不提供受管启动。`notices` 是随已应用策略收到的最近消息，按消息 ID 去重。工作台按本机设备展示通知，消息列表不包含其他租户的数据。
 

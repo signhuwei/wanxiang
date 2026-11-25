@@ -8,6 +8,7 @@ try{
   const p=await b.newPage({viewport:{width:620,height:580}});p.setDefaultTimeout(5000)
   await p.goto(server.url.href);await p.getByText('未连接桌面服务',{exact:true}).waitFor()
   await p.goto(server.url.href + '?mock=1')
+  await p.getByText('版本 0.1.0-demo',{exact:true}).waitFor()
   await p.getByLabel('租户 ID 或简称').fill('demo')
   await p.getByLabel('用户名').fill('employee')
   const password = p.getByLabel('密码', {exact:true})
@@ -35,14 +36,26 @@ try{
   const bridge=await b.newPage();bridge.setDefaultTimeout(3000)
   await bridge.addInitScript(()=>{
     let attempts=0
+    window.__ONEX_DESKTOP_VERSION__='0.1.0-rc99'
+    const pendingState=new Promise(resolve=>{window.resumeDesktopState=resolve})
     window.__TAURI__={core:{invoke:async (_, {request})=>{
-      if(request.op==='state')return {ok:true,state:{version:'test',phase:'ready',tenant:null,connection:'idle',settings:{server_origin:'https://example.invalid',hide_on_close:true},agents:[{id:'test',name:'测试 Agent',status:'failed',message:'TEST-ONLY-RAW-TEXT',actions:['launch']}]}}
+      if(request.op==='state'){
+        await pendingState
+        return {ok:true,state:{version:'0.1.0-rc99',phase:'ready',tenant:null,connection:'idle',settings:{server_origin:'https://example.invalid',hide_on_close:true},agents:[{id:'test',name:'测试 Agent',status:'failed',message:'TEST-ONLY-RAW-TEXT',actions:['launch']}]}}
+      }
       if(++attempts===1)return {ok:false,error:{code:'forbidden',message:'TEST-ONLY-RAW-TEXT'}}
       if(attempts===2)return {ok:false,error:{code:'toString',message:'TEST-ONLY-RAW-TEXT'}}
       throw Error('TEST-ONLY-RAW-TEXT')
     }}}
   })
   await bridge.goto(server.url.href)
+  const version=bridge.locator('header').getByText('版本 0.1.0-rc99',{exact:true})
+  await version.waitFor()
+  await bridge.getByText('正在连接本机服务',{exact:true}).waitFor()
+  const brandBox=await bridge.locator('header .brand b').boundingBox()
+  const versionBox=await version.boundingBox()
+  assert(versionBox.y>=brandBox.y+brandBox.height)
+  await bridge.evaluate(()=>window.resumeDesktopState())
   await bridge.getByText('测试 Agent',{exact:true}).waitFor()
   assert(!await bridge.locator('body').innerText().then(text=>text.includes('TEST-ONLY-RAW-TEXT')))
   for(const safe of ['没有权限执行此操作','操作失败，请稍后重试','本机服务暂不可用，请稍后重试']){
