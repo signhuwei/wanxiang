@@ -1,10 +1,10 @@
 # S1-E6 · 将 Desktop 页面装入 Tauri 2
 
-给 edge 的原生壳接入说明。**发布包只嵌入三个前端文件；只有本地 `main` WebView 可以调用一个业务命令 `desktop_call`。** [IPC.md](IPC.md) 定义命令内部的请求、授权和快照。本文是待实现配置，不是已构建或签收的安装包。
+给 edge 的原生壳接入说明。发布包嵌入下方列出的前端资源。只有本地 `main` WebView 可以调用业务命令 `desktop_call`。 [IPC.md](IPC.md)
 
 ## 1. 静态入口：不启动 Web 服务器
 
-`index.html` 通过 `./app.css` 和 `./app.js` 加载本地资源，无需 Vite、CDN 或 Node 运行时。下面是 `tauri.conf.json` **片段**，假定配置在 `edge/desktop/`；如果实际放在 `edge/desktop/src-tauri/`，把三个路径前缀改成 `../../../desktop-ui/`。路径相对于配置文件，不是运行命令的目录。
+`index.html` 加载本地样式、脚本和标志。下面是 `edge/desktop/tauri.conf.json` 的配置片段，资源路径以配置文件为起点。
 
 ```json
 {
@@ -12,7 +12,8 @@
     "frontendDist": [
       "../../desktop-ui/index.html",
       "../../desktop-ui/app.css",
-      "../../desktop-ui/app.js"
+      "../../desktop-ui/app.js",
+      "../../desktop-ui/logo.png"
     ]
   },
   "app": {
@@ -32,7 +33,7 @@
 
 - `withGlobalTauri: true` 是因为现有无打包页面读取 `window.__TAURI__.core.invoke`。有 JS 接口**不等于**有执行权限；隐藏 JS 属性也不是权限控制。
 - 脚本、样式只来自本地包。`ipc:` 与 `http://ipc.localhost` 是 Tauri IPC 传输目标，不是允许访问任意 localhost 端口。不要加入 Server、上游、通配域、`unsafe-inline` 或 `unsafe-eval`。登录 HTTP 和 daemon 通信由原生层执行。禁止外部顶层导航与新窗口，在原生导航/新窗口回调按本地应用来源拒绝；CSP 的 `connect-src` 不限制顶层导航。
-- HTML 当前还有一份 CSP `<meta>`，供浏览器预览。**两份策略同时生效，取交集**；保留 Tauri 构建时的 CSP hash/nonce 注入，不开启 `dangerousDisableAssetCspModification`。若原生框架注入受重复 meta 限制，在发布资源准备阶段生成无重复 CSP meta 的入口，以 `app.security.csp` 为发布策略，保留源文件供独立预览；不要为消除报错放宽整套 CSP。使用干净暂存目录时，照样只复制这三个文件。
+- HTML 当前还有一份 CSP `<meta>`，供浏览器预览。**两份策略同时生效，取交集**；保留 Tauri 构建时的 CSP hash/nonce 注入，不开启 `dangerousDisableAssetCspModification`。若原生框架注入受重复 meta 限制，在发布资源准备阶段生成无重复 CSP meta 的入口，以 `app.security.csp` 为发布策略，保留源文件供独立预览；不要为消除报错放宽整套 CSP。暂存时按 `frontendDist` 列表复制资源。
 
 ## 3. 只向本地 `main` 授予 `desktop_call`
 

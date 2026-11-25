@@ -1,7 +1,7 @@
 // 用管理端已锁定的浏览器测试依赖；不把测试资源打入 Tauri 窗口。
 import { chromium } from '../../server/web/tests/node_modules/playwright/index.mjs'
 import assert from 'node:assert/strict'
-const files=new Set(['index.html','app.js','app.css','mock.js'])
+const files=new Set(['index.html','app.js','app.css','mock.js','logo.png'])
 const server=Bun.serve({hostname:'127.0.0.1',port:0,fetch(req){const name=new URL(req.url).pathname.slice(1)||'index.html';return files.has(name)?new Response(Bun.file(new URL('../'+name,import.meta.url))):new Response(null,{status:404})}})
 const b=await chromium.launch({channel:'chrome'})
 try{
@@ -9,6 +9,7 @@ try{
   await p.goto(server.url.href);await p.getByText('未连接桌面服务',{exact:true}).waitFor()
   await p.goto(server.url.href + '?mock=1')
   await p.getByText('版本 0.1.0-demo',{exact:true}).waitFor()
+  assert(await p.locator('header .brand-mark').evaluate(mark=>mark.complete&&mark.naturalWidth>0))
   await p.getByLabel('租户 ID 或简称').fill('demo')
   await p.getByLabel('用户名').fill('employee')
   const password = p.getByLabel('密码', {exact:true})
