@@ -65,6 +65,10 @@ pub enum Op {
     },
     Launch {
         agent_id: String,
+        /// Working directory for CLI agents (claude-code, codex, kimi-code).
+        /// Desktop GUI agents ignore this field. When absent for a CLI agent,
+        /// the daemon returns `cwd_required` and the caller must prompt the user.
+        cwd: Option<String>,
     },
     Download {
         agent_id: String,
@@ -290,7 +294,7 @@ impl Bridge {
             Op::Login { target, code, invite_code } => self.login(target, code, invite_code).await,
             Op::PasswordLogin { tenant, username, password } => self.password_login(tenant, username, password).await,
             Op::SelectTenant { tenant_id } => self.select_tenant(tenant_id).await,
-            Op::Launch { agent_id } => self.launch(agent_id).await,
+            Op::Launch { agent_id, cwd } => self.launch(agent_id, cwd).await,
             Op::Download { agent_id } => self.download(agent_id).await,
             Op::Settings { hide_on_close } => self.settings(hide_on_close).await,
             Op::InstallUpdate { .. } => {
@@ -603,7 +607,7 @@ impl Bridge {
         inner.device_id = Some(stored.device_id);
     }
 
-    async fn launch(&self, agent_id: String) -> Reply {
+    async fn launch(&self, agent_id: String, cwd: Option<String>) -> Reply {
         let status = self.ipc_call(&Request::Status).await.map_err(|_| unavailable())?;
         let (launcher, already_launching) = {
             let mut inner = self.inner.lock().unwrap();
@@ -639,7 +643,17 @@ impl Bridge {
         let result = if launcher.gui {
             self.start_native_desktop(launcher.id).await
         } else {
-            spawn_managed_cli(launcher).await.map_err(|_| unavailable())
+            // CLI agents (claude-code, codex, kimi-code) need a valid cwd before launch.
+            // If the caller didn't supply one, return cwd_required so the UI can prompt.
+            let cwd = cwd.as_deref().unwrap_or("").trim();
+            if cwd.is_empty() || !std::path::Path::new(cwd).is_absolute() || !std::path::Path::new(cwd).is_dir() {
+                self.inner.lock().unwrap().launching = None;
+                return Err(ErrorBody {
+                    code: "cwd_required".into(),
+                    message: "请先选择工作目录再启动 Agent".into(),
+                });
+            }
+            spawn_managed_cli(launcher, cwd).await.map_err(|_| unavailable())
         };
         if result.is_err() {
             self.inner.lock().unwrap().launching = None;
@@ -934,12 +948,13 @@ fn launch_script_path(launcher: &AgentLauncher) -> Option<PathBuf> {
 /// macOS：打开一个新的 Terminal.app 窗口运行随包脚本，固定两个参数（目标 app 和脚本自身路径），
 /// 均来自本进程资源目录，不接受调用方输入。
 #[cfg(target_os = "macos")]
-async fn spawn_managed_cli(launcher: &AgentLauncher) -> std::io::Result<()> {
+async fn spawn_managed_cli(launcher: &AgentLauncher, cwd: &str) -> std::io::Result<()> {
     let script = launch_script_path(launcher)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "OneX Agent terminal launcher not found"))?;
     let status = tokio::process::Command::new("/usr/bin/open")
         .args(["-a", "/System/Applications/Utilities/Terminal.app", "--"])
         .arg(&script)
+        .arg(cwd)
         .status()
         .await?;
     if !status.success() {
@@ -952,7 +967,7 @@ async fn spawn_managed_cli(launcher: &AgentLauncher) -> std::io::Result<()> {
 /// 和 `ensure_onexd_running` 解析 `onexd.exe` 用同一种"同目录"约定，见 `lib.rs`）。固定两个参数
 /// `run <已知 Agent ID> --managed`，由固定的启动目录提供参数。`CREATE_NEW_CONSOLE` 给 Agent 自己的控制台。
 #[cfg(windows)]
-async fn spawn_managed_cli(launcher: &AgentLauncher) -> std::io::Result<()> {
+async fn spawn_managed_cli(launcher: &AgentLauncher, cwd: &str) -> std::io::Result<()> {
     const CREATE_NEW_CONSOLE: u32 = 0x00000010;
     let executable = std::env::current_exe()?;
     let onex = executable
@@ -964,6 +979,7 @@ async fn spawn_managed_cli(launcher: &AgentLauncher) -> std::io::Result<()> {
     }
     let mut child = tokio::process::Command::new(&onex)
         .args(["run", launcher.id, "--managed"])
+        .current_dir(cwd)
         .creation_flags(CREATE_NEW_CONSOLE)
         .spawn()?;
     tokio::spawn(async move {

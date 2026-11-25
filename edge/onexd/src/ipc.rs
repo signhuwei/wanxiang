@@ -707,6 +707,19 @@ async fn launch(
     if ipc.state.token.borrow().is_none() {
         return err("unauthenticated", "还没有登录，请先登录 OneX");
     }
+    // CLI agents (non-desktop) must have a valid working directory before launch.
+    // Desktop agents have an in-app directory picker; CLI agents do not.
+    if !desktop {
+        let cwd_path = std::path::Path::new(cwd);
+        if cwd.is_empty() || !cwd_path.is_absolute() || !cwd_path.is_dir() {
+            return json!({
+                "ok": false,
+                "error": "cwd_required",
+                "message": "请先选择工作目录再启动 Agent",
+                "agent": agent,
+            });
+        }
+    }
     // 处于 cutoff 且没有租约时，启动 Agent 立即申请一次租约，不等下一个 60 秒窗口（v0.13）。
     ipc.state.lease.request_lease_now();
     let Some(_prepare) = ctx.try_prepare(agent) else {

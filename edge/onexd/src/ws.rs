@@ -339,6 +339,7 @@ async fn handshake(
             windows_deepseek_desktop_v1: crate::desktop_bundle::windows_deepseek_available(&opts.url),
             codex_desktop_v1: cfg!(all(target_os = "macos", target_arch = "aarch64")),
             claude_desktop_v1: cfg!(all(target_os = "macos", target_arch = "aarch64")),
+            tooth_v1: true,
             id: hello_id.clone(),
             edge_version: opts.edge_version.clone(),
             os: onex_core::ipc::os_name().into(),

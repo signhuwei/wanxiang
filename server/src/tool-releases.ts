@@ -24,6 +24,7 @@ const releaseId = /^tool_[0-9A-HJKMNP-TV-Z]{26}$/;
 const cliAgents = ['claude-code', 'codex', 'kimi-code'] as const;
 type ToolAgent = typeof cliAgents[number];
 type ToolKind = 'skill' | 'mcp' | 'hook' | 'http_search';
+type ToothDelivery = 'system' | 'direct' | 'selected';
 type ToolOS = 'macos' | 'windows';
 type ToolArch = 'arm64' | 'x64';
 type ToolStatus = 'draft' | 'published' | 'disabled';
@@ -31,12 +32,13 @@ type ToolStatus = 'draft' | 'published' | 'disabled';
 export type ToolRelease = {
   id: string; name: string; version: string; kind: ToolKind; agents_json: string;
   os: ToolOS | null; arch: ToolArch | null; entrypoint: string | null; args_json: string;
-  sha256: string | null; size: number | null; status: ToolStatus; revision: number; created_at: string;
+  sha256: string | null; size: number | null; status: ToolStatus; delivery: ToothDelivery | null;
+  revision: number; created_at: string;
 };
 export type ToolReleaseDescriptor = {
-  id: string; name: string; version: string; kind: Exclude<ToolKind, 'http_search'>; agents: ToolAgent[];
+  id: string; name: string; version: string; kind: ToolKind; agents: ToolAgent[];
   os: ToolOS | null; arch: ToolArch | null; entrypoint: string | null; args: string[];
-  sha256: string; size: number;
+  sha256: string; size: number; delivery?: ToothDelivery;
 };
 export type ToolPolicy = { tool_release_ids_json: string; allowed_agents_json: string };
 
@@ -83,7 +85,8 @@ export function hasToolArtifact(dataDir: string, row: Pick<ToolRelease, 'sha256'
 
 function releaseMetadata(row: ToolRelease) {
   return { id: row.id, name: row.name, version: row.version, kind: row.kind, os: row.os, arch: row.arch,
-    entrypoint: row.entrypoint, args: JSON.parse(row.args_json) as string[] };
+    entrypoint: row.entrypoint, args: JSON.parse(row.args_json) as string[],
+    ...(row.delivery && { delivery: row.delivery }) };
 }
 
 export function toolReleaseView(row: ToolRelease, dataDir: string, endpoint?: string) {
@@ -134,7 +137,7 @@ function portablePath(value: unknown, name: string) {
 }
 
 function parseRelease(body: Record<string, unknown>) {
-  if (Object.keys(body).some(key => !['name', 'version', 'kind', 'agents', 'os', 'arch', 'entrypoint', 'args', 'endpoint', 'secret'].includes(key))) invalid('body');
+  if (Object.keys(body).some(key => !['name', 'version', 'kind', 'agents', 'os', 'arch', 'entrypoint', 'args', 'endpoint', 'secret', 'delivery'].includes(key))) invalid('body');
   const name = field(body.name, 'name', 48);
   if (!/^[a-z0-9][a-z0-9-]*$/.test(name) || reserved.test(name)) invalid('name');
   const version = field(body.version, 'version', 64);
@@ -143,7 +146,7 @@ function parseRelease(body: Record<string, unknown>) {
   if (!Array.isArray(body.agents) || !body.agents.length || body.agents.length > cliAgents.length) invalid('agents');
   const agents = body.agents.map(agent => enumField(agent, 'agents', cliAgents));
   if (new Set(agents).size !== agents.length) invalid('agents');
-  const common = { name, version, kind, agents_json: JSON.stringify(agents), args_json: '[]' };
+  const common = { name, version, kind, agents_json: JSON.stringify(agents), args_json: '[]', delivery: null as ToothDelivery | null };
   if (kind === 'http_search') {
     for (const key of ['os', 'arch', 'entrypoint', 'args']) if (body[key] !== undefined) invalid(key);
     const endpoint = URL.parse(field(body.endpoint, 'endpoint', 1024));
@@ -153,9 +156,12 @@ function parseRelease(body: Record<string, unknown>) {
     return { metadata: { ...common, os: null, arch: null, entrypoint: null }, target: { endpoint: endpoint.href, secret } };
   }
   if (body.endpoint !== undefined || body.secret !== undefined) invalid('body');
+  const delivery = body.delivery !== undefined
+    ? enumField(body.delivery, 'delivery', ['system', 'direct', 'selected'] as const)
+    : null;
   if (kind === 'skill') {
     for (const key of ['os', 'arch', 'entrypoint', 'args']) if (body[key] !== undefined) invalid(key);
-    return { metadata: { ...common, os: null, arch: null, entrypoint: null } };
+    return { metadata: { ...common, os: null, arch: null, entrypoint: null, delivery } };
   }
   const os = enumField(body.os, 'os', ['macos', 'windows']);
   const arch = enumField(body.arch, 'arch', ['arm64', 'x64']);
@@ -166,7 +172,7 @@ function parseRelease(body: Record<string, unknown>) {
     || Buffer.byteLength(arg) > 256 || /[\x00-\x1f\x7f]/.test(arg))) invalid('args');
   if (kind === 'hook' && (os !== 'macos' || agents.length !== 1 || agents[0] !== 'claude-code' || args.length)) invalid('agents', 'os', 'args');
   if (Buffer.byteLength(JSON.stringify(args)) > 4096) invalid('args');
-  return { metadata: { ...common, os, arch, entrypoint, args_json: JSON.stringify(args) } };
+  return { metadata: { ...common, os, arch, entrypoint, args_json: JSON.stringify(args), delivery } };
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -287,9 +293,9 @@ export function toolReleaseRoutes(app: Hono, store: Store, opts: ManagementOptio
       const row = { ...metadata, id: `tool_${ulid()}`, status: 'draft' as const, revision: 1, sha256: null, size: null, created_at: iso(at) };
       if (sql.get(`SELECT 1 FROM tool_releases WHERE kind = ? AND name = ? COLLATE NOCASE AND version = ? AND os IS ? AND arch IS ?`,
         [row.kind, row.name, row.version, row.os, row.arch])) throw new ApiError('conflict');
-      sql.run(`INSERT INTO tool_releases (id, name, version, kind, agents_json, os, arch, entrypoint, args_json, status, revision, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [row.id, row.name, row.version, row.kind, row.agents_json, row.os, row.arch, row.entrypoint, row.args_json, row.status, row.revision, row.created_at]);
+      sql.run(`INSERT INTO tool_releases (id, name, version, kind, agents_json, os, arch, entrypoint, args_json, status, delivery, revision, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [row.id, row.name, row.version, row.kind, row.agents_json, row.os, row.arch, row.entrypoint, row.args_json, row.status, row.delivery ?? null, row.revision, row.created_at]);
       if (target) {
         if (!opts.masterKey) throw new ApiError('conflict', { reason: 'master_key_required' });
         sql.run('INSERT INTO tool_search_targets(release_id,endpoint,secret_ciphertext) VALUES(?,?,?)',

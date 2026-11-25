@@ -116,9 +116,23 @@ fn validate_release(tool: &ToolRelease) -> Result<()> {
         "invalid managed tool digest or size"
     );
     match (&*tool.kind, tool.os.as_deref(), tool.arch.as_deref(), tool.entrypoint.as_deref()) {
-        ("skill", None, None, None) if tool.args.is_empty() => {}
+        ("skill", None, None, None) if tool.args.is_empty() => {
+            if let Some(d) = &tool.delivery {
+                ensure!(
+                    matches!(d.as_str(), "system" | "direct" | "selected"),
+                    "invalid tooth delivery mode"
+                );
+            }
+        }
         ("hook", Some("macos"), Some("arm64" | "x64"), Some(path))
-            if portable_path(path) && tool.args.is_empty() && tool.agents == ["claude-code"] => {}
+            if portable_path(path) && tool.args.is_empty() && tool.agents == ["claude-code"] => {
+            if let Some(d) = &tool.delivery {
+                ensure!(
+                    matches!(d.as_str(), "system" | "direct" | "selected"),
+                    "invalid tooth delivery mode"
+                );
+            }
+        }
         ("mcp", Some("macos" | "windows"), Some("arm64" | "x64"), Some(path)) if portable_path(path) => {
             ensure!(
                 tool.args.len() <= 32
@@ -131,6 +145,12 @@ fn validate_release(tool: &ToolRelease) -> Result<()> {
             );
             if cfg!(windows) || tool.os.as_deref() == Some("windows") {
                 ensure!(path.to_ascii_lowercase().ends_with(".exe"), "managed Windows MCP requires an executable");
+            }
+            if let Some(d) = &tool.delivery {
+                ensure!(
+                    matches!(d.as_str(), "system" | "direct" | "selected"),
+                    "invalid tooth delivery mode"
+                );
             }
         }
         _ => bail!("invalid managed tool launch metadata"),

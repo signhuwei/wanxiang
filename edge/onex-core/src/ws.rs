@@ -71,6 +71,8 @@ pub struct Hello {
     pub codex_desktop_v1: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub claude_desktop_v1: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tooth_v1: bool,
     pub id: String,
     pub edge_version: String,
     pub os: String,
@@ -149,6 +151,9 @@ pub struct ToolRelease {
     pub args: Vec<String>,
     pub sha256: String,
     pub size: u64,
+    /// Tooth delivery mode: "system" | "direct" | "selected". Only present when kind == "tooth".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
