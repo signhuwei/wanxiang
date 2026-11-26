@@ -166,6 +166,37 @@ test('platform tool release is audited, immutable and served only for fresh elig
   expect(await page.json()).toMatchObject({ total: 1, items: [{ id: draft.id, status: 'disabled' }], actions: ['create_tool_release'] });
 });
 
+test('contains a stored malformed tool ID without dropping the signed device policy', async () => {
+  const f = await fixture();
+  const { tenantId, userId, token, scoped } = await f.tenant('tool-import@example.test', true);
+  const created = await f.request(base, token, metadata);
+  expect(created.status).toBe(201);
+  const valid = await f.publish(token, await created.json() as Tool, bundle({ 'SKILL.md': entry }));
+  const mac = await f.device(scoped, 'darwin', 'arm64');
+  expect((await f.contract(tenantId, token, [valid.id], ['claude-code'])).status).toBe(201);
+
+  // Simulate a legacy import bypassing both catalog registration and signature validation.
+  const malformed = 'tool_0123456789ABCDEF';
+  await f.store.system.write(sql => sql.run(`INSERT INTO tool_releases
+    (id,name,version,kind,agents_json,args_json,sha256,size,status,delivery,revision,created_at)
+    SELECT ?, 'imported-skill', version, kind, agents_json, args_json, sha256, size, status, 'system', 1, created_at
+    FROM tool_releases WHERE id = ?`, [malformed, valid.id]));
+  const ids = JSON.stringify([valid.id, malformed]);
+  await f.store.tenant(tenantId).write(sql => sql.run(`UPDATE policy_effective
+    SET document_json = json_set(document_json, '$.hot.tool_release_ids_json', ?)
+    WHERE scope = 'member' AND subject_id = ?`, [ids, userId]));
+
+  const config = await f.config(mac.device_token, true);
+  expect(config).toMatchObject({ policy: { policy_revision: 1 } });
+  expect(config.tools).toEqual([expect.objectContaining({ id: valid.id })]);
+  const target = await f.request('/policy/targets/' + userId + '?os=darwin&arch=arm64', scoped);
+  expect(await target.json()).toMatchObject({
+    unavailable: expect.arrayContaining([{ resource_id: malformed, reason: 'tool_release_unavailable' }]),
+  });
+  expect((await f.request('/edge/tool-artifacts/' + malformed, mac.device_token)).status).toBe(404);
+  expect((await f.request('/edge/tool-artifacts/' + valid.id, mac.device_token)).status).toBe(200);
+});
+
 test('rejects ambiguous tool packages and keeps malformed bytes out of storage', async () => {
   const f = await fixture();
   const { token } = await f.tenant('platform@example.test', true);

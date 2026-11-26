@@ -48,8 +48,12 @@ function findToolRelease(db: Reader, id: string) {
   return db.get<ToolRelease>('SELECT * FROM tool_releases WHERE id = ?', [id]);
 }
 
+export function isToolReleaseId(id: string) {
+  return releaseId.test(id);
+}
+
 export function validateToolSet(db: Pick<Transaction, 'all'>, ids: string[], field: string) {
-  if (ids.length > 64 || ids.some(id => !releaseId.test(id)) || new Set(ids).size !== ids.length) invalid(field);
+  if (ids.length > 64 || ids.some(id => !isToolReleaseId(id)) || new Set(ids).size !== ids.length) invalid(field);
   if (!ids.length) return;
   const rows = db.all<ToolRelease>(`SELECT * FROM tool_releases WHERE status = 'published'
     AND id IN (SELECT value FROM json_each(?))`, [JSON.stringify(ids)]);
@@ -121,6 +125,7 @@ export function allowedToolReleases(store: Store, dataDir: string, policy: ToolP
     if (row.status !== 'published') onUnavailable?.(row.id, 'tool_release_disabled');
     else if (!agents.length) onUnavailable?.(row.id, 'tool_agent_denied');
     else if (row.kind === 'http_search') continue;
+    else if (!isToolReleaseId(row.id)) onUnavailable?.(row.id, 'tool_release_unavailable');
     else if (os !== undefined && row.kind !== 'skill' && (row.os !== platform || row.arch !== arch)) {
       onUnavailable?.(row.id, 'tool_platform_mismatch');
     } else if (!hasToolArtifact(dataDir, row)) onUnavailable?.(row.id, 'tool_artifact_missing');

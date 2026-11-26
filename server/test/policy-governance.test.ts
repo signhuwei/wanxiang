@@ -168,5 +168,17 @@ test('signed execution controls preview, restore, private providers, sharing and
     expect((await call(member, desktopPath + '/events')).status).toBe(404);
     expect(db.get('SELECT started_at, ended_at FROM agent_sessions WHERE id = ?', [desktop]))
       .toEqual({ started_at: originalStart, ended_at: null });
+
+    // A restored head can be older than an already retained signature.
+    await db.write(sql => sql.run(`INSERT INTO policy_signatures (revision, reason, issued_by, issued_at, entries_json)
+      SELECT 7, reason, issued_by, issued_at, entries_json FROM policy_signatures WHERE revision = 1`));
+    const active = await (await call(platform, contract)).json() as { platform_revision: number; policy_revision: number };
+    expect(active.platform_revision).toBe(1);
+    const recovery = signed(terms, active.platform_revision, active.policy_revision);
+    expect((await call(platform, contract + '/preview', 'POST', recovery)).status).toBe(200);
+    const renewed = await call(platform, contract + '/signatures', 'POST', recovery);
+    expect(renewed.status).toBe(201);
+    expect(await renewed.json()).toMatchObject({ revision: 8, platform_revision: 8, policy_revision: 8 });
+    expect((await call(platform, contract + '/signatures/7')).status).toBe(200);
   } finally { await store.drain(); store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

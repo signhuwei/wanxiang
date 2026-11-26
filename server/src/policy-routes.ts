@@ -146,7 +146,9 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
       clauseError(`entries.${entries.indexOf(entry)}.${entry.adjustment===undefined?'base_value':'adjustment'}`,
         entry.clause_ref,'balance_warn_below_restrict');
     }
-    return {head,entries,reason:string(body.reason,'reason',500)};
+    const history=sql.get<{revision:number}>('SELECT COALESCE(MAX(revision),0) AS revision FROM policy_signatures')!;
+    const revision=Math.max(head.platform_revision,history.revision)+1;
+    return {head,revision,entries,reason:string(body.reason,'reason',500)};
   }
 
   app.get(`${platform}/adapters`,c=>{
@@ -337,8 +339,7 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
   });
   app.post(`${contracts}/:tenant_id/preview`,async c=>{
     const at=opts.now(),{db,id}=platformTenant(c,at),body=await json(c);
-    const {head,entries,reason}=signingDraft(db,body);
-    const revision=head.platform_revision+1;
+    const {head,revision,entries,reason}=signingDraft(db,body);
     const prospective={revision,entries,reason,issued_at:iso(at),issued_by:''};
     const current=db.get<{n:number}>("SELECT count(*) AS n FROM members WHERE status='active'")!.n;
     const affected=calculatePolicy(db,id,prospective);
@@ -355,15 +356,15 @@ export function policyRoutes(app:Hono, store:Store, opts:ManagementOptions) {
       platformCheck(actor);
       const cached=op.read(sql);
       if (cached) return {response:cached,changed:false};
-      const {head,entries,reason}=signingDraft(sql,body);
-      const signature:Signature={revision:head.platform_revision+1,entries,reason,issued_by:actor,issued_at:iso(at)};
+      const {head,revision,entries,reason}=signingDraft(sql,body);
+      const signature:Signature={revision,entries,reason,issued_by:actor,issued_at:iso(at)};
       const projection=calculatePolicy(sql,id,signature);
       sql.run('INSERT INTO policy_signatures (revision,reason,issued_by,issued_at,entries_json) VALUES (?, ?, ?, ?, ?)',
         [signature.revision,reason,actor,signature.issued_at,JSON.stringify(entries)]);
       const rates=signatureSalesRates(store,entries);
       insertSalesRateSnapshots(sql,signature.revision,signature.issued_at,rates);
       writeSignedPools(sql,signature.revision,signatureRoutingPools(store,rates,body.route_pools));
-      const next={platform_revision:signature.revision,policy_revision:head.policy_revision+1};
+      const next={platform_revision:revision,policy_revision:Math.max(head.policy_revision+1,revision)};
       publishProjection(sql,projection,next,actor,at);
       refreshCommerce(store,id,sql,at);
       audit(sql,actor,'policy.signature.publish',id,{...next,reason,base_revision:body.base_revision},at);

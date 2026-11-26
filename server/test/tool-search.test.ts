@@ -8,13 +8,42 @@ import { authRoutes } from '../src/auth';
 import { balance, initialLease } from '../src/billing';
 import { commerceRoutes } from '../src/commerce';
 import { hash, iso, randomToken } from '../src/credentials';
-import { configPublisher } from '../src/edge-config';
+import { allowedSearchTools, configPublisher } from '../src/edge-config';
 import { eventItems, ingestEvents } from '../src/ingest';
 import { policyRoutes } from '../src/policy-routes';
 import { seedTenant } from '../src/seed';
 import { Store } from '../src/store';
 import { toolReleaseRoutes } from '../src/tool-releases';
 import { runHttpSearch, searchResults } from '../src/tool-search-upstream';
+
+test('hosted search projection excludes an otherwise available release with an invalid stored ID', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'onex-tool-search-import-'));
+  const store = new Store(dir, 2);
+  const valid = 'tool_' + '0'.repeat(26);
+  const malformed = 'tool_0123456789ABCDEF';
+  const at = '2026-11-21T12:00:00.000Z';
+  const tool_prices = [valid, malformed].map(release_id => ({ release_id, per_call_milli: 75 }));
+  try {
+    await store.system.write(sql => {
+      sql.run(`INSERT INTO tool_releases (id,name,version,kind,agents_json,args_json,status,revision,created_at)
+        VALUES (?,'search','1','http_search','["codex"]','[]','published',1,?),
+          (?,'imported-search','1','http_search','["codex"]','[]','published',1,?)`, [valid, at, malformed, at]);
+      sql.run(`INSERT INTO tool_search_targets (release_id,endpoint,secret_ciphertext)
+        VALUES (?,'https://search.example.test',x'00'), (?,'https://search.example.test',x'00')`, [valid, malformed]);
+      sql.run(`INSERT INTO commerce_plans (id,plan_id,version,name,terms_json,created_at,created_by)
+        VALUES ('plan','plan',1,'Test',?,?,'admin')`, [JSON.stringify({ tool_prices }), at]);
+    });
+    const unavailable: { id: string; reason: string }[] = [];
+    const projected = allowedSearchTools(store, {
+      commerce_plan_id: 'plan', tool_release_ids_json: JSON.stringify([valid, malformed]), allowed_agents_json: '["codex"]',
+    }, (id, reason) => unavailable.push({ id, reason }));
+    expect(projected).toEqual([{ id: valid, name: 'search', version: '1', agents: ['codex'] }]);
+    expect(unavailable).toEqual([{ id: malformed, reason: 'tool_release_unavailable' }]);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('registered device HTTP search uses a signed price, one upstream call and one monthly package debit', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'onex-tool-search-'));

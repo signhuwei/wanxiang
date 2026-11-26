@@ -13,7 +13,7 @@ import { balanceFallbackModels, balanceLabels, balanceNotices, balancePolicyEnab
   readBalanceMode, recordBalanceMode } from './policy-balance';
 import { readEffective, readHead, readPolicyDevice } from './policy-data';
 import type { Store } from './store';
-import { allowedToolReleases } from './tool-releases';
+import { allowedToolReleases, isToolReleaseId } from './tool-releases';
 
 export { encryptEdgeSecret } from './edge-secret';
 
@@ -38,8 +38,9 @@ export function allowedSearchTools(store: Store, policy: {
     [policy.tool_release_ids_json]).flatMap(row => {
       const agents = (JSON.parse(row.agents_json) as string[]).filter(agent => allowed.has(agent));
       if (!agents.length) return [];
-      if (!row.configured || !prices.has(row.id)) {
-        onUnavailable?.(row.id, !row.configured ? 'tool_release_unavailable' : 'tool_price_missing');
+      const available = isToolReleaseId(row.id) && row.configured;
+      if (!available || !prices.has(row.id)) {
+        onUnavailable?.(row.id, available ? 'tool_price_missing' : 'tool_release_unavailable');
         return [];
       }
       return [{id:row.id,name:row.name,version:row.version,agents}];

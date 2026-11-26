@@ -23,7 +23,7 @@ import type { Device, Store } from './store';
 
 const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const isText = (value: unknown, max = 128): value is string => typeof value === 'string' && value.length > 0 && value.length <= max;
-const isSeq = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+const isSeq = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
 export function edgeGateway(app: Hono, store: Store, presence: Presence, now: () => number, heartbeatMs: number,
   config: ConfigPublisher, pending: PendingWork, publish: PublishSummary, diag: DiagChannel, projector?: RoutingProjector) {
@@ -68,11 +68,18 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
     let heartbeatBusy = false;
     let routePoolSelected = false;
     let routePoolGated = false;
+    let awaitingConfig: { id: string; revision: number } | undefined;
 
     const live = () => state !== 'closed' && current.get(deviceId)?.socket === socket;
     // A queued write can run in the same tenant batch as a token rotation before socket invalidation runs.
     const canWrite = () => live() && !!store.tenant(tenantId).get('SELECT 1 FROM devices WHERE id = ? AND token_hash = ?', [deviceId, tokenHash]);
-    const send = (msg: Record<string, unknown>) => { if (live()) socket.send(JSON.stringify(msg)); };
+    const send = (msg: Record<string, unknown>) => {
+      if (!live()) return;
+      socket.send(JSON.stringify(msg));
+      if (msg.type === 'config' && isText(msg.id) && isSeq(msg.revision)) {
+        awaitingConfig = { id: msg.id, revision: msg.revision };
+      }
+    };
     const subscription = { tenant: tenantId, agentCache: false, macDesktop: false, windowsDeepseekDesktop: false, codexDesktop: false, claudeDesktop: false, supportsCapabilityContract: false, supportsCapabilityPolicy: false, supportsPolicyRuntime:false, live: canWrite, send };
     const policyCap = () => subscription.supportsCapabilityPolicy && (subscription.supportsPolicyRuntime ||
       !requiresPolicyRuntime(store,readPolicyHot(store.tenant(tenantId),userId)));
@@ -218,7 +225,15 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             } finally { heartbeatBusy = false; }
             return;
           }
-          if (msg.type === 'pong' || (msg.type === 'ack' && isText(msg.re) && typeof msg.ok === 'boolean')) return;
+          if (msg.type === 'pong') return;
+          if (msg.type === 'ack' && isText(msg.re) && typeof msg.ok === 'boolean') {
+            if (awaitingConfig?.id === msg.re) {
+              const { revision } = awaitingConfig;
+              awaitingConfig = undefined;
+              if (!msg.ok) console.warn('OneX Edge rejected configuration', { device_id: deviceId, config_revision: revision });
+            }
+            return;
+          }
           if (routePoolGated && ['lease_renew', 'lease_request', 'config_applied', 'usage'].includes(String(msg.type)) && isText(msg.id)) throw unsupportedRoutePool();
           if (routePoolSelected && projector?.inputs.leaseGate && msg.type === 'lease_request' && isText(msg.id)) {
             if (!isText(msg.op_id)) throw new ApiError('invalid', { fields: ['op_id'] });

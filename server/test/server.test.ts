@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -749,6 +749,33 @@ function connect(f: Awaited<ReturnType<typeof fixture>>, token: string, version 
   }
   return { ws, opened, closed, next, nextOf, send, hello };
 }
+
+test('records a config rejection once with server-owned metadata', async () => {
+  const f = await fixture();
+  const scoped = await f.select(await f.login());
+  const device = await (await f.request('/devices', f.device, scoped)).json() as DeviceReply;
+  const edge = connect(f, device.device_token);
+  expect(await edge.opened).toBe(true);
+  edge.hello('fixture-lease');
+  expect(await edge.next()).toMatchObject({ type: 'welcome' });
+  const config = await edge.nextOf('config');
+  const warn = spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    function reject(re: string) {
+      edge.send({ type: 'ack', re, ok: false, error: { code: 'untrusted-code', message: 'untrusted-message' } });
+    }
+    reject('unsent-config');
+    reject(config.id);
+    reject(config.id);
+    edge.send({ type: 'ping', id: 'after-acks' });
+    expect(await edge.nextOf('pong')).toEqual({ type: 'pong', re: 'after-acks' });
+    expect(warn.mock.calls).toEqual([['OneX Edge rejected configuration', {
+      device_id: device.device_id, config_revision: config.revision,
+    }]]);
+  } finally {
+    warn.mockRestore();
+  }
+});
 
 test('device credentials are scoped, hashed, repaired on lookup, and renewed only after hello', async () => {
   const f = await fixture();
