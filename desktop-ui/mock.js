@@ -39,6 +39,13 @@ export function makeMock(){
         a.actions=[];a.status='starting';start=Date.now();break
       }
       case 'settings':if(typeof r.hide_on_close!=='boolean')return fail('invalid','偏好无效');state.settings.hide_on_close=r.hide_on_close;break
+      case 'reconnect':
+        if(r.force!==undefined&&typeof r.force!=='boolean')return fail('invalid','重连选项无效')
+        if(state.agents.some(agent=>['starting','running'].includes(agent.status))){
+          if(!r.force)return fail('reconnect_busy','当前还有 Agent 或后台任务')
+          start=0;enterTenant(state.tenant)
+        }
+        break
       case 'logout':issued=false;start=0;Object.assign(state,{phase:'signed_out',tenant:null,user:null,tenants:[],connection:'idle',agents:[]});break
       default:return fail('invalid','未知操作')
     }

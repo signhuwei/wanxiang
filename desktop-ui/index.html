@@ -30,9 +30,14 @@
       </div>
     </details>
   </footer>
-  <dialog id="desktop-update-dialog" aria-labelledby="desktop-update-title" aria-describedby="desktop-update-description">
+  <dialog id="desktop-update-dialog" class="app-dialog" aria-labelledby="desktop-update-title" aria-describedby="desktop-update-description">
     <h2 id="desktop-update-title">重启更新 OneX Desktop</h2>
     <p id="desktop-update-description">将更新到 <strong id="desktop-update-version"></strong>，然后重新打开 OneX Desktop。已启动的 Agent 会继续运行，重启后仍可在工作台管理。</p>
     <div class="dialog-actions"><button id="cancel-desktop-update" type="button" autofocus>取消</button><button id="confirm-desktop-update" class="primary" type="button">重启更新</button></div>
+  </dialog>
+  <dialog id="reconnect-dialog" class="app-dialog" aria-labelledby="reconnect-title" aria-describedby="reconnect-description">
+    <h2 id="reconnect-title">重启后台服务</h2>
+    <p id="reconnect-description">当前还有 Agent 或后台任务。重连可能中断正在处理的请求，部分 Agent 需要重新打开。已保存的对话会保留。</p>
+    <div class="dialog-actions"><button id="cancel-reconnect" type="button" autofocus>取消</button><button id="confirm-reconnect" class="primary" type="button">仍然重连</button></div>
   </dialog>
 </body></html>

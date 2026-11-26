@@ -142,6 +142,23 @@ mod windows_impl {
         pub fn into_split(self) -> (ReadHalf, WriteHalf) {
             tokio::io::split(self)
         }
+
+        pub(crate) fn peer_pid(&self) -> io::Result<u32> {
+            use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+
+            let Self::Client(client) = self else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected a daemon pipe client"));
+            };
+            let mut pid = 0;
+            // The client owns the pipe handle, and pid points to a writable DWORD.
+            if unsafe { GetNamedPipeServerProcessId(client.as_raw_handle(), &mut pid) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if pid == 0 {
+                return Err(io::Error::other("could not identify the local pipe server"));
+            }
+            Ok(pid)
+        }
     }
 
     /// 服务端：`bind()` 创建的第一条管道实例（`first_pipe_instance(true)`，用来检测"已有 onexd 在

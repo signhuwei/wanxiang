@@ -3,11 +3,14 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, Instant};
 
-use onex_core::daemon::{exchange, macos_managed_processes_alive, macos_shutdown_when_idle, macos_status_for_pid};
+use onex_core::daemon::{
+    exchange, macos_managed_processes_alive, macos_shutdown, macos_shutdown_when_idle, macos_status_for_pid,
+};
 use onex_core::ipc::Request;
 use serde_json::Value;
 use tokio::process::Command;
 
+use crate::bridge::{ErrorBody, reconnect_busy, reconnect_failed};
 use crate::macos_legacy_deepseek;
 use crate::updater::{Phase, Updater};
 
@@ -22,6 +25,7 @@ const UNREGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_BUSY: Duration = Duration::from_secs(10);
 const POLL_STARTING: Duration = Duration::from_secs(1);
 const START_TIMEOUT: Duration = Duration::from_secs(120);
+const MANUAL_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// An installed bundle has a version stamp checked against both binaries at packaging time.
 /// Development builds and Desktop processes still mapped from the previous bundle never act on a job.
@@ -125,24 +129,97 @@ async fn ipc(socket: &Path, request: Request) -> Option<Value> {
     tokio::time::timeout(Duration::from_secs(3), exchange(socket, &request)).await.ok()?.ok()
 }
 
-pub(crate) async fn reconcile(socket: &Path, version: &str, updater: &Updater) {
-    let Some(stamp) = installed_target(version) else { return };
-    let Some(home) = socket.parent() else { return };
-    let Some(uid) = output("/usr/bin/id", &["-u"]).await else { return };
+async fn installed_service() -> Option<(String, String)> {
+    let uid = output("/usr/bin/id", &["-u"]).await?;
     let uid = uid.trim();
-    if uid.parse::<u32>().ok().is_none_or(|id| id == 0) {
-        return;
-    }
+    uid.parse::<u32>().ok().filter(|id| *id != 0)?;
     let domain = format!("gui/{uid}");
     let service = format!("{domain}/{LAUNCH_AGENT}");
+    Some((domain, service))
+}
+
+async fn service_pid(service: &str) -> Option<u32> {
+    installed_daemon_pid(service, &output(LAUNCHCTL, &["print", service]).await?)
+}
+
+fn restored_device(status: &Value, device: Option<&str>) -> bool {
+    status["ok"] == true
+        && device.is_none_or(|id| {
+            status["logged_in"] == true && status["device_id"] == id && status["ws"] != "unauthenticated"
+        })
+}
+
+pub(crate) async fn restart(socket: &Path, version: &str, device: Option<&str>, force: bool) -> Result<(), ErrorBody> {
+    installed_target(version).ok_or_else(reconnect_failed)?;
+    let (domain, service) = installed_service().await.ok_or_else(reconnect_failed)?;
+    let previous_pid = service_pid(&service).await;
+    if let Some(pid) = previous_pid {
+        let status = tokio::time::timeout(Duration::from_secs(3), macos_status_for_pid(socket, pid))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .filter(|status| restored_device(status, device))
+            .ok_or_else(reconnect_failed)?;
+        if installed_target(version).is_none() {
+            return Err(reconnect_failed());
+        }
+        let reply = tokio::time::timeout(Duration::from_secs(3), async {
+            if force { macos_shutdown(socket, pid).await } else { macos_shutdown_when_idle(socket, pid).await }
+        })
+        .await
+        .map_err(|_| reconnect_failed())?
+        .map_err(|_| reconnect_failed())?;
+        if reply["ok"] != true {
+            return Err(if reply["error"]["code"] == "agents_running" { reconnect_busy() } else { reconnect_failed() });
+        }
+        tracing::info!(pid, force, version = status["version"].as_str(), "requested manual onexd restart");
+    }
+
+    let mut repair_attempted = false;
+    tokio::time::timeout(MANUAL_TIMEOUT, async {
+        loop {
+            installed_target(version).ok_or_else(reconnect_failed)?;
+            if let Some(pid) = service_pid(&service).await {
+                if Some(pid) != previous_pid
+                    && matches!(
+                        tokio::time::timeout(Duration::from_secs(3), macos_status_for_pid(socket, pid)).await,
+                        Ok(Ok(status)) if status["version"] == version && restored_device(&status, device)
+                    )
+                {
+                    return Ok(());
+                }
+            } else if !repair_attempted && failed_registered_daemon(&service).await && verify_installed_plist().await {
+                repair_attempted = true;
+                reregister_daemon(LAUNCHCTL, &domain, &service, UNREGISTER_TIMEOUT).await.map_err(|stage| {
+                    tracing::warn!(stage, "could not re-register onexd during manual restart");
+                    reconnect_failed()
+                })?;
+            }
+            tokio::time::sleep(POLL_STARTING).await;
+        }
+    })
+    .await
+    .map_err(|_| reconnect_failed())?
+}
+
+pub(crate) async fn reconcile(socket: &Path, version: &str, updater: &Updater, transition: &tokio::sync::Mutex<()>) {
+    let Some(stamp) = installed_target(version) else { return };
+    let Some(home) = socket.parent() else { return };
+    let Some((domain, service)) = installed_service().await else { return };
     let devices = home.join("devices");
     let mut handoff: Option<(Instant, Option<String>)> = None;
     let mut no_status_since = Instant::now();
     let mut reregistration_attempted = false;
     let mut previous_hosts = None;
     let mut attempted_hosts = None;
+    let mut delay = Duration::ZERO;
 
     loop {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let _transition = transition.lock().await;
+        delay = POLL_STARTING;
         if !tokio::fs::read_to_string(&stamp).await.is_ok_and(|installed| installed.trim() == version) {
             updater.component_phase(None);
             return;
@@ -172,7 +249,6 @@ pub(crate) async fn reconcile(socket: &Path, version: &str, updater: &Updater) {
                 None => handoff = Some((deadline, None)),
             }
             updater.component_phase(Some(Phase::RestartingDaemon));
-            tokio::time::sleep(POLL_STARTING).await;
             continue;
         }
         if let Some((deadline, device)) = &handoff {
@@ -187,7 +263,6 @@ pub(crate) async fn reconcile(socket: &Path, version: &str, updater: &Updater) {
                 updater.component_phase(Some(Phase::ComponentsFailed));
                 return;
             }
-            tokio::time::sleep(POLL_STARTING).await;
             continue;
         }
         let Some(running_version) = running_version else {
@@ -195,7 +270,6 @@ pub(crate) async fn reconcile(socket: &Path, version: &str, updater: &Updater) {
             if no_status_since.elapsed() >= START_TIMEOUT {
                 return;
             }
-            tokio::time::sleep(POLL_STARTING).await;
             continue;
         };
         no_status_since = Instant::now();
@@ -203,11 +277,7 @@ pub(crate) async fn reconcile(socket: &Path, version: &str, updater: &Updater) {
             updater.component_phase(None);
             return;
         }
-        let Some(pid) = output(LAUNCHCTL, &["print", &service])
-            .await
-            .as_deref()
-            .and_then(|job| installed_daemon_pid(&service, job))
-        else {
+        let Some(pid) = service_pid(&service).await else {
             updater.component_phase(Some(Phase::DaemonRestartRequired));
             return;
         };
@@ -225,11 +295,7 @@ pub(crate) async fn reconcile(socket: &Path, version: &str, updater: &Updater) {
                     let signed = macos_legacy_deepseek::verify_bundles(current);
                     if matches!(tokio::time::timeout(Duration::from_secs(10), signed).await, Ok(true))
                         && installed_target(version).is_some()
-                        && output(LAUNCHCTL, &["print", &service])
-                            .await
-                            .as_deref()
-                            .and_then(|job| installed_daemon_pid(&service, job))
-                            == Some(pid)
+                        && service_pid(&service).await == Some(pid)
                         && matches!(
                             tokio::time::timeout(Duration::from_secs(3), macos_status_for_pid(socket, pid)).await,
                             Ok(Ok(ref status))
@@ -239,13 +305,12 @@ pub(crate) async fn reconcile(socket: &Path, version: &str, updater: &Updater) {
                         let count = macos_legacy_deepseek::terminate(&devices, pid, current);
                         if count > 0 {
                             tracing::info!(count, "retired detached DeepSeek Hosts from the previous onexd");
-                            tokio::time::sleep(POLL_STARTING).await;
                             continue;
                         }
                     }
                 }
                 previous_hosts = hosts;
-                tokio::time::sleep(POLL_BUSY).await;
+                delay = POLL_BUSY;
                 continue;
             }
             Err(error) => {
@@ -267,14 +332,13 @@ pub(crate) async fn reconcile(socket: &Path, version: &str, updater: &Updater) {
                 let device = status.as_ref().filter(|s| s["logged_in"] == true).and_then(|s| s["device_id"].as_str());
                 handoff = Some((Instant::now() + START_TIMEOUT, device.map(str::to_owned)));
                 updater.component_phase(Some(Phase::RestartingDaemon));
-                tokio::time::sleep(POLL_STARTING).await;
             }
             Some(reply) if reply["error"]["code"] == "agents_running" => {
                 updater.component_phase(Some(Phase::WaitingForAgents));
-                tokio::time::sleep(POLL_BUSY).await;
+                delay = POLL_BUSY;
             }
-            None => tokio::time::sleep(POLL_STARTING).await,
-            Some(reply) if reply["error"]["code"] == "conflict" => tokio::time::sleep(POLL_STARTING).await,
+            None => {}
+            Some(reply) if reply["error"]["code"] == "conflict" => {}
             Some(_) => {
                 // Releases predating the idle-guard protocol cannot be stopped safely by Desktop.
                 updater.component_phase(Some(Phase::DaemonRestartRequired));
@@ -294,7 +358,7 @@ mod tests {
 
     use super::{
         DAEMON, LAUNCH_AGENT, LAUNCH_AGENT_PLIST, installed_daemon_pid, matches_installed_plist, needs_reregistration,
-        reregister_daemon,
+        reregister_daemon, restored_device,
     };
 
     const DOMAIN: &str = "gui/501";
@@ -313,6 +377,16 @@ mod tests {
         assert_eq!(installed_daemon_pid(SERVICE, &running.replace(SERVICE, "gui/501/com.other.agent")), None);
         assert_eq!(installed_daemon_pid(SERVICE, &running.replace("\tpid = 1234\n", "")), None);
         assert_eq!(installed_daemon_pid(SERVICE, &running.replace("1234", "0")), None);
+    }
+
+    #[test]
+    fn reconnect_waits_for_the_original_device() {
+        let mut status = json!({"ok": true, "logged_in": true, "device_id": "device-a", "ws": "connecting"});
+        assert!(restored_device(&status, Some("device-a")));
+        assert!(!restored_device(&status, Some("device-b")));
+        status["ws"] = json!("unauthenticated");
+        assert!(!restored_device(&status, Some("device-a")));
+        assert!(restored_device(&status, None));
     }
 
     #[test]

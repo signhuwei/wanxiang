@@ -73,6 +73,7 @@ try{
   await workbench.addInitScript(()=>{
     window.desktopInstallRequests=[]
     window.desktopLaunchRequests=[]
+    window.desktopReconnectRequests=[]
     window.desktopDaemonUpgrading=true
     window.desktopDiagnostics=[]
     window.__TAURI__={core:{invoke:async (_, {request})=>{
@@ -88,6 +89,15 @@ try{
       if(request.op==='install_update'){
         window.desktopInstallRequests.push(request)
         window.desktopUpdate={version:request.version,phase:'downloading',downloaded_bytes:25,total_bytes:100}
+      }
+      if(request.op==='reconnect'){
+        window.desktopReconnectRequests.push(request)
+        if(window.desktopReconnectBusy&&!request.force) return {ok:false,error:{code:'reconnect_busy'}}
+        const outcome=await new Promise(resolve=>{window.finishReconnect=resolve})
+        delete window.finishReconnect
+        if(outcome==='failure') return {ok:false,error:{code:'reconnect_failed',message:'TEST-ONLY-RAW-RECONNECT'}}
+        window.desktopUpdate=undefined
+        window.desktopDaemonUpgrading=false
       }
       const downloading=!!window.downloadRequested
       return {ok:true,state:{
@@ -297,5 +307,33 @@ try{
     assert(await updateButton.isDisabled())
     assert.equal(await workbench.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true)
   }
-  console.log('Desktop：登录、设置、启动即时反馈、目录取消、诊断筛选、实例计数、下载进度及更新确认通过')
+  await workbench.evaluate(()=>{window.desktopReconnectBusy=true})
+  await workbench.getByRole('button',{name:'设置',exact:true}).click()
+  const reconnect=workbench.getByRole('button',{name:'重新连接',exact:true})
+  const reconnectDialog=workbench.getByRole('dialog',{name:'重启后台服务'})
+  await reconnect.click()
+  await reconnectDialog.getByText(/已保存的对话会保留/).waitFor()
+  await workbench.keyboard.press('Escape')
+  await reconnectDialog.waitFor({state:'hidden'})
+  assert.deepEqual(await workbench.evaluate(()=>window.desktopReconnectRequests),[{op:'reconnect'}])
+  assert(await reconnect.evaluate(button=>button===document.activeElement))
+  await reconnect.click()
+  await reconnectDialog.getByRole('button',{name:'仍然重连'}).click()
+  const notice=workbench.getByRole('status')
+  await notice.getByText('正在重新连接…',{exact:true}).waitFor()
+  assert.deepEqual(await workbench.evaluate(()=>window.desktopReconnectRequests),
+    [{op:'reconnect'},{op:'reconnect'},{op:'reconnect',force:true}])
+  await workbench.evaluate(()=>window.finishReconnect('failure'))
+  await notice.getByText('后台服务重连失败，请重试',{exact:true}).waitFor()
+  assert.equal(await updateButton.isVisible(),true)
+  assert(!await workbench.locator('body').innerText().then(text=>text.includes('TEST-ONLY-RAW-RECONNECT')))
+  await workbench.evaluate(()=>{window.desktopReconnectBusy=false})
+  await reconnect.click()
+  await notice.getByText('正在重新连接…',{exact:true}).waitFor()
+  await workbench.evaluate(()=>window.finishReconnect('success'))
+  await notice.getByText('已重新连接',{exact:true}).waitFor()
+  await updateButton.waitFor({state:'hidden'})
+  assert.equal(await reconnectDialog.isVisible(),false)
+  await workbench.getByText('示例租户',{exact:true}).waitFor()
+  console.log('Desktop：登录、设置、手动重连、启动即时反馈、目录取消、诊断筛选、实例计数、下载进度及更新确认通过')
 }finally{await b.close();server.stop(true)}

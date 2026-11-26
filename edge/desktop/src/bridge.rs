@@ -73,6 +73,10 @@ pub enum Op {
     Settings {
         hide_on_close: bool,
     },
+    Reconnect {
+        #[serde(default)]
+        force: bool,
+    },
     InstallUpdate {
         version: String,
     },
@@ -176,6 +180,8 @@ pub struct Bridge {
     http: reqwest::Client,
     inner: Mutex<Inner>,
     mutation: tokio::sync::Mutex<()>,
+    #[cfg(target_os = "macos")]
+    pub(crate) daemon_transition: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -286,6 +292,8 @@ impl Bridge {
                 .expect("build http client"),
             inner: Mutex::new(Inner { hide_on_close: true, ..Default::default() }),
             mutation: tokio::sync::Mutex::new(()),
+            #[cfg(target_os = "macos")]
+            daemon_transition: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -315,6 +323,7 @@ impl Bridge {
             Op::Launch { agent_id } => self.launch(agent_id, pick_workspace).await,
             Op::Download { agent_id } => self.download(agent_id).await,
             Op::Settings { hide_on_close } => self.settings(hide_on_close).await,
+            Op::Reconnect { force } => self.reconnect(force).await,
             Op::InstallUpdate { .. } => {
                 Err(ErrorBody { code: "update_unavailable".into(), message: "更新已变更或暂不可用".into() })
             }
@@ -815,6 +824,18 @@ impl Bridge {
         self.state().await
     }
 
+    async fn reconnect(&self, force: bool) -> Reply {
+        let device = self.inner.lock().unwrap().device_id.clone();
+        #[cfg(target_os = "macos")]
+        {
+            let _transition = self.daemon_transition.lock().await;
+            crate::macos_daemon_update::restart(&self.socket_path, &self.version, device.as_deref(), force).await?;
+        }
+        #[cfg(windows)]
+        crate::windows_daemon_reconnect::restart(&self.socket_path, device.as_deref(), force).await?;
+        self.state().await
+    }
+
     pub(crate) fn hide_on_close(&self) -> bool {
         self.inner.lock().unwrap().hide_on_close
     }
@@ -1224,6 +1245,14 @@ fn history_unavailable() -> ErrorBody {
 
 fn agents_running() -> ErrorBody {
     ErrorBody { code: "agents_running".into(), message: "请先关闭已启动的 OneX Agent".into() }
+}
+
+pub(crate) fn reconnect_busy() -> ErrorBody {
+    ErrorBody { code: "reconnect_busy".into(), message: "受管 Agent、下载或请求仍在运行".into() }
+}
+
+pub(crate) fn reconnect_failed() -> ErrorBody {
+    ErrorBody { code: "reconnect_failed".into(), message: "重新连接失败，请稍后重试".into() }
 }
 
 fn unavailable() -> ErrorBody {

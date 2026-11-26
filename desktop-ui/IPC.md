@@ -18,6 +18,7 @@ UI 是本地静态 HTML/ESM，不直连 Server、daemon socket 或上游。edge 
 | `download` | `agent_id` | 后台下载及校验当前获准的发行。onexd 自行确定版本、来源和摘要，接受后通过快照报告实际进度 |
 | `launch` | `agent_id` | 原生层验证设备与授权。CLI Agent 通过系统窗口选择工作目录后交给随包 CLI，桌面 Agent 使用自己的工作区选择器。下载及校验由 onexd 完成。重复点击不另启进程 |
 | `settings` | `hide_on_close:boolean` | 设置关闭窗口时是否隐藏到托盘。只改此偏好；Server 地址在 S1 UI 中只读 |
+| `reconnect` | `force?:boolean` | 设置页重启本机 onexd，确认后台重新就绪后读取新状态。保留当前设备凭据和历史。后台有 Agent、请求或准备工作时返回 `reconnect_busy`。只有用户在风险提示中确认后，才发送 `force:true` |
 | `logout` | 无 | 受管 Agent 退出并完成回流后，移除当前本机设备令牌并清空显示状态。系统凭据库保留归属已验证的设备密钥 |
 
 `Snapshot` 示例（字段名使用 snake_case）：
@@ -62,6 +63,7 @@ macOS 覆盖安装和自动更新都会在 Desktop 启动后核对实际运行�
 | rate_limited | 请求过快，请稍后重试 | upstream_error | 上游服务出错 |
 | tool_bundle_unavailable | 无法下载或校验受管工具制品，见底部诊断日志 | | |
 | update_unavailable | 当前更新已不可用，请稍后重试 | update_failed | Desktop 更新失败，请重试 |
+| reconnect_busy | 显示重连确认框 | reconnect_failed | 后台服务重连失败，请重试 |
 | internal | 服务内部错误 | 未知/缺失 | 操作失败，请稍后重试 |
 
 拒绝的 invoke 不显示异常字符串；变更请求提示「本机服务暂不可用，请稍后重试」，读取提示「无法读取本机状态，请检查 OneX 服务。」。Agent `failed` 显示「启动失败」，若桥附 `message` 仅补固定提示「请稍后重试或联系管理员」；未知 Agent 状态显示「状态未知」。UI 不展示 `message/detail` 原文。原生返回前仍须裁剪，不能靠隐藏文本来保护 WebView 内存。

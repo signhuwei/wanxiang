@@ -285,7 +285,7 @@ h1 { font-size: 20px; line-height: 1.25; letter-spacing: -.3px; font-weight: 680
 .diagnostics-fields dt { color: var(--muted) }
 .diagnostics-fields dd { margin: 0; font: 10px/1.4 var(--mono); overflow-wrap: anywhere }
 
-#desktop-update-dialog {
+.app-dialog {
   width: min(390px, calc(100% - 34px));
   padding: 17px;
   border: 1px solid var(--line);
@@ -294,11 +294,11 @@ h1 { font-size: 20px; line-height: 1.25; letter-spacing: -.3px; font-weight: 680
   color: inherit;
   box-shadow: 0 12px 40px #1e352329;
 }
-#desktop-update-dialog:not([open]) { display: none }
-#desktop-update-dialog::backdrop { background: #24362a44 }
-#desktop-update-dialog.dialog-fallback { position: fixed; z-index: 1; inset: 0; margin: auto; height: fit-content; box-shadow: 0 0 0 100vmax #24362a44 }
-#desktop-update-dialog h2 { font-size: 16px; font-weight: 680 }
-#desktop-update-dialog p { margin: 8px 0 15px; color: var(--muted); overflow-wrap: anywhere }
+.app-dialog:not([open]) { display: none }
+.app-dialog::backdrop { background: #24362a44 }
+.app-dialog.dialog-fallback { position: fixed; z-index: 1; inset: 0; margin: auto; height: fit-content; box-shadow: 0 0 0 100vmax #24362a44 }
+.app-dialog h2 { font-size: 16px; font-weight: 680 }
+.app-dialog p { margin: 8px 0 15px; color: var(--muted); overflow-wrap: anywhere }
 .dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px }
 
 @media (min-width: 630px) {

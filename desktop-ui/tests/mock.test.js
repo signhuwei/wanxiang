@@ -23,3 +23,16 @@ test('invitation cannot replace OTP and tenant selection precedes launch',async(
   expect(out.state.phase).toBe('signed_out');expect(out.state.agents).toEqual([])
   expect(out.state.settings.hide_on_close).toBe(false)
 })
+
+test('reconnect preserves the signed-in tenant and requires force when a task is active',async()=>{
+  const call=makeMock()
+  await call({op:'password_login',tenant:'demo',username:'employee',password:'Demo-Only-246810'})
+  const idle=await call({op:'reconnect'})
+  expect(idle.state.phase).toBe('ready')
+  await call({op:'launch',agent_id:'claude-code'})
+  const busy=await call({op:'reconnect'})
+  expect(busy.error.code).toBe('reconnect_busy')
+  const restarted=await call({op:'reconnect',force:true})
+  expect(restarted.state.tenant).toEqual(idle.state.tenant)
+  expect(restarted.state.agents[0].status).toBe('available')
+})

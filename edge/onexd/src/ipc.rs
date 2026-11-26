@@ -1517,6 +1517,11 @@ mod upgrade_tests {
             onex_core::daemon::macos_shutdown_when_idle(&socket, 0).await.unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            onex_core::daemon::macos_shutdown(&socket, 0).await.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
         assert!(!shutdown.is_cancelled());
 
         for agent in ["claude-code", "deepseek-desktop"] {

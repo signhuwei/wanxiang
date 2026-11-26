@@ -9,6 +9,8 @@ mod profile;
 mod tray;
 mod update_platform;
 mod updater;
+#[cfg(windows)]
+mod windows_daemon_reconnect;
 #[cfg(any(windows, test))]
 mod windows_update_bundle;
 
@@ -42,11 +44,17 @@ async fn desktop_call(
     }
     let (op, requested_update) =
         if let Op::InstallUpdate { version } = op { (Op::State, Some(version)) } else { (op, None) };
+    #[cfg(target_os = "macos")]
+    let reconnected = matches!(op, Op::Reconnect { .. });
     let action = bridge.begin_diagnostic_action(&op);
     let result = bridge.call_with_workspace(op, || pick_cli_workspace(&window)).await;
     bridge.complete_diagnostic_action(action, &result);
     Ok(match result {
         Ok(state) => {
+            #[cfg(target_os = "macos")]
+            if reconnected {
+                updates.component_phase(None);
+            }
             let origin = &state.settings.server_origin;
             let update = if let Some(version) = requested_update {
                 let Some(update) = updates.install(&version, origin, window.app_handle().clone()) else {
@@ -170,7 +178,7 @@ pub fn run() {
                 {
                     let (socket, version) = daemon_target;
                     let updates = handle.state::<Arc<updater::Updater>>();
-                    macos_daemon_update::reconcile(&socket, &version, &updates).await;
+                    macos_daemon_update::reconcile(&socket, &version, &updates, &bridge.daemon_transition).await;
                 }
             });
             Ok(())

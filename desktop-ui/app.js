@@ -17,7 +17,7 @@ let state,busy=false,activeTab='workbench',last='',serial=0,pendingLaunch
 const seenNotices=new Set()
 const messages={unauthenticated:'登录凭据无效或已过期',forbidden:'没有权限执行此操作',not_found:'对象不存在',conflict:'状态已变化，请刷新后重试',device_already_logged_in:'本机 OneX 已登录。请用同一租户和账号登录，或先用 OneX 命令行退出。',agents_running:'请先关闭已启动的 OneX Agent',history_unavailable:'暂时无法恢复当前账号的本机会话',invalid:'请检查输入内容',seat_limit:'租户人数已达合约上限',balance_exhausted:'橡皮余额不足',lease_expired:'额度租约已过期',agent_not_allowed:'合约不允许该 Agent',model_not_allowed:'合约不允许该模型',rate_limited:'请求过快，请稍后重试',upstream_error:'上游服务出错',update_unavailable:'当前更新已不可用，请稍后重试',update_failed:'Desktop 更新失败，请重试',internal:'服务内部错误'}
 Object.assign(messages,{cwd_required:'请选择可访问的工作目录',terminal_unavailable:'无法启动系统终端，请检查 OneX CLI 安装或查看诊断日志',
-  tool_bundle_unavailable:'无法下载或校验受管工具制品，见底部诊断日志'})
+  tool_bundle_unavailable:'无法下载或校验受管工具制品，见底部诊断日志',reconnect_failed:'后台服务重连失败，请重试'})
 const errorText=code=>typeof code==='string' && Object.hasOwn(messages,code) ? messages[code] : '操作失败，请稍后重试'
 const labels={update_available:'有可用更新',available:'可启动',not_downloaded:'待下载',downloading:'下载中',verifying:'校验中',starting:'启动中',running:'运行中',failed:'启动失败',download_failed:'下载失败',policy_pending:'等待配置同步'}
 const agentTones={running:'good',available:'good',update_available:'attention',downloading:'attention',verifying:'attention',starting:'attention',policy_pending:'attention',failed:'error',download_failed:'error'}
@@ -28,6 +28,7 @@ const updateLabels={available:'有更新',downloading:'下载更新中',installi
   restarting_daemon:'正在切换后台服务',daemon_restart_required:'后台服务待重启'}
 const updateButton=$('desktop-update')
 const updateDialog=$('desktop-update-dialog')
+const reconnectDialog=$('reconnect-dialog')
 let confirmedVersion
 const metricFormat=new Intl.NumberFormat('zh-CN',{maximumFractionDigits:3})
 function node(tag,text){const n=document.createElement(tag);if(text!=null)n.textContent=text;return n}
@@ -43,8 +44,43 @@ async function act(request,message=''){
   if(!call||busy)return
   if(pendingLaunch){showNotice('请等待当前 Agent 启动完成');return}
   busy=true;serial++; const pane=$('content');pane.inert=true
-  try{const r=await call(request);if(!r.ok){showNotice(errorText(r.error?.code),true);return}bindState(r.state);if(request.op==='logout')activeTab='workbench';paint();showNotice(message)}
-  catch{showNotice('本机服务暂不可用，请稍后重试',true)}finally{pane.inert=false;busy=false;refreshDiagnostics()}
+  const reconnecting=request.op==='reconnect'
+  let confirmReconnect=false
+  if(reconnecting)showNotice('正在重新连接…')
+  try{
+    const r=await call(request)
+    if(!r.ok){
+      confirmReconnect=reconnecting&&!request.force&&r.error?.code==='reconnect_busy'
+      showNotice(confirmReconnect?'':errorText(r.error?.code),!confirmReconnect)
+      return
+    }
+    bindState(r.state)
+    if(request.op==='logout')activeTab='workbench'
+    paint()
+    showNotice(message)
+  }catch{
+    showNotice(reconnecting?errorText('reconnect_failed'):'本机服务暂不可用，请稍后重试',true)
+  }finally{
+    pane.inert=false;busy=false
+    if(confirmReconnect)openReconnectDialog()
+    else if(reconnecting)$('reconnect')?.focus()
+    refreshDiagnostics()
+  }
+}
+
+function openReconnectDialog() {
+  if (typeof reconnectDialog.showModal==='function') reconnectDialog.showModal()
+  else {
+    reconnectDialog.classList.add('dialog-fallback')
+    reconnectDialog.setAttribute('open','')
+  }
+  $('cancel-reconnect').focus()
+}
+
+function closeReconnectDialog() {
+  if (typeof reconnectDialog.close==='function') reconnectDialog.close()
+  else reconnectDialog.removeAttribute('open')
+  $('reconnect')?.focus()
 }
 
 async function launchAgent(agent) {
@@ -124,6 +160,9 @@ function paintSettings(content) {
   toggle.append(checkbox,'关闭窗口时隐藏到托盘')
   const actions=styled('div','form-actions')
   actions.append(button('保存设置',()=>act({op:'settings',hide_on_close:checkbox.checked},'设置已保存'),true))
+  const reconnect=button('重新连接',()=>act({op:'reconnect'},'已重新连接'))
+  reconnect.id='reconnect'
+  actions.append(reconnect)
   if (state.phase!=='signed_out') {
     const logout=button('退出登录',()=>act({op:'logout'}))
     logout.classList.add('danger')
@@ -181,7 +220,8 @@ function paintUpdate() {
   updateButton.disabled=!!pendingLaunch||!canInstallUpdate(update)
   updateButton.title={
     components_failed:'重新打开 Desktop 后重试组件切换',
-    daemon_restart_required:'现有后台版本需要手动切换，请先结束运行中的 Agent'
+    waiting_for_agents:'Agent 退出后会自动切换，也可以在设置中手动重新连接',
+    daemon_restart_required:'可在设置中重新连接后台服务'
   }[update.phase]??`目标版本 ${update.version}`
   updateButton.textContent=updateLabels[update.phase]
   if (update.phase==='downloading'&&update.total_bytes>0&&Number.isFinite(update.downloaded_bytes)) {
@@ -572,6 +612,15 @@ $('prefs').onclick=()=>openTab('settings')
 updateButton.onclick=openUpdateDialog
 $('cancel-desktop-update').onclick=closeUpdateDialog
 $('confirm-desktop-update').onclick=installUpdate
+$('cancel-reconnect').onclick=closeReconnectDialog
+$('confirm-reconnect').onclick=()=>{
+  closeReconnectDialog()
+  act({op:'reconnect',force:true},'已重新连接')
+}
+reconnectDialog.oncancel=event=>{
+  event.preventDefault()
+  closeReconnectDialog()
+}
 updateDialog.onkeydown=event=>{
   if (event.key==='Escape') {
     event.preventDefault()
