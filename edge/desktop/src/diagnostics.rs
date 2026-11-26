@@ -13,11 +13,14 @@ const LOG_COUNT: usize = 150;
 pub(crate) struct Entry {
     at_ms: i64,
     source: &'static str,
+    component: &'static str,
     level: &'static str,
     event: &'static str,
     version: Option<String>,
     agent: Option<&'static str>,
     code: Option<&'static str>,
+    stage: Option<&'static str>,
+    http_status: Option<u16>,
     config_revision: Option<u64>,
     exit_code: Option<i32>,
 }
@@ -61,11 +64,14 @@ impl Session {
         self.entries.push_back(Entry {
             at_ms: millis(OffsetDateTime::now_utc()),
             source: "desktop",
+            component: "onex_desktop::bridge",
             level,
             event,
             version: safe_version(version),
             agent,
             code,
+            stage: None,
+            http_status: None,
             config_revision: None,
             exit_code: None,
         });
@@ -168,18 +174,32 @@ fn parse(line: &str) -> Option<(OffsetDateTime, Entry)> {
         _ => return None,
     };
     let (component, message) = remainder.trim_start().split_once(": ")?;
-    let event = EVENTS.iter().find_map(|&(target, prefix, event)| {
+    let (component, event) = EVENTS.iter().find_map(|&(target, prefix, event)| {
         (component == target
             && message.strip_prefix(prefix).is_some_and(|tail| tail.is_empty() || tail.starts_with(' ')))
-        .then_some(event)
+        .then_some((target, event))
     })?;
     // The original line contains account paths, credentials and arbitrary error text. Return fixed
     // event names and tightly typed metadata, never an original line, arbitrary field or identifier.
     let field = |key: &str| message.split_whitespace().find_map(|word| word.strip_prefix(key));
     let agent = field("agent=").and_then(|raw| AGENTS.iter().copied().find(|agent| *agent == raw.trim_matches('"')));
     let version = (event == "daemon_started").then(|| field("version=").and_then(safe_version)).flatten();
-    let code = if event == "config_rejected" {
-        match field("reason=").map(|reason| reason.trim_matches('"')) {
+    let (code, stage, http_status) = if event == "tool_bundle_failed" {
+        let code = field("reason_code=").and_then(tool_failure_code);
+        let stage = field("stage=").and_then(|value| known(value, TOOL_FAILURE_STAGES));
+        let http_status = field("http_status=")
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|status| (100..=599).contains(status));
+        let legacy_insecure_origin = message
+            .split_once(" error=")
+            .is_some_and(|(_, value)| value.trim_matches('"') == "managed tool download requires HTTPS");
+        if code.is_none() && legacy_insecure_origin {
+            (Some("tool_transport_required"), Some("origin"), None)
+        } else {
+            (code, stage, http_status)
+        }
+    } else if event == "config_rejected" {
+        let code = match field("reason=").map(|reason| reason.trim_matches('"')) {
             Some("设备策略包含无效或不适用的受管工具") => Some("policy_tools_invalid"),
             Some("设备策略包含不适用的受管发行") => Some("policy_agents_invalid"),
             Some("设备策略修订号无效或已回退") => Some("policy_revision_invalid"),
@@ -187,9 +207,10 @@ fn parse(line: &str) -> Option<(OffsetDateTime, Entry)> {
             Some("设备策略路由与费率不一致") => Some("policy_rates_invalid"),
             Some("不支持的设备策略版本") => Some("policy_abi_unsupported"),
             _ => None,
-        }
+        };
+        (code, None, None)
     } else {
-        None
+        (None, None, None)
     };
     let config_revision =
         matches!(event, "config_applied" | "config_rejected").then(|| field("revision=")?.parse().ok()).flatten();
@@ -198,9 +219,43 @@ fn parse(line: &str) -> Option<(OffsetDateTime, Entry)> {
         .flatten();
     Some((
         at,
-        Entry { at_ms: millis(at), source: "daemon", level, event, version, agent, code, config_revision, exit_code },
+        Entry {
+            at_ms: millis(at),
+            source: "daemon",
+            component,
+            level,
+            event,
+            version,
+            agent,
+            code,
+            stage,
+            http_status,
+            config_revision,
+            exit_code,
+        },
     ))
 }
+
+fn known(value: &str, choices: &[&'static str]) -> Option<&'static str> {
+    choices.iter().copied().find(|choice| *choice == value.trim_matches('"'))
+}
+
+pub(crate) fn tool_failure_code(value: &str) -> Option<&'static str> {
+    known(value, TOOL_FAILURE_CODES)
+}
+
+const TOOL_FAILURE_STAGES: &[&str] = &["origin", "descriptor", "request", "response", "integrity", "bundle"];
+const TOOL_FAILURE_CODES: &[&str] = &[
+    "tool_origin_invalid",
+    "tool_transport_required",
+    "tool_descriptor_invalid",
+    "tool_request_failed",
+    "tool_http_status",
+    "tool_response_failed",
+    "tool_size_mismatch",
+    "tool_digest_mismatch",
+    "tool_bundle_invalid",
+];
 
 const AGENTS: &[&str] =
     &["claude-code", "codex", "kimi-code", "deepseek-desktop", "workbuddy", "codex-desktop", "claude-desktop"];
@@ -231,6 +286,41 @@ const EVENTS: &[(&str, &str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_tool_diagnostics_and_ignores_unrecognized_fields() {
+        let (_, structured) = parse(concat!(
+            "2026-11-26T00:00:02Z  WARN onexd::ipc: managed tool bundle resolution failed ",
+            "agent=deepseek-desktop stage=integrity reason_code=tool_digest_mismatch http_status=200 ",
+            "path=SECRET_PATH error=SECRET_MESSAGE"
+        ))
+        .unwrap();
+        assert_eq!(structured.component, "onexd::ipc");
+        assert_eq!(structured.stage, Some("integrity"));
+        assert_eq!(structured.code, Some("tool_digest_mismatch"));
+        assert_eq!(structured.http_status, Some(200));
+        assert!(!serde_json::to_string(&structured).unwrap().contains("SECRET"));
+
+        let (_, legacy) = parse(concat!(
+            "2026-11-26T00:00:02Z  WARN onexd::ipc: managed tool bundle resolution failed ",
+            "agent=claude-code error=managed tool download requires HTTPS"
+        ))
+        .unwrap();
+        assert_eq!(legacy.code, Some("tool_transport_required"));
+        assert_eq!(legacy.stage, Some("origin"));
+
+        let (_, untrusted) = parse(concat!(
+            "2026-11-26T00:00:02Z  WARN onexd::ipc: managed tool bundle resolution failed ",
+            "agent=SECRET_AGENT stage=SECRET_STAGE reason_code=SECRET_REASON http_status=999"
+        ))
+        .unwrap();
+        assert!(
+            untrusted.agent.is_none()
+                && untrusted.stage.is_none()
+                && untrusted.code.is_none()
+                && untrusted.http_status.is_none()
+        );
+    }
 
     #[test]
     fn emits_only_known_events_and_metadata_inside_the_current_session() {

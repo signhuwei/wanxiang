@@ -276,7 +276,14 @@ h1 { font-size: 20px; line-height: 1.25; letter-spacing: -.3px; font-weight: 680
 .diagnostics-entry .diagnostics-tag { text-align: end }
 .diagnostics-entry[data-level="warn"] .diagnostics-tag { color: var(--amber) }
 .diagnostics-entry[data-level="error"] .diagnostics-tag { color: var(--red) }
-.diagnostics-entry > span:last-child { grid-column: 1 / -1 }
+.diagnostics-description, .diagnostics-details { grid-column: 1 / -1 }
+.diagnostics-details > summary { padding: 3px 0; font-size: 11px; cursor: pointer }
+.diagnostics-fields {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 10px; margin: 4px 0 0;
+  padding: 7px 9px; background: var(--surface); border: 1px solid var(--line); border-radius: 5px;
+}
+.diagnostics-fields dt { color: var(--muted) }
+.diagnostics-fields dd { margin: 0; font: 10px/1.4 var(--mono); overflow-wrap: anywhere }
 
 #desktop-update-dialog {
   width: min(390px, calc(100% - 34px));

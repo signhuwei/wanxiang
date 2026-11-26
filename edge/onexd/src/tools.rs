@@ -199,9 +199,13 @@ pub(crate) fn validate_device_releases(tools: &[ToolRelease], os: &str, arch: &s
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn decode(tool: &ToolRelease, raw: &[u8]) -> Result<Bundle> {
-    ensure!(raw.len() as u64 == tool.size, "managed tool size mismatch");
-    ensure!(format!("{:x}", Sha256::digest(raw)) == tool.sha256, "managed tool digest mismatch");
+    verify_bytes(tool, raw)?;
+    decode_verified(tool, raw)
+}
+
+fn decode_verified(tool: &ToolRelease, raw: &[u8]) -> Result<Bundle> {
     let WireBundle { files } = serde_json::from_slice(raw).context("invalid managed tool bundle")?;
     ensure!(!files.is_empty() && files.len() <= MAX_FILES, "invalid managed tool file count");
 
@@ -244,47 +248,139 @@ pub(crate) fn decode(tool: &ToolRelease, raw: &[u8]) -> Result<Bundle> {
     })
 }
 
-pub(crate) async fn download(origin: &str, token: &str, releases: &[ToolRelease]) -> Result<Vec<Bundle>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DownloadFailure {
+    Origin,
+    Transport,
+    Descriptor,
+    Request,
+    Http(u16),
+    Response,
+    Size,
+    Digest,
+    Bundle,
+}
+
+impl DownloadFailure {
+    pub(crate) fn stage(self) -> &'static str {
+        match self {
+            Self::Origin | Self::Transport => "origin",
+            Self::Descriptor => "descriptor",
+            Self::Request => "request",
+            Self::Http(_) | Self::Response => "response",
+            Self::Size | Self::Digest => "integrity",
+            Self::Bundle => "bundle",
+        }
+    }
+
+    pub(crate) fn reason_code(self) -> &'static str {
+        match self {
+            Self::Origin => "tool_origin_invalid",
+            Self::Transport => "tool_transport_required",
+            Self::Descriptor => "tool_descriptor_invalid",
+            Self::Request => "tool_request_failed",
+            Self::Http(_) => "tool_http_status",
+            Self::Response => "tool_response_failed",
+            Self::Size => "tool_size_mismatch",
+            Self::Digest => "tool_digest_mismatch",
+            Self::Bundle => "tool_bundle_invalid",
+        }
+    }
+
+    pub(crate) fn http_status(self) -> Option<u16> {
+        if let Self::Http(status) = self { Some(status) } else { None }
+    }
+}
+
+impl std::fmt::Display for DownloadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Size => f.write_str("managed tool size mismatch"),
+            Self::Digest => f.write_str("managed tool digest mismatch"),
+            Self::Http(status) => write!(f, "managed tool download failed: HTTP {status}"),
+            other => f.write_str(other.reason_code()),
+        }
+    }
+}
+
+impl std::error::Error for DownloadFailure {}
+
+fn verify_bytes(tool: &ToolRelease, raw: &[u8]) -> Result<(), DownloadFailure> {
+    if raw.len() as u64 != tool.size {
+        return Err(DownloadFailure::Size);
+    }
+    if format!("{:x}", Sha256::digest(raw)) != tool.sha256 {
+        return Err(DownloadFailure::Digest);
+    }
+    Ok(())
+}
+
+fn tool_origin(origin: &str) -> Result<(String, bool), DownloadFailure> {
+    let base = crate::ipc::normalize_origin(origin).ok_or(DownloadFailure::Origin)?;
+    let url = reqwest::Url::parse(&base).map_err(|_| DownloadFailure::Origin)?;
+    if url.scheme() == "https" {
+        return Ok((base, false));
+    }
+    // Match the supported direct LAN control plane without allowing HTTP to a public host or proxy.
+    let host = url.host_str().ok_or(DownloadFailure::Origin)?;
+    let private = host == "localhost" || match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unique_local(),
+        Err(_) => false,
+    };
+    if !private {
+        return Err(DownloadFailure::Transport);
+    }
+    Ok((base, true))
+}
+
+pub(crate) async fn download(origin: &str, token: &str, releases: &[ToolRelease]) -> Result<Vec<Bundle>, DownloadFailure> {
     if releases.is_empty() {
         return Ok(Vec::new());
     }
-    let base = crate::ipc::normalize_origin(origin).context("invalid OneX Server origin")?;
-    let url = reqwest::Url::parse(&base)?;
-    let loopback =
-        url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]" | "::1"));
-    ensure!(url.scheme() == "https" || loopback, "managed tool download requires HTTPS");
+    let (base, direct) = tool_origin(origin)?;
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(90));
-    if loopback {
+    if direct {
         builder = builder.no_proxy();
     }
-    let client = builder.build()?;
+    let client = builder.build().map_err(|_| DownloadFailure::Request)?;
 
-    ensure!(releases.len() <= MAX_RELEASES, "too many managed tool releases");
-    for release in releases {
-        validate_release(release)?;
+    if releases.len() > MAX_RELEASES {
+        return Err(DownloadFailure::Descriptor);
     }
-    validate_selection(releases)?;
+    for release in releases {
+        validate_release(release).map_err(|_| DownloadFailure::Descriptor)?;
+    }
+    validate_selection(releases).map_err(|_| DownloadFailure::Descriptor)?;
     let mut tools = Vec::with_capacity(releases.len());
     for tool in releases {
         let response = client
             .get(format!("{base}/v1/edge/tool-artifacts/{}", tool.id))
             .bearer_auth(token)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
-        ensure!(response.status().is_success(), "managed tool download failed: HTTP {}", response.status());
-        ensure!(response.content_length().is_none_or(|size| size == tool.size), "managed tool size mismatch");
+            .map_err(|_| DownloadFailure::Request)?;
+        if !response.status().is_success() {
+            return Err(DownloadFailure::Http(response.status().as_u16()));
+        }
+        if response.content_length().is_some_and(|size| size != tool.size) {
+            return Err(DownloadFailure::Size);
+        }
         let mut raw = Vec::with_capacity(tool.size as usize);
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(reqwest::Error::without_url)?;
-            ensure!(raw.len() as u64 + chunk.len() as u64 <= tool.size, "managed tool exceeds its declared size");
+            let chunk = chunk.map_err(|_| DownloadFailure::Response)?;
+            if raw.len() as u64 + chunk.len() as u64 > tool.size {
+                return Err(DownloadFailure::Size);
+            }
             raw.extend_from_slice(&chunk);
         }
-        tools.push(decode(tool, &raw)?);
+        verify_bytes(tool, &raw)?;
+        tools.push(decode_verified(tool, &raw).map_err(|_| DownloadFailure::Bundle)?);
     }
     Ok(tools)
 }
@@ -610,18 +706,33 @@ mod tests {
                     recorded.store(true, Ordering::Relaxed);
                 }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host: std::net::Ipv4Addr = std::env::var("ONEX_TEST_TOOL_BIND").unwrap_or_else(|_| "127.0.0.1".into())
+            .parse().unwrap();
+        assert!(host.is_loopback() || host.is_private());
+        let listener = tokio::net::TcpListener::bind((host, 0)).await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let output = download(&origin, "test-device", std::slice::from_ref(&tool)).await.unwrap();
         assert_eq!(output[0].files[0].1, b"inert skill marker");
         let error = download(&origin, "wrong-device", std::slice::from_ref(&tool)).await.err().unwrap();
-        assert!(error.to_string().contains("401"));
+        assert_eq!(error, DownloadFailure::Http(401));
         let error = download(&origin, "test-device", &[redirected]).await.err().unwrap();
-        assert!(error.to_string().contains("307"));
+        assert_eq!(error, DownloadFailure::Http(307));
         assert!(!reached.load(Ordering::Relaxed));
         task.abort();
+    }
+
+    #[test]
+    fn tool_download_transport_accepts_direct_lan_without_allowing_plaintext_public_hosts() {
+        for origin in ["http://192.168.3.211:18700", "http://10.20.30.40", "http://172.31.0.1", "http://[fd00::1]", "http://localhost"] {
+            assert_eq!(tool_origin(origin), Ok((origin.to_owned(), true)));
+        }
+        for origin in ["http://1.1.1.1", "http://172.32.0.1", "http://198.51.100.7", "http://mapcan.xyz:18700"] {
+            assert_eq!(tool_origin(origin), Err(DownloadFailure::Transport));
+        }
+        assert_eq!(tool_origin("http://user@192.168.3.211"), Err(DownloadFailure::Origin));
+        assert_eq!(tool_origin("https://mapcan.xyz"), Ok(("https://mapcan.xyz".into(), false)));
     }
 
     #[cfg(unix)]

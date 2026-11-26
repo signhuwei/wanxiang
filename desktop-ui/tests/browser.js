@@ -83,6 +83,7 @@ try{
         const result=await new Promise(resolve=>{window.finishDesktopLaunch=resolve})
         delete window.finishDesktopLaunch
         if(result==='cancel')return {ok:false,error:{code:'launch_cancelled'}}
+        if(result==='tool_failed')return {ok:false,error:{code:'tool_bundle_unavailable',message:'TEST-ONLY-RAW-DIAGNOSTIC'}}
       }
       if(request.op==='install_update'){
         window.desktopInstallRequests.push(request)
@@ -140,6 +141,14 @@ try{
   await deepseek.getByText('运行中',{exact:true}).waitFor()
   await workbench.evaluate(()=>window.finishDesktopLaunch())
   await deepseek.getByRole('button',{name:'启动中…'}).waitFor({state:'hidden'})
+  await workbench.evaluate(()=>{
+    window.deepseekState='available'
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  await deepseekLaunch.click()
+  await workbench.waitForFunction(()=>!!window.finishDesktopLaunch)
+  await workbench.evaluate(()=>window.finishDesktopLaunch('tool_failed'))
+  await workbench.getByRole('status').getByText('无法下载或校验受管工具制品，见底部诊断日志',{exact:true}).waitFor()
   await codex.getByRole('button',{name:'启动',exact:true}).click()
   await codex.getByText('等待选择工作目录',{exact:true}).waitFor()
   assert(await codex.getByText('运行实例 2',{exact:true}).isVisible())
@@ -171,6 +180,8 @@ try{
       {at_ms:1795654800123,source:'daemon',level:'warn',event:'config_rejected',config_revision:166,
         code:'policy_tools_invalid',version:'0.1.0-rc27',message:'TEST-ONLY-RAW-DIAGNOSTIC'},
       {at_ms:1795654801000,source:'desktop',level:'info',event:'launch_cancelled',agent:'codex',version:'0.1.0-rc28'},
+      {at_ms:1795654802000,source:'daemon',component:'onexd::ipc',level:'warn',event:'tool_bundle_failed',agent:'deepseek-desktop',
+        code:'tool_http_status',stage:'response',http_status:403,version:'0.1.0-rc27',detail:'TEST-ONLY-RAW-DIAGNOSTIC'},
       {at_ms:1795654801000,source:'desktop',level:'info',event:'TEST-ONLY-RAW-DIAGNOSTIC'},
     ]
   })
@@ -178,8 +189,24 @@ try{
   await diagnostics.getByText('诊断日志',{exact:true}).click()
   await diagnostics.getByText('Desktop 0.1.0-rc28 · onexd 0.1.0-rc27 · 本地时间',{exact:true}).waitFor()
   await diagnostics.getByText('设备配置被拒绝 · 受管工具无效或不适用 · 配置 #166',{exact:true}).waitFor()
-  assert.equal(await diagnostics.getByRole('listitem').count(),2)
+  assert.equal(await diagnostics.getByRole('listitem').count(),3)
   assert.match(await diagnostics.locator('time').first().innerText(),/\d{2}:\d{2}:\d{2}/)
+  const toolFailure=diagnostics.getByRole('listitem').filter({hasText:'受管工具下载或校验失败'})
+  const toolDetails=toolFailure.locator('summary')
+  await toolDetails.press('Enter')
+  for (const value of ['tool_bundle_failed','onexd::ipc','tool_http_status','response','403']) {
+    await toolFailure.getByText(value,{exact:true}).waitFor()
+  }
+  await workbench.evaluate(()=>{
+    window.desktopDiagnostics.unshift({at_ms:1795654803000,source:'daemon',level:'warn',event:'agent_artifact_failed',
+      component:'TEST-ONLY-RAW-DIAGNOSTIC',stage:'TEST-ONLY-RAW-DIAGNOSTIC',code:'TEST-ONLY-RAW-DIAGNOSTIC'})
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  await diagnostics.getByText('Agent 制品未就绪',{exact:true}).waitFor()
+  assert(await toolDetails.evaluate(summary=>summary.parentElement.open&&document.activeElement===summary))
+  await diagnostics.getByLabel('筛选').fill('tool_http_status')
+  assert.equal(await diagnostics.getByRole('listitem').count(),1)
+  await diagnostics.getByLabel('筛选').fill('')
   assert(!await diagnostics.innerText().then(text=>text.includes('TEST-ONLY-RAW-DIAGNOSTIC')))
   await diagnostics.getByLabel('来源').selectOption('desktop')
   assert.equal(await diagnostics.getByRole('listitem').count(),1)

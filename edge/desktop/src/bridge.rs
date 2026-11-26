@@ -807,12 +807,7 @@ impl Bridge {
         if reply["ok"] == true {
             return Ok(());
         }
-        let error = &reply["error"];
-        let Some(code) = error["code"].as_str().filter(|code| KNOWN_CODES.contains(code)) else {
-            return Err(unavailable());
-        };
-        let Some(message) = error["message"].as_str() else { return Err(unavailable()) };
-        Err(ErrorBody { code: code.into(), message: message.into() })
+        Err(native_launch_error(&reply["error"]))
     }
 
     async fn settings(&self, hide_on_close: bool) -> Reply {
@@ -1186,9 +1181,30 @@ fn diagnostic_error(error: &ErrorBody) -> &'static str {
     KNOWN_CODES
         .iter()
         .copied()
-        .chain(["cwd_required", "terminal_unavailable"])
+        .chain(["cwd_required", "terminal_unavailable", "tool_bundle_unavailable"])
         .find(|code| *code == error.code)
         .unwrap_or("internal")
+}
+
+fn native_launch_error(error: &Value) -> ErrorBody {
+    let Some(code) = error["code"].as_str().filter(|code| KNOWN_CODES.contains(code)) else {
+        return unavailable();
+    };
+    let Some(message) = error["message"].as_str() else { return unavailable() };
+    if code == "upstream_error"
+        && (error
+            .pointer("/detail/reason_code")
+            .and_then(Value::as_str)
+            .and_then(diagnostics::tool_failure_code)
+            .is_some()
+            || message == "无法下载或校验受管 Skill 或 MCP 制品")
+    {
+        return ErrorBody {
+            code: "tool_bundle_unavailable".into(),
+            message: "无法下载或校验受管工具制品，见底部诊断日志".into(),
+        };
+    }
+    ErrorBody { code: code.into(), message: message.into() }
 }
 
 fn forbidden() -> ErrorBody {
@@ -1217,6 +1233,27 @@ fn unavailable() -> ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_launch_distinguishes_recognized_tool_bundle_failures() {
+        let failure = native_launch_error(&json!({"code":"upstream_error", "message":"SECRET_MESSAGE",
+            "detail":{"reason_code":"tool_http_status","stage":"response","http_status":403}}));
+        assert_eq!(failure.code, "tool_bundle_unavailable");
+        assert_eq!(diagnostic_error(&failure), "tool_bundle_unavailable");
+        assert!(!serde_json::to_string(&failure).unwrap().contains("SECRET_MESSAGE"));
+        assert_eq!(
+            native_launch_error(&json!({"code":"upstream_error", "message":"无法下载或校验受管 Skill 或 MCP 制品"}))
+                .code,
+            "tool_bundle_unavailable"
+        );
+        assert_eq!(
+            native_launch_error(
+                &json!({"code":"upstream_error", "message":"failed", "detail":{"reason_code":"unknown"}})
+            )
+            .code,
+            "upstream_error"
+        );
+    }
 
     #[test]
     fn desktop_launch_accepts_only_agent_id_from_webview() {

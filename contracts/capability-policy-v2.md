@@ -163,6 +163,8 @@ Server 重连重建最新快照，随附该设备用户有权接收的最近策�
 
 Tooth 保留发行的 `delivery` 元数据，取值为 `system`、`direct` 或 `selected`。启动使用签发及逐级收窄后的 `access.tools`，交付方式本身不授予权限。`GET /v1/platform/tool-targets` 返回每个 Agent 支持的工具种类和桌面平台，由平台页面用来约束发行表单。相同发行可以同时适用于 CLI 和 Desktop。
 
+工具制品下载使用设备已配置的 OneX Server 原点。公网站点使用 HTTPS，受控 LAN 的 HTTP 仅接受私有 IP 字面地址并直连。下载禁止跨地址重定向，仍逐次复核设备授权及制品字节数、SHA-256 和包结构。
+
 支持桌面 Tooth 的 Edge 在 `hello` 中声明 `tooth_v1: true` 以及 `desktop_tool_targets`，例如 `{"deepseek-desktop":["skill"]}`。Server 对每项工具分别取发行目标、生效 Agent、设备平台、已下发的受管发行及客户端声明的工具种类的交集。缺少声明的设备继续接收同一发行中匹配的 CLI 目标。空交集省略该项工具。客户端按本机工具适配清单校验，不支持的工具类型不能用于启动。
 
 ### 实现时的接口字段

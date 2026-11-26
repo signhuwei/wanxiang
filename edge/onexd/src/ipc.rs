@@ -802,8 +802,14 @@ async fn launch(
         } {
             Ok(tools) => tools,
             Err(error) => {
-                warn!(agent, %error, "managed tool bundle resolution failed");
-                return err("upstream_error", "无法下载或校验受管 Skill 或 MCP 制品");
+                let stage = error.stage();
+                let reason_code = error.reason_code();
+                let http_status = error.http_status();
+                warn!(agent, stage, reason_code, http_status = http_status.unwrap_or(0), "managed tool bundle resolution failed");
+                return json!({ "ok": false, "error": {
+                    "code": "upstream_error", "message": "无法下载或校验受管工具制品",
+                    "detail": { "stage": stage, "reason_code": reason_code, "http_status": http_status }
+                }});
             }
         }
     };

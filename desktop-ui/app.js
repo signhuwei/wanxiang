@@ -16,7 +16,8 @@ $('badge').hidden=!demo
 let state,busy=false,activeTab='workbench',last='',serial=0,pendingLaunch
 const seenNotices=new Set()
 const messages={unauthenticated:'登录凭据无效或已过期',forbidden:'没有权限执行此操作',not_found:'对象不存在',conflict:'状态已变化，请刷新后重试',device_already_logged_in:'本机 OneX 已登录。请用同一租户和账号登录，或先用 OneX 命令行退出。',agents_running:'请先关闭已启动的 OneX Agent',history_unavailable:'暂时无法恢复当前账号的本机会话',invalid:'请检查输入内容',seat_limit:'租户人数已达合约上限',balance_exhausted:'橡皮余额不足',lease_expired:'额度租约已过期',agent_not_allowed:'合约不允许该 Agent',model_not_allowed:'合约不允许该模型',rate_limited:'请求过快，请稍后重试',upstream_error:'上游服务出错',update_unavailable:'当前更新已不可用，请稍后重试',update_failed:'Desktop 更新失败，请重试',internal:'服务内部错误'}
-Object.assign(messages,{cwd_required:'请选择可访问的工作目录',terminal_unavailable:'无法启动系统终端，请检查 OneX CLI 安装或查看诊断日志'})
+Object.assign(messages,{cwd_required:'请选择可访问的工作目录',terminal_unavailable:'无法启动系统终端，请检查 OneX CLI 安装或查看诊断日志',
+  tool_bundle_unavailable:'无法下载或校验受管工具制品，见底部诊断日志'})
 const errorText=code=>typeof code==='string' && Object.hasOwn(messages,code) ? messages[code] : '操作失败，请稍后重试'
 const labels={update_available:'有可用更新',available:'可启动',not_downloaded:'待下载',downloading:'下载中',verifying:'校验中',starting:'启动中',running:'运行中',failed:'启动失败',download_failed:'下载失败',policy_pending:'等待配置同步'}
 const agentTones={running:'good',available:'good',update_available:'attention',downloading:'attention',verifying:'attention',starting:'attention',policy_pending:'attention',failed:'error',download_failed:'error'}
@@ -391,19 +392,40 @@ const diagnosticEvents={
 }
 const diagnosticCodes={policy_tools_invalid:'受管工具无效或不适用',policy_agents_invalid:'Agent 发行不适用',
   policy_revision_invalid:'策略修订号无效或已回退',policy_identity_invalid:'策略与登录身份不符',
-  policy_rates_invalid:'路由与费率不一致',policy_abi_unsupported:'设备策略版本不受支持'}
+  policy_rates_invalid:'路由与费率不一致',policy_abi_unsupported:'设备策略版本不受支持',
+  tool_origin_invalid:'服务地址无效',tool_transport_required:'受管工具要求受信下载地址',tool_descriptor_invalid:'工具发行描述无效',
+  tool_request_failed:'工具下载请求失败',tool_http_status:'工具下载返回 HTTP 错误',tool_response_failed:'读取工具文件失败',
+  tool_size_mismatch:'工具文件大小不符',tool_digest_mismatch:'工具文件摘要不符',tool_bundle_invalid:'工具包格式无效'}
+const diagnosticComponents=new Set(['onex_desktop::bridge','onexd','onexd::ipc','onexd::ws','onexd::router'])
+const diagnosticStages=new Set(['origin','descriptor','request','response','integrity','bundle'])
 const diagnosticAgents={'claude-code':'Claude Code',codex:'Codex CLI','kimi-code':'Kimi Code','deepseek-desktop':'DeepSeek Desktop',
   workbuddy:'WorkBuddy','codex-desktop':'Codex Desktop','claude-desktop':'Claude Desktop'}
 const diagnosticTime=new Intl.DateTimeFormat('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'})
 const safeVersion=version=>typeof version==='string'&&/^\d[\w.+-]{0,47}$/.test(version)?version:null
 const lookup=(dictionary,key)=>typeof key==='string'&&Object.hasOwn(dictionary,key)?dictionary[key]:null
-let diagnosticData,diagnosticsTicket=0,diagnosticsPending=false,diagnosticsError=false
+let diagnosticData,diagnosticsTicket=0,diagnosticsPending=false,diagnosticsError=false,diagnosticRows=new Map()
 
 function clearDiagnostics() {
   diagnosticsTicket++
   diagnosticData=null
+  diagnosticRows.clear()
+  $('diagnostics-events').replaceChildren()
   diagnosticsError=false
   paintDiagnostics()
+}
+
+function diagnosticDetails(event, fields) {
+  const details=styled('details','diagnostics-details')
+  const summary=node('summary','详细')
+  summary.setAttribute('aria-label',`${event}的详细信息`)
+  const list=styled('dl','diagnostics-fields')
+  for (const [name,value] of fields) {
+    const item=node('dd')
+    item.append(node('code',value))
+    list.append(node('dt',name),item)
+  }
+  details.append(summary,list)
+  return details
 }
 
 function paintDiagnostics() {
@@ -414,27 +436,49 @@ function paintDiagnostics() {
   $('diagnostics-versions').textContent=`Desktop ${desktop} · onexd ${daemon} · 本地时间`
   const sourceFilter=$('diagnostics-source').value,levelFilter=$('diagnostics-level').value
   const query=$('diagnostics-query').value.trim().toLowerCase()
-  const rows=[]
+  const rows=[],nextRows=new Map(),occurrences=new Map()
   for (const entry of diagnosticData?.entries??[]) {
     const source=lookup(diagnosticSources,entry.source),level=lookup(diagnosticLevels,entry.level),event=lookup(diagnosticEvents,entry.event)
     const time=new Date(entry.at_ms)
     if (!source||!level||!event||!Number.isFinite(time.getTime())) continue
-    if ((sourceFilter&&entry.source!==sourceFilter)||(levelFilter&&entry.level!==levelFilter)) continue
-    const details=[lookup(diagnosticAgents,entry.agent),lookup(diagnosticCodes,entry.code)??lookup(messages,entry.code)]
-    if (Number.isSafeInteger(entry.config_revision)&&entry.config_revision>=0) details.push(`配置 #${entry.config_revision}`)
-    if (Number.isSafeInteger(entry.exit_code)) details.push(`退出码 ${entry.exit_code}`)
+    const agent=lookup(diagnosticAgents,entry.agent),error=lookup(diagnosticCodes,entry.code)??lookup(messages,entry.code)
+    const component=diagnosticComponents.has(entry.component)?entry.component:null
+    const stage=diagnosticStages.has(entry.stage)?entry.stage:null
+    const revision=Number.isSafeInteger(entry.config_revision)&&entry.config_revision>=0?entry.config_revision:null
+    const exitCode=Number.isSafeInteger(entry.exit_code)?entry.exit_code:null
+    const http=Number.isInteger(entry.http_status)&&entry.http_status>=100&&entry.http_status<=599?entry.http_status:null
     const version=safeVersion(entry.version),timestamp=diagnosticTime.format(time)
-    const description=[event,...details.filter(Boolean)].join(' · ')
-    if (query&&![timestamp,source,level,version,entry.event,entry.agent,description].filter(Boolean).join(' ').toLowerCase().includes(query)) continue
-    const row=styled('li','diagnostics-entry')
-    row.dataset.level=entry.level
-    const when=node('time',timestamp)
-    when.dateTime=time.toISOString()
-    row.append(when,styled('span','diagnostics-tag',`${level} · ${source}${version?' '+version:''}`),node('span',description))
+    const description=[event,agent,error,revision==null?null:`配置 #${revision}`,exitCode==null?null:`退出码 ${exitCode}`].filter(Boolean).join(' · ')
+    const fields=[['UTC 时间',time.toISOString()],['事件',entry.event],['模块',component],['版本',version],['Agent',agent?entry.agent:null],
+      ['错误代码',error?entry.code:null],['执行阶段',stage],['HTTP 状态',http],['配置修订号',revision],['退出码',exitCode]]
+      .filter(([,value])=>value!=null)
+    const fingerprint=JSON.stringify([entry.source,entry.level,description,fields])
+    const occurrence=(occurrences.get(fingerprint)??0)+1
+    occurrences.set(fingerprint,occurrence)
+    const key=`${occurrence}:${fingerprint}`
+    let row=diagnosticRows.get(key)
+    if (!row) {
+      row=styled('li','diagnostics-entry')
+      row.dataset.level=entry.level
+      const when=node('time',timestamp)
+      when.dateTime=time.toISOString()
+      row.append(when,styled('span','diagnostics-tag',`${level} · ${source}${version?' '+version:''}`),
+        styled('span','diagnostics-description',description),diagnosticDetails(event,fields))
+    }
+    nextRows.set(key,row)
+    if ((sourceFilter&&entry.source!==sourceFilter)||(levelFilter&&entry.level!==levelFilter)) continue
+    if (query&&![timestamp,source,level,description,...fields.flat()].join(' ').toLowerCase().includes(query)) continue
     rows.push(row)
   }
+  diagnosticRows=nextRows
   const scroll=entries.scrollTop
-  entries.replaceChildren(...rows)
+  const focus=document.activeElement
+  const visible=new Set(rows)
+  for (const row of [...entries.children]) if (!visible.has(row)) row.remove()
+  for (const [index,row] of rows.entries()) {
+    if (entries.children[index]!==row) entries.insertBefore(row,entries.children[index]??null)
+  }
+  if (entries.contains(focus)&&document.activeElement!==focus) focus.focus({preventScroll:true})
   entries.scrollTop=scroll
   hint.textContent=diagnosticsError?'暂时无法读取诊断日志。':!diagnosticData?'正在读取诊断日志…':rows.length?'':query||sourceFilter||levelFilter?'没有匹配的日志。':'当前没有诊断记录。'
   hint.hidden=!hint.textContent
