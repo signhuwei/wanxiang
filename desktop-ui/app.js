@@ -429,7 +429,8 @@ const diagnosticEvents={
   model_request_rejected:'模型请求被拒绝',model_output_capped:'已按租约调整模型输出上限',
   tool_bundle_failed:'受管工具下载或校验失败',tool_prepare_failed:'准备受管工具失败',desktop_bundle_rejected:'桌面 Agent 制品被拒绝',
   desktop_profile_rejected:'桌面 Agent 配置被拒绝',desktop_spawn_failed:'无法启动桌面 Agent 进程',agent_prepared:'Agent 启动参数已就绪',
-  agent_exited:'Agent 已退出',desktop_exited:'桌面 Agent 已退出',ipc_failed:'本机服务连接失败',daemon_failed:'后台异常退出'
+  agent_exited:'Agent 已退出',desktop_exited:'桌面 Agent 已退出',ipc_failed:'本机服务连接失败',daemon_failed:'后台异常退出',
+  issue_submit_failed:'反馈提交失败',issue_list_failed:'反馈记录加载失败'
 }
 const diagnosticCodes={policy_tools_invalid:'受管工具无效或不适用',policy_agents_invalid:'Agent 发行不适用',
   policy_revision_invalid:'策略修订号无效或已回退',policy_identity_invalid:'策略与登录身份不符',
@@ -439,9 +440,14 @@ const diagnosticCodes={policy_tools_invalid:'受管工具无效或不适用',pol
   tool_size_mismatch:'工具文件大小不符',tool_digest_mismatch:'工具文件摘要不符',tool_bundle_invalid:'工具包格式无效',
   lease_request_too_large:'单次请求预估费用超过租约上限',lease_exhausted:'本机租约可用额度不足',lease_expired:'租约已过期',
   lease_missing:'本机当前没有租约',balance_exhausted:'租户余额不足',quota_exhausted:'成员或组配额不足',lease_cutoff:'服务已撤销租约',
-  model_upstream_http:'模型渠道返回 HTTP 错误',lease_output_capped:'按租约可用额度降低本次输出上限'}
+  model_upstream_http:'模型渠道返回 HTTP 错误',lease_output_capped:'按租约可用额度降低本次输出上限',
+  issue_identity_changed:'本机登录设备已变化',issue_identity_missing:'设备未登录',issue_origin_invalid:'反馈服务地址无效',
+  issue_client_failed:'无法准备反馈请求',issue_transport_failed:'无法连接反馈服务',issue_request_timeout:'反馈服务请求超时',
+  issue_http_status:'反馈服务返回 HTTP 错误',issue_response_invalid:'反馈服务响应无效',issue_operation_pending:'已有操作正在进行',
+  issue_input_invalid:'反馈输入超出限制',issue_ipc_timeout:'本机后台响应超时',issue_ipc_failed:'无法访问本机后台',
+  issue_update_required:'本机后台版本暂不支持反馈',issue_daemon_rejected:'本机后台拒绝反馈请求',issue_daemon_reply_invalid:'本机后台反馈响应无效'}
 const diagnosticComponents=new Set(['onex_desktop::bridge','onexd','onexd::ipc','onexd::ws','onexd::router'])
-const diagnosticStages=new Set(['origin','descriptor','request','response','integrity','bundle','lease','upstream'])
+const diagnosticStages=new Set(['origin','descriptor','request','response','integrity','bundle','lease','upstream','identity','decode','ipc','validate','compatibility'])
 const diagnosticAgents={'claude-code':'Claude Code',codex:'Codex CLI','kimi-code':'Kimi Code','deepseek-desktop':'DeepSeek Desktop',
   workbuddy:'WorkBuddy','codex-desktop':'Codex Desktop','claude-desktop':'Claude Desktop'}
 const diagnosticTime=new Intl.DateTimeFormat('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'})
@@ -453,6 +459,12 @@ const lookup=(dictionary,key)=>typeof key==='string'&&Object.hasOwn(dictionary,k
 let diagnosticData,diagnosticsTicket=0,diagnosticsPending=false,diagnosticsError=false,diagnosticRows=new Map()
 
 let issueEpoch=0,issueCursor=null,historyTicket=0
+function issueErrorText(code) {
+  if(code==='issue_update_required')return '当前后台版本不支持反馈，请先完成更新'
+  if(code==='upstream_error')return '反馈服务请求失败，请查看诊断日志'
+  if(code==='internal')return '本机反馈服务暂不可用，请查看诊断日志'
+  return errorText(code)
+}
 function resetIssues() {
   issueEpoch++; historyTicket++; issueCursor=null
   $('issue-form').reset(); $('issue-history').replaceChildren(); $('issue-more').hidden=true
@@ -467,12 +479,12 @@ async function loadIssues(more=false) {
   try {
     const r=await call({op:'issue_list',cursor:more?issueCursor:null})
     if(ticket!==historyTicket)return
-    if(!r.ok)throw Error(errorText(r.error?.code))
+    if(!r.ok){$('issue-status').textContent=issueErrorText(r.error?.code);return}
     if(!more)$('issue-history').replaceChildren()
     for(const item of r.issues.items){const li=node('li');li.append(node('small',`${new Date(item.created_at).toLocaleString()} · 图片 ${item.image_count} · 日志 ${item.log_count}`),node('p',item.text));$('issue-history').append(li)}
     issueCursor=r.issues.next_cursor; $('issue-more').hidden=!issueCursor
     if(!$('issue-history').childElementCount)$('issue-history').append(node('li','暂无反馈'))
-  }catch(e){if(ticket===historyTicket)$('issue-status').textContent=e.message||'反馈记录加载失败'}
+  }catch{if(ticket===historyTicket)$('issue-status').textContent='反馈记录加载失败，请查看诊断日志'}
   finally{if(ticket===historyTicket)$('issue-more').disabled=false}
 }
 $('issue-more').onclick=()=>loadIssues(true)
@@ -489,12 +501,15 @@ $('issue-form').onsubmit=async event=>{
     $('issue-status').textContent='请填写反馈内容；图片仅支持 PNG、JPEG、WebP，最多 3 张，每张不超过 1 MiB';return
   }
   $('issue-fields').disabled=true; $('issue-status').textContent='正在提交…'
+  let readingImages=true
   try{
     const images=await Promise.all(files.map(file=>new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve({mime:file.type,data:r.result.split(',')[1]});r.onerror=()=>reject(Error('图片读取失败'));r.readAsDataURL(file)})))
+    readingImages=false
     if(epoch!==issueEpoch)return
     const r=await call({op:'issue_submit',text,images,include_logs});if(epoch!==issueEpoch)return
-    if(!r.ok)throw Error(errorText(r.error?.code));$('issue-form').reset();$('issue-status').textContent='已提交';await loadIssues()
-  }catch(e){if(epoch===issueEpoch)$('issue-status').textContent=e.message||'反馈提交失败'}
+    if(!r.ok){$('issue-status').textContent=issueErrorText(r.error?.code);return}
+    $('issue-form').reset();$('issue-status').textContent='已提交';await loadIssues()
+  }catch{if(epoch===issueEpoch)$('issue-status').textContent=readingImages?'图片读取失败':'反馈提交失败，请查看诊断日志'}
   finally{if(epoch===issueEpoch)$('issue-fields').disabled=false}
 }
 function clearDiagnostics() {

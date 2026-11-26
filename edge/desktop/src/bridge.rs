@@ -97,6 +97,17 @@ pub struct ErrorBody {
     pub message: String,
 }
 
+struct IssueFailure {
+    error: ErrorBody,
+    details: diagnostics::Details,
+}
+
+impl IssueFailure {
+    fn local(error: ErrorBody, reason: &'static str, stage: &'static str) -> Self {
+        Self { error, details: diagnostics::Details { code: Some(reason), stage: Some(stage), http_status: None } }
+    }
+}
+
 pub type Reply = Result<Snapshot, ErrorBody>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -364,7 +375,13 @@ impl Bridge {
         };
         let mut inner = self.inner.lock().unwrap();
         if let diagnostics::Action::Launch(agent) = action {
-            inner.diagnostics.push(&self.version, "info", "launch_requested", Some(agent), None);
+            inner.diagnostics.push(
+                &self.version,
+                "info",
+                "launch_requested",
+                Some(agent),
+                diagnostics::Details::default(),
+            );
         }
         Some((action, inner.diagnostics.since))
     }
@@ -390,7 +407,13 @@ impl Bridge {
         };
         let mut inner = self.inner.lock().unwrap();
         if since == inner.diagnostics.since {
-            inner.diagnostics.push(&self.version, level, event, Some(agent), code);
+            inner.diagnostics.push(
+                &self.version,
+                level,
+                event,
+                Some(agent),
+                diagnostics::Details { code, ..Default::default() },
+            );
         }
     }
 
@@ -417,11 +440,33 @@ impl Bridge {
     }
 
     pub(crate) async fn issue(&self, op: Op) -> Result<Value, ErrorBody> {
-        let _change = self.mutation.try_lock().map_err(|_| invalid("已有操作正在进行"))?;
-        let device_id = {
-            let inner = self.inner.lock().unwrap();
-            inner.device_id.clone().filter(|_| inner.phase == Phase::Ready).ok_or_else(device_session_conflict)?
-        };
+        let submit = matches!(op, Op::IssueSubmit { .. });
+        let since = self.inner.lock().unwrap().diagnostics.since;
+        self.issue_exchange(op, submit).await.map_err(|failure| {
+            let mut inner = self.inner.lock().unwrap();
+            if since == inner.diagnostics.since {
+                let event = if submit { "issue_submit_failed" } else { "issue_list_failed" };
+                inner.diagnostics.push(&self.version, "error", event, None, failure.details);
+            }
+            failure.error
+        })
+    }
+
+    async fn issue_exchange(&self, op: Op, submit: bool) -> Result<Value, IssueFailure> {
+        let _change = self.mutation.try_lock().map_err(|_| {
+            IssueFailure::local(
+                ErrorBody { code: "conflict".into(), message: "已有操作正在进行".into() },
+                "issue_operation_pending",
+                "ipc",
+            )
+        })?;
+        let device_id =
+            {
+                let inner = self.inner.lock().unwrap();
+                inner.device_id.clone().filter(|_| inner.phase == Phase::Ready).ok_or_else(|| {
+                    IssueFailure::local(device_session_conflict(), "issue_identity_missing", "identity")
+                })?
+            };
         let request = match op {
             Op::IssueList { cursor } => Request::IssueList { device_id, cursor },
             Op::IssueSubmit { text, images, include_logs } => {
@@ -430,7 +475,11 @@ impl Bridge {
                     || images.len() > 3
                     || images.iter().any(|image| image.data.len() > 1398104)
                 {
-                    return Err(invalid("反馈内容或图片超过限制"));
+                    return Err(IssueFailure::local(
+                        invalid("反馈内容或图片超过限制"),
+                        "issue_input_invalid",
+                        "validate",
+                    ));
                 }
                 let logs = if include_logs {
                     self.diagnostics().await.entries.into_iter().take(28).map(|entry| json!(entry)).collect()
@@ -439,12 +488,13 @@ impl Bridge {
                 };
                 Request::IssueSubmit { device_id, text, images, logs }
             }
-            _ => return Err(invalid("未知反馈操作")),
+            _ => return Err(IssueFailure::local(invalid("未知反馈操作"), "issue_input_invalid", "validate")),
         };
-        tokio::time::timeout(Duration::from_secs(25), ipc_call_with(&self.socket_path, &request))
+        let reply = tokio::time::timeout(Duration::from_secs(25), ipc_call_with(&self.socket_path, &request))
             .await
-            .map_err(|_| unavailable())?
-            .map_err(|_| unavailable())
+            .map_err(|_| IssueFailure::local(unavailable(), "issue_ipc_timeout", "ipc"))?
+            .map_err(|_| IssueFailure::local(unavailable(), "issue_ipc_failed", "ipc"))?;
+        issue_reply(reply, submit)
     }
 
     async fn send_code(&self, target: String) -> Reply {
@@ -1246,6 +1296,38 @@ fn diagnostic_error(error: &ErrorBody) -> &'static str {
         .unwrap_or("internal")
 }
 
+fn issue_reply(reply: Value, submit: bool) -> Result<Value, IssueFailure> {
+    let valid = if submit { reply["issues"]["id"].is_string() } else { reply["issues"]["items"].is_array() };
+    if reply["ok"] == true && valid {
+        return Ok(reply);
+    }
+    let error = &reply["error"];
+    let legacy_message = if submit {
+        "无法解析请求：unknown variant `issue_submit`"
+    } else {
+        "无法解析请求：unknown variant `issue_list`"
+    };
+    if error["code"] == "invalid"
+        && error["message"].as_str().is_some_and(|message| message.starts_with(legacy_message))
+    {
+        return Err(IssueFailure::local(
+            ErrorBody {
+                code: "issue_update_required".into(), message: "当前后台版本不支持反馈，请先完成更新".into()
+            },
+            "issue_update_required",
+            "compatibility",
+        ));
+    }
+    let mut details = diagnostics::Details::issue(&error["detail"]);
+    if details.code.is_none() {
+        details.code =
+            Some(if valid || error.is_object() { "issue_daemon_rejected" } else { "issue_daemon_reply_invalid" });
+        details.stage = Some("ipc");
+    }
+    let code = error["code"].as_str().filter(|code| KNOWN_CODES.contains(code)).unwrap_or("internal");
+    Err(IssueFailure { error: ErrorBody { code: code.into(), message: "反馈请求失败".into() }, details })
+}
+
 fn native_launch_error(error: &Value) -> ErrorBody {
     let Some(code) = error["code"].as_str().filter(|code| KNOWN_CODES.contains(code)) else {
         return unavailable();
@@ -1301,6 +1383,57 @@ fn unavailable() -> ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn feedback_ipc_failure_is_in_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("onexd.sock");
+        let listener = onex_core::transport::bind(&socket).await.unwrap();
+        let daemon = tokio::spawn(async move {
+            let (reader, mut writer) = listener.accept().await.unwrap().into_split();
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["cmd"], "issue_submit");
+            writer.write_all(concat!(
+                "{\"ok\":false,\"error\":{\"code\":\"upstream_error\",\"message\":\"SECRET_RAW_MESSAGE\",",
+                "\"detail\":{\"reason_code\":\"issue_http_status\",\"stage\":\"response\",\"http_status\":502}}}\n"
+            ).as_bytes()).await.unwrap();
+        });
+        let bridge = Bridge::new(socket);
+        {
+            let mut inner = bridge.inner.lock().unwrap();
+            inner.phase = Phase::Ready;
+            inner.device_id = Some("dev_test".into());
+        }
+        let failure = bridge
+            .issue(Op::IssueSubmit { text: "SECRET_FEEDBACK_TEXT".into(), images: vec![], include_logs: false })
+            .await
+            .unwrap_err();
+        assert!(!failure.message.contains("SECRET"));
+        let history =
+            serde_json::to_value(bridge.inner.lock().unwrap().diagnostics.view("0.1.0", None, vec![])).unwrap();
+        let entry = &history["entries"][0];
+        assert_eq!(entry["event"], "issue_submit_failed");
+        assert_eq!(entry["code"], "issue_http_status");
+        assert_eq!(entry["stage"], "response");
+        assert_eq!(entry["http_status"], 502);
+        assert!(!history.to_string().contains("SECRET"));
+        daemon.await.unwrap();
+    }
+
+    #[test]
+    fn unsupported_legacy_daemon_feedback_is_reported_as_update_required() {
+        let failure = issue_reply(
+            json!({"ok":false,"error":{"code":"invalid",
+            "message":"无法解析请求：unknown variant `issue_submit`, expected one of SECRET_FIXTURE"}}),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(failure.error.code, "issue_update_required");
+        assert_eq!(failure.details.code, Some("issue_update_required"));
+        assert_eq!(failure.details.stage, Some("compatibility"));
+        assert!(!failure.error.message.contains("SECRET"));
+    }
 
     #[test]
     fn desktop_launch_distinguishes_recognized_tool_bundle_failures() {

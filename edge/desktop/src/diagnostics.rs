@@ -43,6 +43,42 @@ pub(crate) enum Action {
     Download(&'static str),
 }
 
+#[derive(Default)]
+pub(crate) struct Details {
+    pub code: Option<&'static str>,
+    pub stage: Option<&'static str>,
+    pub http_status: Option<u16>,
+}
+
+impl Details {
+    pub(crate) fn issue(error: &serde_json::Value) -> Self {
+        Self {
+            code: error["reason_code"].as_str().and_then(|code| {
+                known(
+                    code,
+                    &[
+                        "issue_identity_changed",
+                        "issue_identity_missing",
+                        "issue_origin_invalid",
+                        "issue_client_failed",
+                        "issue_transport_failed",
+                        "issue_request_timeout",
+                        "issue_http_status",
+                        "issue_response_invalid",
+                    ],
+                )
+            }),
+            stage: error["stage"]
+                .as_str()
+                .and_then(|stage| known(stage, &["identity", "origin", "request", "response", "decode"])),
+            http_status: error["http_status"]
+                .as_u64()
+                .filter(|status| (100..=599).contains(status))
+                .map(|status| status as u16),
+        }
+    }
+}
+
 pub(crate) struct Session {
     pub since: OffsetDateTime,
     entries: VecDeque<Entry>,
@@ -61,7 +97,7 @@ impl Session {
         level: &'static str,
         event: &'static str,
         agent: Option<&'static str>,
-        code: Option<&'static str>,
+        details: Details,
     ) {
         if self.entries.len() == LOG_COUNT {
             self.entries.pop_front();
@@ -74,9 +110,9 @@ impl Session {
             event,
             version: safe_version(version),
             agent,
-            code,
-            stage: None,
-            http_status: None,
+            code: details.code,
+            stage: details.stage,
+            http_status: details.http_status,
             config_revision: None,
             exit_code: None,
             model: None,

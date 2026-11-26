@@ -88,6 +88,12 @@ try{
     window.desktopDiagnostics=[]
     window.__TAURI__={core:{invoke:async (_, {request})=>{
       if(request.op==='diagnostics')return {ok:true,diagnostics:{desktop_version:'0.1.0-rc28',daemon_version:'0.1.0-rc27',entries:window.desktopDiagnostics}}
+      if(request.op==='issue_list')return {ok:true,issues:{items:[],next_cursor:null}}
+      if(request.op==='issue_submit'){
+        window.desktopDiagnostics.unshift({at_ms:1795654805000,source:'desktop',component:'onex_desktop::bridge',level:'error',
+          event:'issue_submit_failed',code:'issue_http_status',stage:'response',http_status:502})
+        return {ok:false,error:{code:'upstream_error',message:'TEST-ONLY-RAW-ISSUE'}}
+      }
       if(request.op==='download') window.downloadRequested=request.agent_id
       if(request.op==='launch'){
         window.desktopLaunchRequests.push(request)
@@ -250,6 +256,20 @@ try{
   await diagnostics.getByLabel('来源').selectOption('')
   await diagnostics.getByLabel('筛选').fill('166')
   assert.equal(await diagnostics.getByRole('listitem').count(),1)
+  await diagnostics.getByLabel('级别').selectOption('')
+  await diagnostics.getByLabel('筛选').fill('')
+  await diagnostics.getByRole('tab',{name:'issue',exact:true}).click()
+  await diagnostics.locator('#issue-text').fill('保留失败的反馈草稿')
+  await diagnostics.getByRole('button',{name:'提交',exact:true}).click()
+  await diagnostics.getByText('反馈服务请求失败，请查看诊断日志',{exact:true}).waitFor()
+  assert.equal(await diagnostics.locator('#issue-text').inputValue(),'保留失败的反馈草稿')
+  await diagnostics.locator('#logs-tab').click()
+  const issueFailure=diagnostics.getByRole('listitem').filter({hasText:'反馈提交失败'})
+  await issueFailure.locator('summary').click()
+  for (const value of ['issue_submit_failed','issue_http_status','response','502']) {
+    await issueFailure.getByText(value,{exact:true}).waitFor()
+  }
+  assert(!await diagnostics.innerText().then(text=>text.includes('TEST-ONLY-RAW-ISSUE')))
   await diagnostics.getByText('....',{exact:true}).click()
   await workbench.getByText('运行实例 2').waitFor()
   await workbench.getByText('2.125',{exact:true}).waitFor()

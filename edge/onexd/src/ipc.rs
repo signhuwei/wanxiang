@@ -363,18 +363,26 @@ async fn dispatch(req: Request, ipc: &Arc<Ipc>, socket: &Path) -> (Value, bool) 
 }
 
 async fn issue_request(ipc: &Ipc, device: &str, body: Option<Value>, cursor: Option<String>) -> Value {
+    let operation = if body.is_some() { "submit" } else { "list" };
     let _identity = ipc.identity_transition.lock().await;
     if ipc.state.expected_device_id.read().unwrap().as_deref() != Some(device) {
-        return err("conflict", "本机登录设备已变化");
+        return issue_failure(operation, "conflict", "issue_identity_changed", "identity", None);
     }
-    let Some(token) = ipc.state.token.borrow().clone() else { return err("unauthenticated", "请先登录") };
-    let Some(origin) = &ipc.server_url else { return err("invalid", "服务地址不可用") };
+    let Some(token) = ipc.state.token.borrow().clone() else {
+        return issue_failure(operation, "unauthenticated", "issue_identity_missing", "identity", None);
+    };
+    let Some(origin) = ipc.server_url.as_deref().and_then(normalize_origin) else {
+        return issue_failure(operation, "invalid", "issue_origin_invalid", "origin", None);
+    };
+    // Feedback is a OneX control-plane operation carrying the same device bearer.
+    // Use the configured origin directly, just like device history recovery.
     let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(20))
         .build()
     else {
-        return err("internal", "无法连接服务");
+        return issue_failure(operation, "internal", "issue_client_failed", "request", None);
     };
     let url = format!("{origin}/v1/edge/issues");
     let request = if let Some(data) = body {
@@ -383,8 +391,12 @@ async fn issue_request(ipc: &Ipc, device: &str, body: Option<Value>, cursor: Opt
         let request = client.get(url).query(&[("limit", "20")]);
         if let Some(cursor) = cursor { request.query(&[("cursor", cursor)]) } else { request }
     };
-    let Ok(response) = request.bearer_auth(token).send().await else {
-        return err("upstream_error", "无法连接反馈服务");
+    let response = match request.bearer_auth(token).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let reason = if error.is_timeout() { "issue_request_timeout" } else { "issue_transport_failed" };
+            return issue_failure(operation, "upstream_error", reason, "request", None);
+        }
     };
     let status = response.status();
     if !status.is_success() {
@@ -395,12 +407,20 @@ async fn issue_request(ipc: &Ipc, device: &str, body: Option<Value>, cursor: Opt
             422 | 413 => "invalid",
             _ => "upstream_error",
         };
-        return err(code, "反馈请求失败");
+        return issue_failure(operation, code, "issue_http_status", "response", Some(status.as_u16()));
     }
     match response.json::<Value>().await {
         Ok(data) => json!({"ok":true,"issues":data}),
-        Err(_) => err("invalid", "反馈服务响应无效"),
+        Err(_) => issue_failure(operation, "upstream_error", "issue_response_invalid", "decode", Some(status.as_u16())),
     }
+}
+
+fn issue_failure(operation: &str, code: &str, reason: &str, stage: &str, status: Option<u16>) -> Value {
+    warn!(operation, reason_code = reason, stage, http_status = status.unwrap_or_default(), "feedback request failed");
+    json!({"ok":false,"error":{
+        "code":code,"message":"反馈请求失败",
+        "detail":{"reason_code":reason,"stage":stage,"http_status":status}
+    }})
 }
 
 async fn resume_device(ipc: &Ipc, origin: &str, session: &str) -> (Value, bool) {
@@ -1543,6 +1563,89 @@ async fn write_line(w: &mut (impl AsyncWriteExt + Unpin), v: &Value) -> Result<(
     s.push('\n');
     w.write_all(s.as_bytes()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod issue_tests {
+    use super::*;
+    use axum::{
+        Json,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+    };
+
+    #[tokio::test]
+    async fn feedback_bypasses_proxy_and_reports_http_status() {
+        // Use a child process so changing proxy settings cannot affect other tests.
+        if std::env::var_os("ONEX_TEST_ISSUE_PROXY_CHILD").is_none() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let app = axum::Router::new().fallback(|| async { StatusCode::BAD_GATEWAY });
+                axum::serve(listener, app).await.unwrap();
+            });
+            let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ipc::issue_tests::feedback_bypasses_proxy_and_reports_http_status"])
+                .env("ONEX_TEST_ISSUE_PROXY_CHILD", "1")
+                .env("HTTP_PROXY", &proxy)
+                .env("http_proxy", &proxy)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                .kill_on_drop(true)
+                .output();
+            let output = tokio::time::timeout(std::time::Duration::from_secs(15), child).await.unwrap().unwrap();
+            server.abort();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed"), "{stdout}");
+            return;
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let http = axum::Router::new().route(
+            "/v1/edge/issues",
+            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers["authorization"], "Bearer test-device");
+                if body["text"] == "accepted" {
+                    (StatusCode::CREATED, Json(json!({"id":"iss_test"})))
+                } else {
+                    (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"SECRET_RAW_RESPONSE"})))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, http).await.unwrap();
+        });
+        let default_client = reqwest::Client::new();
+        assert_eq!(
+            default_client.get(format!("{origin}/v1/edge/issues")).send().await.unwrap().status(),
+            StatusCode::BAD_GATEWAY,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(State::default());
+        *state.expected_device_id.write().unwrap() = Some("dev_test".into());
+        state.token.send_replace(Some("test-device".into()));
+        let ipc = Ipc {
+            state,
+            outbox: Arc::new(Outbox::open(&dir.path().join("outbox.sqlite")).unwrap()),
+            router_addr: None,
+            server_url: Some(origin),
+            launch: None,
+            credentials: None,
+            identity_transition: Default::default(),
+            shutdown: CancellationToken::new(),
+        };
+        let success = issue_request(&ipc, "dev_test", Some(json!({"text":"accepted"})), None).await;
+        assert_eq!(success, json!({"ok":true,"issues":{"id":"iss_test"}}));
+        let failure = issue_request(&ipc, "dev_test", Some(json!({"text":"SECRET_FEEDBACK"})), None).await;
+        assert_eq!(failure["error"]["code"], "upstream_error");
+        assert_eq!(
+            failure["error"]["detail"],
+            json!({"reason_code":"issue_http_status","stage":"response","http_status":503})
+        );
+        assert!(!failure.to_string().contains("SECRET"));
+        server.abort();
+    }
 }
 
 #[cfg(test)]
