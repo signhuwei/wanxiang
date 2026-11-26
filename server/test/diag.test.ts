@@ -121,6 +121,33 @@ async function fixture(withStorage = true) {
   return { ...service, request, putUpload, owner, relogin, registerDevice, connectEdge, linkedEdge, codeFor, objectStorage, advance: (ms: number) => { time += ms; }, now: () => time };
 }
 
+test('feedback binds the submitting device to its user and restricts platform attachments', async () => {
+  const f = await fixture(false);
+  const a = await f.owner('feedback@example.test');
+  const b = await f.owner('master@example.test', { platformAdmin: true });
+  const edge = await f.registerDevice(a.scoped), other = await f.registerDevice(b.scoped);
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jC1sAAAAASUVORK5CYII=';
+  const logs = Array.from({length:28}, (_, at_ms) => ({at_ms,source:'daemon',level:'info',event:'daemon_started'}));
+  const post = (data:Record<string,unknown>) => f.request('/edge/issues', data, edge.device_token);
+  expect((await post({text:' ',images:[]})).status).toBe(422);
+  expect((await post({text:'test', logs:[...logs, logs[0]]})).status).toBe(422);
+  expect((await post({text:'test', images:[{mime:'image/png',data:'Tm90IGFuIGltYWdl'}]})).status).toBe(422);
+  const created = await post({text:'Synthetic feedback',logs,images:[{mime:'image/png',data:png}]});
+  expect(created.status).toBe(201);
+  const {id} = await created.json() as {id:string};
+  const own = await f.request('/edge/issues',undefined,edge.device_token);
+  expect(await own.json()).toMatchObject({total:1,items:[{id,image_count:1,log_count:28}]});
+  expect(await (await f.request('/edge/issues',undefined,other.device_token)).json()).toMatchObject({total:0});
+  for (const path of ['/platform/issues',`/platform/issues/${id}`,`/platform/issues/${id}/images/0`]) {
+    expect((await f.request(path,undefined,a.global)).status).toBe(403);
+    expect((await f.request(path,undefined,b.scoped)).status).toBe(403);
+  }
+  expect(await (await f.request(`/platform/issues/${id}`,undefined,b.global)).json()).toMatchObject({id,tenant_id:a.tenantId,logs});
+  const image = await f.request(`/platform/issues/${id}/images/0`,undefined,b.global);
+  expect(image.headers.get('content-type')).toBe('image/png');
+  expect(Buffer.from(await image.arrayBuffer()).toString('base64')).toBe(png);
+});
+
 test('owner requests a logs diag job, online Edge uploads it, and only an authorized reader can download it', async (): Promise<void> => {
   const f: Fixture = await fixture();
   const a = await f.owner('owner-a@example.test');

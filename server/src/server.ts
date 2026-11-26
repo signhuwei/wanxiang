@@ -19,6 +19,7 @@ import type { ObjectStorage } from './object-storage';
 import { PendingWork } from './pending';
 import { SERVER_ARTIFACT_UPLOAD_PATH, serverReleaseRoutes, type ReleaseRuntime } from './server-releases';
 import { personalLoginTokenRoutes } from './personal-login-tokens';
+import { issueRoutes } from './issues';
 import { platformRoutes } from './platform-management';
 import { modelPoolRoutes } from './model-pool';
 import { providerChannelRoutes } from './provider-channels';
@@ -94,6 +95,7 @@ export async function createServer(opts: Options) {
     });
     const limitedBody = (maxSize: number) => bodyLimit({ maxSize,
       onError: (c) => c.json({ error: new ApiError('invalid', { fields: ['body'] }).body() }, 422) });
+    const issueBody = limitedBody(4_400_000);
     const smallBody = limitedBody(8192);
     const capabilityBody = limitedBody(65536);
     const capabilityWrite = /^\/v1\/(?:contract\/configuration(?:\/preview)?|platform\/(?:contract-templates|capability-contracts\/[^/]+(?:\/preview)?))$/;
@@ -103,6 +105,7 @@ export async function createServer(opts: Options) {
         || SERVER_ARTIFACT_UPLOAD_PATH.test(c.req.path) || AGENT_ARTIFACT_UPLOAD_PATH.test(c.req.path)
         || TOOL_ARTIFACT_UPLOAD_PATH.test(c.req.path));
     app.use('/v1/*', (c, next) => {
+      if (c.req.method === 'POST' && c.req.path === '/v1/edge/issues') return issueBody(c,next);
       if (isRawUpload(c)) return next();
       const isWrite = c.req.method === 'POST' || c.req.method === 'PUT';
       return isWrite && (capabilityWrite.test(c.req.path) || /^\/v1\/(?:platform\/)?policy\//.test(c.req.path)) ? capabilityBody(c, next) : smallBody(c, next);
@@ -128,6 +131,7 @@ export async function createServer(opts: Options) {
     };
     personalLoginTokenRoutes(app, store, management);
     tenantRoutes(app, store, management);
+    issueRoutes(app, store, management);
     platformRoutes(app, store, management);
     modelPoolRoutes(app, store, management);
     providerChannelRoutes(app, store, management);

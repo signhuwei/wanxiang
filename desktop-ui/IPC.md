@@ -10,6 +10,8 @@ UI 是本地静态 HTML/ESM，不直连 Server、daemon socket 或上游。edge 
 |---|---|---|
 | `state` | 无 | 返回当前安全快照，不触发网络写操作 |
 | `diagnostics` | 无 | 读取当前桌面进程及已核验设备的最近诊断事件，返回 `{ok:true,diagnostics:{desktop_version,daemon_version,entries}}` |
+| `issue_list` | `cursor?` | 由 onexd 使用当前设备令牌读取本用户在当前租户的反馈记录，不向 WebView 暴露令牌 |
+| `issue_submit` | `text,images,include_logs` | 提交文本、最多 3 张 PNG/JPEG/WebP 图片（每张最大 1 MiB）及可选最近 28 条白名单诊断日志；仅转发当前设备身份，服务端重新核对令牌与归属 |
 | `install_update` | `version` | 用户确认标题栏当前显示的目标版本后请求更新。原生层复核发行并启动更新，保持正在运行的 Agent 纳管 |
 | `send_code` | `target` | 向配置好的 Server 请求验证码；限流错误原样分类 |
 | `login` | `target,code,invite_code?` | `kind:desktop`；邀请码仅用于入租。返回选租户快照，不返回令牌 |

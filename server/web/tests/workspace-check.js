@@ -58,6 +58,19 @@ try {
   await page.getByPlaceholder('6 位验证码').fill(code)
   await button('登录').click()
   await page.waitForURL(/#\/platform$/)
+  if (process.argv.includes('--issues-only')) {
+    const user = app.store.system.get('SELECT owner_user_id FROM tenants WHERE id=?',[seed.tenantId])
+    await app.store.system.write(sql => {
+      sql.run('INSERT INTO issues VALUES (?,?,?,?,?,?,?,?,?)', ['iss_test',seed.tenantId,user.owner_user_id,'fixture-device','浏览器反馈样例','[]',new Date().toISOString(),0,0])
+    })
+    await link('运维管理').click()
+    await link('用户反馈').click()
+    await page.getByText('浏览器反馈样例',{exact:true}).click()
+    await page.getByRole('heading',{name:'反馈详情'}).waitFor()
+    await page.locator('.inline-body').getByText('浏览器反馈样例',{exact:true}).waitFor()
+    await button('← 返回').click()
+    assert.deepEqual(errors,[])
+  } else {
   await enterTenant()
   await page.locator('tr.clickable').waitFor()
   await page.getByRole('combobox',{name:'状态'}).selectOption('disabled')
@@ -103,6 +116,9 @@ try {
   await button('保存').click()
   await page.locator('.table-scroll').last().getByText('0.015', { exact: true }).waitFor()
   await capture('pricing-real')
+  await link('运维管理').click()
+  await link('用户反馈').click()
+  await page.getByRole('heading', { name: '用户反馈' }).waitFor()
   await link('能力合约').click()
   await link('合约模板').click()
   await button('发布新模板').click()
@@ -192,6 +208,7 @@ try {
   await checkLiveObservation({app,seed,page,target,capture,summaryOnly})
   assert.deepEqual(errors, [])
   console.log('真实 Server：登录、成员筛选、分组、邀请码、平台目录、倍率、租户合约和充值通过')
+  }
 } finally {
   await browser.close()
   await app.close()

@@ -17,8 +17,10 @@
   </main>
   <footer class="diagnostics-footer" id="diagnostics-footer" hidden>
     <details id="diagnostics">
-      <summary>诊断日志</summary>
+      <summary aria-label="诊断日志与反馈" title="日志与反馈">....</summary>
       <div class="diagnostics-body">
+        <div class="feedback-tabs" role="tablist" aria-label="日志与反馈"><button id="logs-tab" role="tab" aria-controls="logs-panel" aria-selected="true">logs</button><button id="issue-tab" role="tab" aria-controls="issue-panel" aria-selected="false">issue</button></div>
+        <section id="logs-panel" role="tabpanel" aria-labelledby="logs-tab">
         <p id="diagnostics-versions" class="diagnostics-versions"></p>
         <div class="diagnostics-controls">
           <label>来源<select id="diagnostics-source"><option value="">全部来源</option><option value="desktop">Desktop</option><option value="daemon">onexd</option></select></label>
@@ -27,6 +29,17 @@
         </div>
         <p id="diagnostics-hint" class="diagnostics-hint"></p>
         <ol id="diagnostics-events" class="diagnostics-events" aria-label="最近诊断日志"></ol>
+        </section>
+        <section id="issue-panel" role="tabpanel" aria-labelledby="issue-tab" hidden>
+          <form id="issue-form"><fieldset id="issue-fields">
+            <textarea id="issue-text" required maxlength="20000" rows="3" aria-label="反馈内容" placeholder="描述你遇到的问题…"></textarea>
+            <label>添加图片 <input id="issue-images" type="file" multiple accept="image/png,image/jpeg,image/webp"></label>
+            <small>最多 3 张，每张不超过 1 MiB</small>
+            <label><input id="issue-logs" type="checkbox">附带最近日志（最多 28 条）</label>
+            <button class="primary" type="submit">提交</button>
+          </fieldset></form>
+          <p role="status" id="issue-status"></p><h3>我的反馈</h3><ol id="issue-history"></ol><button type="button" id="issue-more" hidden>加载更多</button>
+        </section>
       </div>
     </details>
   </footer>

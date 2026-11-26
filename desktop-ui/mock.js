@@ -1,6 +1,7 @@
 const tenant={id:'ten_demo',name:'示例研发部'}
 const fail=(code,message)=>({ok:false,error:{code,message}})
 export function makeMock(){
+  const issues=new Map()
   let issued=false,start=0
   const state={version:'0.1.0-demo',phase:'signed_out',user:null,tenant:null,tenants:[],connection:'idle',agents:[],settings:{server_origin:'https://onex.example.invalid',hide_on_close:true}}
   function enterTenant(tenant) {
@@ -13,6 +14,12 @@ export function makeMock(){
     switch(r.op){
       case 'state':
         if(start && Date.now()-start>=650 && state.agents.length){state.agents[0].status='running';start=0}break
+      case 'issue_list': case 'issue_submit': {
+        if(state.phase!=='ready')return fail('unauthenticated','请先登录')
+        const key=JSON.stringify([state.tenant.id,state.user.name]),items=issues.get(key)??[]
+        if(r.op==='issue_submit'){items.unshift({id:crypto.randomUUID(),created_at:new Date().toISOString(),text:r.text,image_count:r.images.length,log_count:0});issues.set(key,items)}
+        return {ok:true,issues:{items:structuredClone(items),next_cursor:null}}
+      }
       case 'diagnostics':
         return {ok:true,diagnostics:{desktop_version:state.version,daemon_version:null,entries:[]}}
       case 'send_code':

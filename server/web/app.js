@@ -10,6 +10,7 @@ import { devicesPage } from './devices.js'
 import { observePage,sharedSessions } from './observation.js'
 import { statisticsPage } from './statistics.js'
 import { billingPage } from './billing.js'
+import { issuesPage } from './issues.js'
 import { auditPage } from './audit.js'
 import { agentReleasesPage } from './agent-releases.js'
 import { catalog } from './catalog.js'
@@ -112,7 +113,7 @@ function appendQuotaItem(items, quota) {
 const platformNavigation = [
   ['能力合约', [['contracts', '平台合约'], ['templates', '合约模板'], ['definitions', '条目库'], ['commerce','商业计费']]],
   ['能力管理', [['catalog', 'Provider'], ['models', '签约型号'], ['model-references', '型号码表'], ['model-test-quotas', '管理员测试额度'], ['fx-rates', '采购汇率'], ['agents', 'Agent'], ['tools', 'Tools']]],
-  ['运维管理', [['maintenance', '维护与发布'], ['releases', 'Edge 安装包']]]
+  ['运维管理', [['maintenance', '维护与发布'], ['releases', 'Edge 安装包'], ['issues', '用户反馈']]]
 ]
 const platformPath = hash => hash.split('/')[2] || 'contracts'
 const platformGroup = path => platformNavigation.find(([, pages]) => pages.some(([id]) => path === id)) ?? platformNavigation[0]
@@ -326,6 +327,7 @@ function route() {
     container.append(nav, view)
     ws.append(container)
     if (path === 'maintenance') serverReleasesPage(view, platformApi, signal)
+    else if (path === 'issues') issuesPage(view, platformApi, signal)
     else if (path === 'contracts') platformPolicyContracts(view, platformApi, signal)
     else if (path === 'templates') platformPolicyTemplates(view, platformApi, signal)
     else if (path === 'definitions') platformPolicyDefinitions(view, platformApi, signal)

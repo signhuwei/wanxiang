@@ -1,5 +1,8 @@
 /* OneX 管理端。台账保持 32–40px 行高，工具栏与页码固定。 */
 
+.issue-content { white-space: pre-wrap; overflow-wrap: anywhere; }
+.issue-picture { display: block; max-width: min(100%, 720px); max-height: 480px; object-fit: contain; margin: 12px 0; }
+
 /* 基础配色与字体由 theme.css 和 Desktop 共用。 */
 :root {
   --control-line: #d4dfd6;

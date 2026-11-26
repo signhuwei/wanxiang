@@ -121,3 +121,10 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 - `GET /v1/observe/statistics?from=YYYY-MM-DD&to=YYYY-MM-DD&agent=`。按北京时间自然日（两端含当日），缺省为最近 30 天，支持近 90 天以内不超过 30 日的区间。返回 `totals`、`daily`、`agents`、`as_of` 和 `actions`。计量包括新增会话、事件、用户轮次、请求、输入输出与缓存 token、毫橡皮及待结算请求。孤立用量归到 `unknown`。活跃人数按查询范围内去重，不能相加合计。
 - `GET /v1/observe/statistics/parquet` 使用相同过滤条件，返回按日期及 Agent 汇总的 Parquet。成功导出写入租户审计 `observe.statistics.export`。
 - 统计与会话摘要使用相同的当前可见范围。统计和导出只提供汇总字段，不返回正文、身份标识或原始用量单据。私有快照按租户隔离，从 SQLite 生成。配置 RustFS 时，每 15 分钟将活跃租户的最新快照同步至私有存储。DuckDB 执行 Parquet 查询，在线事件及计费仍写 SQLite。
+
+## Desktop 用户反馈
+
+- `GET /v1/edge/issues?q=&cursor=&limit=` 使用活动设备令牌，按设备所属租户和用户返回本人记录。
+- `POST /v1/edge/issues` 使用活动设备令牌，JSON `{text,images:[{mime,data}],logs}`；最多 3 张 base64 图片，MIME 为 PNG/JPEG/WebP，每张不超过 1 MiB；日志最多 28 条、总大小不超过 100 KiB。提交文本不超过 20,000 字符。每用户每小时最多 20 条。
+- `GET /v1/platform/issues?q=&cursor=&limit=`、`GET /v1/platform/issues/:id` 与 `GET /v1/platform/issues/:id/images/:index` 仅平台管理员 token 可访问。图片响应经鉴权，设置 no-sniff。
+- 图片在平台管理界面呈现；日志只存诊断白名单字段，并由 master 展开查看。

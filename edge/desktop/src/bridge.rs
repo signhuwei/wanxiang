@@ -47,6 +47,14 @@ const KNOWN_CODES: &[&str] = &[
 pub enum Op {
     State,
     Diagnostics,
+    IssueList {
+        cursor: Option<String>,
+    },
+    IssueSubmit {
+        text: String,
+        images: Vec<onex_core::ipc::IssueImage>,
+        include_logs: bool,
+    },
     SendCode {
         target: String,
     },
@@ -315,7 +323,7 @@ impl Bridge {
             .map_err(|_| ErrorBody { code: "conflict".into(), message: "已有操作正在进行".into() })?;
         match op {
             Op::State => self.state().await,
-            Op::Diagnostics => Err(invalid("诊断日志请使用只读入口")),
+            Op::Diagnostics | Op::IssueList { .. } | Op::IssueSubmit { .. } => Err(invalid("诊断日志请使用只读入口")),
             Op::SendCode { target } => self.send_code(target).await,
             Op::Login { target, code, invite_code } => self.login(target, code, invite_code).await,
             Op::PasswordLogin { tenant, username, password } => self.password_login(tenant, username, password).await,
@@ -406,6 +414,37 @@ impl Bridge {
             daemon.clear();
         }
         inner.diagnostics.view(&self.version, daemon_version, daemon)
+    }
+
+    pub(crate) async fn issue(&self, op: Op) -> Result<Value, ErrorBody> {
+        let _change = self.mutation.try_lock().map_err(|_| invalid("已有操作正在进行"))?;
+        let device_id = {
+            let inner = self.inner.lock().unwrap();
+            inner.device_id.clone().filter(|_| inner.phase == Phase::Ready).ok_or_else(device_session_conflict)?
+        };
+        let request = match op {
+            Op::IssueList { cursor } => Request::IssueList { device_id, cursor },
+            Op::IssueSubmit { text, images, include_logs } => {
+                if text.trim().is_empty()
+                    || text.len() > 80000
+                    || images.len() > 3
+                    || images.iter().any(|image| image.data.len() > 1398104)
+                {
+                    return Err(invalid("反馈内容或图片超过限制"));
+                }
+                let logs = if include_logs {
+                    self.diagnostics().await.entries.into_iter().take(28).map(|entry| json!(entry)).collect()
+                } else {
+                    Vec::new()
+                };
+                Request::IssueSubmit { device_id, text, images, logs }
+            }
+            _ => return Err(invalid("未知反馈操作")),
+        };
+        tokio::time::timeout(Duration::from_secs(25), ipc_call_with(&self.socket_path, &request))
+            .await
+            .map_err(|_| unavailable())?
+            .map_err(|_| unavailable())
     }
 
     async fn send_code(&self, target: String) -> Reply {

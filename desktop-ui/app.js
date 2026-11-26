@@ -452,6 +452,51 @@ const diagnosticBlocks=value=>diagnosticCount(value)==null?null:metricFormat.for
 const lookup=(dictionary,key)=>typeof key==='string'&&Object.hasOwn(dictionary,key)?dictionary[key]:null
 let diagnosticData,diagnosticsTicket=0,diagnosticsPending=false,diagnosticsError=false,diagnosticRows=new Map()
 
+let issueEpoch=0,issueCursor=null,historyTicket=0
+function resetIssues() {
+  issueEpoch++; historyTicket++; issueCursor=null
+  $('issue-form').reset(); $('issue-history').replaceChildren(); $('issue-more').hidden=true
+  $('issue-fields').disabled=state?.phase!=='ready'
+  $('issue-status').textContent=$('issue-fields').disabled?'登录后可提交和查看反馈':''
+  if(diagnostics.open&&!$('issue-panel').hidden) loadIssues()
+}
+async function loadIssues(more=false) {
+  if(state?.phase!=='ready')return
+  const ticket=++historyTicket
+  $('issue-more').disabled=true
+  try {
+    const r=await call({op:'issue_list',cursor:more?issueCursor:null})
+    if(ticket!==historyTicket)return
+    if(!r.ok)throw Error(errorText(r.error?.code))
+    if(!more)$('issue-history').replaceChildren()
+    for(const item of r.issues.items){const li=node('li');li.append(node('small',`${new Date(item.created_at).toLocaleString()} · 图片 ${item.image_count} · 日志 ${item.log_count}`),node('p',item.text));$('issue-history').append(li)}
+    issueCursor=r.issues.next_cursor; $('issue-more').hidden=!issueCursor
+    if(!$('issue-history').childElementCount)$('issue-history').append(node('li','暂无反馈'))
+  }catch(e){if(ticket===historyTicket)$('issue-status').textContent=e.message||'反馈记录加载失败'}
+  finally{if(ticket===historyTicket)$('issue-more').disabled=false}
+}
+$('issue-more').onclick=()=>loadIssues(true)
+function selectFooter(issue){
+  $('issue-panel').hidden=!issue; $('logs-panel').hidden=issue
+  $('logs-tab').setAttribute('aria-selected',String(!issue)); $('issue-tab').setAttribute('aria-selected',String(issue))
+  if(issue)loadIssues();else refreshDiagnostics()
+}
+$('logs-tab').onclick=()=>selectFooter(false); $('issue-tab').onclick=()=>selectFooter(true)
+$('issue-form').onsubmit=async event=>{
+  event.preventDefault(); if($('issue-fields').disabled||state?.phase!=='ready')return
+  const epoch=issueEpoch,text=$('issue-text').value.trim(),files=Array.from($('issue-images').files),include_logs=$('issue-logs').checked
+  if(!text||files.length>3||files.some(f=>!['image/png','image/jpeg','image/webp'].includes(f.type)||!f.size||f.size>1048576)){
+    $('issue-status').textContent='请填写反馈内容；图片仅支持 PNG、JPEG、WebP，最多 3 张，每张不超过 1 MiB';return
+  }
+  $('issue-fields').disabled=true; $('issue-status').textContent='正在提交…'
+  try{
+    const images=await Promise.all(files.map(file=>new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve({mime:file.type,data:r.result.split(',')[1]});r.onerror=()=>reject(Error('图片读取失败'));r.readAsDataURL(file)})))
+    if(epoch!==issueEpoch)return
+    const r=await call({op:'issue_submit',text,images,include_logs});if(epoch!==issueEpoch)return
+    if(!r.ok)throw Error(errorText(r.error?.code));$('issue-form').reset();$('issue-status').textContent='已提交';await loadIssues()
+  }catch(e){if(epoch===issueEpoch)$('issue-status').textContent=e.message||'反馈提交失败'}
+  finally{if(epoch===issueEpoch)$('issue-fields').disabled=false}
+}
 function clearDiagnostics() {
   diagnosticsTicket++
   diagnosticData=null
@@ -536,7 +581,7 @@ function paintDiagnostics() {
 }
 
 async function refreshDiagnostics() {
-  if (!call||!diagnostics.open||diagnosticsPending||document.hidden) return
+  if (!call||!diagnostics.open||$('logs-panel').hidden||diagnosticsPending||document.hidden) return
   diagnosticsPending=true
   const ticket=diagnosticsTicket
   try {
@@ -567,6 +612,7 @@ function bindState(next) {
   if (changedScope) {
     seenNotices.clear()
     clearDiagnostics()
+    resetIssues()
   }
 }
 
@@ -627,7 +673,7 @@ updateDialog.onkeydown=event=>{
     closeUpdateDialog()
   }
 }
-diagnostics.ontoggle=()=>{if(diagnostics.open){paintDiagnostics();refreshDiagnostics()}}
+diagnostics.ontoggle=()=>{if(diagnostics.open){paintDiagnostics();if($('issue-panel').hidden)refreshDiagnostics();else loadIssues()}}
 for (const id of ['diagnostics-source','diagnostics-level','diagnostics-query']) $(id).oninput=paintDiagnostics
 if(!call){$('title').textContent='未连接桌面服务';$('content').append(styled('p','empty-state','请从 OneX Desktop 打开；浏览器演示请显式使用 ?mock=1。'))}else{
   $('diagnostics-footer').hidden=false

@@ -37,7 +37,7 @@ test('migrations persist version, WAL mode and independent tenant databases', as
     expect(db.tenant(b.tenantId).get('SELECT user_id FROM members')).toEqual({ user_id: b.userId });
     expect(() => first.get('SELECT 1')).toThrow();
     expect(db.tenant(a.tenantId).get('SELECT user_id FROM members')).toEqual({ user_id: a.userId });
-    expect(db.system.get('PRAGMA user_version')).toEqual({ user_version: 28 });
+    expect(db.system.get('PRAGMA user_version')).toEqual({ user_version: 29 });
     const starter = db.system.get<{ entries_json: string }>(
       "SELECT entries_json FROM policy_templates WHERE id = 'team' AND version = 1")!;
     const choices = Object.fromEntries((JSON.parse(starter.entries_json) as { clause_ref: { id: string }; value: unknown }[])

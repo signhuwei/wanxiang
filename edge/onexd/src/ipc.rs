@@ -219,18 +219,27 @@ pub async fn serve(listener: Listener, path: PathBuf, ipc: Arc<Ipc>) {
 async fn handle(stream: Connection, ipc: &Arc<Ipc>, socket: &Path) -> Result<()> {
     let (r, mut w) = stream.into_split();
     let mut r = BufReader::new(r);
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
         line.clear();
-        let n = (&mut r).take(MAX_LINE).read_line(&mut line).await?;
+        let mut n = (&mut r).take(MAX_LINE).read_until(b'\n', &mut line).await?;
+        // Only the dedicated attachment command needs a larger bounded frame.
+        let limit =
+            if n as u64 == MAX_LINE && !line.ends_with(&[b'\n']) && line.starts_with(br#"{"cmd":"issue_submit","#) {
+                let limit = 4_400_000;
+                n += (&mut r).take(limit - MAX_LINE).read_until(b'\n', &mut line).await?;
+                limit
+            } else {
+                MAX_LINE
+            };
         if n == 0 {
             return Ok(());
         }
-        if !line.ends_with('\n') && n as u64 == MAX_LINE {
-            write_line(&mut w, &err("invalid", "请求超过 64 KB")).await?;
+        if !line.ends_with(&[b'\n']) && n as u64 == limit {
+            write_line(&mut w, &err("invalid", "请求超过大小限制")).await?;
             return Ok(());
         }
-        let request = serde_json::from_str::<Request>(line.trim());
+        let request = serde_json::from_slice::<Request>(&line);
         let _identity = if matches!(
             request,
             Ok(Request::Login { .. }
@@ -264,6 +273,11 @@ async fn handle(stream: Connection, ipc: &Arc<Ipc>, socket: &Path) -> Result<()>
 async fn dispatch(req: Request, ipc: &Arc<Ipc>, socket: &Path) -> (Value, bool) {
     match req {
         Request::Status => (ok(status(ipc)), false),
+        Request::IssueSubmit { device_id, text, images, logs } => {
+            let body = json!({"text": text, "images": images, "logs": logs});
+            (issue_request(ipc, &device_id, Some(body), None).await, false)
+        }
+        Request::IssueList { device_id, cursor } => (issue_request(ipc, &device_id, None, cursor).await, false),
         Request::Login { token, server, device_id } => (login(ipc, token, server, device_id), false),
         Request::ResumeDevice { server, session_token } => resume_device(ipc, &server, &session_token).await,
         Request::Logout => logout(ipc),
@@ -345,6 +359,47 @@ async fn dispatch(req: Request, ipc: &Arc<Ipc>, socket: &Path) -> (Value, bool) 
             info!("shutdown requested via ipc");
             (json!({"ok": true}), true)
         }
+    }
+}
+
+async fn issue_request(ipc: &Ipc, device: &str, body: Option<Value>, cursor: Option<String>) -> Value {
+    let _identity = ipc.identity_transition.lock().await;
+    if ipc.state.expected_device_id.read().unwrap().as_deref() != Some(device) {
+        return err("conflict", "本机登录设备已变化");
+    }
+    let Some(token) = ipc.state.token.borrow().clone() else { return err("unauthenticated", "请先登录") };
+    let Some(origin) = &ipc.server_url else { return err("invalid", "服务地址不可用") };
+    let Ok(client) = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    else {
+        return err("internal", "无法连接服务");
+    };
+    let url = format!("{origin}/v1/edge/issues");
+    let request = if let Some(data) = body {
+        client.post(url).json(&data)
+    } else {
+        let request = client.get(url).query(&[("limit", "20")]);
+        if let Some(cursor) = cursor { request.query(&[("cursor", cursor)]) } else { request }
+    };
+    let Ok(response) = request.bearer_auth(token).send().await else {
+        return err("upstream_error", "无法连接反馈服务");
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let code = match status.as_u16() {
+            401 => "unauthenticated",
+            403 => "forbidden",
+            429 => "rate_limited",
+            422 | 413 => "invalid",
+            _ => "upstream_error",
+        };
+        return err(code, "反馈请求失败");
+    }
+    match response.json::<Value>().await {
+        Ok(data) => json!({"ok":true,"issues":data}),
+        Err(_) => err("invalid", "反馈服务响应无效"),
     }
 }
 
@@ -805,7 +860,13 @@ async fn launch(
                 let stage = error.stage();
                 let reason_code = error.reason_code();
                 let http_status = error.http_status();
-                warn!(agent, stage, reason_code, http_status = http_status.unwrap_or(0), "managed tool bundle resolution failed");
+                warn!(
+                    agent,
+                    stage,
+                    reason_code,
+                    http_status = http_status.unwrap_or(0),
+                    "managed tool bundle resolution failed"
+                );
                 return json!({ "ok": false, "error": {
                     "code": "upstream_error", "message": "无法下载或校验受管工具制品",
                     "detail": { "stage": stage, "reason_code": reason_code, "http_status": http_status }

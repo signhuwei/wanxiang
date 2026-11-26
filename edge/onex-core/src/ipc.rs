@@ -44,6 +44,16 @@ pub fn default_home() -> Result<PathBuf, &'static str> {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
+    IssueSubmit {
+        device_id: String,
+        text: String,
+        images: Vec<IssueImage>,
+        logs: Vec<Value>,
+    },
+    IssueList {
+        device_id: String,
+        cursor: Option<String>,
+    },
     /// 登录成功后交给 onexd 的设备身份。只带 token 时（旧用法／调试）只存内存，不落 Keychain，
     /// daemon 重启要重新登录。带齐 `server`/`device_id` 时额外持久化到 macOS Keychain（私钥是
     /// daemon 自己内存里生成的那把，从不经 IPC 输入或输出），daemon 重启后自动恢复同一个已登录
@@ -117,6 +127,13 @@ pub enum Request {
         expected_pid: Option<u32>,
     },
     Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueImage {
+    pub mime: String,
+    pub data: String,
 }
 
 /// 设备的 os、arch，hello 和设备注册用同一套写法（`darwin`/`arm64`、`win32`/`x64`）。
