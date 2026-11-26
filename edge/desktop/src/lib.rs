@@ -1,5 +1,6 @@
 //! OneX Desktop 原生桥：Tauri 2 应用的业务逻辑，独立于 `tauri::Builder` 便于测试。
 pub mod bridge;
+mod diagnostics;
 #[cfg(target_os = "macos")]
 mod macos_daemon_update;
 #[cfg(target_os = "macos")]
@@ -20,7 +21,7 @@ use tauri::{Manager, State, WebviewWindow, WebviewWindowBuilder};
 use bridge::{Bridge, Op};
 
 /// 唯一对外暴露的命令：封闭的 op 列表，拒绝未知字段（`Op` 用 `#[serde(tag = "op")]`，多余字段默认即拒）。
-/// 返回类型固定 `Ok`：前端始终按 `{ok, state|error}` 这一种成功的 IPC 外形解析，区分「本次操作被拒绝
+/// 返回类型固定 `Ok`：前端始终按 `{ok, state|diagnostics|error}` 解析，区分「本次操作被拒绝
 /// （ok:false）」和「IPC 本身失败（Tauri reject）」没有意义，也避免 reject 路径携带原始错误文本。
 #[tauri::command]
 async fn desktop_call(
@@ -36,9 +37,15 @@ async fn desktop_call(
         Ok(op) => op,
         Err(_) => return Ok(reply_err("invalid", "请检查输入内容")),
     };
+    if matches!(op, Op::Diagnostics) {
+        return Ok(serde_json::json!({"ok": true, "diagnostics": bridge.diagnostics().await}));
+    }
     let (op, requested_update) =
         if let Op::InstallUpdate { version } = op { (Op::State, Some(version)) } else { (op, None) };
-    Ok(match bridge.call(op).await {
+    let action = bridge.begin_diagnostic_action(&op);
+    let result = bridge.call_with_workspace(op, || pick_cli_workspace(&window)).await;
+    bridge.complete_diagnostic_action(action, &result);
+    Ok(match result {
         Ok(state) => {
             let origin = &state.settings.server_origin;
             let update = if let Some(version) = requested_update {
@@ -57,6 +64,15 @@ async fn desktop_call(
         }
         Err(e) => reply_err(&e.code, &e.message),
     })
+}
+
+async fn pick_cli_workspace(window: &WebviewWindow) -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_parent(window)
+        .set_title("选择 Agent 工作目录")
+        .pick_folder()
+        .await
+        .map(|folder| folder.path().to_path_buf())
 }
 
 /// 本地主窗口的 origin 判定，这是 `desktop_call` 唯一的访问控制点，必须精确匹配到具体平台：

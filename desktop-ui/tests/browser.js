@@ -74,9 +74,16 @@ try{
     window.desktopInstallRequests=[]
     window.desktopLaunchRequests=[]
     window.desktopDaemonUpgrading=true
+    window.desktopDiagnostics=[]
     window.__TAURI__={core:{invoke:async (_, {request})=>{
+      if(request.op==='diagnostics')return {ok:true,diagnostics:{desktop_version:'0.1.0-rc28',daemon_version:'0.1.0-rc27',entries:window.desktopDiagnostics}}
       if(request.op==='download') window.downloadRequested=request.agent_id
-      if(request.op==='launch') window.desktopLaunchRequests.push(request)
+      if(request.op==='launch'){
+        window.desktopLaunchRequests.push(request)
+        const result=await new Promise(resolve=>{window.finishDesktopLaunch=resolve})
+        delete window.finishDesktopLaunch
+        if(result==='cancel')return {ok:false,error:{code:'launch_cancelled'}}
+      }
       if(request.op==='install_update'){
         window.desktopInstallRequests.push(request)
         window.desktopUpdate={version:request.version,phase:'downloading',downloaded_bytes:25,total_bytes:100}
@@ -92,10 +99,11 @@ try{
         agents:[
           {id:'claude-code',vendor:'Anthropic',name:'Claude Code',status:downloading?'downloading':'not_downloaded',
             actions:downloading?[]:['download'],progress:downloading?{downloaded_bytes:15,total_bytes:30}:null},
-          {id:'codex',vendor:'OpenAI',name:'Codex',status:'running',runtime_kind:'cli',instance_count:2,
+          {id:'codex',vendor:'OpenAI',name:'Codex',status:window.codexState||'running',runtime_kind:'cli',instance_count:2,
+            workspace_pending:window.codexChoosing||false,
             actions:window.desktopDaemonUpgrading?[]:['launch'],
             launch_blocked:window.desktopDaemonUpgrading?'daemon_update_pending':null},
-          {id:'deepseek-desktop',vendor:'DeepSeek',name:'DeepSeek Harness',status:'available',runtime_kind:'gui',
+          {id:'deepseek-desktop',vendor:'DeepSeek',name:'DeepSeek Harness',status:window.deepseekState||'available',runtime_kind:'gui',
             actions:window.desktopDaemonUpgrading?[]:['launch'],
             launch_blocked:window.desktopDaemonUpgrading?'daemon_update_pending':null},
         ],
@@ -120,7 +128,67 @@ try{
   await deepseek.getByText('可启动',{exact:true}).waitFor()
   assert(await deepseekLaunch.isEnabled())
   await deepseekLaunch.click()
+  await deepseek.getByRole('button',{name:'启动中…'}).waitFor()
+  assert(await deepseek.getByRole('button',{name:'启动中…'}).isDisabled())
+  await deepseek.getByText('正在准备启动',{exact:true}).waitFor()
+  await workbench.waitForFunction(()=>!!window.finishDesktopLaunch)
   assert.deepEqual(await workbench.evaluate(()=>window.desktopLaunchRequests),[{op:'launch',agent_id:'deepseek-desktop'}])
+  await workbench.evaluate(()=>{
+    window.deepseekState='running'
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  await deepseek.getByText('运行中',{exact:true}).waitFor()
+  await workbench.evaluate(()=>window.finishDesktopLaunch())
+  await deepseek.getByRole('button',{name:'启动中…'}).waitFor({state:'hidden'})
+  await codex.getByRole('button',{name:'启动',exact:true}).click()
+  await codex.getByText('等待选择工作目录',{exact:true}).waitFor()
+  assert(await codex.getByText('运行实例 2',{exact:true}).isVisible())
+  await workbench.waitForFunction(()=>!!window.finishDesktopLaunch)
+  await workbench.evaluate(()=>window.finishDesktopLaunch('cancel'))
+  await workbench.getByRole('status').getByText('已取消启动',{exact:true}).waitFor()
+  assert(await codex.getByRole('button',{name:'启动',exact:true}).isEnabled())
+  await codex.getByRole('button',{name:'启动',exact:true}).click()
+  await workbench.waitForFunction(()=>!!window.finishDesktopLaunch)
+  await workbench.evaluate(()=>{
+    window.codexChoosing=true
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  await codex.getByText('等待选择工作目录',{exact:true}).waitFor()
+  await workbench.evaluate(()=>{
+    window.codexChoosing=false
+    window.codexState='verifying'
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  await codex.getByText('正在校验 Agent',{exact:true}).waitFor()
+  assert(await codex.getByText('运行实例 2',{exact:true}).isVisible())
+  await workbench.evaluate(()=>{
+    window.codexState='running'
+    window.finishDesktopLaunch()
+  })
+  await codex.getByRole('button',{name:'启动',exact:true}).waitFor()
+  await workbench.evaluate(()=>{
+    window.desktopDiagnostics=[
+      {at_ms:1795654800123,source:'daemon',level:'warn',event:'config_rejected',config_revision:166,
+        code:'policy_tools_invalid',version:'0.1.0-rc27',message:'TEST-ONLY-RAW-DIAGNOSTIC'},
+      {at_ms:1795654801000,source:'desktop',level:'info',event:'launch_cancelled',agent:'codex',version:'0.1.0-rc28'},
+      {at_ms:1795654801000,source:'desktop',level:'info',event:'TEST-ONLY-RAW-DIAGNOSTIC'},
+    ]
+  })
+  const diagnostics=workbench.locator('#diagnostics')
+  await diagnostics.getByText('诊断日志',{exact:true}).click()
+  await diagnostics.getByText('Desktop 0.1.0-rc28 · onexd 0.1.0-rc27 · 本地时间',{exact:true}).waitFor()
+  await diagnostics.getByText('设备配置被拒绝 · 受管工具无效或不适用 · 配置 #166',{exact:true}).waitFor()
+  assert.equal(await diagnostics.getByRole('listitem').count(),2)
+  assert.match(await diagnostics.locator('time').first().innerText(),/\d{2}:\d{2}:\d{2}/)
+  assert(!await diagnostics.innerText().then(text=>text.includes('TEST-ONLY-RAW-DIAGNOSTIC')))
+  await diagnostics.getByLabel('来源').selectOption('desktop')
+  assert.equal(await diagnostics.getByRole('listitem').count(),1)
+  await diagnostics.getByLabel('级别').selectOption('warn')
+  await diagnostics.getByText('没有匹配的日志。').waitFor()
+  await diagnostics.getByLabel('来源').selectOption('')
+  await diagnostics.getByLabel('筛选').fill('166')
+  assert.equal(await diagnostics.getByRole('listitem').count(),1)
+  await diagnostics.getByText('诊断日志',{exact:true}).click()
   await workbench.getByText('运行实例 2').waitFor()
   await workbench.getByText('2.125',{exact:true}).waitFor()
   await workbench.getByText('能力配置 · v7').click()
@@ -187,5 +255,5 @@ try{
     assert(await updateButton.isDisabled())
     assert.equal(await workbench.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true)
   }
-  console.log('Desktop：登录、设置、桥错误、配置消息、实例计数、下载进度及更新确认通过')
+  console.log('Desktop：登录、设置、启动即时反馈、目录取消、诊断筛选、实例计数、下载进度及更新确认通过')
 }finally{await b.close();server.stop(true)}

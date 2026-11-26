@@ -13,6 +13,8 @@ export function makeMock(){
     switch(r.op){
       case 'state':
         if(start && Date.now()-start>=650 && state.agents.length){state.agents[0].status='running';start=0}break
+      case 'diagnostics':
+        return {ok:true,diagnostics:{desktop_version:state.version,daemon_version:null,entries:[]}}
       case 'send_code':
         if(r.target!=='demo@example.test')return fail('invalid','演示仅接受 demo@example.test'); issued=true;break
       case 'login':

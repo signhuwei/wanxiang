@@ -31,6 +31,7 @@ pub(crate) fn prepare(
     run: &Path,
     cwd: &Path,
     env: &mut BTreeMap<String, String>,
+    mcp: &[crate::tools::Mcp],
 ) -> Result<PathBuf> {
     crate::codex_launch::validate_project(cwd)?;
     let config = profile.join("codex");
@@ -62,6 +63,16 @@ pub(crate) fn prepare(
     };
     let mut settings = plan.settings()?;
     settings.push(r#"desktop.conversationDetailMode = "STEPS_COMMANDS""#.into());
+    for server in mcp {
+        let name = format!("mcp_servers.{}", server.name);
+        let command = crate::desktop_launch::path_text(&server.command)?;
+        settings.push(format!("{name}.command = {}", crate::codex_launch::quote(&command)));
+        settings.push(format!("{name}.args = {}", serde_json::to_string(&server.args)?));
+        settings.push(format!("{name}.required = true"));
+        for key in [MODEL_TOKEN, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
+            settings.push(format!("{name}.env.{key} = \"\""));
+        }
+    }
     crate::desktop_launch::publish(&config, "config.toml", settings.join("\n").as_bytes())?;
     let plan_file = run.join("codex-desktop.json");
     launch::write_private(&plan_file, &serde_json::to_vec(&plan)?)?;

@@ -20,6 +20,7 @@ import { applyReceipt, observeUnsupported, parseReceipt, ROUTE_POOL_CAPABILITY, 
   sendCurrentTarget, unsupportedRoutePool } from './route-pool-session';
 import { meteredRouteExecution, type RoutingProjector } from './route-projection';
 import type { Device, Store } from './store';
+import { parseDesktopToolTargets, type DesktopToolTargets } from './tool-releases';
 
 const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const isText = (value: unknown, max = 128): value is string => typeof value === 'string' && value.length > 0 && value.length <= max;
@@ -80,7 +81,8 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
         awaitingConfig = { id: msg.id, revision: msg.revision };
       }
     };
-    const subscription = { tenant: tenantId, agentCache: false, macDesktop: false, windowsDeepseekDesktop: false, codexDesktop: false, claudeDesktop: false, supportsCapabilityContract: false, supportsCapabilityPolicy: false, supportsPolicyRuntime:false, live: canWrite, send };
+    const subscription = { tenant: tenantId, agentCache: false, macDesktop: false, windowsDeepseekDesktop: false, codexDesktop: false, claudeDesktop: false, supportsCapabilityContract: false, supportsCapabilityPolicy: false, supportsPolicyRuntime:false,
+      desktopToolTargets: {} as DesktopToolTargets, live: canWrite, send };
     const policyCap = () => subscription.supportsCapabilityPolicy && (subscription.supportsPolicyRuntime ||
       !requiresPolicyRuntime(store,readPolicyHot(store.tenant(tenantId),userId)));
     const stop = (code: number, reason: string) => {
@@ -145,6 +147,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
           }
           if (!msg || typeof msg !== 'object' || Array.isArray(msg)) { stop(1007, 'invalid JSON frame'); return; }
           if (state === 'hello') {
+            const desktopToolTargets = parseDesktopToolTargets(msg.desktop_tool_targets);
             if (msg.type !== 'hello' || !isText(msg.id) || msg.edge_version !== version || !isText(msg.os, 32) || !isText(msg.arch, 32)
               || (msg.agent_cache !== undefined && typeof msg.agent_cache !== 'boolean')
               || (msg.capability_contract_v1 !== undefined && typeof msg.capability_contract_v1 !== 'boolean')
@@ -154,6 +157,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
               || (msg.windows_deepseek_desktop_v1 !== undefined && typeof msg.windows_deepseek_desktop_v1 !== 'boolean')
               || (msg.codex_desktop_v1 !== undefined && typeof msg.codex_desktop_v1 !== 'boolean')
               || (msg.claude_desktop_v1 !== undefined && typeof msg.claude_desktop_v1 !== 'boolean')
+              || (msg.tooth_v1 !== undefined && typeof msg.tooth_v1 !== 'boolean') || desktopToolTargets === null
               || !isSeq(msg.config_revision) || !isSeq(msg.outbox_last_seq) || (msg.lease_id != null && !isText(msg.lease_id))) {
               stop(1008, 'hello required'); return;
             }
@@ -165,6 +169,7 @@ export function edgeGateway(app: Hono, store: Store, presence: Presence, now: ()
             subscription.windowsDeepseekDesktop = msg.windows_deepseek_desktop_v1 === true;
             subscription.codexDesktop = msg.codex_desktop_v1 === true;
             subscription.claudeDesktop = msg.claude_desktop_v1 === true;
+            subscription.desktopToolTargets = msg.tooth_v1 === true ? desktopToolTargets : {};
             const routePool = selectsRoutePool(projector, tenantId, deviceId, msg);
             routePoolSelected = routePool.selected;
             state = 'starting';

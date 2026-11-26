@@ -292,6 +292,120 @@ async fn original_gui_switches_native_workspaces() -> anyhow::Result<()> {
     run_original_deepseek(Scenario::Workspaces, false).await
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opens the signed DeepSeek GUI in a disposable native profile; set ONEX_DEEPSEEK_QA_BUNDLE"]
+async fn original_gui_lists_managed_skill_before_first_prompt() -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let root = tempfile::tempdir()?;
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace)?;
+    let workspace = workspace.canonicalize()?;
+    let (release, entry) = original_deepseek_entry()?;
+    let (state, addr, _usage) = router_fixture(&release, None).await?;
+    let models = crate::ipc::deepseek_model_choices(&state.config.read().unwrap());
+    let body = serde_json::to_vec(&json!({"files":[{
+        "path":"SKILL.md", "data":STANDARD.encode("---\nname: onex-qa-skill\ndescription: Synthetic managed catalogue proof.\n---\nSynthetic managed body.\n")
+    }]}))?;
+    let tool: onex_core::ws::ToolRelease = serde_json::from_value(json!({
+        "id":crate::id::new("tool"), "name":"onex-qa-skill", "version":"1.0.0", "kind":"skill",
+        "agents":["deepseek-desktop"], "args":[], "sha256":format!("{:x}",Sha256::digest(&body)), "size":body.len()
+    }))?;
+    let skills = [crate::tools::decode(&tool, &body)?];
+    let outbox = Arc::new(Outbox::open(&root.path().join("outbox.sqlite"))?);
+    let token = crate::id::token();
+    let desktop_launch::Prepared { launch, workspace: workspace_hash, .. } = desktop_launch::prepare(
+        &desktop_launch::Request {
+            owner: "qa-device",
+            home: root.path(),
+            agent: &release.agent,
+            entry: &entry,
+            cwd: &workspace,
+            token: &token,
+            model_bearer: None,
+            router: &addr,
+            model: "onex-qa",
+            deepseek_models: &models,
+            tools: &skills,
+        },
+        None,
+    )?;
+    let plugin = launch.run_dir.join("catalogue-probe.mjs");
+    let receipt = root.path().join("catalogue-result.json");
+    std::fs::write(
+        &plugin,
+        r#"
+import { writeFileSync } from 'node:fs'
+export const name = 'onex-catalogue-qualification'
+export const inject = ['sessionController','sessionSkillCatalog','workspaceRegistry']
+export function apply(ctx, config) {
+  const timer = setTimeout(async () => {
+    try {
+      const workspace = await ctx.workspaceRegistry.create(config.workspace)
+      const signal = AbortSignal.timeout(10000)
+      const {sessionId} = await ctx.sessionController.create({workspaceId:workspace.id}, signal)
+      const result = await ctx.sessionSkillCatalog.list({sessionId}, signal)
+      writeFileSync(config.receipt, JSON.stringify({names:result.skills.map(skill => skill.name)}), {mode:0o600})
+    } catch (error) { writeFileSync(config.receipt, JSON.stringify({error:error.message}), {mode:0o600}) }
+  }, 4000)
+  ctx.on('dispose', () => clearTimeout(timer))
+}
+"#,
+    )?;
+    let profile = launch.config_dir.join("profiles/desktop");
+    let patch_path = profile.join("cordis.patch.yml");
+    let mut patch: Vec<Value> = serde_json::from_slice(&std::fs::read(&patch_path)?)?;
+    patch.push(json!({"insert":[{"id":"onex-catalogue-qualification","name":reqwest::Url::from_file_path(plugin).unwrap().as_str(),
+        "config":{"workspace":workspace,"receipt":receipt}}]}));
+    std::fs::write(&patch_path, serde_json::to_vec(&patch)?)?;
+    state.desktop_sessions.start(
+        token.clone(),
+        "qa-device".into(),
+        release.agent.clone(),
+        release.version.clone(),
+        release.id.clone(),
+        "onex-qa".into(),
+        workspace_hash,
+        outbox,
+    );
+    state.desktop_sessions.set_deepseek_models(&token, &models);
+    let log = root.path().join("native.log");
+    let mut child = tokio::process::Command::new(&entry)
+        .env_clear()
+        .envs(&launch.env)
+        .args(&launch.args)
+        .current_dir(&workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log)?)
+        .kill_on_drop(true)
+        .process_group(0)
+        .spawn()?;
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(raw) = std::fs::read(&receipt) {
+                if let Ok(result) = serde_json::from_slice::<Value>(&raw) {
+                    return Ok::<_, anyhow::Error>(result);
+                }
+            }
+            anyhow::ensure!(child.try_wait()?.is_none(), "native GUI exited before listing Skills");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    let stopped = stop_original_macos_desktop(&mut child, &profile).await;
+    state.desktop_sessions.stop(&token);
+    crate::launch::finish(root.path(), &launch.launch_id)?;
+    let result = result??;
+    anyhow::ensure!(
+        result["names"].as_array().is_some_and(|names| names.contains(&json!("onex-qa-skill"))),
+        "native Skill list before the first prompt did not include the managed package: {result}"
+    );
+    stopped?;
+    Ok(())
+}
+
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "opens the original DeepSeek Windows GUI; set ONEX_DEEPSEEK_QA_INSTALLER and ONEX_DEEPSEEK_QA_BUNDLE"]
@@ -461,6 +575,7 @@ async fn run_original_deepseek(scenario: Scenario, host_only: bool) -> anyhow::R
                 router: &addr,
                 model: "onex-qa",
                 deepseek_models: &models,
+                tools: &[],
             },
             None,
         )?;

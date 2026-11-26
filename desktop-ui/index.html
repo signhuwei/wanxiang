@@ -15,6 +15,21 @@
     <p id="notice" role="status" aria-live="polite"></p>
     <div id="content"></div>
   </main>
+  <footer class="diagnostics-footer" id="diagnostics-footer" hidden>
+    <details id="diagnostics">
+      <summary>诊断日志</summary>
+      <div class="diagnostics-body">
+        <p id="diagnostics-versions" class="diagnostics-versions"></p>
+        <div class="diagnostics-controls">
+          <label>来源<select id="diagnostics-source"><option value="">全部来源</option><option value="desktop">Desktop</option><option value="daemon">onexd</option></select></label>
+          <label>级别<select id="diagnostics-level"><option value="">全部级别</option><option value="info">信息</option><option value="warn">警告</option><option value="error">错误</option></select></label>
+          <label>筛选<input id="diagnostics-query" type="search" placeholder="事件、Agent 或版本"></label>
+        </div>
+        <p id="diagnostics-hint" class="diagnostics-hint"></p>
+        <ol id="diagnostics-events" class="diagnostics-events" aria-label="最近诊断日志"></ol>
+      </div>
+    </details>
+  </footer>
   <dialog id="desktop-update-dialog" aria-labelledby="desktop-update-title" aria-describedby="desktop-update-description">
     <h2 id="desktop-update-title">重启更新 OneX Desktop</h2>
     <p id="desktop-update-description">将更新到 <strong id="desktop-update-version"></strong>，然后重新打开 OneX Desktop。已启动的 Agent 会继续运行，重启后仍可在工作台管理。</p>

@@ -9,13 +9,14 @@ UI 是本地静态 HTML/ESM，不直连 Server、daemon socket 或上游。edge 
 | op | 入参 | 行为 |
 |---|---|---|
 | `state` | 无 | 返回当前安全快照，不触发网络写操作 |
+| `diagnostics` | 无 | 读取当前桌面进程及已核验设备的最近诊断事件，返回 `{ok:true,diagnostics:{desktop_version,daemon_version,entries}}` |
 | `install_update` | `version` | 用户确认标题栏当前显示的目标版本后请求更新。原生层复核发行并启动更新，保持正在运行的 Agent 纳管 |
 | `send_code` | `target` | 向配置好的 Server 请求验证码；限流错误原样分类 |
 | `login` | `target,code,invite_code?` | `kind:desktop`；邀请码仅用于入租。返回选租户快照，不返回令牌 |
 | `password_login` | `tenant,username,password` | 接受租户 ID 或简称。以 `kind:desktop` 验证账号，沿用当前设备、恢复该账号的原设备或注册新设备，完成后注销该用户会话。快照只含公开显示信息 |
 | `select_tenant` | `tenant_id` | 只能选择返回的稳定 ID。原生层换取租户会话，再验证或恢复设备 |
 | `download` | `agent_id` | 后台下载及校验当前获准的发行。onexd 自行确定版本、来源和摘要，接受后通过快照报告实际进度 |
-| `launch` | `agent_id` | 仅启动当前目录授权的 `claude-code`、`codex` 或 `kimi-code`。原生层验证设备与授权，将所选 Agent 交给随包 CLI，下载及校验由 onexd 完成。重复点击不另启进程 |
+| `launch` | `agent_id` | 原生层验证设备与授权。CLI Agent 通过系统窗口选择工作目录后交给随包 CLI，桌面 Agent 使用自己的工作区选择器。下载及校验由 onexd 完成。重复点击不另启进程 |
 | `settings` | `hide_on_close:boolean` | 设置关闭窗口时是否隐藏到托盘。只改此偏好；Server 地址在 S1 UI 中只读 |
 | `logout` | 无 | 受管 Agent 退出并完成回流后，移除当前本机设备令牌并清空显示状态。系统凭据库保留归属已验证的设备密钥 |
 
@@ -25,11 +26,15 @@ UI 是本地静态 HTML/ESM，不直连 Server、daemon socket 或上游。edge 
 {"version":"0.1.0-demo","phase":"ready","user":{"name":"示例员工"},"tenant":{"id":"ten_demo","name":"示例租户"},"tenants":[],"connection":"connected","agents":[{"id":"claude-code","name":"Claude Code","version":"demo","status":"available","actions":["launch"]}],"settings":{"server_origin":"https://onex.example.invalid","hide_on_close":true}}
 ```
 
-macOS 桌面一键启动 Codex 的默认工作目录是 `~/OneX Workspace`。通过终端在其他项目目录运行 `onex run codex` 时，保留该终端的工作目录。
+从 Desktop 启动 CLI Agent 时，选中的工作目录由原生层传给终端，取消选择返回 `launch_cancelled`。通过终端运行 `onex run` 时，沿用该终端的工作目录。
 
 `phase`：`signed_out | choose_tenant | ready`。登录前 `user/tenant` 为 null，目录为空。选择态 `tenants:[{id,name}]`、`tenant:null`；包括单租户，用户确认后再进入。`ready` 目录仅含当前身份允许查看的 Agent。`connection: idle | connecting | connected | backoff`；短时失联不是注销。顶层 `version` 是 Desktop 的完整打包版本，所有阶段均返回，设置页展示。原生窗口启动时也会提供同一版本，Logo 下方无需等待 daemon 即可显示。`agents[].status: available | update_available | not_downloaded | downloading | verifying | starting | running | download_failed | policy_pending | failed`；`update_available` 在 S1 仅作提示，`actions:[]`，页面不提供启动或更新。失败可带中文 `message`。快照不含验证码、令牌、安装路径、Provider 密钥、对话内容或完整日志；`server_origin` 无用户信息/query/fragment。错误用契约码及可展示中文，桥不可将敏感原始异常转发给 UI。
 
 `agents[].launch_blocked` 可为 `daemon_update_pending` 或 `launch_in_progress`，只在具备启动条件的 Agent 暂需等待时返回。页面显示禁用的「启动」和等待原因，正在运行的 Agent 仍显示运行状态及实例数。`actions` 含 `launch` 时启动操作才可执行。
+
+点击启动立即显示等待状态。`agents[].workspace_pending` 表示原生工作目录选择正在进行。目录选择和启动请求期间，页面继续读取后台状态及已展开的诊断日志。选好目录后，等待状态跟随后台的准备进度。用户取消选择时恢复启动操作，已有的运行实例计数持续更新。
+
+底部「诊断日志」展开时读取最多 150 条事件，可按级别、来源和关键词筛选。每项包含毫秒时间戳、来源、级别和固定事件名，可附版本、Agent、配置修订号、退出码及固定错误分类。页面按本地时间显示到秒。桌面桥按当前设备隔离诊断范围，只从受信目录读取最近的固定格式日志并提取白名单字段。凭据、会话内容、文件路径和原始错误消息均不进入 WebView。
 
 能力策略状态仅在登录的设备与租户匹配时返回。`policy` 包含已应用的设备配置修订、策略修订、平台签发修订、租户配置修订与脱敏展示条目。`policy_pending` 表示设备未接受最近一次应执行的快照，等待同步时不提供受管启动。`notices` 是随已应用策略收到的最近消息，按消息 ID 去重。工作台按本机设备展示通知，消息列表不包含其他租户的数据。
 

@@ -13,9 +13,10 @@ showVersion(installedVersion)
 const demo=mock&&!invoke
 const call=invoke ? request=>invoke('desktop_call',{request}) : demo ? (await import('./mock.js')).makeMock() : null
 $('badge').hidden=!demo
-let state,busy=false,activeTab='workbench',last='',serial=0
+let state,busy=false,activeTab='workbench',last='',serial=0,pendingLaunch
 const seenNotices=new Set()
 const messages={unauthenticated:'登录凭据无效或已过期',forbidden:'没有权限执行此操作',not_found:'对象不存在',conflict:'状态已变化，请刷新后重试',device_already_logged_in:'本机 OneX 已登录。请用同一租户和账号登录，或先用 OneX 命令行退出。',agents_running:'请先关闭已启动的 OneX Agent',history_unavailable:'暂时无法恢复当前账号的本机会话',invalid:'请检查输入内容',seat_limit:'租户人数已达合约上限',balance_exhausted:'橡皮余额不足',lease_expired:'额度租约已过期',agent_not_allowed:'合约不允许该 Agent',model_not_allowed:'合约不允许该模型',rate_limited:'请求过快，请稍后重试',upstream_error:'上游服务出错',update_unavailable:'当前更新已不可用，请稍后重试',update_failed:'Desktop 更新失败，请重试',internal:'服务内部错误'}
+Object.assign(messages,{cwd_required:'请选择可访问的工作目录',terminal_unavailable:'无法启动系统终端，请检查 OneX CLI 安装或查看诊断日志'})
 const errorText=code=>typeof code==='string' && Object.hasOwn(messages,code) ? messages[code] : '操作失败，请稍后重试'
 const labels={update_available:'有可用更新',available:'可启动',not_downloaded:'待下载',downloading:'下载中',verifying:'校验中',starting:'启动中',running:'运行中',failed:'启动失败',download_failed:'下载失败',policy_pending:'等待配置同步'}
 const agentTones={running:'good',available:'good',update_available:'attention',downloading:'attention',verifying:'attention',starting:'attention',policy_pending:'attention',failed:'error',download_failed:'error'}
@@ -39,9 +40,47 @@ function showNotice(text='',attention=false) {
 }
 async function act(request,message=''){
   if(!call||busy)return
+  if(pendingLaunch){showNotice('请等待当前 Agent 启动完成');return}
   busy=true;serial++; const pane=$('content');pane.inert=true
-  try{const r=await call(request);if(!r.ok){showNotice(errorText(r.error?.code),true);return}state=r.state;last=JSON.stringify(state);if(request.op==='logout'){activeTab='workbench';seenNotices.clear()};paint();showNotice(message)}
-  catch{showNotice('本机服务暂不可用，请稍后重试',true)}finally{pane.inert=false;busy=false}
+  try{const r=await call(request);if(!r.ok){showNotice(errorText(r.error?.code),true);return}bindState(r.state);if(request.op==='logout')activeTab='workbench';paint();showNotice(message)}
+  catch{showNotice('本机服务暂不可用，请稍后重试',true)}finally{pane.inert=false;busy=false;refreshDiagnostics()}
+}
+
+async function launchAgent(agent) {
+  if (!call||busy||pendingLaunch) return
+  const tenant=state.tenant?.id,user=state.user?.name
+  pendingLaunch={id:agent.id,workspaceObserved:false}
+  serial++
+  paint()
+  showNotice(`${agent.name} · ${launchStage(agent)}`)
+  try {
+    const result=await call({op:'launch',agent_id:agent.id})
+    if (state.phase!=='ready'||state.tenant?.id!==tenant||state.user?.name!==user) return
+    serial++
+    if (!result.ok) {
+      const code=result.error?.code
+      if (code==='launch_cancelled') showNotice('已取消启动')
+      else showNotice(errorText(code),true)
+      return
+    }
+    bindState(result.state)
+    showNotice()
+  } catch {
+    showNotice('本机服务暂不可用，请稍后重试',true)
+  } finally {
+    pendingLaunch=null
+    paint()
+    refreshDiagnostics()
+  }
+}
+
+function launchStage(agent) {
+  if (agent.workspace_pending) return '等待选择工作目录'
+  if (agent.status==='downloading') return '正在下载 Agent'
+  if (agent.status==='verifying') return '正在校验 Agent'
+  if (agent.status==='starting') return '等待 Agent 就绪'
+  if (agent.runtime_kind==='cli'&&!pendingLaunch.workspaceObserved&&agent.launch_blocked!=='launch_in_progress') return '等待选择工作目录'
+  return '正在准备启动'
 }
 
 function paintLogin(content) {
@@ -98,7 +137,6 @@ function paint(){
   paintUpdate()
   const c=$('content')
   c.replaceChildren()
-  showNotice()
   const scope=$('scope'),connection=$('connection')
   scope.textContent=[state.tenant?.name,state.user?.name].filter(Boolean).join(' · ')
   scope.hidden=!scope.textContent
@@ -139,7 +177,7 @@ function paintUpdate() {
   const update=state?.desktop_update
   updateButton.hidden=!update?.version||!Object.hasOwn(updateLabels,update.phase)
   if (updateButton.hidden) return
-  updateButton.disabled=!canInstallUpdate(update)
+  updateButton.disabled=!!pendingLaunch||!canInstallUpdate(update)
   updateButton.title={
     components_failed:'重新打开 Desktop 后重试组件切换',
     daemon_restart_required:'现有后台版本需要手动切换，请先结束运行中的 Agent'
@@ -152,7 +190,7 @@ function paintUpdate() {
 
 function openUpdateDialog() {
   const update=state?.desktop_update
-  if (busy||!canInstallUpdate(update)||!update.version) return
+  if (busy||pendingLaunch||!canInstallUpdate(update)||!update.version) return
   confirmedVersion=update.version
   $('desktop-update-version').textContent=confirmedVersion
   if (typeof updateDialog.showModal==='function') updateDialog.showModal()
@@ -214,6 +252,8 @@ function paintUsage(content,usage) {
 
 function paintAgent(agent) {
   const row=styled('div','row')
+  const requested=pendingLaunch?.id===agent.id
+  const starting=requested||agent.status==='starting'
   const launchBlock=Object.hasOwn(launchBlockLabels,agent.launch_blocked)?launchBlockLabels[agent.launch_blocked]:null
   const canLaunch=agent.status!=='update_available'&&!launchBlock&&agent.actions?.includes('launch')
   const family=agent.id.split('-')[0]
@@ -229,6 +269,13 @@ function paintAgent(agent) {
   status.dataset.tone=!waitingToLaunch&&Object.hasOwn(agentTones,agent.status)?agentTones[agent.status]:'neutral'
   meta.append(status)
   if (agent.runtime_kind==='cli'&&agent.instance_count>0) meta.append(styled('span','instance-count','运行实例 '+agent.instance_count))
+  if (starting) row.classList.add('agent-launching')
+  if (requested) {
+    const indicator=styled('span','agent-status launch-feedback',launchStage(agent))
+    indicator.dataset.tone='attention'
+    indicator.setAttribute('aria-live','polite')
+    meta.append(indicator)
+  } else if (starting) status.classList.add('launch-feedback')
   const launchBlockId=`agent-launch-block-${agent.id}`
   if (launchBlock) {
     const reason=waitingToLaunch?status:styled('span','agent-status',launchBlock)
@@ -241,18 +288,23 @@ function paintAgent(agent) {
 
   const actions=styled('div','agent-actions')
   if (agent.actions?.includes('download')) {
-    actions.append(button(agent.status==='download_failed'?'重试下载':'下载',()=>act({op:'download',agent_id:agent.id})))
+    const download=button(agent.status==='download_failed'?'重试下载':'下载',()=>act({op:'download',agent_id:agent.id}))
+    download.disabled=!!pendingLaunch
+    actions.append(download)
   }
-  if (canLaunch||launchBlock) {
-    const launch=button('启动',canLaunch?()=>act({op:'launch',agent_id:agent.id}):null)
+  if (canLaunch||launchBlock||starting) {
+    const launch=button(starting?'启动中…':'启动',canLaunch?()=>launchAgent(agent):null)
     launch.classList.add('launch-button')
+    launch.disabled=!!pendingLaunch||!!launchBlock||starting
     if (launchBlock) {
       launch.disabled=true
       launch.setAttribute('aria-describedby',launchBlockId)
     }
-    const arrow=styled('span','action-icon','↗')
-    arrow.setAttribute('aria-hidden','true')
-    launch.append(arrow)
+    if (!starting) {
+      const arrow=styled('span','action-icon','↗')
+      arrow.setAttribute('aria-hidden','true')
+      launch.append(arrow)
+    }
     actions.append(launch)
   }
   if (actions.childElementCount) row.append(actions)
@@ -325,6 +377,104 @@ function paintMessages(content) {
   content.append(list)
 }
 
+const diagnostics=$('diagnostics')
+const diagnosticSources={desktop:'Desktop',daemon:'onexd'}
+const diagnosticLevels={info:'信息',warn:'警告',error:'错误'}
+const diagnosticEvents={
+  launch_requested:'开始准备启动',launch_accepted:'已受理启动',launch_cancelled:'已取消启动',
+  launch_rejected:'启动失败',download_accepted:'已受理下载',download_rejected:'下载失败',daemon_started:'后台启动',router_listening:'本地路由就绪',
+  ws_connected:'已连接服务',ws_disconnected:'服务连接断开',config_applied:'已应用设备配置',config_rejected:'设备配置被拒绝',
+  lease_rejected:'租约被拒绝',upstream_failed:'上游请求失败',agent_artifact_failed:'Agent 制品未就绪',
+  tool_bundle_failed:'受管工具下载或校验失败',tool_prepare_failed:'准备受管工具失败',desktop_bundle_rejected:'桌面 Agent 制品被拒绝',
+  desktop_profile_rejected:'桌面 Agent 配置被拒绝',desktop_spawn_failed:'无法启动桌面 Agent 进程',agent_prepared:'Agent 启动参数已就绪',
+  agent_exited:'Agent 已退出',desktop_exited:'桌面 Agent 已退出',ipc_failed:'本机服务连接失败',daemon_failed:'后台异常退出'
+}
+const diagnosticCodes={policy_tools_invalid:'受管工具无效或不适用',policy_agents_invalid:'Agent 发行不适用',
+  policy_revision_invalid:'策略修订号无效或已回退',policy_identity_invalid:'策略与登录身份不符',
+  policy_rates_invalid:'路由与费率不一致',policy_abi_unsupported:'设备策略版本不受支持'}
+const diagnosticAgents={'claude-code':'Claude Code',codex:'Codex CLI','kimi-code':'Kimi Code','deepseek-desktop':'DeepSeek Desktop',
+  workbuddy:'WorkBuddy','codex-desktop':'Codex Desktop','claude-desktop':'Claude Desktop'}
+const diagnosticTime=new Intl.DateTimeFormat('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'})
+const safeVersion=version=>typeof version==='string'&&/^\d[\w.+-]{0,47}$/.test(version)?version:null
+const lookup=(dictionary,key)=>typeof key==='string'&&Object.hasOwn(dictionary,key)?dictionary[key]:null
+let diagnosticData,diagnosticsTicket=0,diagnosticsPending=false,diagnosticsError=false
+
+function clearDiagnostics() {
+  diagnosticsTicket++
+  diagnosticData=null
+  diagnosticsError=false
+  paintDiagnostics()
+}
+
+function paintDiagnostics() {
+  if (!diagnostics.open) return
+  const entries=$('diagnostics-events'),hint=$('diagnostics-hint')
+  const desktop=safeVersion(diagnosticData?.desktop_version)??safeVersion(installedVersion??state?.version)??'—'
+  const daemon=safeVersion(diagnosticData?.daemon_version)??'—'
+  $('diagnostics-versions').textContent=`Desktop ${desktop} · onexd ${daemon} · 本地时间`
+  const sourceFilter=$('diagnostics-source').value,levelFilter=$('diagnostics-level').value
+  const query=$('diagnostics-query').value.trim().toLowerCase()
+  const rows=[]
+  for (const entry of diagnosticData?.entries??[]) {
+    const source=lookup(diagnosticSources,entry.source),level=lookup(diagnosticLevels,entry.level),event=lookup(diagnosticEvents,entry.event)
+    const time=new Date(entry.at_ms)
+    if (!source||!level||!event||!Number.isFinite(time.getTime())) continue
+    if ((sourceFilter&&entry.source!==sourceFilter)||(levelFilter&&entry.level!==levelFilter)) continue
+    const details=[lookup(diagnosticAgents,entry.agent),lookup(diagnosticCodes,entry.code)??lookup(messages,entry.code)]
+    if (Number.isSafeInteger(entry.config_revision)&&entry.config_revision>=0) details.push(`配置 #${entry.config_revision}`)
+    if (Number.isSafeInteger(entry.exit_code)) details.push(`退出码 ${entry.exit_code}`)
+    const version=safeVersion(entry.version),timestamp=diagnosticTime.format(time)
+    const description=[event,...details.filter(Boolean)].join(' · ')
+    if (query&&![timestamp,source,level,version,entry.event,entry.agent,description].filter(Boolean).join(' ').toLowerCase().includes(query)) continue
+    const row=styled('li','diagnostics-entry')
+    row.dataset.level=entry.level
+    const when=node('time',timestamp)
+    when.dateTime=time.toISOString()
+    row.append(when,styled('span','diagnostics-tag',`${level} · ${source}${version?' '+version:''}`),node('span',description))
+    rows.push(row)
+  }
+  const scroll=entries.scrollTop
+  entries.replaceChildren(...rows)
+  entries.scrollTop=scroll
+  hint.textContent=diagnosticsError?'暂时无法读取诊断日志。':!diagnosticData?'正在读取诊断日志…':rows.length?'':query||sourceFilter||levelFilter?'没有匹配的日志。':'当前没有诊断记录。'
+  hint.hidden=!hint.textContent
+}
+
+async function refreshDiagnostics() {
+  if (!call||!diagnostics.open||diagnosticsPending||document.hidden) return
+  diagnosticsPending=true
+  const ticket=diagnosticsTicket
+  try {
+    const reply=await call({op:'diagnostics'})
+    if (ticket!==diagnosticsTicket) return
+    diagnosticsError=!reply.ok||!Array.isArray(reply.diagnostics?.entries)
+    if (!diagnosticsError) diagnosticData=reply.diagnostics
+  } catch {
+    if (ticket===diagnosticsTicket) diagnosticsError=true
+  } finally {
+    diagnosticsPending=false
+    if (ticket!==diagnosticsTicket) refreshDiagnostics()
+    else paintDiagnostics()
+  }
+}
+
+function bindState(next) {
+  const changedScope=state?.phase!==next.phase||state?.tenant?.id!==next.tenant?.id||state?.user?.name!==next.user?.name
+  state=next
+  last=JSON.stringify(next)
+  if (pendingLaunch&&!changedScope) {
+    const agent=state.agents.find(agent=>agent.id===pendingLaunch.id)
+    if (agent) {
+      pendingLaunch.workspaceObserved ||= agent.workspace_pending
+      showNotice(`${agent.name} · ${launchStage(agent)}`)
+    }
+  }
+  if (changedScope) {
+    seenNotices.clear()
+    clearDiagnostics()
+  }
+}
+
 async function refresh() {
   if (!call||busy||document.hidden) return
   const seq=++serial
@@ -338,24 +488,23 @@ async function refresh() {
     const serialized=JSON.stringify(response.state)
     if (last!==serialized) {
       const previousIds=new Set(state?.notices?.map(notice=>notice.id))
-      if (state?.tenant?.id!==response.state.tenant?.id) seenNotices.clear()
       const latest=response.state.notices?.find(notice=>!previousIds.has(notice.id))
+      bindState(response.state)
       if (activeTab==='messages') {
         for (const notice of (response.state.notices??[])) seenNotices.add(notice.id)
       }
-      last=serialized
-      state=response.state
       paint()
-      if (latest && activeTab!=='messages') showNotice(latest.title)
+      if (latest && activeTab!=='messages'&&!pendingLaunch) showNotice(latest.title)
     }
   } catch {
-    if (seq===serial) showNotice('无法读取本机状态，请检查 OneX 服务。',true)
+    if (seq===serial&&!pendingLaunch) showNotice('无法读取本机状态，请检查 OneX 服务。',true)
   }
 }
 
 function openTab(tab) {
   if (!state||busy) return
   activeTab=tab
+  if (!pendingLaunch) showNotice()
   if (tab==='messages') {
     for (const notice of (state.notices??[])) seenNotices.add(notice.id)
   }
@@ -374,4 +523,12 @@ updateDialog.onkeydown=event=>{
     closeUpdateDialog()
   }
 }
-if(!call){$('title').textContent='未连接桌面服务';$('content').append(styled('p','empty-state','请从 OneX Desktop 打开；浏览器演示请显式使用 ?mock=1。'))}else{await refresh();setInterval(refresh,2000);document.addEventListener('visibilitychange',refresh)}
+diagnostics.ontoggle=()=>{if(diagnostics.open){paintDiagnostics();refreshDiagnostics()}}
+for (const id of ['diagnostics-source','diagnostics-level','diagnostics-query']) $(id).oninput=paintDiagnostics
+if(!call){$('title').textContent='未连接桌面服务';$('content').append(styled('p','empty-state','请从 OneX Desktop 打开；浏览器演示请显式使用 ?mock=1。'))}else{
+  $('diagnostics-footer').hidden=false
+  await refresh()
+  const poll=()=>{refresh();refreshDiagnostics()}
+  setInterval(poll,2000)
+  document.addEventListener('visibilitychange',poll)
+}

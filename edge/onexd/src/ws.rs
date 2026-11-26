@@ -340,6 +340,7 @@ async fn handshake(
             codex_desktop_v1: cfg!(all(target_os = "macos", target_arch = "aarch64")),
             claude_desktop_v1: cfg!(all(target_os = "macos", target_arch = "aarch64")),
             tooth_v1: true,
+            desktop_tool_targets: crate::tools::desktop_targets(crate::desktop_bundle::windows_deepseek_available(&opts.url)),
             id: hello_id.clone(),
             edge_version: opts.edge_version.clone(),
             os: onex_core::ipc::os_name().into(),
@@ -609,6 +610,7 @@ async fn connected(
                     }
                     Msg::Config(c) => {
                         let id = c.id.clone();
+                        let revision = c.revision;
                         if state.token.borrow().as_deref() != Some(token) {
                             return Ok(());
                         }
@@ -622,7 +624,10 @@ async fn connected(
                                     send(tx, &Msg::ConfigApplied(proof)).await?;
                                 }
                             }
-                            Err(error) => send(tx, &ack_err(id, "invalid", error)).await?,
+                            Err(error) => {
+                                warn!(revision, reason = error, "device configuration rejected");
+                                send(tx, &ack_err(id, "invalid", error)).await?;
+                            }
                         }
                     }
                     Msg::Lease(l) => {

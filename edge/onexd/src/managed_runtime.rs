@@ -84,8 +84,7 @@ fn validate(r: &AgentRelease) -> Result<(), ResolveError> {
     if r.size == 0 {
         return Err(ResolveError::BadRelease("size must be greater than zero"));
     }
-    let max_mib = if desktop { 768 } else { 512 };
-    if r.size > max_mib * 1024 * 1024 {
+    if r.size > artifact_size_limit(&r.agent) {
         return Err(ResolveError::BadRelease("size is outside the supported artifact limit"));
     }
     if !is_server_artifact(r) {
@@ -97,6 +96,11 @@ fn validate(r: &AgentRelease) -> Result<(), ResolveError> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn artifact_size_limit(agent: &str) -> u64 {
+    let max_mib = if Bundle::manages(agent) { 768 } else { 512 };
+    max_mib * 1024 * 1024
 }
 
 pub(crate) fn is_server_artifact(release: &AgentRelease) -> bool {

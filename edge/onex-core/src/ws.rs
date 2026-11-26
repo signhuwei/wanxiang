@@ -73,6 +73,8 @@ pub struct Hello {
     pub claude_desktop_v1: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tooth_v1: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub desktop_tool_targets: HashMap<String, Vec<String>>,
     pub id: String,
     pub edge_version: String,
     pub os: String,
@@ -151,7 +153,7 @@ pub struct ToolRelease {
     pub args: Vec<String>,
     pub sha256: String,
     pub size: u64,
-    /// Tooth delivery mode: "system" | "direct" | "selected". Only present when kind == "tooth".
+    /// Tooth delivery mode for a distributable tool: system, direct or selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<String>,
 }

@@ -13,13 +13,13 @@ import { balanceFallbackModels, balanceLabels, balanceNotices, balancePolicyEnab
   readBalanceMode, recordBalanceMode } from './policy-balance';
 import { readEffective, readHead, readPolicyDevice } from './policy-data';
 import type { Store } from './store';
-import { allowedToolReleases, isToolReleaseId } from './tool-releases';
+import { allowedToolReleases, isToolReleaseId, projectDeviceTools, type DesktopToolTargets } from './tool-releases';
 
 export { encryptEdgeSecret } from './edge-secret';
 
 const maxPolicyScopeRefs = 64;
 type Subscription = DesktopCapabilities & { tenant: string; agentCache: boolean; supportsCapabilityContract: boolean; supportsCapabilityPolicy: boolean; supportsPolicyRuntime?: boolean;
-  live: () => boolean; send: (value: Record<string, unknown>) => void };
+  desktopToolTargets?: DesktopToolTargets; live: () => boolean; send: (value: Record<string, unknown>) => void };
 type RouteRow = { model_id: string; route_model: string | null; upstream_model: string; provider_id: string; protocol: string;
   base_url: string; auth: string | null; proxy: string | null; name: string;
   context_window: number; max_output_tokens: number | null;
@@ -56,11 +56,14 @@ export function deviceRuntime(policy: { runtime_rules_json?: string } | null) {
 }
 
 export function requiresPolicyRuntime(store: Store, policy: {
-  runtime_rules_json?: string; commerce_plan_id?: string|null; tool_release_ids_json: string
+  runtime_rules_json?: string; commerce_plan_id?: string|null; tool_release_ids_json: string; allowed_agents_json: string
 } | null) {
   return !!policy && (!!policy.commerce_plan_id || Object.keys(deviceRuntime(policy)).length>0 ||
     (policy.tool_release_ids_json!=='[]' && !!store.system.get(`SELECT 1 FROM tool_releases
-      WHERE kind='hook' AND status='published' AND id IN (SELECT value FROM json_each(?)) LIMIT 1`,[policy.tool_release_ids_json])));
+      WHERE kind='hook' AND status='published' AND id IN (SELECT value FROM json_each(?))
+        AND 'claude-code' IN (SELECT value FROM json_each(agents_json))
+        AND 'claude-code' IN (SELECT value FROM json_each(?)) LIMIT 1`,
+      [policy.tool_release_ids_json, policy.allowed_agents_json])));
 }
 
 export function effectiveModelConfig(store: Store, contract: { allowed_models_json: string; lease_budget_milli: number; commerce_plan_id?: string|null } | null, now: number) {
@@ -170,7 +173,8 @@ export function configPublisher(store: Store, dataDir: string, now: () => number
         // still be delivered so the device can use platform-side forwarding or a later key exchange.
         return candidates.filter(item=>!participant.public_key || routeSecrets.has(item.route.provider_id)).sort(upstreamOrder).map(item=>item.route);
       });
-      const tools = allowedToolReleases(store, dataDir, policy, participant.os, participant.arch);
+      const tools = projectDeviceTools(allowedToolReleases(store, dataDir, policy, participant.os, participant.arch),
+        new Set(agents.map(agent => agent.agent)), sub.desktopToolTargets ?? {});
       const searchTools = allowedSearchTools(store, policy).map(({id,name,agents}) => ({id,name,agents}));
       const mode = balancePolicyEnabled(policy) ? readBalanceMode(db) : null;
       const eligible = mode === 'restricted' ? new Set(balanceFallbackModels(policy)) : null;

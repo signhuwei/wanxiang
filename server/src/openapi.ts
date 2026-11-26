@@ -4,6 +4,7 @@ import { INPUT_MULTIPLIER_BASIS } from './input-multiplier';
 import { observedAgents } from './observe';
 import { quoteDimensions } from './procurement';
 import { commitPattern, digestPattern, MAX_RELEASE_BYTES } from './release-package';
+import toolTargetCatalog from './tool-targets.json';
 
 const text = { type: 'string' };
 const nullableText = { type: ['string', 'null'] };
@@ -81,12 +82,13 @@ const publicDesktopRelease = object({ id: text, version: text, os: desktopOs, ar
   size: { type: 'integer', minimum: 0 }, sha256: text, published_at: text, download_url: text });
 const toolId = { ...text, pattern: '^tool_[0-9A-HJKMNP-TV-Z]{26}$' };
 const toolFields = { name: text, version: text, kind: { ...text, enum: ['skill', 'mcp', 'hook', 'http_search'] },
-  agents: { type: 'array', minItems: 1, uniqueItems: true, items: { ...text, enum: ['claude-code', 'codex', 'kimi-code'] } },
+  agents: { type: 'array', minItems: 1, uniqueItems: true, items: { ...text, enum: Object.keys(toolTargetCatalog) } },
   os: { enum: ['macos', 'windows', null] }, arch: { enum: ['arm64', 'x64', null] },
   entrypoint: nullableText, args: { type: 'array', items: text } };
+const toolDelivery = { ...text, enum: ['system', 'direct', 'selected'] };
 const toolReleaseBase = managed({ id: toolId, ...toolFields, status: { ...text, enum: ['draft', 'published', 'disabled'] },
   created_at: timestamp, artifact_cached: boolean, sha256: nullableText, size: { type: ['integer', 'null'], minimum: 1 } });
-const toolRelease = { ...toolReleaseBase, properties: { ...toolReleaseBase.properties, endpoint: { ...text, format: 'uri' }, has_key: boolean } };
+const toolRelease = { ...toolReleaseBase, properties: { ...toolReleaseBase.properties, delivery: toolDelivery, endpoint: { ...text, format: 'uri' }, has_key: boolean } };
 const searchReceipt = object({
   call_id: text, release_id: toolId, session_id: text, plan_id: text, fee_milli: sequence, package_used_milli: sequence,
   status: { ...text, enum: ['awaiting_result', 'charged', 'failed'] },
@@ -937,9 +939,11 @@ export const openapi = {
     '/v1/edge/agent-artifacts/{id}': { get: { summary: '按当前设备和能力合约下载 Agent 制品', security: [{ DeviceToken: [] }],
       parameters: agentArtifactRangeParameters,
       responses: { ...agentArtifactDownloadResponses, 404: error('制品不存在或当前合约不允许') } } },
+    '/v1/platform/tool-targets': { get: detailOf(object({ agents: { type: 'object', additionalProperties:
+      object({ kinds: { type: 'array', items: text }, platforms: { type: 'array', items: text } }, ['kinds']) } })) },
     '/v1/platform/tool-releases': { get: listOf(toolRelease),
       post: { ...write(object({ ...toolFields, os: { ...text, enum: ['macos', 'windows'] }, arch: desktopArch,
-        entrypoint: text, endpoint: { ...text, format: 'uri' }, secret: { ...text, writeOnly: true } },
+        delivery: toolDelivery, entrypoint: text, endpoint: { ...text, format: 'uri' }, secret: { ...text, writeOnly: true } },
         ['name', 'version', 'kind', 'agents']), toolRelease, 'create'),
         description: '新建固定版本。MCP 与 Hook 需要系统、架构和启动文件。HTTP 搜索需要 HTTPS endpoint 和上游凭据。' } },
     '/v1/platform/tool-releases/{id}': { get: detailOf(toolRelease) },

@@ -6,6 +6,7 @@ import { idempotencyKey } from './idempotency.js'
 const releasePath = '/platform/tool-releases'
 const kindLabels = { skill: 'Skill', mcp: 'MCP（stdio）', hook: 'Hook（PostToolUse）', http_search: 'HTTP 搜索' }
 const statusLabels = { draft: '草稿', published: '已发布', disabled: '已停用' }
+const deliveryLabels = { system: '系统', direct: '直配', selected: '选择' }
 const systemLabels = { macos: 'macOS', windows: 'Windows' }
 const optionList = labels => Object.entries(labels).map(([value, label]) => ({ value, label }))
 const maxFiles = 256
@@ -17,6 +18,7 @@ const pathSegment = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,79}$/
 const fields = [
   { key: 'name', label: '标识', placeholder: '例如 review-notes' }, { key: 'version', label: '版本', placeholder: '例如 1.0.0' },
   { key: 'kind', label: '类型', type: 'select', options: optionList(kindLabels), allowEmpty: false },
+  { key: 'delivery', label: 'Tooth 交付方式', type: 'select', options: optionList(deliveryLabels) },
   { key: 'os', label: '系统', type: 'select', options: optionList(systemLabels), allowEmpty: false },
   { key: 'arch', label: '架构', type: 'select', options: optionList({ arm64: 'ARM64', x64: 'x64' }), allowEmpty: false },
   { key: 'entrypoint', label: '启动文件', placeholder: '例如 bin/tool.exe', wide: true },
@@ -67,30 +69,32 @@ export async function buildToolBundle(record, files, folder = false) {
   return bundle
 }
 
-function createDraft(pane, api, signal, done) {
+function createDraft(pane, api, signal, toolTargets, done) {
   const agents = el('fieldset', 'tool-agents')
   agents.append(el('legend', null, '适用 Agent'))
   const selectedAgents = el('input')
   selectedAgents.type = 'hidden'
   selectedAgents.dataset.field = 'selected_agents'
   agents.append(selectedAgents)
-  for (const agent of ['claude-code', 'codex', 'kimi-code']) {
+  for (const agent of Object.keys(toolTargets)) {
     const label = el('label')
     const box = el('input')
     box.type = 'checkbox'
     box.value = agent
-    label.append(box, document.createTextNode(AGENT_LABELS[agent]))
+    label.append(box, document.createTextNode(AGENT_LABELS[agent] || agent))
     agents.append(label)
   }
-  agents.addEventListener('change', () => {
+  const refreshSelection = () => {
     selectedAgents.value = [...agents.querySelectorAll('input:checked')].map(box => box.value).join(',')
-  })
+  }
+  agents.addEventListener('change', refreshSelection)
   const createFields = [...fields, ...searchFields]
   editForm(pane, {
     mode: 'create', label: '新建草稿', fields: createFields, values: { kind: 'skill', os: 'macos', arch: 'arm64' },
     submit(value, options) {
       if (!value.selected_agents) throw new Error('请至少选择一个适用 Agent')
       const body = { name: value.name?.trim(), version: value.version?.trim(), kind: value.kind, agents: value.selected_agents.split(',') }
+      if (value.delivery && body.kind !== 'http_search') body.delivery = value.delivery
       if (!/^[a-z0-9][a-z0-9-]{0,47}$/.test(body.name ?? '') || reserved.test(body.name)) {
         throw new Error('工具标识使用小写字母、数字和短横线，最多 48 字符，并以字母或数字开头。')
       }
@@ -125,12 +129,26 @@ function createDraft(pane, api, signal, done) {
     return field
   })
   const mcpFields = toggleFields(['os', 'arch', 'entrypoint', 'args'])
+  const [deliveryField] = toggleFields(['delivery'])
   const hostedFields = toggleFields(searchFields.map(field => field.key))
+  const os = pane.body.querySelector('[name="os"]')
+  const arch = pane.body.querySelector('[name="arch"]')
   function selectKind() {
     for (const field of mcpFields) field.hidden = ['skill', 'http_search'].includes(kind.value)
     for (const field of hostedFields) field.hidden = kind.value !== 'http_search'
+    deliveryField.hidden = kind.value === 'http_search'
+    const platform = `${os.value === 'macos' ? 'darwin' : 'win32'}/${arch.value}`
+    for (const box of agents.querySelectorAll('input[type="checkbox"]')) {
+      const { kinds, platforms } = toolTargets[box.value]
+      box.disabled = !kinds.includes(kind.value) || (kind.value !== 'skill' && !!platforms && !platforms.includes(platform))
+      box.closest('label').hidden = box.disabled
+      if (box.disabled) box.checked = false
+    }
+    refreshSelection()
   }
   kind.addEventListener('change', selectKind)
+  os.addEventListener('change', selectKind)
+  arch.addEventListener('change', selectKind)
   selectKind()
   pane.body.append(agents)
 }
@@ -218,7 +236,8 @@ export function platformToolsPage(host, api, signal) {
         editForm(pane, {
           mode: 'view',
           fields: [
-            ...fields.filter(field => !['skill', 'http_search'].includes(record.kind) || ['name', 'version', 'kind'].includes(field.key)),
+            ...fields.filter(field => ['name', 'version', 'kind'].includes(field.key)
+              || (record.kind !== 'http_search' && (field.key === 'delivery' || record.kind !== 'skill'))),
             { key: 'agentLabels', label: '适用 Agent', wide: true }, { key: 'statusLabel', label: '状态' },
             ...(record.kind === 'http_search'
               ? [searchFields[0], { key: 'keyStatus', label: '凭据' }]
@@ -242,12 +261,16 @@ export function platformToolsPage(host, api, signal) {
         pane.body.append(el('p', 'muted', '正在读取发行…'))
         record = await api.get(endpoint(), { signal })
         if (pane.body.isConnected) render()
-      } else createDraft(pane, api, signal, saved => {
+      } else {
+        const { agents: toolTargets } = await api.get('/platform/tool-targets', { signal })
         if (!pane.body.isConnected) return
-        record = saved
-        pane.setTitle(`${record.name} · ${record.version}`)
-        render()
-      })
+        createDraft(pane, api, signal, toolTargets, saved => {
+          if (!pane.body.isConnected) return
+          record = saved
+          pane.setTitle(`${record.name} · ${record.version}`)
+          render()
+        })
+      }
     })
   }
 

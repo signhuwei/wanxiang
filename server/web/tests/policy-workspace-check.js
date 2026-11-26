@@ -116,7 +116,9 @@ try {
   assert.equal(await page.locator('.inline-drill .drill-context .toolbar').count(), 1)
   await label('标识').fill('policy-check-skill')
   await label('版本').fill('1.0')
+  await label('Tooth 交付方式').selectOption('system')
   await label('Claude Code').check()
+  await label('DeepSeek Harness Desktop').check()
   await button('新建草稿').click()
   await wait('policy-check-skill · 1.0')
   await page.locator('input[type="file"]:not([webkitdirectory])').setInputFiles({
@@ -133,6 +135,7 @@ try {
   await label('版本').fill('1.0')
   await label('类型').selectOption('http_search')
   assert.equal(await label('启动文件').isVisible(), false)
+  assert.equal(await label('DeepSeek Harness Desktop').isVisible(), false)
   await label('HTTPS 搜索接口').fill('https://search.example.test/v1/search')
   await label('上游 Bearer 凭据').fill('test-browser-search-secret')
   await label('Claude Code').check()

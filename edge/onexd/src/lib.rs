@@ -4,6 +4,7 @@ pub mod attachment_pdf;
 pub mod capture;
 pub mod chat;
 mod claude_desktop;
+mod desktop_tools;
 mod codex_capture;
 #[doc(hidden)]
 pub mod codex_desktop;

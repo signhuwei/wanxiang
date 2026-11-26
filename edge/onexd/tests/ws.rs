@@ -819,7 +819,7 @@ async fn v2_policy_is_applied_atomically_and_proved_only_for_current_identity() 
     let mut peer = server.accept().await;
     let hello = peer.handshake(0, 15000).await;
     assert_eq!(hello["capability_policy_v2"], true);
-    let config = json!({
+    let mut config = json!({
         "type": "config", "id": "initial", "revision": 4, "agent_cache": true,
         "routes": [{"model":"allowed","model_id":"mdl_1","provider_id":"prv_1","protocol":"anthropic","base_url":"https://upstream.example"}],
         "rates": [{"model_id":"mdl_1","input_milli_per_mtok":20,"output_milli_per_mtok":25,
@@ -834,6 +834,19 @@ async fn v2_policy_is_applied_atomically_and_proved_only_for_current_identity() 
             "secrets":[key]
         }
     });
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        assert_eq!(hello["desktop_tool_targets"]["codex-desktop"], json!(["skill", "mcp"]));
+        config["agents"] = json!([{
+            "id": "codex_desktop_fixture", "agent": "codex-desktop", "version": "26.1117.41037",
+            "os": "darwin", "arch": "arm64", "url": "/v1/edge/agent-artifacts/codex_desktop_fixture",
+            "sha256": "67d362df03de37ebd794a64608abf98a2b0b1be2783d33a950abdd83ed89b279", "size": 582_617_625
+        }]);
+        config["tools"] = json!([{
+            "id": "tool_01M7WTAQK4C81842QVN6XQACSB", "name": "fixture", "version": "1.0.0",
+            "kind": "skill", "agents": ["codex", "codex-desktop"], "delivery": "system",
+            "sha256": "a".repeat(64), "size": 100
+        }]);
+    }
     let mut wrongly_bound = config.clone();
     wrongly_bound["policy"]["user_id"] = json!("usr_foreign");
     peer.send(wrongly_bound).await;

@@ -154,16 +154,19 @@ function prepareTask(create, policy, modelTokenFor) {
     const args = []
     for (let i = 0; i < params.args.length; ++i) {
       const arg = params.args[i]
-      if (arg === '--model' || arg === '--fallback-model') { ++i; continue }
+      if (arg === '--model' || arg === '--fallback-model' || (policy.mcp && arg === '--mcp-config')) { ++i; continue }
+      if (policy.mcp && (arg.startsWith('--mcp-config=') || arg === '--strict-mcp-config')) continue
       if (!arg.startsWith('--model=') && !arg.startsWith('--fallback-model=')) args.push(arg)
     }
     args.push('--model', id)
+    if (policy.mcp) args.push('--mcp-config', policy.mcp, '--strict-mcp-config')
     const env = {...params.env, ACC_PRODUCT_CONFIG_V3:JSON.stringify(bootstrap),
       CODEBUDDY_MODEL:id, CODEBUDDY_SMALL_FAST_MODEL:id, ONEX_WORKBUDDY_SESSION_MODEL_TOKEN:modelToken}
     delete env.ACC_PRODUCT_CONFIG_PATH
     delete env.ACC_PRODUCT_CONFIG_V2
     delete env.ACC_PRODUCT_CONFIG
     delete env.ONEX_WORKBUDDY_POLICY
+    if (policy.skills) env.CODEBUDDY_SESSION_SKILL_DIRS = policy.skills
     return create.call(this, {...params, env, args}, ...rest)
   }
 }
@@ -173,6 +176,8 @@ function install(policyFile, entry) {
   const expected = path.join(policy.bundle, 'Contents/Resources/app.asar/main/daemon-app-server-entry.js')
   if (entry !== expected || fs.realpathSync(policy.bundle) !== policy.bundle ||
       path.dirname(policyFile) !== __dirname || path.dirname(policy.credential) !== __dirname ||
+      (policy.skills && policy.skills !== path.join(fs.realpathSync(__dirname), 'managed-tools', 'skills')) ||
+      (policy.mcp && policy.mcp !== path.join(__dirname, 'managed-mcp.json')) ||
       !/^http:\/\/127\.0\.0\.1:[1-9]\d{0,4}$/.test(policy.origin) || !policy.model) {
     throw new Error('Invalid OneX WorkBuddy launch policy')
   }

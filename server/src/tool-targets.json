@@ -1,0 +1,9 @@
+{
+  "claude-code": { "kinds": ["skill", "mcp", "hook", "http_search"] },
+  "codex": { "kinds": ["skill", "mcp", "http_search"] },
+  "kimi-code": { "kinds": ["skill", "mcp", "http_search"] },
+  "deepseek-desktop": { "kinds": ["skill", "mcp"], "platforms": ["darwin/arm64", "win32/x64"] },
+  "workbuddy": { "kinds": ["skill", "mcp", "hook"], "platforms": ["darwin/arm64"] },
+  "codex-desktop": { "kinds": ["skill", "mcp"], "platforms": ["darwin/arm64"] },
+  "claude-desktop": { "kinds": ["skill", "mcp", "hook"], "platforms": ["darwin/arm64"] }
+}

@@ -34,6 +34,7 @@ pub(crate) fn prepare(
     engine_archive: &Path,
     engine: RuntimeBundle,
     env: &mut BTreeMap<String, String>,
+    tools: &crate::desktop_tools::PreparedTools,
 ) -> Result<Profile> {
     ensure!(request.agent == "claude-desktop", "invalid Claude Desktop launch target");
     let endpoint = request.router.parse::<SocketAddr>().context("invalid Claude Desktop local router")?;
@@ -87,6 +88,7 @@ pub(crate) fn prepare(
         "blockReadsOutsideWorkingDirectories":true,
         "sshHostAllowlist":[],
         "sshConfigs":[],
+        "managedMcpServers":tools.claude_mcp()?,
         "isLocalDevMcpEnabled":false,
         "isDesktopExtensionEnabled":false
     });
@@ -100,6 +102,7 @@ pub(crate) fn prepare(
         }))?,
     )?;
     publish(&desktop, "claude_desktop_config.json", br#"{"deploymentMode":"3p"}"#)?;
+    tools.write_claude_hooks(&code)?;
 
     env.insert("HOME".into(), path_text(&home)?);
     env.insert("CFFIXED_USER_HOME".into(), path_text(&home)?);

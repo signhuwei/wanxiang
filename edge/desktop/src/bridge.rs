@@ -4,14 +4,14 @@
 //! 偏好、daemon IPC 客户端，只向 WebView 返回裁剪后的安全快照。UI 本身没有任何网络或文件权限。
 //!
 //! **启动走系统终端，不是本进程 fork**：受管 Agent 需要真实 PTY/控制台，Tauri 的 WebView
-//! 进程没有终端可接管。两个平台分开实现（见 `spawn_managed_cli`）：macOS 按与 Codex 的裁决打开
-//! 系统 Terminal.app 运行一个固定、随包分发、不接受外部参数的 `.command`；Windows 不经中间脚本，
-//! 直接用 `CREATE_NEW_CONSOLE` 起装在 Desktop 同目录的 `onex.exe` sidecar。两条路径都复用现有 CLI
-//! 的 `Launch`/`LaunchDone` 流程；这里不经 IPC 传 program、路径或环境，也不自己管子进程生命周期。
+//! 进程没有终端可接管。macOS 使用 Terminal.app 运行随包脚本，Windows 通过
+//! `CREATE_NEW_CONSOLE` 运行随包 CLI。工作目录由原生选择器提供。两平台共用 CLI 的
+//! `Launch`/`LaunchDone` 流程，应用内的 WebView 只提供已知的 Agent ID。
 //!
 //! onexd 持久化设备令牌和私钥。桌面只保存显示所需的账号和租户信息，并与 daemon 的设备身份核对。
 
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::profile;
+use crate::{diagnostics, profile};
 
 /// 对应 IPC.md 的错误码表；未知码折叠为 `internal`，由 UI 按固定文案显示。
 const KNOWN_CODES: &[&str] = &[
@@ -46,6 +46,7 @@ const KNOWN_CODES: &[&str] = &[
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Op {
     State,
+    Diagnostics,
     SendCode {
         target: String,
     },
@@ -65,10 +66,6 @@ pub enum Op {
     },
     Launch {
         agent_id: String,
-        /// Working directory for CLI agents (claude-code, codex, kimi-code).
-        /// Desktop GUI agents ignore this field. When absent for a CLI agent,
-        /// the daemon returns `cwd_required` and the caller must prompt the user.
-        cwd: Option<String>,
     },
     Download {
         agent_id: String,
@@ -137,6 +134,8 @@ pub struct Agent {
     pub progress: Option<ArtifactProgress>,
     pub status: String,
     pub actions: Vec<String>,
+    #[serde(default)]
+    pub workspace_pending: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_blocked: Option<LaunchBlock>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,6 +188,16 @@ struct Inner {
     hide_on_close: bool,
     send_code_target: Option<String>,
     launching: Option<(&'static str, Instant)>,
+    selecting_workspace: Option<&'static str>,
+    diagnostics: diagnostics::Session,
+}
+
+struct WorkspaceSelection<'a>(&'a Mutex<Inner>);
+
+impl Drop for WorkspaceSelection<'_> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().selecting_workspace = None;
+    }
 }
 
 struct AgentLauncher {
@@ -281,6 +290,14 @@ impl Bridge {
     }
 
     pub async fn call(&self, op: Op) -> Reply {
+        self.call_with_workspace(op, || std::future::ready(None)).await
+    }
+
+    pub(crate) async fn call_with_workspace<F, P>(&self, op: Op, pick_workspace: F) -> Reply
+    where
+        F: FnOnce() -> P,
+        P: Future<Output = Option<PathBuf>>,
+    {
         if matches!(op, Op::State) {
             return self.state().await;
         }
@@ -290,11 +307,12 @@ impl Bridge {
             .map_err(|_| ErrorBody { code: "conflict".into(), message: "已有操作正在进行".into() })?;
         match op {
             Op::State => self.state().await,
+            Op::Diagnostics => Err(invalid("诊断日志请使用只读入口")),
             Op::SendCode { target } => self.send_code(target).await,
             Op::Login { target, code, invite_code } => self.login(target, code, invite_code).await,
             Op::PasswordLogin { tenant, username, password } => self.password_login(tenant, username, password).await,
             Op::SelectTenant { tenant_id } => self.select_tenant(tenant_id).await,
-            Op::Launch { agent_id, cwd } => self.launch(agent_id, cwd).await,
+            Op::Launch { agent_id } => self.launch(agent_id, pick_workspace).await,
             Op::Download { agent_id } => self.download(agent_id).await,
             Op::Settings { hide_on_close } => self.settings(hide_on_close).await,
             Op::InstallUpdate { .. } => {
@@ -315,9 +333,70 @@ impl Bridge {
                 inner.user_name = None;
                 inner.tenant = None;
                 inner.launching = None;
+                inner.diagnostics = diagnostics::Session::default();
             }
         }
         self.snapshot(status.as_ref()).await
+    }
+
+    pub(crate) fn begin_diagnostic_action(&self, op: &Op) -> Option<(diagnostics::Action, time::OffsetDateTime)> {
+        let action = match op {
+            Op::Launch { agent_id } => diagnostics::Action::Launch(agent_launcher(agent_id)?.id),
+            Op::Download { agent_id } => diagnostics::Action::Download(agent_launcher(agent_id)?.id),
+            _ => return None,
+        };
+        let mut inner = self.inner.lock().unwrap();
+        if let diagnostics::Action::Launch(agent) = action {
+            inner.diagnostics.push(&self.version, "info", "launch_requested", Some(agent), None);
+        }
+        Some((action, inner.diagnostics.since))
+    }
+
+    pub(crate) fn complete_diagnostic_action(
+        &self,
+        action: Option<(diagnostics::Action, time::OffsetDateTime)>,
+        reply: &Reply,
+    ) {
+        let Some((action, since)) = action else { return };
+        let (agent, level, event, code) = match (action, reply) {
+            (diagnostics::Action::Launch(agent), Ok(_)) => (agent, "info", "launch_accepted", None),
+            (diagnostics::Action::Launch(agent), Err(error)) if error.code == "launch_cancelled" => {
+                (agent, "info", "launch_cancelled", None)
+            }
+            (diagnostics::Action::Launch(agent), Err(error)) => {
+                (agent, "error", "launch_rejected", Some(diagnostic_error(error)))
+            }
+            (diagnostics::Action::Download(agent), Ok(_)) => (agent, "info", "download_accepted", None),
+            (diagnostics::Action::Download(agent), Err(error)) => {
+                (agent, "error", "download_rejected", Some(diagnostic_error(error)))
+            }
+        };
+        let mut inner = self.inner.lock().unwrap();
+        if since == inner.diagnostics.since {
+            inner.diagnostics.push(&self.version, level, event, Some(agent), code);
+        }
+    }
+
+    pub(crate) async fn diagnostics(&self) -> diagnostics::DiagnosticView {
+        let status = self.ipc_call(&Request::Status).await.ok();
+        let daemon_version =
+            status.as_ref().and_then(|value| value["version"].as_str()).and_then(diagnostics::safe_version);
+        let (since, account) = {
+            let inner = self.inner.lock().unwrap();
+            (
+                inner.diagnostics.since,
+                status.as_ref().is_some_and(|status| inner.phase == Phase::Ready && same_device(status, &inner)),
+            )
+        };
+        let directory = self.socket_path.with_file_name("logs");
+        let mut daemon = tokio::task::spawn_blocking(move || diagnostics::daemon_logs(&directory, since, account))
+            .await
+            .unwrap_or_default();
+        let inner = self.inner.lock().unwrap();
+        if since != inner.diagnostics.since {
+            daemon.clear();
+        }
+        inner.diagnostics.view(&self.version, daemon_version, daemon)
     }
 
     async fn send_code(&self, target: String) -> Reply {
@@ -575,6 +654,7 @@ impl Bridge {
         inner.pending = None;
         inner.phase = Phase::Ready;
         inner.send_code_target = None;
+        inner.diagnostics = diagnostics::Session::default();
         Ok(())
     }
 
@@ -605,11 +685,16 @@ impl Bridge {
         inner.user_name = Some(stored.user_name);
         inner.tenant = Some(Tenant { id: stored.tenant_id, name: stored.tenant_name });
         inner.device_id = Some(stored.device_id);
+        inner.diagnostics = diagnostics::Session::default();
     }
 
-    async fn launch(&self, agent_id: String, cwd: Option<String>) -> Reply {
+    async fn launch<F, P>(&self, agent_id: String, pick_workspace: F) -> Reply
+    where
+        F: FnOnce() -> P,
+        P: Future<Output = Option<PathBuf>>,
+    {
         let status = self.ipc_call(&Request::Status).await.map_err(|_| unavailable())?;
-        let (launcher, already_launching) = {
+        let (launcher, already_launching, device_id) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.phase != Phase::Ready || !same_device(&status, &inner) {
                 return Err(forbidden());
@@ -632,9 +717,11 @@ impl Bridge {
                 {
                     return Err(invalid_agent());
                 }
-                inner.launching = Some((launcher.id, Instant::now() + Duration::from_secs(5)));
+                if launcher.gui {
+                    inner.launching = Some((launcher.id, Instant::now() + Duration::from_secs(5)));
+                }
             }
-            (launcher, already)
+            (launcher, already, inner.device_id.clone())
         };
         // 重复点击不另启进程：直接返回当前快照
         if already_launching {
@@ -643,17 +730,40 @@ impl Bridge {
         let result = if launcher.gui {
             self.start_native_desktop(launcher.id).await
         } else {
-            // CLI agents (claude-code, codex, kimi-code) need a valid cwd before launch.
-            // If the caller didn't supply one, return cwd_required so the UI can prompt.
-            let cwd = cwd.as_deref().unwrap_or("").trim();
-            if cwd.is_empty() || !std::path::Path::new(cwd).is_absolute() || !std::path::Path::new(cwd).is_dir() {
-                self.inner.lock().unwrap().launching = None;
-                return Err(ErrorBody {
-                    code: "cwd_required".into(),
-                    message: "请先选择工作目录再启动 Agent".into(),
-                });
+            let workspace = {
+                self.inner.lock().unwrap().selecting_workspace = Some(launcher.id);
+                let _selection = WorkspaceSelection(&self.inner);
+                pick_workspace().await
+            };
+            match workspace {
+                Some(cwd) if cwd.is_absolute() && cwd.is_dir() && cwd.to_str().is_some() => {
+                    let status = self.ipc_call(&Request::Status).await.map_err(|_| unavailable())?;
+                    {
+                        let mut inner = self.inner.lock().unwrap();
+                        if inner.phase != Phase::Ready || inner.device_id != device_id || !same_device(&status, &inner)
+                        {
+                            return Err(forbidden());
+                        }
+                        if !self.ready_agents(Some(&status), &inner).iter().any(|agent| {
+                            agent.id == launcher.id && agent.actions.iter().any(|action| action == "launch")
+                        }) {
+                            return Err(ErrorBody {
+                                code: "agent_not_allowed".into(),
+                                message: "启动授权已变更".into(),
+                            });
+                        }
+                        inner.launching = Some((launcher.id, Instant::now() + Duration::from_secs(5)));
+                    }
+                    spawn_managed_cli(launcher, &cwd).await.map_err(|error| {
+                        tracing::warn!(agent = launcher.id, kind = ?error.kind(), "could not open managed Agent terminal");
+                        ErrorBody { code: "terminal_unavailable".into(), message: "无法打开 Agent 终端".into() }
+                    })
+                }
+                Some(_) => {
+                    Err(ErrorBody { code: "cwd_required".into(), message: "请选择可用的工作目录".into() })
+                }
+                None => Err(ErrorBody { code: "launch_cancelled".into(), message: "已取消启动".into() }),
             }
-            spawn_managed_cli(launcher, cwd).await.map_err(|_| unavailable())
         };
         if result.is_err() {
             self.inner.lock().unwrap().launching = None;
@@ -757,6 +867,7 @@ impl Bridge {
             inner.pending = None;
             inner.send_code_target = None;
             inner.launching = None;
+            inner.diagnostics = diagnostics::Session::default();
         }
         // Windows：`Logout` 让 onexd 把自己整个关掉（和 macOS 一致，见 onexd/src/ipc.rs::logout），
         // macOS 靠 LaunchAgent 的 KeepAlive 自动重启；Windows 没有等价机制，Desktop 必须在这里自己
@@ -839,6 +950,7 @@ impl Bridge {
                     progress: serde_json::from_value(a["progress"].clone()).ok(),
                     status: status.into(),
                     actions,
+                    workspace_pending: inner.selecting_workspace == Some(launcher.id),
                     launch_blocked,
                     message: None,
                 })
@@ -945,29 +1057,52 @@ fn launch_script_path(launcher: &AgentLauncher) -> Option<PathBuf> {
     bundled.is_file().then_some(bundled)
 }
 
-/// macOS：打开一个新的 Terminal.app 窗口运行随包脚本，固定两个参数（目标 app 和脚本自身路径），
-/// 均来自本进程资源目录，不接受调用方输入。
+/// Terminal.app opens a command file as a document. A private, single-use wrapper passes
+/// the selected directory as a literal argument to the fixed bundled launcher.
 #[cfg(target_os = "macos")]
-async fn spawn_managed_cli(launcher: &AgentLauncher, cwd: &str) -> std::io::Result<()> {
+async fn spawn_managed_cli(launcher: &AgentLauncher, cwd: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
     let script = launch_script_path(launcher)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "OneX Agent terminal launcher not found"))?;
+    let directory = tempfile::Builder::new().prefix("onex-terminal-").tempdir()?;
+    let wrapper = directory.path().join("Launch OneX Agent.command");
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o700).open(&wrapper)?;
+    file.write_all(terminal_command(&script, cwd)?.as_bytes())?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    drop(file);
     let status = tokio::process::Command::new("/usr/bin/open")
         .args(["-a", "/System/Applications/Utilities/Terminal.app", "--"])
-        .arg(&script)
-        .arg(cwd)
+        .arg(&wrapper)
         .status()
         .await?;
     if !status.success() {
         return Err(std::io::Error::other(format!("Terminal.app launch failed: {status}")));
     }
+    // Terminal opens the file asynchronously. Its wrapper removes this directory after opening.
+    let _ = directory.keep();
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_command(script: &Path, cwd: &Path) -> std::io::Result<String> {
+    let quote = |path: &Path| {
+        let value = path.to_str().ok_or_else(|| std::io::Error::other("path is not UTF-8"))?;
+        Ok::<_, std::io::Error>(format!("'{}'", value.replace('\'', "'\\''")))
+    };
+    Ok(format!(
+        "#!/bin/sh\nset -eu\n/bin/rm -f -- \"$0\" || :\n/bin/rmdir -- \"$(/usr/bin/dirname \"$0\")\" || :\nexec {} {}\n",
+        quote(script)?,
+        quote(cwd)?,
+    ))
 }
 
 /// Windows：不经中间脚本，直接起装在 Desktop 同目录的 `onex.exe`（Tauri externalBin sidecar，
 /// 和 `ensure_onexd_running` 解析 `onexd.exe` 用同一种"同目录"约定，见 `lib.rs`）。固定两个参数
 /// `run <已知 Agent ID> --managed`，由固定的启动目录提供参数。`CREATE_NEW_CONSOLE` 给 Agent 自己的控制台。
 #[cfg(windows)]
-async fn spawn_managed_cli(launcher: &AgentLauncher, cwd: &str) -> std::io::Result<()> {
+async fn spawn_managed_cli(launcher: &AgentLauncher, cwd: &Path) -> std::io::Result<()> {
     const CREATE_NEW_CONSOLE: u32 = 0x00000010;
     let executable = std::env::current_exe()?;
     let onex = executable
@@ -1047,6 +1182,15 @@ fn invalid(message: &str) -> ErrorBody {
     ErrorBody { code: "invalid".into(), message: message.into() }
 }
 
+fn diagnostic_error(error: &ErrorBody) -> &'static str {
+    KNOWN_CODES
+        .iter()
+        .copied()
+        .chain(["cwd_required", "terminal_unavailable"])
+        .find(|code| *code == error.code)
+        .unwrap_or("internal")
+}
+
 fn forbidden() -> ErrorBody {
     ErrorBody { code: "forbidden".into(), message: "没有权限执行此操作".into() }
 }
@@ -1073,6 +1217,81 @@ fn unavailable() -> ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_launch_accepts_only_agent_id_from_webview() {
+        assert!(matches!(
+            serde_json::from_value::<Op>(json!({"op": "launch", "agent_id": "codex"})),
+            Ok(Op::Launch { agent_id }) if agent_id == "codex"
+        ));
+        assert!(
+            serde_json::from_value::<Op>(json!({
+                "op": "launch", "agent_id": "codex", "cwd": "/tmp"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_picker_is_visible_and_leaves_running_instances_intact() {
+        let bridge = Bridge::new(PathBuf::from("unused/onexd.sock"));
+        let agent_state = json!({"logged_in":true, "ws":"connected", "device_id":"dev_a",
+            "version":env!("CARGO_PKG_VERSION"), "managed_agents":[{"id":"codex", "version":"1.0.0",
+                "status":"running", "instance_count":2}]});
+        {
+            let mut inner = bridge.inner.lock().unwrap();
+            inner.phase = Phase::Ready;
+            inner.device_id = Some("dev_a".into());
+            inner.selecting_workspace = Some("codex");
+        }
+        let picker = WorkspaceSelection(&bridge.inner);
+        let agents = bridge.ready_agents(Some(&agent_state), &bridge.inner.lock().unwrap());
+        assert!(agents[0].workspace_pending);
+        assert_eq!(agents[0].status, "running");
+        assert_eq!(agents[0].instance_count, 2);
+        drop(picker);
+        let agents = bridge.ready_agents(Some(&agent_state), &bridge.inner.lock().unwrap());
+        assert!(!agents[0].workspace_pending);
+        assert!(agents[0].actions.contains(&"launch".into()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminal_launchers_preserve_the_native_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let resources = temporary.path().join("OneX Desktop's Resources");
+        let cli_dir = resources.join("onex/bin");
+        let workspace = temporary.path().join("项目 with 'quotes' and $(printf untrusted)");
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let cli = cli_dir.join("onex");
+        std::fs::write(
+            &cli,
+            "#!/bin/sh\nset -eu\n[ \"$1\" = run ] && [ \"$3\" = --managed ]\nprintf '%s\\n' \"$2\"\npwd -P\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        for (id, launcher) in [
+            ("claude-code", include_str!("../../../deploy/mac/onex-run-claude.command")),
+            ("codex", include_str!("../../../deploy/mac/onex-run-codex.command")),
+            ("kimi-code", include_str!("../../../deploy/mac/onex-run-kimi.command")),
+        ] {
+            let script = resources.join(format!("{id}.command"));
+            std::fs::write(&script, launcher).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let directory = tempfile::tempdir_in(temporary.path()).unwrap();
+            let wrapper = directory.path().join("Run OneX.command");
+            std::fs::write(&wrapper, terminal_command(&script, &workspace).unwrap()).unwrap();
+            let output = std::process::Command::new("/bin/sh").arg(&wrapper).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), format!("{id}\n{}\n", workspace.display()));
+            assert!(!directory.path().exists());
+        }
+    }
 
     #[test]
     fn desktop_projects_only_supported_agents_from_the_current_device() {

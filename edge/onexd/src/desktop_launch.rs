@@ -46,6 +46,7 @@ pub(crate) struct Request<'a> {
     pub(crate) router: &'a str,
     pub(crate) model: &'a str,
     pub(crate) deepseek_models: &'a [DeepSeekModel],
+    pub(crate) tools: &'a [crate::tools::Bundle],
 }
 
 pub(crate) struct Prepared {
@@ -105,21 +106,30 @@ pub(crate) fn prepare(
             ("no_proxy".to_owned(), "127.0.0.1,localhost".into()),
         ]);
         let origin = format!("http://{}", request.router);
+        let tools = crate::desktop_tools::prepare(request.agent, &run, request.tools)?;
         let mut claude_profile = None;
         let mut args = vec![format!("--user-data-dir={}", path_text(&data)?)];
         let config = match request.agent {
             "claude-desktop" => {
                 let (archive, engine) = engine_archive.context("missing Claude Desktop runtime")?;
-                let prepared = crate::claude_desktop::prepare(request, &home, &run, &cwd, archive, engine, &mut env)?;
+                let prepared =
+                    crate::claude_desktop::prepare(request, &home, &run, &cwd, archive, engine, &mut env, &tools)?;
+                tools.link_skills(&prepared.code)?;
                 let code = prepared.code.clone();
                 claude_profile = Some(prepared);
                 args.clear();
                 code
             }
-            "codex-desktop" => crate::codex_desktop::prepare(request, &profile, &data, &run, &cwd, &mut env)?,
+            "codex-desktop" => {
+                let agents = crate::desktop_tools::private_subdirectory(&home, ".agents")?;
+                tools.link_skills(&agents)?;
+                crate::codex_desktop::prepare(request, &profile, &data, &run, &cwd, &mut env, &tools.mcp)?
+            }
             "workbuddy" => {
                 let config = profile.join("config");
                 launch::private_dir(&config)?;
+                tools.link_skills(&config)?;
+                let mcp = tools.write_mcp(&run)?;
                 let model_bearer = request.model_bearer.context("WorkBuddy requires a separate model credential")?;
                 anyhow::ensure!(
                     !model_bearer.is_empty() && model_bearer != request.token,
@@ -149,7 +159,8 @@ pub(crate) fn prepare(
                     &policy,
                     &serde_json::to_vec(&json!({
                         "origin":origin, "workspace":workspace, "config":path_text(&config)?, "bundle":path_text(app)?, "model":request.model,
-                        "privateHome":path_text(&home.canonicalize()?)?, "credential":path_text(&credential)?
+                        "privateHome":path_text(&home.canonicalize()?)?, "credential":path_text(&credential)?,
+                        "skills":path_text(&tools.skills)?, "mcp":path_text(&mcp)?
                     }))?,
                 )?;
                 let quote =
@@ -164,7 +175,12 @@ pub(crate) fn prepare(
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => Default::default(),
                     _ => bail!("invalid WorkBuddy settings path"),
                 };
-                settings.insert("hooks".into(), json!({"UserPromptSubmit":handler,"Stop":handler}));
+                settings.insert(
+                    "hooks".into(),
+                    json!({
+                        "UserPromptSubmit":handler,"Stop":handler,"PostToolUse":tools.post_tool_use()?
+                    }),
+                );
                 publish(&config, "settings.json", &serde_json::to_vec_pretty(&settings)?)?;
                 env.insert("WORKBUDDY_CONFIG_DIR".into(), path_text(&config)?);
                 env.insert("CODEBUDDY_CONFIG_DIR".into(), path_text(&config)?);
@@ -203,24 +219,26 @@ pub(crate) fn prepare(
                     "name":"onex-managed-desktop", "version":"1.0.0", "private":true,
                     "dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]}}
                 });
-                let patch = json!([
-                    { "id":"credentials", "disabled":true },
-                    { "insert":[{"id":"onex-session-credentials","name":credentials_url.as_str()}] },
-                    { "id":"llm-deepseek", "disabled":true },
-                    { "id":"llm-deepseek-account", "disabled":true },
-                    { "id":"plugin-manager", "disabled":true },
-                    { "id":"tool-plugin-manager", "disabled":true },
-                    { "id":"llm-pi-ai", "config": { "providers":providers } },
-                    { "id":"agent-default-model", "config": { "provider":default_provider, "model":request.model } },
-                    { "insert": [{ "id":"onex-managed-session", "name":plugin_url.as_str(), "config": {
+                let mut patch = vec![
+                    json!({ "id":"credentials", "disabled":true }),
+                    json!({ "insert":[{"id":"onex-session-credentials","name":credentials_url.as_str()}] }),
+                    json!({ "id":"llm-deepseek", "disabled":true }),
+                    json!({ "id":"llm-deepseek-account", "disabled":true }),
+                    json!({ "id":"plugin-manager", "disabled":true }),
+                    json!({ "id":"tool-plugin-manager", "disabled":true }),
+                    json!({ "id":"llm-pi-ai", "config": { "providers":providers } }),
+                    json!({ "id":"agent-default-model", "config": { "provider":default_provider, "model":request.model } }),
+                    json!({ "insert": [{ "id":"onex-managed-session", "name":plugin_url.as_str(), "config": {
                         "origin":origin, "workspace":workspace, "models":model_permissions, "credential":path_text(&credential)?,
                         "extractor":path_text(&std::env::current_exe()?)?
-                    }}] },
-                ]);
+                    }}] }),
+                ];
+                tools.insert_deepseek_mcp(&mut patch)?;
                 publish(&desktop, "cordis.yml", b"[]\n")?;
                 publish(&desktop, "package.json", &serde_json::to_vec_pretty(&manifest)?)?;
                 publish(&desktop, "cordis.patch.yml", &serde_json::to_vec_pretty(&patch)?)?;
                 env.insert("DSH_HOME".into(), path_text(&root)?);
+                env.insert("DSH_AGENTS_HOME".into(), path_text(&tools.root)?);
                 env.insert("DSH_DESKTOP_USER_DATA_DIR".into(), path_text(&data)?);
                 root
             }
@@ -492,6 +510,7 @@ fn deepseek_uses_private_windows_profile_and_loadable_adapter_urls() {
         router: "127.0.0.1:19876",
         model: "contract-model",
         deepseek_models: &[DeepSeekModel::new("contract-model".into(), AgentProtocol::Chat, false, None, None)],
+        tools: &[],
     };
     let prepared = prepare(&request, None).unwrap();
     let state = &prepared.launch;
@@ -525,6 +544,7 @@ fn deepseek_uses_private_windows_profile_and_loadable_adapter_urls() {
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tests {
     use super::*;
+    use base64::{Engine, engine::general_purpose::STANDARD};
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -546,6 +566,7 @@ mod tests {
             router: "127.0.0.1:19876",
             model: "contract-model",
             deepseek_models: &[],
+            tools: &[],
         };
         let prepared = prepare(&request, None).unwrap();
         let launch = &prepared.launch;
@@ -568,7 +589,8 @@ mod tests {
         assert_eq!(models["models"].as_array().unwrap().len(), 1);
         assert!(!models.to_string().contains(request.token));
         let settings = read_json(&config.join("settings.json"));
-        assert_eq!(settings["hooks"].as_object().unwrap().len(), 2);
+        assert_eq!(settings["hooks"].as_object().unwrap().len(), 3);
+        assert_eq!(settings["hooks"]["PostToolUse"], json!([]));
         let command = settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(command.contains(" workbuddy-hook "));
         assert!(command.contains(&std::env::current_exe().unwrap().display().to_string()));
@@ -586,8 +608,24 @@ mod tests {
         let mut vendor_settings = settings;
         vendor_settings["theme"] = json!("from-vendor");
         std::fs::write(config.join("settings.json"), serde_json::to_vec(&vendor_settings).unwrap()).unwrap();
-        let next = prepare(&request, None).unwrap();
+        let raw =
+            serde_json::to_vec(&json!({"files":[{"path":"hook.sh","data":STANDARD.encode("#!/bin/sh\nexit 0\n")}]}))
+                .unwrap();
+        let hook = serde_json::from_value(json!({
+            "id":crate::id::new("tool"), "name":"probe", "version":"1.0.0", "kind":"hook",
+            "agents":["workbuddy"], "os":"macos", "arch":"arm64", "entrypoint":"hook.sh", "args":[],
+            "sha256":format!("{:x}",Sha256::digest(&raw)), "size":raw.len()
+        }))
+        .unwrap();
+        let tools = [crate::tools::decode(&hook, &raw).unwrap()];
+        let upgraded = Request { tools: &tools, ..request };
+        let next = prepare(&upgraded, None).unwrap();
         assert_eq!(read_json(&config.join("settings.json"))["theme"], "from-vendor");
+        let current_hooks = &read_json(&config.join("settings.json"))["hooks"];
+        assert_eq!(current_hooks["Stop"], current_hooks["UserPromptSubmit"]);
+        let post = current_hooks["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(post.contains("-u ONEX_WORKBUDDY_SESSION_MODEL_TOKEN"));
+        assert!(post.contains("managed-tools/hooks/probe/hook.sh"));
         assert_ne!(next.runtime.as_ref().unwrap().path(), runtime);
         drop(prepared);
         assert!(!runtime.exists());

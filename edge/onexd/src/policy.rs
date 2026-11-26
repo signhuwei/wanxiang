@@ -179,7 +179,7 @@ pub(crate) fn stage(
             && release.sha256.len() == 64
             && release.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
             && release.size > 0
-            && release.size <= 512 * 1024 * 1024
+            && release.size <= crate::managed_runtime::artifact_size_limit(&release.agent)
             && release_ids.insert(release.id.as_str())
     }) {
         return Err("设备策略包含不适用的受管发行");

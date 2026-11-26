@@ -159,7 +159,11 @@ Server 重连重建最新快照，随附该设备用户有权接收的最近策�
 
 通配路由还携带匹配该前缀的固定上游模型名，作为精确别名。WorkBuddy、Codex Desktop、Claude Desktop 可选与各自协议兼容的合约精确别名和通配路由发布的固定模型。Edge 启动和每次请求均按该范围校验。在受限余额档位，只有先前发布的精确名称可以转入获准的低成本模型。
 
-`access.tools` 是可逐级缩小的 Tools 发布集合，目录标识为 `tools`。已签发且有效的发布还需匹配当前设备和获准 Agent。完整配置的 `tools` 字段为发行清单，每项为 `{id,name,version,kind,agents,os,arch,entrypoint,args,sha256,size}`。通用 Skill 的 `os`、`arch` 与 `entrypoint` 为 `null`。包下载 `GET /v1/edge/tool-artifacts/:id` 使用设备凭据并逐次复核当前授权。Edge 先按清单校验内容，再在新启动 Agent 的独立配置范围内为支持的 Agent 安装 Skill 或登记 stdio MCP。现有进程继续使用启动时的快照。
+`access.tools` 是可逐级缩小的 Tools 发布集合，目录标识为 `tools`。已签发且有效的发布还需匹配当前设备和获准 Agent。完整配置的 `tools` 字段为发行清单，每项为 `{id,name,version,kind,agents,os,arch,entrypoint,args,sha256,size,delivery?}`。通用 Skill 的 `os`、`arch` 与 `entrypoint` 为 `null`。包下载 `GET /v1/edge/tool-artifacts/:id` 使用设备凭据并逐次复核当前授权。Edge 先按清单校验内容，再在新启动 Agent 的独立配置范围内安装原生支持的工具。现有进程继续使用启动时的快照。
+
+Tooth 保留发行的 `delivery` 元数据，取值为 `system`、`direct` 或 `selected`。启动使用签发及逐级收窄后的 `access.tools`，交付方式本身不授予权限。`GET /v1/platform/tool-targets` 返回每个 Agent 支持的工具种类和桌面平台，由平台页面用来约束发行表单。相同发行可以同时适用于 CLI 和 Desktop。
+
+支持桌面 Tooth 的 Edge 在 `hello` 中声明 `tooth_v1: true` 以及 `desktop_tool_targets`，例如 `{"deepseek-desktop":["skill"]}`。Server 对每项工具分别取发行目标、生效 Agent、设备平台、已下发的受管发行及客户端声明的工具种类的交集。缺少声明的设备继续接收同一发行中匹配的 CLI 目标。空交集省略该项工具。客户端按本机工具适配清单校验，不支持的工具类型不能用于启动。
 
 ### 实现时的接口字段
 

@@ -9,6 +9,7 @@ import { bearer, hash, iso } from './credentials';
 import { enumField, expectRevision, pagination, platformActor, type ManagementOptions } from './management';
 import { readPolicyHot } from './policy-data';
 import { encryptProviderSecret } from './provider-secret';
+import toolTargetCatalog from './tool-targets.json';
 import { toolSearchRoutes } from './tool-search';
 import type { RunSearch } from './tool-search-upstream';
 import type { Store, Transaction } from './store';
@@ -21,13 +22,38 @@ const maxDecodedBytes = 16 * 1024 * 1024;
 const maxFiles = 256;
 const maxLaunchBytes = 96 * 1024 * 1024;
 const releaseId = /^tool_[0-9A-HJKMNP-TV-Z]{26}$/;
-const cliAgents = ['claude-code', 'codex', 'kimi-code'] as const;
-type ToolAgent = typeof cliAgents[number];
+type ToolAgent = keyof typeof toolTargetCatalog;
 type ToolKind = 'skill' | 'mcp' | 'hook' | 'http_search';
 type ToothDelivery = 'system' | 'direct' | 'selected';
 type ToolOS = 'macos' | 'windows';
 type ToolArch = 'arm64' | 'x64';
 type ToolStatus = 'draft' | 'published' | 'disabled';
+export const toolTargets: Record<ToolAgent, { kinds: readonly string[]; platforms?: readonly string[] }> = toolTargetCatalog;
+export const toolAgents = Object.keys(toolTargets) as ToolAgent[];
+export type DesktopToolTargets = Record<string, string[]>;
+
+export function parseDesktopToolTargets(input: unknown): DesktopToolTargets | null {
+  if (input === undefined) return {};
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return null;
+  const rows = Object.entries(input);
+  if (rows.length > 32 || rows.some(([agent, kinds]) => agent.length === 0 || agent.length > 64 || !Array.isArray(kinds)
+    || kinds.length > 16 || kinds.some(kind => typeof kind !== 'string' || !kind.length || kind.length > 32))) return null;
+  return Object.fromEntries(rows);
+}
+
+function toolTarget(agent: string, kind: ToolKind) {
+  if (!Object.hasOwn(toolTargets, agent)) return undefined;
+  const target = toolTargets[agent as ToolAgent];
+  return target.kinds.includes(kind) ? target : undefined;
+}
+
+export function projectDeviceTools(tools: ToolReleaseDescriptor[], agents: ReadonlySet<string>, declared: DesktopToolTargets) {
+  return tools.flatMap(tool => {
+    const eligible = tool.agents.filter(agent => !toolTargets[agent].platforms
+      || (agents.has(agent) && Object.hasOwn(declared, agent) && declared[agent]?.includes(tool.kind)));
+    return eligible.length ? [{ ...tool, agents: eligible }] : [];
+  });
+}
 
 export type ToolRelease = {
   id: string; name: string; version: string; kind: ToolKind; agents_json: string;
@@ -60,7 +86,7 @@ export function validateToolSet(db: Pick<Transaction, 'all'>, ids: string[], fie
   if (rows.length !== ids.length) invalid(field);
 
   const agents = rows.map(row => JSON.parse(row.agents_json) as ToolAgent[]);
-  for (const agent of cliAgents) {
+  for (const agent of toolAgents) {
     for (const os of ['macos', 'windows']) {
       for (const arch of ['arm64', 'x64']) {
         const installed = new Set<string>();
@@ -121,15 +147,16 @@ export function allowedToolReleases(store: Store, dataDir: string, policy: ToolP
     }
   }
   for (const row of rows) {
-    const agents = (JSON.parse(row.agents_json) as ToolAgent[]).filter(agent => allowed.has(agent));
+    const agents = (JSON.parse(row.agents_json) as ToolAgent[]).filter(agent => allowed.has(agent) && toolTarget(agent, row.kind));
+    const targets = agents.filter(agent => os === undefined || toolTargets[agent].platforms?.includes(`${os}/${arch}`) !== false);
     if (row.status !== 'published') onUnavailable?.(row.id, 'tool_release_disabled');
     else if (!agents.length) onUnavailable?.(row.id, 'tool_agent_denied');
     else if (row.kind === 'http_search') continue;
     else if (!isToolReleaseId(row.id)) onUnavailable?.(row.id, 'tool_release_unavailable');
-    else if (os !== undefined && row.kind !== 'skill' && (row.os !== platform || row.arch !== arch)) {
+    else if (!targets.length || (os !== undefined && row.kind !== 'skill' && (row.os !== platform || row.arch !== arch))) {
       onUnavailable?.(row.id, 'tool_platform_mismatch');
     } else if (!hasToolArtifact(dataDir, row)) onUnavailable?.(row.id, 'tool_artifact_missing');
-    else releases.push({ ...releaseMetadata(row), kind: row.kind, agents, sha256: row.sha256, size: row.size });
+    else releases.push({ ...releaseMetadata(row), kind: row.kind, agents: targets, sha256: row.sha256, size: row.size });
   }
   return releases;
 }
@@ -148,9 +175,9 @@ function parseRelease(body: Record<string, unknown>) {
   const version = field(body.version, 'version', 64);
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(version)) invalid('version');
   const kind = enumField(body.kind, 'kind', ['skill', 'mcp', 'hook', 'http_search']);
-  if (!Array.isArray(body.agents) || !body.agents.length || body.agents.length > cliAgents.length) invalid('agents');
-  const agents = body.agents.map(agent => enumField(agent, 'agents', cliAgents));
-  if (new Set(agents).size !== agents.length) invalid('agents');
+  if (!Array.isArray(body.agents) || !body.agents.length || body.agents.length > toolAgents.length) invalid('agents');
+  const agents = body.agents.map(agent => enumField(agent, 'agents', toolAgents));
+  if (new Set(agents).size !== agents.length || agents.some(agent => !toolTarget(agent, kind))) invalid('agents');
   const common = { name, version, kind, agents_json: JSON.stringify(agents), args_json: '[]', delivery: null as ToothDelivery | null };
   if (kind === 'http_search') {
     for (const key of ['os', 'arch', 'entrypoint', 'args']) if (body[key] !== undefined) invalid(key);
@@ -170,12 +197,14 @@ function parseRelease(body: Record<string, unknown>) {
   }
   const os = enumField(body.os, 'os', ['macos', 'windows']);
   const arch = enumField(body.arch, 'arch', ['arm64', 'x64']);
+  const targetPlatform = `${os === 'macos' ? 'darwin' : 'win32'}/${arch}`;
+  if (agents.some(agent => toolTargets[agent].platforms?.includes(targetPlatform) === false)) invalid('agents', 'os', 'arch');
   const entrypoint = portablePath(body.entrypoint, 'entrypoint');
   if (os === 'windows' && !entrypoint.toLowerCase().endsWith('.exe')) invalid('entrypoint');
   const args = body.args ?? [];
   if (!Array.isArray(args) || args.length > 32 || args.some(arg => typeof arg !== 'string' || !arg.isWellFormed()
     || Buffer.byteLength(arg) > 256 || /[\x00-\x1f\x7f]/.test(arg))) invalid('args');
-  if (kind === 'hook' && (os !== 'macos' || agents.length !== 1 || agents[0] !== 'claude-code' || args.length)) invalid('agents', 'os', 'args');
+  if (kind === 'hook' && (os !== 'macos' || args.length)) invalid('os', 'args');
   if (Buffer.byteLength(JSON.stringify(args)) > 4096) invalid('args');
   return { metadata: { ...common, os, arch, entrypoint, args_json: JSON.stringify(args), delivery } };
 }
@@ -275,6 +304,10 @@ export function toolReleaseRoutes(app: Hono, store: Store, opts: ManagementOptio
     ? store.system.get<{ endpoint: string }>('SELECT endpoint FROM tool_search_targets WHERE release_id=?', [row.id])?.endpoint : undefined;
   const view = (row: ToolRelease) => toolReleaseView(row, opts.dataDir, endpoint(row));
   const directory = join(opts.dataDir, 'tool-artifacts');
+  app.get('/v1/platform/tool-targets', c => {
+    platformActor(store, c, opts.now());
+    return c.json({ agents: toolTargets });
+  });
   app.get(base, (c) => {
     platformActor(store, c, opts.now());
     const page = pagination(c);

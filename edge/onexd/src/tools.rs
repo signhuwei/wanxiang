@@ -1,5 +1,5 @@
 //! Download approved, immutable tool bundles and stage them inside one managed launch.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,9 +17,32 @@ const DECODED_LIMIT: usize = 16 * 1024 * 1024;
 const MAX_FILES: usize = 256;
 const MAX_RELEASES: usize = 64;
 const TOTAL_WIRE_LIMIT: u64 = 96 * 1024 * 1024;
-const TOOL_AGENTS: &[&str] = &["claude-code", "codex", "kimi-code"];
+#[derive(Deserialize)]
+struct ToolTarget {
+    kinds: Vec<String>,
+    platforms: Option<Vec<String>>,
+}
+
+fn targets() -> &'static HashMap<String, ToolTarget> {
+    static TARGETS: std::sync::OnceLock<HashMap<String, ToolTarget>> = std::sync::OnceLock::new();
+    TARGETS.get_or_init(|| {
+        serde_json::from_str(include_str!("../../../server/src/tool-targets.json")).expect("tool target catalog")
+    })
+}
+
+pub(crate) fn desktop_targets(windows_deepseek: bool) -> HashMap<String, Vec<String>> {
+    let os = onex_core::ipc::os_name();
+    let platform = format!("{os}/{}", onex_core::ipc::arch_name());
+    targets()
+        .iter()
+        .filter(|(_, target)| target.platforms.as_ref().is_some_and(|platforms| platforms.contains(&platform)))
+        .filter(|(agent, _)| os != "win32" || (agent.as_str() == "deepseek-desktop" && windows_deepseek))
+        .map(|(agent, target)| (agent.clone(), target.kinds.clone()))
+        .collect()
+}
 
 fn supports_target(tool: &ToolRelease, os: &str, arch: &str) -> bool {
+    let desktop_platform = format!("{os}/{arch}");
     let platform = match os {
         "darwin" => "macos",
         "win32" => "windows",
@@ -27,6 +50,11 @@ fn supports_target(tool: &ToolRelease, os: &str, arch: &str) -> bool {
     };
     tool.os.as_deref().is_none_or(|target| target == platform)
         && tool.arch.as_deref().is_none_or(|target| target == arch)
+        && tool.agents.iter().all(|agent| {
+            targets().get(agent).is_some_and(|target| {
+                target.platforms.as_ref().is_none_or(|platforms| platforms.contains(&desktop_platform))
+            })
+        })
 }
 
 pub(crate) fn select<'a>(tools: &'a [ToolRelease], agent: &str, os: &str, arch: &str) -> Vec<&'a ToolRelease> {
@@ -39,9 +67,9 @@ pub(crate) fn select<'a>(tools: &'a [ToolRelease], agent: &str, os: &str, arch: 
 }
 
 pub(crate) struct Bundle {
-    kind: String,
-    name: String,
-    entrypoint: Option<String>,
+    pub(crate) kind: String,
+    pub(crate) name: String,
+    pub(crate) entrypoint: Option<String>,
     args: Vec<String>,
     files: Vec<(String, Vec<u8>)>,
 }
@@ -97,7 +125,9 @@ fn validate_release(tool: &ToolRelease) -> Result<()> {
     let mut agents = BTreeSet::new();
     ensure!(
         !tool.agents.is_empty()
-            && tool.agents.iter().all(|agent| TOOL_AGENTS.contains(&agent.as_str()) && agents.insert(agent)),
+            && tool.agents.iter().all(|agent| {
+                targets().get(agent).is_some_and(|target| target.kinds.contains(&tool.kind)) && agents.insert(agent)
+            }),
         "invalid managed tool agents"
     );
     let name = tool.name.as_bytes();
@@ -116,23 +146,9 @@ fn validate_release(tool: &ToolRelease) -> Result<()> {
         "invalid managed tool digest or size"
     );
     match (&*tool.kind, tool.os.as_deref(), tool.arch.as_deref(), tool.entrypoint.as_deref()) {
-        ("skill", None, None, None) if tool.args.is_empty() => {
-            if let Some(d) = &tool.delivery {
-                ensure!(
-                    matches!(d.as_str(), "system" | "direct" | "selected"),
-                    "invalid tooth delivery mode"
-                );
-            }
-        }
+        ("skill", None, None, None) if tool.args.is_empty() => {}
         ("hook", Some("macos"), Some("arm64" | "x64"), Some(path))
-            if portable_path(path) && tool.args.is_empty() && tool.agents == ["claude-code"] => {
-            if let Some(d) = &tool.delivery {
-                ensure!(
-                    matches!(d.as_str(), "system" | "direct" | "selected"),
-                    "invalid tooth delivery mode"
-                );
-            }
-        }
+            if portable_path(path) && tool.args.is_empty() => {}
         ("mcp", Some("macos" | "windows"), Some("arm64" | "x64"), Some(path)) if portable_path(path) => {
             ensure!(
                 tool.args.len() <= 32
@@ -146,15 +162,13 @@ fn validate_release(tool: &ToolRelease) -> Result<()> {
             if cfg!(windows) || tool.os.as_deref() == Some("windows") {
                 ensure!(path.to_ascii_lowercase().ends_with(".exe"), "managed Windows MCP requires an executable");
             }
-            if let Some(d) = &tool.delivery {
-                ensure!(
-                    matches!(d.as_str(), "system" | "direct" | "selected"),
-                    "invalid tooth delivery mode"
-                );
-            }
         }
         _ => bail!("invalid managed tool launch metadata"),
     }
+    ensure!(
+        tool.delivery.as_deref().is_none_or(|mode| matches!(mode, "system" | "direct" | "selected")),
+        "invalid tooth delivery mode"
+    );
     Ok(())
 }
 
@@ -179,13 +193,13 @@ pub(crate) fn validate_device_releases(tools: &[ToolRelease], os: &str, arch: &s
             "managed tool is repeated or targets another device"
         );
     }
-    for agent in TOOL_AGENTS {
+    for agent in targets().keys() {
         validate_selection(select(tools, agent, os, arch))?;
     }
     Ok(())
 }
 
-fn decode(tool: &ToolRelease, raw: &[u8]) -> Result<Bundle> {
+pub(crate) fn decode(tool: &ToolRelease, raw: &[u8]) -> Result<Bundle> {
     ensure!(raw.len() as u64 == tool.size, "managed tool size mismatch");
     ensure!(format!("{:x}", Sha256::digest(raw)) == tool.sha256, "managed tool digest mismatch");
     let WireBundle { files } = serde_json::from_slice(raw).context("invalid managed tool bundle")?;
@@ -275,13 +289,13 @@ pub(crate) async fn download(origin: &str, token: &str, releases: &[ToolRelease]
     Ok(tools)
 }
 
-struct Mcp {
-    name: String,
-    command: PathBuf,
-    args: Vec<String>,
+pub(crate) struct Mcp {
+    pub(crate) name: String,
+    pub(crate) command: PathBuf,
+    pub(crate) args: Vec<String>,
 }
 
-fn install(bundles: &[Bundle], executable_root: &Path, skills: &Path) -> Result<Vec<Mcp>> {
+pub(crate) fn install(bundles: &[Bundle], executable_root: &Path, skills: &Path) -> Result<Vec<Mcp>> {
     let mut servers = Vec::new();
     for bundle in bundles {
         let destination = match bundle.kind.as_str() {
@@ -491,6 +505,7 @@ mod tests {
                 args: if mcp { vec!["alpha \"beta\"".into()] } else { vec![] },
                 sha256: format!("{:x}", Sha256::digest(&raw)),
                 size: raw.len() as u64,
+                delivery: None,
             },
             raw,
         )

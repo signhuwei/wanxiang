@@ -712,12 +712,7 @@ async fn launch(
     if !desktop {
         let cwd_path = std::path::Path::new(cwd);
         if cwd.is_empty() || !cwd_path.is_absolute() || !cwd_path.is_dir() {
-            return json!({
-                "ok": false,
-                "error": "cwd_required",
-                "message": "请先选择工作目录再启动 Agent",
-                "agent": agent,
-            });
+            return err("cwd_required", "请先选择工作目录再启动 Agent");
         }
     }
     // 处于 cutoff 且没有租约时，启动 Agent 立即申请一次租约，不等下一个 60 秒窗口（v0.13）。
@@ -927,9 +922,11 @@ async fn launch(
                 router: router_addr,
                 model: &model,
                 deepseek_models: &deepseek_models,
+                tools: &installed_tools,
             },
             approved.as_ref().expect("desktop launch always has an approved release"),
             claude_engine.as_ref().map(|(path, engine)| (path.as_path(), *engine)),
+            &tool_releases,
         )
         .await;
     }
@@ -1115,6 +1112,7 @@ async fn start_desktop(
     request: crate::desktop_launch::Request<'_>,
     release: &onex_core::ws::AgentRelease,
     engine_archive: Option<(&Path, crate::desktop_bundle::RuntimeBundle)>,
+    tool_releases: &[onex_core::ws::ToolRelease],
 ) -> Value {
     use std::process::Stdio;
 
@@ -1126,6 +1124,20 @@ async fn start_desktop(
                 return err("invalid", "无法准备私有桌面应用配置");
             }
         };
+    {
+        let pool = ipc.state.pool_launch_config();
+        let config = ipc.state.config.read().unwrap();
+        let config = pool.as_ref().unwrap_or(&config);
+        let (os, arch) = (onex_core::ipc::os_name(), onex_core::ipc::arch_name());
+        if config.policy_blocked
+            || config.balance_stopped()
+            || crate::managed_runtime::select(&config.agents, request.agent, os, arch).ok() != Some(release)
+            || !crate::tools::select(&config.tools, request.agent, os, arch).into_iter().eq(tool_releases.iter())
+        {
+            let _ = crate::launch::finish(&ctx.home, &launch.launch_id);
+            return err("agent_not_allowed", "桌面 Agent 或受管工具授权已变化，请重试");
+        }
+    }
     #[cfg(windows)]
     let (job, mut protocol) = if request.agent == "deepseek-desktop" {
         use crate::{windows_desktop_job::DesktopJob, windows_dsh_protocol::DshProtocolGuard};

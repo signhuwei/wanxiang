@@ -1802,13 +1802,25 @@ test('signed release selections reach only compatible Apple Silicon Edges', asyn
   const baseRelease = await f.request(path, { ...existing, status: 'active' }, admin);
   expect(baseRelease.status).toBe(201);
   const baseId = (await baseRelease.json() as {id:string}).id;
+  const toolPath = '/platform/tool-releases';
+  const toolDraft = await f.request(toolPath, { name: 'desktop-skill', version: '1.0.0', kind: 'skill',
+    agents: ['claude-code', 'deepseek-desktop', 'codex-desktop', 'claude-desktop'], delivery: 'system' }, admin);
+  expect(toolDraft.status).toBe(201);
+  const toolId = (await toolDraft.json() as { id: string }).id;
+  const toolUpload = await fetch(new URL(`/v1${toolPath}/${toolId}/artifact?revision=1`, f.server.url), {
+    method: 'PUT', headers: { authorization: `Bearer ${admin}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ files: [{ path: 'SKILL.md', data: Buffer.from('---\nname: desktop-skill\ndescription: Test\n---\n').toString('base64') }] }),
+  });
+  expect(toolUpload.status).toBe(200);
+  expect((await f.request(`${toolPath}/${toolId}/publish`, { revision: 2 }, admin)).status).toBe(200);
   const device = await (await f.request('/devices', f.device, tenant)).json() as DeviceReply;
   expect((await f.request(edgeRuntimePath, undefined, device.device_token)).status).toBe(404);
   expect((await f.request(edgeRuntimePath)).status).toBe(401);
   const signaturePath = '/platform/policy/contracts/' + f.tenantId + '/signatures';
   function signReleases(revision: number, releases: string[]) {
     const values = { 'seats.limit': 2, 'lease.budget': 2000,
-      'access.agents': ['deepseek-desktop', 'codex-desktop', 'claude-desktop'], 'access.releases': releases };
+      'access.agents': ['claude-code', 'deepseek-desktop', 'codex-desktop', 'claude-desktop'], 'access.releases': releases,
+      'access.tools': [toolId] };
     return f.request(signaturePath, {expected_policy_revision: revision, expected_platform_revision: revision,
       base_revision: revision || null, reason: 'Signed desktop eligibility',
       entries: Object.entries(values).map(([id, adjustment]) => ({clause_ref: {id, version: 1}, template_ref: null, adjustment}))},
@@ -1829,7 +1841,7 @@ test('signed release selections reach only compatible Apple Silicon Edges', asyn
   expect(effective.status).toBe(200);
   expect((await effective.json() as {releases: {id: string}[]}).releases.map(row => row.id).sort())
     .toEqual([baseId, staged.id, claudeStage.id].sort());
-  for (const { features, expected } of [
+  for (const { features, expected, toolAgents } of [
     { features: { agent_cache: true, mac_desktop_v1: true }, expected: ['deepseek-desktop'] },
     { features: { agent_cache: true, windows_deepseek_desktop_v1: true }, expected: [] },
     { features: { agent_cache: true, codex_desktop_v1: true }, expected: [] },
@@ -1837,6 +1849,12 @@ test('signed release selections reach only compatible Apple Silicon Edges', asyn
     { features: { agent_cache: true, mac_desktop_v1: true, claude_desktop_v1: true }, expected: ['claude-desktop', 'deepseek-desktop'] },
     { features: { agent_cache: true, mac_desktop_v1: true, codex_desktop_v1: true, claude_desktop_v1: true },
       expected: ['claude-desktop', 'codex-desktop', 'deepseek-desktop'] },
+    { features: { agent_cache: true, mac_desktop_v1: true, tooth_v1: true,
+      desktop_tool_targets: { 'deepseek-desktop': ['skill'], 'codex-desktop': ['skill'], 'claude-desktop': ['skill'] } },
+      expected: ['deepseek-desktop'], toolAgents: ['claude-code', 'deepseek-desktop'] },
+    { features: { agent_cache: true, mac_desktop_v1: true, codex_desktop_v1: true, claude_desktop_v1: true, tooth_v1: true,
+      desktop_tool_targets: { 'deepseek-desktop': ['skill'], 'codex-desktop': ['mcp'], 'claude-desktop': ['skill'] } },
+      expected: ['claude-desktop', 'codex-desktop', 'deepseek-desktop'], toolAgents: ['claude-code', 'deepseek-desktop', 'claude-desktop'] },
   ]) {
     const edge = connect(f, device.device_token);
     expect(await edge.opened).toBe(true);
@@ -1846,6 +1864,7 @@ test('signed release selections reach only compatible Apple Silicon Edges', asyn
     await edge.nextOf('cutoff');
     const config = await edge.nextOf('config');
     expect(config.agents.map((row: { agent: string }) => row.agent).sort()).toEqual(expected);
+    expect(config.tools).toMatchObject([{ id: toolId, delivery: 'system', agents: toolAgents ?? ['claude-code'] }]);
     edge.ws.close();
     await edge.closed;
   }
