@@ -3,7 +3,7 @@ resolver = "3"
 members = ["onex-core", "onexd", "onex-cli", "desktop"]
 
 [workspace.package]
-version = "0.1.0-rc33"
+version = "0.1.0-rc34"
 edition = "2024"
 
 [workspace.dependencies]
