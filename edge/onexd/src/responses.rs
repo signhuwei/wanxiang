@@ -32,7 +32,8 @@ use crate::outbox::now_ms;
 use crate::pricing::cost_milli;
 use crate::router::{
     AgentProtocol, MAX_UPSTREAM_BODY, Meter, Outcome, RouteSelectionError, Router, SelectedRoute, Tokens, UsageRecord,
-    block_error, header_value, read_limited, response_headers, tokio_stream_from,
+    admit_deepseek, block_error, header_value, log_lease_rejection, log_upstream_status, read_limited,
+    response_headers, tokio_stream_from,
 };
 use crate::sse::{Event, Splitter};
 
@@ -146,7 +147,9 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
                 );
             }
             Err(RouteSelectionError::BalanceExhausted) => {
-                return err_before_headers_block(Block::Cutoff(crate::lease::CutoffReason::Balance));
+                let blocked = Block::Cutoff(crate::lease::CutoffReason::Balance);
+                log_lease_rejection(&model, blocked);
+                return err_before_headers_block(blocked);
             }
             Err(RouteSelectionError::RoutePoolPending) => {
                 return err_before_headers(
@@ -225,18 +228,47 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
             );
         }
     };
+    if wire == Wire::Chat
+        && (!req["messages"].as_array().is_some_and(|messages| !messages.is_empty())
+            || req.get("n").is_some_and(|n| !n.is_null() && n.as_u64() != Some(1)))
+    {
+        return err_before_headers(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid",
+            "请求须提供 messages，且每次生成一条回复。",
+        );
+    }
+    let mut max_output = None;
+    for &field in output_fields {
+        if let Some(value) = req.get(field).filter(|value| !value.is_null()) {
+            let Some(tokens) = value.as_u64().filter(|tokens| *tokens > 0 && max_output.is_none()) else {
+                return err_before_headers(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid",
+                    &format!("{field} 必须是正整数，且只能指定一个输出上限。"),
+                );
+            };
+            max_output = Some((field, tokens));
+        }
+    }
+    let deepseek_ticket = if deepseek {
+        let (field, requested) = max_output.unwrap_or(("max_tokens", 4096));
+        match admit_deepseek(&rt.state.lease, &rate, &model, est_input, requested) {
+            Ok((ticket, maximum)) => {
+                req[field] = maximum.into();
+                Some(ticket)
+            }
+            Err(blocked) => {
+                log_lease_rejection(&model, blocked);
+                return err_before_headers_block(blocked);
+            }
+        }
+    } else {
+        None
+    };
     let upstream_model = route.upstream_model.clone().unwrap_or_else(|| model.clone());
     let kinds = if to_chat { chat_tool_kinds(&req) } else { HashMap::new() };
     let out_body = if wire == Wire::Chat {
-        if !req["messages"].as_array().is_some_and(|messages| !messages.is_empty())
-            || req.get("n").is_some_and(|n| !n.is_null() && n.as_u64() != Some(1))
-        {
-            return err_before_headers(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid",
-                "请求须提供 messages，且每次生成一条回复。",
-            );
-        }
         if stream && !req["stream_options"].is_object() {
             req["stream_options"] = json!({});
         }
@@ -282,25 +314,22 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
     out_headers.insert(header::AUTHORIZATION, header_value(&format!("Bearer {}", key.as_str())));
     out_headers.insert(header::ACCEPT_ENCODING, "identity".parse().unwrap());
 
-    let mut max_output = None;
-    for field in output_fields {
-        if let Some(value) = req.get(field).filter(|value| !value.is_null()) {
-            let Some(tokens) = value.as_u64().filter(|tokens| *tokens > 0 && max_output.is_none()) else {
-                return err_before_headers(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "invalid",
-                    &format!("{field} 必须是正整数，且只能指定一个输出上限。"),
-                );
-            };
-            max_output = Some(tokens);
-        }
-    }
-    let ticket = match rt.state.lease.admit_model_with(&route.model_id, |remaining| {
-        let output = max_output.unwrap_or_else(|| output_reservation(&rate, est_input, remaining));
-        Meter::new(rate.clone(), output, est_input).reservation
-    }) {
+    let ticket = match deepseek_ticket.map_or_else(
+        || {
+            rt.state.lease.admit_model_with(&route.model_id, |remaining| {
+                let output = max_output
+                    .map(|(_, tokens)| tokens)
+                    .unwrap_or_else(|| output_reservation(&rate, est_input, remaining));
+                Meter::new(rate.clone(), output, est_input).reservation
+            })
+        },
+        Ok,
+    ) {
         Ok(ticket) => ticket,
-        Err(block) => return err_before_headers_block(block),
+        Err(blocked) => {
+            log_lease_rejection(&model, blocked);
+            return err_before_headers_block(blocked);
+        }
     };
     rt.state.upstream.lock().unwrap().inflight += 1;
 
@@ -372,6 +401,7 @@ async fn openai_request(rt: Arc<Router>, headers: HeaderMap, body: Bytes, wire: 
     };
 
     let status = resp.status();
+    log_upstream_status(&req_ctx.rec.model, status);
     if status.is_success() {
         req_ctx.meter.tokens.input = est_input;
     }
@@ -409,6 +439,9 @@ impl ReqCtx {
     fn finish(&mut self) {
         let Some(ticket) = self.ticket.take() else { return };
         let rec = &mut self.rec;
+        if let Outcome::Stopped(blocked) = rec.outcome {
+            log_lease_rejection(&rec.model, blocked);
+        }
         rec.tokens = self.meter.final_tokens(rec.usage_final);
         rec.cost_milli = cost_milli(&self.meter.rate, &rec.tokens);
         rec.lease_id = ticket.finish(rec.cost_milli);

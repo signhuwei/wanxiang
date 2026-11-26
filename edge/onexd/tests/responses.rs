@@ -754,3 +754,43 @@ async fn desktop_chat_uses_launch_binding_and_preserves_chat_tools() {
     assert!(!incomplete.usage_final);
     assert_eq!(incomplete.outcome.as_str(), "upstream_error");
 }
+
+#[tokio::test]
+async fn deepseek_flash_fits_native_output_ceiling_to_live_lease_and_bills_actual_usage() {
+    let mut env = env_with("openai_chat").await;
+    grant(&env.state, "lse_flash", 2, 1000, 600_000);
+    {
+        let mut config = env.state.config.write().unwrap();
+        config.routes[0].model = "deepseek-flash".into();
+        config.rates[0].input_milli_per_mtok = 3000;
+        config.rates[0].output_milli_per_mtok = 9661;
+    }
+    let launch_token = "deepseek-launch-token";
+    env.state.launch_tokens.write().unwrap().insert(
+        launch_token.into(),
+        onexd::state::LaunchBinding {
+            approved_model: Some("deepseek-flash".into()),
+            session_id: "desktop-session".into(),
+            agent: "deepseek-desktop".into(),
+            release_id: None,
+            first_native_session: None,
+        },
+    );
+    let chat = env.url.replace("/v1/responses", "/v1/chat/completions");
+    let request = |prompt: &str| {
+        env.http.post(&chat).bearer_auth(launch_token).json(&json!({
+            "model":"deepseek-flash", "messages":[{"role":"user","content":prompt}], "max_tokens":131072,
+        }))
+    };
+    let reply = request("scenario:chat").send().await.unwrap();
+    assert_eq!(reply.status(), StatusCode::OK);
+    assert_eq!(reply.json::<Value>().await.unwrap()["choices"][0]["message"]["content"], "hi there");
+    let cap = env.upstream.seen.lock().unwrap().body.as_ref().unwrap()["max_tokens"].as_u64().unwrap();
+    assert!((100_000..=1_000_000_000 / 9661).contains(&cap));
+    assert_eq!(request(&"a".repeat(1_200_000)).send().await.unwrap().status(), StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(env.calls(), 1);
+    let usage = env.usage().await;
+    assert_eq!((usage.tokens.input, usage.tokens.output, usage.cost_milli), (10, 5, 1));
+    assert_eq!(env.ledger(), (1, 0));
+    assert!(env.usage.try_recv().is_err());
+}

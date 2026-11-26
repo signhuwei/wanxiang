@@ -23,6 +23,11 @@ pub(crate) struct Entry {
     http_status: Option<u16>,
     config_revision: Option<u64>,
     exit_code: Option<i32>,
+    model: Option<String>,
+    reservation_milli: Option<u64>,
+    lease_budget_milli: Option<u64>,
+    requested_output_tokens: Option<u64>,
+    applied_output_tokens: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -74,6 +79,11 @@ impl Session {
             http_status: None,
             config_revision: None,
             exit_code: None,
+            model: None,
+            reservation_milli: None,
+            lease_budget_milli: None,
+            requested_output_tokens: None,
+            applied_output_tokens: None,
         });
     }
 
@@ -184,20 +194,29 @@ fn parse(line: &str) -> Option<(OffsetDateTime, Entry)> {
     let field = |key: &str| message.split_whitespace().find_map(|word| word.strip_prefix(key));
     let agent = field("agent=").and_then(|raw| AGENTS.iter().copied().find(|agent| *agent == raw.trim_matches('"')));
     let version = (event == "daemon_started").then(|| field("version=").and_then(safe_version)).flatten();
-    let (code, stage, http_status) = if event == "tool_bundle_failed" {
+    let model_rejected = event == "model_request_rejected";
+    let model_capped = event == "model_output_capped";
+    let (code, stage) = if event == "tool_bundle_failed" {
         let code = field("reason_code=").and_then(tool_failure_code);
         let stage = field("stage=").and_then(|value| known(value, TOOL_FAILURE_STAGES));
-        let http_status = field("http_status=")
-            .and_then(|value| value.parse::<u16>().ok())
-            .filter(|status| (100..=599).contains(status));
         let legacy_insecure_origin = message
             .split_once(" error=")
             .is_some_and(|(_, value)| value.trim_matches('"') == "managed tool download requires HTTPS");
         if code.is_none() && legacy_insecure_origin {
-            (Some("tool_transport_required"), Some("origin"), None)
+            (Some("tool_transport_required"), Some("origin"))
         } else {
-            (code, stage, http_status)
+            (code, stage)
         }
+    } else if model_rejected {
+        (
+            field("reason_code=").and_then(|value| known(value, MODEL_REJECTION_CODES)),
+            field("stage=").and_then(|value| known(value, &["lease", "upstream"])),
+        )
+    } else if model_capped {
+        (
+            field("reason_code=").and_then(|value| known(value, &["lease_output_capped"])),
+            field("stage=").and_then(|value| known(value, &["lease"])),
+        )
     } else if event == "config_rejected" {
         let code = match field("reason=").map(|reason| reason.trim_matches('"')) {
             Some("设备策略包含无效或不适用的受管工具") => Some("policy_tools_invalid"),
@@ -208,10 +227,13 @@ fn parse(line: &str) -> Option<(OffsetDateTime, Entry)> {
             Some("不支持的设备策略版本") => Some("policy_abi_unsupported"),
             _ => None,
         };
-        (code, None, None)
+        (code, None)
     } else {
-        (None, None, None)
+        (None, None)
     };
+    let http_status = (event == "tool_bundle_failed" || model_rejected)
+        .then(|| field("http_status=")?.parse::<u16>().ok().filter(|status| (100..=599).contains(status)))
+        .flatten();
     let config_revision =
         matches!(event, "config_applied" | "config_rejected").then(|| field("revision=")?.parse().ok()).flatten();
     let exit_code = (event == "agent_exited")
@@ -232,8 +254,23 @@ fn parse(line: &str) -> Option<(OffsetDateTime, Entry)> {
             http_status,
             config_revision,
             exit_code,
+            model: (model_rejected || model_capped).then(|| safe_model(field("model=")?)).flatten(),
+            reservation_milli: model_rejected.then(|| field("reservation_milli=")?.parse().ok()).flatten(),
+            lease_budget_milli: model_rejected.then(|| field("lease_budget_milli=")?.parse().ok()).flatten(),
+            requested_output_tokens: model_capped.then(|| field("requested_output_tokens=")?.parse().ok()).flatten(),
+            applied_output_tokens: model_capped.then(|| field("applied_output_tokens=")?.parse().ok()).flatten(),
         },
     ))
+}
+
+fn safe_model(value: &str) -> Option<String> {
+    let model = value.trim_matches('"');
+    (model.len() <= 128
+        && model.split('/').all(|segment| {
+            segment.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+                && segment.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-:+".contains(&byte))
+        }))
+    .then(|| model.to_owned())
 }
 
 fn known(value: &str, choices: &[&'static str]) -> Option<&'static str> {
@@ -256,6 +293,16 @@ const TOOL_FAILURE_CODES: &[&str] = &[
     "tool_digest_mismatch",
     "tool_bundle_invalid",
 ];
+const MODEL_REJECTION_CODES: &[&str] = &[
+    "lease_request_too_large",
+    "lease_exhausted",
+    "lease_expired",
+    "lease_missing",
+    "balance_exhausted",
+    "quota_exhausted",
+    "lease_cutoff",
+    "model_upstream_http",
+];
 
 const AGENTS: &[&str] =
     &["claude-code", "codex", "kimi-code", "deepseek-desktop", "workbuddy", "codex-desktop", "claude-desktop"];
@@ -271,6 +318,8 @@ const EVENTS: &[(&str, &str, &str)] = &[
     ("onexd::ws", "device configuration rejected", "config_rejected"),
     ("onexd::ws", "lease rejected", "lease_rejected"),
     ("onexd::router", "upstream request failed", "upstream_failed"),
+    ("onexd::router", "model request rejected", "model_request_rejected"),
+    ("onexd::router", "model output capped by lease", "model_output_capped"),
     ("onexd::ipc", "ipc connection", "ipc_failed"),
     ("onexd::ipc", "managed agent artifact resolution failed", "agent_artifact_failed"),
     ("onexd::ipc", "managed tool bundle resolution failed", "tool_bundle_failed"),
@@ -286,6 +335,45 @@ const EVENTS: &[(&str, &str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn separates_local_model_reservation_from_upstream_http_errors() {
+        let (_, lease) = parse(concat!(
+            "2026-11-26T03:24:17Z  WARN onexd::router: model request rejected ",
+            "stage=\"lease\" reason_code=\"lease_request_too_large\" http_status=402 model=\"deepseek-flash\" ",
+            "reservation_milli=1267 lease_budget_milli=1000 prompt=SECRET_PROMPT"
+        ))
+        .unwrap();
+        assert_eq!(lease.model.as_deref(), Some("deepseek-flash"));
+        assert_eq!(lease.code, Some("lease_request_too_large"));
+        assert_eq!(lease.stage, Some("lease"));
+        assert_eq!(lease.http_status, Some(402));
+        assert_eq!(lease.reservation_milli, Some(1267));
+        assert_eq!(lease.lease_budget_milli, Some(1000));
+        assert!(!serde_json::to_string(&lease).unwrap().contains("SECRET"));
+
+        let (_, upstream) = parse(concat!(
+            "2026-11-26T03:24:18Z  WARN onexd::router: model request rejected ",
+            "stage=upstream reason_code=model_upstream_http http_status=402 model=https://SECRET_HOST/SECRET_PATH"
+        ))
+        .unwrap();
+        assert_eq!(upstream.code, Some("model_upstream_http"));
+        assert_eq!(upstream.stage, Some("upstream"));
+        assert_eq!(upstream.http_status, Some(402));
+        assert!(upstream.model.is_none());
+        assert!(!serde_json::to_string(&upstream).unwrap().contains("SECRET"));
+
+        let (_, capped) = parse(concat!(
+            "2026-11-26T03:24:19Z  INFO onexd::router: model output capped by lease ",
+            "stage=lease reason_code=lease_output_capped model=deepseek/deepseek-flash:free ",
+            "requested_output_tokens=131072 applied_output_tokens=99999"
+        ))
+        .unwrap();
+        assert_eq!(capped.event, "model_output_capped");
+        assert_eq!(capped.model.as_deref(), Some("deepseek/deepseek-flash:free"));
+        assert_eq!(capped.requested_output_tokens, Some(131072));
+        assert_eq!(capped.applied_output_tokens, Some(99999));
+    }
 
     #[test]
     fn extracts_tool_diagnostics_and_ignores_unrecognized_fields() {

@@ -386,6 +386,7 @@ const diagnosticEvents={
   launch_rejected:'启动失败',download_accepted:'已受理下载',download_rejected:'下载失败',daemon_started:'后台启动',router_listening:'本地路由就绪',
   ws_connected:'已连接服务',ws_disconnected:'服务连接断开',config_applied:'已应用设备配置',config_rejected:'设备配置被拒绝',
   lease_rejected:'租约被拒绝',upstream_failed:'上游请求失败',agent_artifact_failed:'Agent 制品未就绪',
+  model_request_rejected:'模型请求被拒绝',model_output_capped:'已按租约调整模型输出上限',
   tool_bundle_failed:'受管工具下载或校验失败',tool_prepare_failed:'准备受管工具失败',desktop_bundle_rejected:'桌面 Agent 制品被拒绝',
   desktop_profile_rejected:'桌面 Agent 配置被拒绝',desktop_spawn_failed:'无法启动桌面 Agent 进程',agent_prepared:'Agent 启动参数已就绪',
   agent_exited:'Agent 已退出',desktop_exited:'桌面 Agent 已退出',ipc_failed:'本机服务连接失败',daemon_failed:'后台异常退出'
@@ -395,13 +396,19 @@ const diagnosticCodes={policy_tools_invalid:'受管工具无效或不适用',pol
   policy_rates_invalid:'路由与费率不一致',policy_abi_unsupported:'设备策略版本不受支持',
   tool_origin_invalid:'服务地址无效',tool_transport_required:'受管工具要求受信下载地址',tool_descriptor_invalid:'工具发行描述无效',
   tool_request_failed:'工具下载请求失败',tool_http_status:'工具下载返回 HTTP 错误',tool_response_failed:'读取工具文件失败',
-  tool_size_mismatch:'工具文件大小不符',tool_digest_mismatch:'工具文件摘要不符',tool_bundle_invalid:'工具包格式无效'}
+  tool_size_mismatch:'工具文件大小不符',tool_digest_mismatch:'工具文件摘要不符',tool_bundle_invalid:'工具包格式无效',
+  lease_request_too_large:'单次请求预估费用超过租约上限',lease_exhausted:'本机租约可用额度不足',lease_expired:'租约已过期',
+  lease_missing:'本机当前没有租约',balance_exhausted:'租户余额不足',quota_exhausted:'成员或组配额不足',lease_cutoff:'服务已撤销租约',
+  model_upstream_http:'模型渠道返回 HTTP 错误',lease_output_capped:'按租约可用额度降低本次输出上限'}
 const diagnosticComponents=new Set(['onex_desktop::bridge','onexd','onexd::ipc','onexd::ws','onexd::router'])
-const diagnosticStages=new Set(['origin','descriptor','request','response','integrity','bundle'])
+const diagnosticStages=new Set(['origin','descriptor','request','response','integrity','bundle','lease','upstream'])
 const diagnosticAgents={'claude-code':'Claude Code',codex:'Codex CLI','kimi-code':'Kimi Code','deepseek-desktop':'DeepSeek Desktop',
   workbuddy:'WorkBuddy','codex-desktop':'Codex Desktop','claude-desktop':'Claude Desktop'}
 const diagnosticTime=new Intl.DateTimeFormat('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'})
 const safeVersion=version=>typeof version==='string'&&/^\d[\w.+-]{0,47}$/.test(version)?version:null
+const safeDiagnosticModel=model=>typeof model==='string'&&model.length<=128&&/^[a-zA-Z0-9][a-zA-Z0-9._:+-]*(?:\/[a-zA-Z0-9][a-zA-Z0-9._:+-]*)*$/.test(model)?model:null
+const diagnosticCount=value=>Number.isSafeInteger(value)&&value>=0?value:null
+const diagnosticBlocks=value=>diagnosticCount(value)==null?null:metricFormat.format(value/1000)+' 块'
 const lookup=(dictionary,key)=>typeof key==='string'&&Object.hasOwn(dictionary,key)?dictionary[key]:null
 let diagnosticData,diagnosticsTicket=0,diagnosticsPending=false,diagnosticsError=false,diagnosticRows=new Map()
 
@@ -447,10 +454,14 @@ function paintDiagnostics() {
     const revision=Number.isSafeInteger(entry.config_revision)&&entry.config_revision>=0?entry.config_revision:null
     const exitCode=Number.isSafeInteger(entry.exit_code)?entry.exit_code:null
     const http=Number.isInteger(entry.http_status)&&entry.http_status>=100&&entry.http_status<=599?entry.http_status:null
+    const modelEvent=entry.event==='model_request_rejected'||entry.event==='model_output_capped'
+    const model=modelEvent?safeDiagnosticModel(entry.model):null
     const version=safeVersion(entry.version),timestamp=diagnosticTime.format(time)
-    const description=[event,agent,error,revision==null?null:`配置 #${revision}`,exitCode==null?null:`退出码 ${exitCode}`].filter(Boolean).join(' · ')
+    const description=[event,agent,model,error,revision==null?null:`配置 #${revision}`,exitCode==null?null:`退出码 ${exitCode}`].filter(Boolean).join(' · ')
     const fields=[['UTC 时间',time.toISOString()],['事件',entry.event],['模块',component],['版本',version],['Agent',agent?entry.agent:null],
-      ['错误代码',error?entry.code:null],['执行阶段',stage],['HTTP 状态',http],['配置修订号',revision],['退出码',exitCode]]
+      ['模型',model],['错误代码',error?entry.code:null],['执行阶段',stage],['HTTP 状态',http],['配置修订号',revision],['退出码',exitCode],
+      ['预估预留',modelEvent?diagnosticBlocks(entry.reservation_milli):null],['租约上限',modelEvent?diagnosticBlocks(entry.lease_budget_milli):null],
+      ['请求输出 Token 上限',modelEvent?diagnosticCount(entry.requested_output_tokens):null],['实际采用的输出 Token 上限',modelEvent?diagnosticCount(entry.applied_output_tokens):null]]
       .filter(([,value])=>value!=null)
     const fingerprint=JSON.stringify([entry.source,entry.level,description,fields])
     const occurrence=(occurrences.get(fingerprint)??0)+1

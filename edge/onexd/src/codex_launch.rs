@@ -108,12 +108,29 @@ fn require_absent(path: &Path) -> Result<()> {
     }
 }
 
+fn require_no_workspace_config(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            // Workspaces can contain an unused .codex directory. Only a real,
+            // empty directory has no configuration, hooks or rules to load.
+            if metadata.is_dir()
+                && std::fs::read_dir(path).with_context(|| format!("检查 {}", path.display()))?.next().is_none()
+            {
+                return Ok(());
+            }
+            bail!("Codex 受管启动无法使用外部配置或技能目录 {}", path.display())
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("检查 {}", path.display())),
+    }
+}
+
 pub(crate) fn validate_project(cwd: &Path) -> Result<()> {
     let canonical = cwd.canonicalize()?;
     let git_root = canonical.ancestors().find(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok());
     let project = git_root.unwrap_or(&canonical);
     for dir in canonical.ancestors().take_while(|dir| dir.starts_with(project)) {
-        require_absent(&dir.join(".codex"))?;
+        require_no_workspace_config(&dir.join(".codex"))?;
         require_absent(&dir.join(".agents/skills"))?;
     }
     Ok(())
@@ -162,6 +179,22 @@ mod tests {
         std::fs::write(project.join(".git"), b"gitdir: x").unwrap();
         validate_project(&cwd).unwrap();
         std::fs::create_dir(project.join(".codex")).unwrap();
+        std::fs::create_dir(cwd.join(".codex")).unwrap();
+        validate_project(&cwd).unwrap();
+        std::fs::write(project.join(".codex/config.toml"), b"model = 'workspace-model'").unwrap();
         assert!(validate_project(&cwd).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_project_config_and_workspace_skills_are_still_rejected() {
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let project_config = workspace.path().join(".codex");
+        std::os::unix::fs::symlink(external.path(), &project_config).unwrap();
+        assert!(validate_project(workspace.path()).is_err());
+        std::fs::remove_file(project_config).unwrap();
+        std::fs::create_dir_all(workspace.path().join(".agents/skills")).unwrap();
+        assert!(validate_project(workspace.path()).is_err());
     }
 }

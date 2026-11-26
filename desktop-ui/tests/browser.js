@@ -182,6 +182,10 @@ try{
       {at_ms:1795654801000,source:'desktop',level:'info',event:'launch_cancelled',agent:'codex',version:'0.1.0-rc28'},
       {at_ms:1795654802000,source:'daemon',component:'onexd::ipc',level:'warn',event:'tool_bundle_failed',agent:'deepseek-desktop',
         code:'tool_http_status',stage:'response',http_status:403,version:'0.1.0-rc27',detail:'TEST-ONLY-RAW-DIAGNOSTIC'},
+      {at_ms:1795654803000,source:'daemon',component:'onexd::router',level:'warn',event:'model_request_rejected',model:'deepseek-flash',
+        code:'lease_request_too_large',stage:'lease',http_status:402,reservation_milli:1267,lease_budget_milli:1000},
+      {at_ms:1795654804000,source:'daemon',component:'onexd::router',level:'info',event:'model_output_capped',model:'deepseek-flash',
+        code:'lease_output_capped',stage:'lease',requested_output_tokens:131072,applied_output_tokens:99999},
       {at_ms:1795654801000,source:'desktop',level:'info',event:'TEST-ONLY-RAW-DIAGNOSTIC'},
     ]
   })
@@ -189,7 +193,7 @@ try{
   await diagnostics.getByText('诊断日志',{exact:true}).click()
   await diagnostics.getByText('Desktop 0.1.0-rc28 · onexd 0.1.0-rc27 · 本地时间',{exact:true}).waitFor()
   await diagnostics.getByText('设备配置被拒绝 · 受管工具无效或不适用 · 配置 #166',{exact:true}).waitFor()
-  assert.equal(await diagnostics.getByRole('listitem').count(),3)
+  assert.equal(await diagnostics.getByRole('listitem').count(),5)
   assert.match(await diagnostics.locator('time').first().innerText(),/\d{2}:\d{2}:\d{2}/)
   const toolFailure=diagnostics.getByRole('listitem').filter({hasText:'受管工具下载或校验失败'})
   const toolDetails=toolFailure.locator('summary')
@@ -197,6 +201,17 @@ try{
   for (const value of ['tool_bundle_failed','onexd::ipc','tool_http_status','response','403']) {
     await toolFailure.getByText(value,{exact:true}).waitFor()
   }
+  const rejectedRequest=diagnostics.getByRole('listitem').filter({hasText:'模型请求被拒绝'})
+  await rejectedRequest.locator('summary').click()
+  for (const value of ['deepseek-flash','lease_request_too_large','lease','402','1.267 块','1 块']) {
+    await rejectedRequest.getByText(value,{exact:true}).waitFor()
+  }
+  const cappedOutput=diagnostics.getByRole('listitem').filter({hasText:'已按租约调整模型输出上限'})
+  await cappedOutput.locator('summary').click()
+  for (const value of ['lease_output_capped','131072','99999']) {
+    await cappedOutput.getByText(value,{exact:true}).waitFor()
+  }
+  await toolDetails.focus()
   await workbench.evaluate(()=>{
     window.desktopDiagnostics.unshift({at_ms:1795654803000,source:'daemon',level:'warn',event:'agent_artifact_failed',
       component:'TEST-ONLY-RAW-DIAGNOSTIC',stage:'TEST-ONLY-RAW-DIAGNOSTIC',code:'TEST-ONLY-RAW-DIAGNOSTIC'})

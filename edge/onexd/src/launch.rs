@@ -109,6 +109,10 @@ pub struct Launch {
 /// `prepare_<agent>` 函数，不改这个函数以外的公共骨架（`finish`/`clean_stale` 按 `launch_id`
 /// 操作，和具体是哪个 Agent 无关）。
 pub fn prepare(r: &Request) -> Result<Launch> {
+    prepare_with_model_choices(r, &[])
+}
+
+pub(crate) fn prepare_with_model_choices(r: &Request, model_choices: &[String]) -> Result<Launch> {
     if !r.program.is_absolute() {
         bail!("agent executable path must be absolute: {}", r.program.display());
     }
@@ -116,16 +120,15 @@ pub fn prepare(r: &Request) -> Result<Launch> {
         bail!("working directory not found: {}", r.cwd.display());
     }
     match r.agent {
-        "claude-code" => prepare_claude_code(r),
+        "claude-code" => prepare_claude_code(r, model_choices),
         "codex" => crate::codex_launch::prepare(r),
         "kimi-code" => crate::kimi_launch::prepare_kimi_code(r),
         other => bail!("no managed launch preparer for agent {other}"),
     }
 }
 
-/// Claude Code 的准备逻辑（S1-E4 最小版）：不变，只是从通用 `prepare()` 里搬出来，
-/// 调用前已经做过 program/cwd 的公共校验。
-fn prepare_claude_code(r: &Request) -> Result<Launch> {
+/// Claude Code 使用本次启动的私有配置和路由候选模型。
+fn prepare_claude_code(r: &Request, model_choices: &[String]) -> Result<Launch> {
     let ns = r.home.join("agents/claude-code");
     let config_dir = ns.join("claude");
     let user_home = ns.join("home");
@@ -141,10 +144,16 @@ fn prepare_claude_code(r: &Request) -> Result<Launch> {
     private_dir(&r.home.join("run"))?;
     private_dir(&run_dir)?;
     let base_url = format!("http://{}", r.router_addr);
+    let mut available_models: Vec<_> = model_choices.iter().map(String::as_str).collect();
+    if !available_models.contains(&r.model) {
+        available_models.insert(0, r.model);
+    }
+    let model_options: Vec<_> = available_models.iter().map(|model| json!({"model": model, "label": model})).collect();
     let settings = json!({
         "env": {"ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_API_KEY": r.local_token},
         "model": r.model,
-        "availableModels": [r.model],
+        "availableModels": available_models,
+        "modelPicker": {"replaceBuiltInOptions": true, "options": model_options},
     });
     let settings_path = run_dir.join("settings.json");
     write_private(&settings_path, serde_json::to_string_pretty(&settings)?.as_bytes())?;
@@ -418,7 +427,8 @@ mod tests {
             cwd: cwd.path(),
             client_env: &env,
         };
-        let l = prepare(&r).unwrap();
+        let choices = ["Qwen3.8-27B".to_string(), "claude-opus-5-5".to_string(), "deepseek-flash".to_string()];
+        let l = prepare_with_model_choices(&r, &choices).unwrap();
         let ns = home.path().join("agents/claude-code");
         assert_eq!(l.env["HOME"], ns.join("home").to_string_lossy());
         assert_eq!(l.env["CLAUDE_CONFIG_DIR"], ns.join("claude").to_string_lossy());
@@ -444,6 +454,12 @@ mod tests {
         let s: Value = serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
         assert_eq!(s["env"]["ANTHROPIC_API_KEY"], "0123456789abcdef0123456789abcdef");
         assert_eq!(s["model"], "Qwen3.8-27B");
+        assert_eq!(s["availableModels"], json!(choices));
+        assert_eq!(s["modelPicker"], json!({"replaceBuiltInOptions": true, "options": [
+            {"model":"Qwen3.8-27B", "label":"Qwen3.8-27B"},
+            {"model":"claude-opus-5-5", "label":"claude-opus-5-5"},
+            {"model":"deepseek-flash", "label":"deepseek-flash"},
+        ]}));
 
         let cj: Value = serde_json::from_slice(&std::fs::read(ns.join("claude/.claude.json")).unwrap()).unwrap();
         assert_eq!(cj["hasCompletedOnboarding"], true);

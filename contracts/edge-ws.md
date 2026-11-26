@@ -171,6 +171,7 @@ S1 起存在的缺陷：续租回 `cutoff` 后，Edge 保留旧租约并重放�
 ### Responses 入口补充
 
 - **预留**：有 `max_output_tokens` 时按它计输出；没有时按 4096 输出 token 预留，但不超过当前租约剩余额度（取较小值，最低 1 个 token），不因缺省值报 TooLarge。估算输入照旧。Responses 入口的 TooLarge 文案不提 max_tokens，写“这次请求预估花费超过单个额度租约的上限，请缩短上下文或联系管理员调高租约额度”。
+- **受管 DeepSeek**：保留签约模型对外公布的上下文与输出上限。每轮采用原生请求上限，并在预留事务内按当前设备租约及模型剩余额度收窄可负担的输出上限。发给上游的上限与预留一致。输入加最低输出仍无法覆盖时拒绝，实际耗用仍按上游用量核算。
 - **错误**：未发响应头时，HTTP 状态按 `errors.md`，响应体 `{"error":{"type":"<kind>","code":"<errors.md code>","message":"..."}}`，`kind` 与 Anthropic 错误体同一组取值（`billing_error`、`permission_error`、`invalid_request_error`、`api_error`）。已发头时写一条 `response.failed` 事件（`response.status = "failed"`，`response.error = {code, message}`），然后结束流，不再发 `response.completed`。
 - **字段处理**：同协议转发时原样透传 `previous_response_id`、`store`、`include`、`reasoning` 等字段。转 Chat 时：带 `previous_response_id` 的请求返回 `invalid` 并说明需要关闭服务端会话存储；`reasoning` 输入项丢弃；`include` 忽略；`store` 不转发。受管 Codex 的本机令牌固定使用 `store=false`，由 Edge 在原生 Responses 转发时落实。
 - **计量**：与 `/v1/messages` 共用同一套实时计量（router 的 Meter）：放行前按预留检查租约，流式期间按已收到的输出增量估算花费并检查租约，超额时中断。流中断（取消、cutoff、上游断开）或缺 usage 时，按已收到的部分计价，`complete=false`。

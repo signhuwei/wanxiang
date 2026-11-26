@@ -842,7 +842,7 @@ async fn launch(
             && crate::hosted_search::select(cfg, agent).eq(search_releases.iter())
     };
     // 别名候选：精确名字的路由；通配路由用它固定的上游模型名（server 的 MVP seed 是 `*` → Qwen3.8-27B）
-    let (models, routable, deepseek_models) = {
+    let (models, routable, deepseek_models, model_pinned) = {
         let pool = ipc.state.pool_launch_config();
         let cfg = ipc.state.config.read().unwrap();
         let cfg = pool.as_ref().unwrap_or(&cfg);
@@ -884,7 +884,7 @@ async fn launch(
                 model.is_some_and(|name| protocol.select_agent_route(&cfg, name, Some(agent)).is_some()),
             )
         };
-        (models, routable, deepseek_models)
+        (models, routable, deepseek_models, pool.is_some())
     };
     let model = match model {
         Some(m) if routable => m.to_string(),
@@ -949,6 +949,8 @@ async fn launch(
     let prepared = if agent == "kimi-code" {
         let include_history = !ctx.running.lock().unwrap().values().any(|launch| launch.agent == agent);
         crate::kimi_launch::prepare_kimi_code_with_history(&r, include_history)
+    } else if agent == "claude-code" && !model_pinned {
+        crate::launch::prepare_with_model_choices(&r, &models)
     } else {
         crate::launch::prepare(&r)
     };

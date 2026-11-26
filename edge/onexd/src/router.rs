@@ -415,7 +415,7 @@ pub(crate) struct Meter {
 impl Meter {
     /// 预留 = max_tokens × 输出单价 + 估算输入 × 输入单价（sprint-1 范围决定）。
     pub(crate) fn new(rate: Rate, max_tokens: u64, est_input: u64) -> Self {
-        let reservation = cost_milli(&rate, &Tokens { input: est_input, output: max_tokens, ..Default::default() });
+        let reservation = request_reservation(&rate, est_input, max_tokens);
         Self { rate, tokens: Tokens::default(), est_output: 0, input_reported: false, reservation }
     }
 
@@ -435,6 +435,59 @@ impl Meter {
     /// 结束时的用量：拿到最终用量按实际，否则按已见部分。
     pub(crate) fn final_tokens(&self, usage_final: bool) -> Tokens {
         if usage_final { self.tokens } else { self.seen() }
+    }
+}
+
+fn request_reservation(rate: &Rate, input: u64, output: u64) -> i64 {
+    cost_milli(rate, &Tokens { input, output, ..Default::default() })
+}
+
+/// DeepSeek sends its advertised model maximum on every turn. Fit that ceiling to the active lease
+/// under the same lock that reserves funds, then send exactly that output limit to the upstream.
+pub(crate) fn admit_deepseek(
+    lease: &Arc<crate::lease::Ledger>,
+    rate: &Rate,
+    model: &str,
+    input: u64,
+    requested: u64,
+) -> Result<(crate::lease::Ticket, u64), Block> {
+    let mut output = requested;
+    let ticket = lease.admit_model_with(&rate.model_id, |remaining| {
+        if rate.output_milli_per_mtok != 0 {
+            let available = u128::from(remaining.max(0) as u64) * 1_000_000;
+            let input_cost = u128::from(input) * u128::from(rate.input_milli_per_mtok);
+            let affordable = available.saturating_sub(input_cost) / u128::from(rate.output_milli_per_mtok);
+            // Preserve the normal lease rejection when estimated input plus one output token cannot fit.
+            output = affordable.max(1).min(u128::from(requested)) as u64;
+        }
+        request_reservation(rate, input, output)
+    })?;
+    if output < requested {
+        info!(model = %model, stage = "lease", reason_code = "lease_output_capped",
+            requested_output_tokens = requested, applied_output_tokens = output, "model output capped by lease");
+    }
+    Ok((ticket, output))
+}
+
+pub(crate) fn log_lease_rejection(model: &str, blocked: Block) {
+    let (http_status, _, _, _) = block_error(blocked);
+    let (reason_code, reservation_milli, lease_budget_milli) = match blocked {
+        Block::NoLease => ("lease_missing", 0, 0),
+        Block::Expired => ("lease_expired", 0, 0),
+        Block::Exhausted => ("lease_exhausted", 0, 0),
+        Block::TooLarge { reserve, budget } => ("lease_request_too_large", reserve, budget),
+        Block::Cutoff(CutoffReason::Balance) => ("balance_exhausted", 0, 0),
+        Block::Cutoff(CutoffReason::Quota) => ("quota_exhausted", 0, 0),
+        Block::Cutoff(_) => ("lease_cutoff", 0, 0),
+    };
+    warn!(model = %model, stage = "lease", reason_code, http_status = http_status.as_u16(),
+        reservation_milli, lease_budget_milli, "model request rejected");
+}
+
+pub(crate) fn log_upstream_status(model: &str, status: StatusCode) {
+    if !status.is_success() {
+        warn!(model = %model, stage = "upstream", reason_code = "model_upstream_http",
+            http_status = status.as_u16(), "model request rejected");
     }
 }
 
@@ -884,7 +937,11 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
             Err(RouteSelectionError::ModelNotAllowed) => {
                 return anthropic_error(StatusCode::FORBIDDEN, "permission_error", "此模型已不在生效合约中。");
             }
-            Err(RouteSelectionError::BalanceExhausted) => return block_response(Block::Cutoff(CutoffReason::Balance)),
+            Err(RouteSelectionError::BalanceExhausted) => {
+                let blocked = Block::Cutoff(CutoffReason::Balance);
+                log_lease_rejection(&model, blocked);
+                return block_response(blocked);
+            }
             Err(RouteSelectionError::RoutePoolPending) => {
                 return anthropic_error(StatusCode::FORBIDDEN, "permission_error", ROUTE_POOL_PENDING_MESSAGE);
             }
@@ -964,7 +1021,28 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
                 );
             }
         };
-    let max_tokens = req.get("max_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let mut max_tokens = req.get("max_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let deepseek_ticket = if deepseek && max_tokens > 0 {
+        match admit_deepseek(
+            &rt.state.lease,
+            rate.as_ref().expect("a DeepSeek message requires a rate"),
+            &model,
+            input,
+            max_tokens,
+        ) {
+            Ok((ticket, maximum)) => {
+                max_tokens = maximum;
+                req["max_tokens"] = maximum.into();
+                Some(ticket)
+            }
+            Err(blocked) => {
+                log_lease_rejection(&model, blocked);
+                return block_response(blocked);
+            }
+        }
+    } else {
+        None
+    };
     let upstream_model = route.upstream_model.clone().unwrap_or_else(|| model.clone());
     let body = if to_chat {
         // `?beta=true` 之类的查询参数属于 Anthropic，不带给 Chat 上游。
@@ -973,7 +1051,7 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
             Err(msg) => return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg),
         }
     } else {
-        if upstream_model != model || execution.clamps_output() || !documents.is_empty() {
+        if upstream_model != model || execution.clamps_output() || deepseek_ticket.is_some() || !documents.is_empty() {
             req["model"] = Value::String(upstream_model.clone());
             Bytes::from(serde_json::to_vec(&req).unwrap())
         } else {
@@ -1003,13 +1081,14 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
     }
 
     let meter = Meter::new(rate.expect("a message requires a rate"), max_tokens, input);
-    let ticket = match rt.state.lease.admit_model(&route.model_id, meter.reservation) {
-        Ok(t) => t,
-        Err(b) => {
-            info!(model = %model, reason = ?b, reservation_milli = meter.reservation, "request blocked by lease");
-            return block_response(b);
-        }
-    };
+    let ticket =
+        match deepseek_ticket.map_or_else(|| rt.state.lease.admit_model(&route.model_id, meter.reservation), Ok) {
+            Ok(t) => t,
+            Err(b) => {
+                log_lease_rejection(&model, b);
+                return block_response(b);
+            }
+        };
     rt.state.upstream.lock().unwrap().inflight += 1;
 
     let rec = UsageRecord {
@@ -1071,6 +1150,7 @@ async fn messages(AxState(rt): AxState<Arc<Router>>, uri: Uri, headers: HeaderMa
     };
 
     let status = resp.status();
+    log_upstream_status(&req.rec.model, status);
     let resp_headers = response_headers(resp.headers());
     let is_sse = resp
         .headers()
@@ -1228,6 +1308,9 @@ impl Req {
 
     fn finish(self) {
         let Req { rt, mut rec, meter, ticket, started, first_native_session, permit: _permit } = self;
+        if let Outcome::Stopped(blocked) = rec.outcome {
+            log_lease_rejection(&rec.model, blocked);
+        }
         // 用量不完整时只按已见部分计价，标 complete=false，预留绝不当作已发生的花费。
         rec.tokens = meter.final_tokens(rec.usage_final);
         rec.cost_milli = cost_milli(&meter.rate, &rec.tokens);
