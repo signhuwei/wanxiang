@@ -77,7 +77,8 @@ pub fn render(r: &Request) -> Result<String, String> {
     writeln!(out).unwrap();
 
     for m in r.models {
-        writeln!(out, "[models.{}]", toml_key(&m.id)).unwrap();
+        let id = if is_bare_key(&m.id) { m.id.clone() } else { toml_string(&m.id) };
+        writeln!(out, "[models.{id}]").unwrap();
         writeln!(out, "provider = {}", toml_string(r.provider_id)).unwrap();
         writeln!(out, "model = {}", toml_string(&m.model)).unwrap();
         writeln!(out, "max_context_size = {}", m.max_context_size).unwrap();
@@ -105,7 +106,7 @@ fn toml_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
+            c if (c as u32) < 0x20 || c == '\x7f' => {
                 write!(out, "\\u{:04x}", c as u32).unwrap();
             }
             c => out.push(c),
@@ -115,14 +116,13 @@ fn toml_string(s: &str) -> String {
     out
 }
 
-/// 裸 key（`[providers.<id>]` 的 `<id>` 部分）：TOML 裸 key 只能是 `[A-Za-z0-9_-]+`，
-/// 其余字符都会被 TOML 解析器拒绝或改变语义，这里不做转写，直接拒绝——调用方的 `<id>` 本来就是
-/// 内部生成的 provider/model 别名，不是用户可控的任意字符串，出现非法字符是调用方的 bug。
+fn is_bare_key(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Provider IDs are generated locally. Signed model aliases may need quoted TOML keys.
 fn toml_key(s: &str) -> String {
-    assert!(
-        !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
-        "not a valid bare TOML key: {s:?}"
-    );
+    assert!(is_bare_key(s), "not a valid bare TOML key: {s:?}");
     s.to_string()
 }
 

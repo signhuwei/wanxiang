@@ -1,7 +1,7 @@
 //! 本机 IPC：按行分隔的 JSON 协议，Unix 走 socket、Windows 走具名管道，见 `onex_core::transport`
 //! 和 `onex_core::ipc`。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -842,7 +842,7 @@ async fn launch(
             && crate::hosted_search::select(cfg, agent).eq(search_releases.iter())
     };
     // 别名候选：精确名字的路由；通配路由用它固定的上游模型名（server 的 MVP seed 是 `*` → Qwen3.8-27B）
-    let (models, routable, deepseek_models, model_pinned) = {
+    let (models, routable, deepseek_models, model_limits, model_pinned) = {
         let pool = ipc.state.pool_launch_config();
         let cfg = ipc.state.config.read().unwrap();
         let cfg = pool.as_ref().unwrap_or(&cfg);
@@ -877,14 +877,27 @@ async fn launch(
             (
                 exact
                     .chain(wildcard)
-                    .filter(|name| !desktop || protocol.select_agent_route(&cfg, name, Some(agent)).is_some())
+                    .filter(|name| protocol.select_agent_route(cfg, name, Some(agent)).is_some())
                     .filter(|name| seen.insert(*name))
                     .map(str::to_owned)
                     .collect(),
-                model.is_some_and(|name| protocol.select_agent_route(&cfg, name, Some(agent)).is_some()),
+                model.is_some_and(|name| protocol.select_agent_route(cfg, name, Some(agent)).is_some()),
             )
         };
-        (models, routable, deepseek_models, pool.is_some())
+        let model_limits = if pool.is_none() && matches!(agent, "codex" | "kimi-code") {
+            models
+                .iter()
+                .map(String::as_str)
+                .chain(model)
+                .filter_map(|name| {
+                    let route = protocol.select_agent_route(cfg, name, Some(agent))?;
+                    cfg.model_limits.get(&route.model_id).copied().map(|limits| (name.to_owned(), limits))
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        (models, routable, deepseek_models, model_limits, pool.is_some())
     };
     let model = match model {
         Some(m) if routable => m.to_string(),
@@ -948,7 +961,13 @@ async fn launch(
     };
     let prepared = if agent == "kimi-code" {
         let include_history = !ctx.running.lock().unwrap().values().any(|launch| launch.agent == agent);
-        crate::kimi_launch::prepare_kimi_code_with_history(&r, include_history)
+        if model_pinned {
+            crate::kimi_launch::prepare_kimi_code_with_history(&r, include_history)
+        } else {
+            crate::kimi_launch::prepare_kimi_code_with_model_choices(&r, include_history, &models, &model_limits)
+        }
+    } else if agent == "codex" && !model_pinned {
+        crate::codex_launch::prepare_with_models(&r, &models, &model_limits)
     } else if agent == "claude-code" && !model_pinned {
         crate::launch::prepare_with_model_choices(&r, &models)
     } else {

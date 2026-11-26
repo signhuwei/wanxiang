@@ -1,9 +1,12 @@
 //! Prepare the managed Codex profile and pin its loopback Responses provider.
 
+use std::collections::{BTreeMap, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use onex_core::ws::ModelLimits;
+use serde_json::{Value, json};
 
 use crate::launch::{self, Launch, Request};
 
@@ -16,6 +19,20 @@ pub(crate) use history::{HistoryLease, RestoredHistory, prefix_digest, restore_h
 pub(super) const PROVIDER: &str = "onex";
 
 pub(crate) fn prepare(r: &Request) -> Result<Launch> {
+    prepare_with_models(r, &[], &BTreeMap::new())
+}
+
+pub(crate) fn prepare_with_models(
+    r: &Request,
+    model_choices: &[String],
+    model_limits: &BTreeMap<String, ModelLimits>,
+) -> Result<Launch> {
+    if !r.program.is_absolute() {
+        bail!("agent executable path must be absolute: {}", r.program.display());
+    }
+    if !r.cwd.is_absolute() || !r.cwd.is_dir() {
+        bail!("working directory not found: {}", r.cwd.display());
+    }
     validate_project(r.cwd)?;
     #[cfg(target_os = "macos")]
     require_absent(Path::new("/etc/codex"))?;
@@ -30,12 +47,24 @@ pub(crate) fn prepare(r: &Request) -> Result<Launch> {
         launch::private_dir(dir)?;
     }
 
+    let catalog = config_dir.join("models.json");
+    let catalog_path = catalog.to_str().context("Codex model catalog path must be UTF-8")?;
+    let mut seen = HashSet::new();
+    let entries: Vec<_> = std::iter::once(r.model)
+        .chain(model_choices.iter().map(String::as_str))
+        .filter(|model| seen.insert(*model))
+        .enumerate()
+        .map(|(priority, model)| model_entry(model, priority, model_limits.get(model)))
+        .collect();
+    launch::write_private(&catalog, &serde_json::to_vec(&json!({ "models": entries }))?)?;
+
     let suffix = launch_id.trim_start_matches("lch_");
     let token_name = format!("ONEX_CODEX_TOKEN_{suffix}");
     let provider_key = format!("model_providers.{PROVIDER}");
     let settings = [
         ("model".into(), quote(r.model)),
         ("model_provider".into(), quote(PROVIDER)),
+        ("model_catalog_json".into(), quote(catalog_path)),
         (format!("{provider_key}.name"), quote("OneX")),
         (format!("{provider_key}.base_url"), quote(&format!("http://{}/v1", r.router_addr))),
         (format!("{provider_key}.env_key"), quote(&token_name)),
@@ -93,6 +122,31 @@ pub(crate) fn prepare(r: &Request) -> Result<Launch> {
         config_dir,
         run_dir,
     })
+}
+
+fn model_entry(model: &str, priority: usize, limits: Option<&ModelLimits>) -> Value {
+    let mut entry = json!({
+        "slug": model,
+        "display_name": model,
+        "base_instructions": "Help the user with their coding tasks.",
+        "supported_reasoning_levels": [],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": priority,
+        "support_verbosity": false,
+        "truncation_policy": { "mode": "tokens", "limit": 10000 },
+        "experimental_supported_tools": [],
+    });
+    if let Some(limits) = limits {
+        entry["context_window"] = json!(limits.context_window);
+        entry["max_context_window"] = json!(limits.context_window);
+        // Codex's native catalog has no field for the signed output limit.
+        if let Some(output) = limits.max_output_tokens {
+            entry["description"] = json!(format!("最大输出 {output} Token"));
+        }
+    }
+    entry
 }
 
 pub(crate) fn quote(value: &str) -> String {
@@ -167,6 +221,45 @@ mod tests {
         assert!(!config.contains(request.local_token));
         assert!(first.args.iter().all(|arg| !arg.contains(request.local_token)));
         assert!(!first.env.contains_key("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn model_catalog_contains_only_launch_choices_and_their_signed_limits() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let request = Request {
+            agent: "codex",
+            home: home.path(),
+            router_addr: "127.0.0.1:1",
+            local_token: "fake-onex-launch-token",
+            model: "default-model",
+            program: &std::env::current_exe().unwrap(),
+            cwd: project.path(),
+            client_env: &BTreeMap::new(),
+        };
+        let choices = ["other-model".into(), "default-model".into(), "other-model".into()];
+        let signed_limits = ModelLimits {
+            context_window: 262_144.try_into().unwrap(),
+            max_output_tokens: Some(16_384.try_into().unwrap()),
+        };
+        let limits = [("default-model".into(), signed_limits), ("unroutable".into(), signed_limits)].into();
+        let launch = prepare_with_models(&request, &choices, &limits).unwrap();
+        let catalog = launch.config_dir.join("models.json");
+        let setting = format!("model_catalog_json = {}", quote(catalog.to_str().unwrap()));
+        let config = std::fs::read_to_string(launch.config_dir.join("config.toml")).unwrap();
+        assert!(config.lines().any(|line| line == setting));
+        assert!(launch.args.windows(2).any(|pair| pair == ["-c", &setting]));
+
+        let json: Value = serde_json::from_slice(&std::fs::read(catalog).unwrap()).unwrap();
+        let models = json["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["slug"], "default-model");
+        assert_eq!(models[0]["context_window"], 262_144);
+        assert_eq!(models[0]["max_context_window"], 262_144);
+        assert_eq!(models[0]["description"], "最大输出 16384 Token");
+        assert_eq!(models[1]["slug"], "other-model");
+        assert!(models[1].get("context_window").is_none());
+        assert!(models[1].get("description").is_none());
     }
 
     #[test]

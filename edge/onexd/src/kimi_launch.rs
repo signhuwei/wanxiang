@@ -3,10 +3,11 @@
 //! 每次启动使用独立的 KIMI_CODE_HOME。原生 CLI 从该目录读取 config.toml，
 //! 启动结束及 daemon 重启时删除配置，保留会话记录。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
+use onex_core::ws::ModelLimits;
 
 use crate::id;
 use crate::kimi_config;
@@ -58,11 +59,8 @@ fn client_env_get<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'
     env.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v)
 }
 
-/// `Request.model` 目前只是获准模型别名，不携带 Server 端 `models.context_window`
-/// （见 `contracts/data-model.md` 的 `models` 表）。这里不猜测真实值，只保证生成的
-/// 配置能启动；等 `Request` 能带上真实 context window 时再替换，不在这里悄悄编一个
-/// 看起来精确的数字。
-const PLACEHOLDER_MAX_CONTEXT_SIZE: u64 = 32_000;
+/// Kimi requires a context size for models supplied by older servers without model limits.
+const DEFAULT_MAX_CONTEXT_SIZE: u64 = 32_000;
 
 /// Kimi Code 的准备逻辑。调用前应已经做过 `r.program`/`r.cwd` 的公共校验
 /// （和 `launch::prepare` 对 Claude Code 的顺序一致），这里只做 Kimi Code 特有的部分。
@@ -71,6 +69,15 @@ pub fn prepare_kimi_code(r: &Request) -> Result<Launch> {
 }
 
 pub(crate) fn prepare_kimi_code_with_history(r: &Request, include_history: bool) -> Result<Launch> {
+    prepare_kimi_code_with_model_choices(r, include_history, &[], &BTreeMap::new())
+}
+
+pub(crate) fn prepare_kimi_code_with_model_choices(
+    r: &Request,
+    include_history: bool,
+    model_choices: &[String],
+    limits_by_alias: &BTreeMap<String, ModelLimits>,
+) -> Result<Launch> {
     if !r.program.is_absolute() {
         bail!("agent executable path must be absolute: {}", r.program.display());
     }
@@ -98,19 +105,28 @@ pub(crate) fn prepare_kimi_code_with_history(r: &Request, include_history: bool)
     private_dir(&r.home.join("run"))?;
     private_dir(&run_dir)?;
 
-    let models = [kimi_config::ModelSpec {
-        id: "onex".into(),
-        model: r.model.into(),
-        max_context_size: PLACEHOLDER_MAX_CONTEXT_SIZE,
-        max_output_size: None,
-        capabilities: vec!["tool_use".into()],
-    }];
+    let default_model_id = if model_choices.is_empty() { "onex" } else { r.model };
+    let mut seen = BTreeSet::new();
+    let models: Vec<_> = std::iter::once(r.model)
+        .chain(model_choices.iter().map(String::as_str))
+        .filter(|alias| seen.insert(*alias))
+        .map(|alias| {
+            let limits = limits_by_alias.get(alias);
+            kimi_config::ModelSpec {
+                id: if alias == r.model { default_model_id } else { alias }.into(),
+                model: alias.into(),
+                max_context_size: limits.map_or(DEFAULT_MAX_CONTEXT_SIZE, |limits| limits.context_window.get()),
+                max_output_size: limits.and_then(|limits| limits.max_output_tokens.map(|limit| limit.get())),
+                capabilities: vec!["tool_use".into()],
+            }
+        })
+        .collect();
     let config_req = kimi_config::Request {
         provider_id: "onex",
         router_addr: r.router_addr,
         local_token: r.local_token,
         models: &models,
-        default_model_id: "onex",
+        default_model_id,
     };
     let config_text = kimi_config::render(&config_req).map_err(|e| anyhow!("render kimi config.toml: {e}"))?;
     let config_path = config_dir.join("config.toml");
@@ -150,7 +166,8 @@ pub(crate) fn prepare_kimi_code_with_history(r: &Request, include_history: bool)
     env.insert("KIMI_CODE_WATCH".into(), "0".into());
 
     // 显式技能目录只包含受管资源。原生配置及参数仍由目标制品验收。
-    let args = vec!["--model".into(), "onex".into(), "--skills-dir".into(), skills.to_string_lossy().into_owned()];
+    let args =
+        vec!["--model".into(), default_model_id.into(), "--skills-dir".into(), skills.to_string_lossy().into_owned()];
     Ok(Launch {
         launch_id,
         session_id,
@@ -218,6 +235,49 @@ fn uuid_v4() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_launch_model_menu_uses_signed_aliases_and_limits() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let program = std::env::current_exe().unwrap();
+        let env = BTreeMap::new();
+        let request = Request {
+            agent: "kimi-code",
+            home: home.path(),
+            router_addr: "127.0.0.1:4567",
+            local_token: "fixture-token",
+            model: "Qwen3.8-27B",
+            program: &program,
+            cwd: cwd.path(),
+            client_env: &env,
+        };
+        let choices = ["provider/flash-v1.2".into(), "Qwen3.8-27B".into(), "provider/flash-v1.2".into()];
+        let limits = BTreeMap::from([(
+            "provider/flash-v1.2".into(),
+            ModelLimits {
+                context_window: 262_144_u64.try_into().unwrap(),
+                max_output_tokens: Some(8192_u64.try_into().unwrap()),
+            },
+        )]);
+        let launch = prepare_kimi_code_with_model_choices(&request, false, &choices, &limits).unwrap();
+        let config = std::fs::read_to_string(launch.config_dir.join("config.toml")).unwrap();
+        assert_eq!(&launch.args[..2], &["--model", "Qwen3.8-27B"]);
+        assert!(config.contains("default_model = \"Qwen3.8-27B\""));
+        assert_eq!(config.matches("[models.\"Qwen3.8-27B\"]").count(), 1);
+        assert!(config.contains("max_context_size = 32000"));
+        assert_eq!(config.matches("[models.\"provider/flash-v1.2\"]").count(), 1);
+        assert!(config.contains(concat!(
+            "[models.\"provider/flash-v1.2\"]\nprovider = \"onex\"\nmodel = \"provider/flash-v1.2\"\n",
+            "max_context_size = 262144\nmax_output_size = 8192\n"
+        )));
+
+        let legacy = prepare_kimi_code_with_history(&request, false).unwrap();
+        let config = std::fs::read_to_string(legacy.config_dir.join("config.toml")).unwrap();
+        assert_eq!(&legacy.args[..2], &["--model", "onex"]);
+        assert!(config.contains("[models.onex]"));
+        assert_eq!(config.matches("[models.").count(), 1);
+    }
 
     #[cfg(unix)]
     fn client_env() -> BTreeMap<String, String> {
