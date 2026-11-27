@@ -38,5 +38,5 @@ RUN apt-get update \
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 COPY server/src/release-package.ts server/src/release-store.ts ./server/src/
-COPY deploy/compose/compose.yaml deploy/compose/initialize.ts deploy/compose/release-worker.ts ./deploy/compose/
+COPY deploy/compose/compose.yaml deploy/compose/initialize.ts deploy/compose/release-worker.ts deploy/compose/relocate-native-desktop.ts ./deploy/compose/
 ENTRYPOINT ["flock", "--no-fork", "-n", "/data/server/maintenance/.docker-rollout.lock", "bun", "--no-env-file", "/opt/onex/deploy/compose/release-worker.ts"]
