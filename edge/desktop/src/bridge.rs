@@ -50,6 +50,16 @@ pub enum Op {
     IssueList {
         cursor: Option<String>,
     },
+    IssueDetail {
+        id: String,
+        before_revision: Option<u64>,
+    },
+    IssueComment {
+        id: String,
+        revision: u64,
+        text: String,
+        request_id: String,
+    },
     IssueSubmit {
         text: String,
         images: Vec<onex_core::ipc::IssueImage>,
@@ -334,7 +344,8 @@ impl Bridge {
             .map_err(|_| ErrorBody { code: "conflict".into(), message: "已有操作正在进行".into() })?;
         match op {
             Op::State => self.state().await,
-            Op::Diagnostics | Op::IssueList { .. } | Op::IssueSubmit { .. } => Err(invalid("诊断日志请使用只读入口")),
+            Op::Diagnostics | Op::IssueList { .. } | Op::IssueSubmit { .. } | Op::IssueDetail { .. } |
+            Op::IssueComment { .. } => Err(invalid("请使用诊断和反馈入口")),
             Op::SendCode { target } => self.send_code(target).await,
             Op::Login { target, code, invite_code } => self.login(target, code, invite_code).await,
             Op::PasswordLogin { tenant, username, password } => self.password_login(tenant, username, password).await,
@@ -440,20 +451,21 @@ impl Bridge {
     }
 
     pub(crate) async fn issue(&self, op: Op) -> Result<Value, ErrorBody> {
-        let submit = matches!(op, Op::IssueSubmit { .. });
+        let command = op.issue_command().ok_or_else(|| invalid("未知反馈操作"))?;
+        let writes = matches!(command, "issue_submit" | "issue_comment");
         let since = self.inner.lock().unwrap().diagnostics.since;
-        self.issue_exchange(op, submit).await.map_err(|failure| {
+        self.issue_exchange(op, command, writes).await.map_err(|failure| {
             let mut inner = self.inner.lock().unwrap();
             if since == inner.diagnostics.since {
-                let event = if submit { "issue_submit_failed" } else { "issue_list_failed" };
+                let event = if writes { "issue_submit_failed" } else { "issue_list_failed" };
                 inner.diagnostics.push(&self.version, "error", event, None, failure.details);
             }
             failure.error
         })
     }
 
-    async fn issue_exchange(&self, op: Op, submit: bool) -> Result<Value, IssueFailure> {
-        let _change = self.mutation.try_lock().map_err(|_| {
+    async fn issue_exchange(&self, op: Op, command: &str, writes: bool) -> Result<Value, IssueFailure> {
+        let _change = writes.then(|| self.mutation.try_lock()).transpose().map_err(|_| {
             IssueFailure::local(
                 ErrorBody { code: "conflict".into(), message: "已有操作正在进行".into() },
                 "issue_operation_pending",
@@ -467,8 +479,16 @@ impl Bridge {
                     IssueFailure::local(device_session_conflict(), "issue_identity_missing", "identity")
                 })?
             };
+        let active_device = device_id.clone();
         let request = match op {
             Op::IssueList { cursor } => Request::IssueList { device_id, cursor },
+            Op::IssueDetail { id, before_revision } => Request::IssueDetail { device_id, id, before_revision },
+            Op::IssueComment { id, revision, text, request_id } => {
+                if text.trim().is_empty() || text.encode_utf16().count() > 1200 {
+                    return Err(IssueFailure::local(invalid("回复内容无效"), "issue_input_invalid", "validate"));
+                }
+                Request::IssueComment { device_id, id, revision, text, request_id }
+            }
             Op::IssueSubmit { text, images, include_logs } => {
                 if text.trim().is_empty()
                     || text.len() > 80000
@@ -494,7 +514,11 @@ impl Bridge {
             .await
             .map_err(|_| IssueFailure::local(unavailable(), "issue_ipc_timeout", "ipc"))?
             .map_err(|_| IssueFailure::local(unavailable(), "issue_ipc_failed", "ipc"))?;
-        issue_reply(reply, submit)
+        let inner = self.inner.lock().unwrap();
+        if inner.phase != Phase::Ready || inner.device_id.as_ref() != Some(&active_device) {
+            return Err(IssueFailure::local(device_session_conflict(), "issue_identity_changed", "identity"));
+        }
+        issue_reply(reply, command)
     }
 
     async fn send_code(&self, target: String) -> Reply {
@@ -1296,19 +1320,33 @@ fn diagnostic_error(error: &ErrorBody) -> &'static str {
         .unwrap_or("internal")
 }
 
-fn issue_reply(reply: Value, submit: bool) -> Result<Value, IssueFailure> {
-    let valid = if submit { reply["issues"]["id"].is_string() } else { reply["issues"]["items"].is_array() };
+impl Op {
+    pub(crate) fn issue_command(&self) -> Option<&'static str> {
+        match self {
+            Self::IssueList { .. } => Some("issue_list"),
+            Self::IssueSubmit { .. } => Some("issue_submit"),
+            Self::IssueDetail { .. } => Some("issue_detail"),
+            Self::IssueComment { .. } => Some("issue_comment"),
+            _ => None,
+        }
+    }
+}
+
+fn issue_reply(reply: Value, command: &str) -> Result<Value, IssueFailure> {
+    let info = &reply["issues"];
+    let valid = match command {
+        "issue_list" => info["items"].is_array(),
+        "issue_detail" => info["id"].is_string() && info["activities"].is_array(),
+        "issue_comment" => info["id"].is_string() && info["revision"].is_u64(),
+        _ => info["id"].is_string(),
+    };
     if reply["ok"] == true && valid {
         return Ok(reply);
     }
     let error = &reply["error"];
-    let legacy_message = if submit {
-        "无法解析请求：unknown variant `issue_submit`"
-    } else {
-        "无法解析请求：unknown variant `issue_list`"
-    };
+    let legacy_message = format!("无法解析请求：unknown variant `{command}`");
     if error["code"] == "invalid"
-        && error["message"].as_str().is_some_and(|message| message.starts_with(legacy_message))
+        && error["message"].as_str().is_some_and(|message| message.starts_with(&legacy_message))
     {
         return Err(IssueFailure::local(
             ErrorBody {
@@ -1426,7 +1464,7 @@ mod tests {
         let failure = issue_reply(
             json!({"ok":false,"error":{"code":"invalid",
             "message":"无法解析请求：unknown variant `issue_submit`, expected one of SECRET_FIXTURE"}}),
-            true,
+            "issue_submit",
         )
         .unwrap_err();
         assert_eq!(failure.error.code, "issue_update_required");

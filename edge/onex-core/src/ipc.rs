@@ -54,6 +54,18 @@ pub enum Request {
         device_id: String,
         cursor: Option<String>,
     },
+    IssueDetail {
+        device_id: String,
+        id: String,
+        before_revision: Option<u64>,
+    },
+    IssueComment {
+        device_id: String,
+        id: String,
+        revision: u64,
+        text: String,
+        request_id: String,
+    },
     /// 登录成功后交给 onexd 的设备身份。只带 token 时（旧用法／调试）只存内存，不落 Keychain，
     /// daemon 重启要重新登录。带齐 `server`/`device_id` 时额外持久化到 macOS Keychain（私钥是
     /// daemon 自己内存里生成的那把，从不经 IPC 输入或输出），daemon 重启后自动恢复同一个已登录

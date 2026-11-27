@@ -14,11 +14,22 @@ export function makeMock(){
     switch(r.op){
       case 'state':
         if(start && Date.now()-start>=650 && state.agents.length){state.agents[0].status='running';start=0}break
-      case 'issue_list': case 'issue_submit': {
+      case 'issue_list': case 'issue_submit': case 'issue_detail': case 'issue_comment': {
         if(state.phase!=='ready')return fail('unauthenticated','请先登录')
         const key=JSON.stringify([state.tenant.id,state.user.name]),items=issues.get(key)??[]
-        if(r.op==='issue_submit'){items.unshift({id:crypto.randomUUID(),created_at:new Date().toISOString(),text:r.text,image_count:r.images.length,log_count:0});issues.set(key,items)}
-        return {ok:true,issues:{items:structuredClone(items),next_cursor:null}}
+        if(r.op==='issue_list')return {ok:true,issues:{items:structuredClone(items),next_cursor:null}}
+        if(r.op==='issue_submit'){
+          const item={id:crypto.randomUUID(),created_at:new Date().toISOString(),text:r.text,image_count:r.images.length,
+            log_count:0,status:'open',revision:1,activities:[],actions:['comment'],next_before_revision:null}
+          items.unshift(item);issues.set(key,items)
+          return {ok:true,issues:{id:item.id}}
+        }
+        const item=items.find(entry=>entry.id===r.id)
+        if(!item)return fail('not_found','反馈不存在')
+        if(r.op==='issue_detail')return {ok:true,issues:structuredClone(item)}
+        if(r.revision!==item.revision)return fail('conflict','反馈已有更新')
+        item.activities.unshift({revision:++item.revision,role:'member',text:r.text,status:null,created_at:new Date().toISOString()})
+        return {ok:true,issues:{id:item.id,revision:item.revision}}
       }
       case 'diagnostics':
         return {ok:true,diagnostics:{desktop_version:state.version,daemon_version:null,entries:[]}}

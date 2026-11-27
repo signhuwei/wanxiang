@@ -38,7 +38,21 @@
             <label><input id="issue-logs" type="checkbox">附带最近日志（最多 28 条）</label>
             <button class="primary" type="submit">提交</button>
           </fieldset></form>
-          <p role="status" id="issue-status"></p><h3>我的反馈</h3><ol id="issue-history"></ol><button type="button" id="issue-more" hidden>加载更多</button>
+          <p role="status" id="issue-status"></p>
+          <div id="issue-list"><h3>我的反馈</h3><ol id="issue-history"></ol><button type="button" id="issue-more" hidden>加载更多</button></div>
+          <section id="issue-detail" aria-label="反馈详情" hidden>
+            <button type="button" id="issue-back">返回我的反馈</button>
+            <p id="issue-current-status" role="status"></p>
+            <p id="issue-original"></p>
+            <h3>处理动态</h3>
+            <ol id="issue-activities"></ol>
+            <button type="button" id="issue-older" hidden>更早的动态</button>
+            <form id="issue-comment" hidden>
+              <label>补充回复<textarea id="issue-comment-text" required maxlength="1200" rows="3"></textarea></label>
+              <button type="submit" class="primary" id="issue-comment-send">发送回复</button>
+            </form>
+            <p role="status" id="issue-detail-hint"></p>
+          </section>
         </section>
       </div>
     </details>

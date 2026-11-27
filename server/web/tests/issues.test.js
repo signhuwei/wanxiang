@@ -7,5 +7,5 @@ test('platform issues page is available only under platform maintenance navigati
   expect(app).toContain("['issues', '用户反馈']")
   expect(app).toContain("issuesPage(view, platformApi, signal)")
   expect(page).toContain("api.download(`${path}/images/${i}`")
-  expect(page).toContain('ledger.resume(snapshot)')
+  expect(page).toContain('ledger.reloadInBackground()')
 })

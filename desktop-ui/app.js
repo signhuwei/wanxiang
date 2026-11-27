@@ -458,7 +458,10 @@ const diagnosticBlocks=value=>diagnosticCount(value)==null?null:metricFormat.for
 const lookup=(dictionary,key)=>typeof key==='string'&&Object.hasOwn(dictionary,key)?dictionary[key]:null
 let diagnosticData,diagnosticsTicket=0,diagnosticsPending=false,diagnosticsError=false,diagnosticRows=new Map()
 
-let issueEpoch=0,issueCursor=null,historyTicket=0
+const issueStatuses={open:'待处理',in_progress:'处理中',resolved:'已解决',closed:'已关闭'}
+let issueEpoch=0,issueCursor=null,historyTicket=0,loadingIssues=false,expandedHistory=false
+let selectedIssue
+const issueRows=new Map()
 function issueErrorText(code) {
   if(code==='issue_update_required')return '当前后台版本不支持反馈，请先完成更新'
   if(code==='upstream_error')return '反馈服务请求失败，请查看诊断日志'
@@ -466,32 +469,149 @@ function issueErrorText(code) {
   return errorText(code)
 }
 function resetIssues() {
-  issueEpoch++; historyTicket++; issueCursor=null
+  issueEpoch++; historyTicket++; issueCursor=null; loadingIssues=false; expandedHistory=false
+  issueRows.clear()
+  closeIssue(false)
   $('issue-form').reset(); $('issue-history').replaceChildren(); $('issue-more').hidden=true
   $('issue-fields').disabled=state?.phase!=='ready'
   $('issue-status').textContent=$('issue-fields').disabled?'登录后可提交和查看反馈':''
   if(diagnostics.open&&!$('issue-panel').hidden) loadIssues()
 }
-async function loadIssues(more=false) {
-  if(state?.phase!=='ready')return
+async function loadIssues(more=false,background=false,reset=false) {
+  if(state?.phase!=='ready'||(loadingIssues&&!reset))return
   const ticket=++historyTicket
-  $('issue-more').disabled=true
+  loadingIssues=$('issue-more').disabled=true
   try {
     const r=await call({op:'issue_list',cursor:more?issueCursor:null})
     if(ticket!==historyTicket)return
-    if(!r.ok){$('issue-status').textContent=issueErrorText(r.error?.code);return}
-    if(!more)$('issue-history').replaceChildren()
-    for(const item of r.issues.items){const li=node('li');li.append(node('small',`${new Date(item.created_at).toLocaleString()} · 图片 ${item.image_count} · 日志 ${item.log_count}`),node('p',item.text));$('issue-history').append(li)}
-    issueCursor=r.issues.next_cursor; $('issue-more').hidden=!issueCursor
-    if(!$('issue-history').childElementCount)$('issue-history').append(node('li','暂无反馈'))
-  }catch{if(ticket===historyTicket)$('issue-status').textContent='反馈记录加载失败，请查看诊断日志'}
-  finally{if(ticket===historyTicket)$('issue-more').disabled=false}
+    if(!r.ok){if(!background)$('issue-status').textContent=issueErrorText(r.error?.code);return}
+    const history=$('issue-history')
+    if(reset||(!expandedHistory&&!more)){
+      const currentIds=new Set(r.issues.items.map(item=>item.id))
+      for(const [id,row] of issueRows)if(!currentIds.has(id)){row.li.remove();issueRows.delete(id)}
+    }
+    for(const item of r.issues.items)paintIssueRow(item)
+    const ordered=[...issueRows.values()].sort((a,b)=>b.item.created_at.localeCompare(a.item.created_at)||b.item.id.localeCompare(a.item.id))
+    history.querySelector('.no-issues')?.remove()
+    ordered.forEach(({li},i)=>{if(history.children[i]!==li)history.insertBefore(li,history.children[i]??null)})
+    if(!ordered.length)history.append(styled('li','no-issues','暂无反馈'))
+    if(reset)expandedHistory=false
+    if(more||!expandedHistory)issueCursor=r.issues.next_cursor
+    if(more)expandedHistory=true
+    $('issue-more').hidden=!issueCursor
+  }catch{if(ticket===historyTicket&&!background)$('issue-status').textContent='反馈记录加载失败，请查看诊断日志'}
+  finally{if(ticket===historyTicket)loadingIssues=$('issue-more').disabled=false}
+}
+function paintIssueRow(item) {
+  let row=issueRows.get(item.id)
+  if(row?.item.revision>item.revision)return
+  if(!row){
+    const li=node('li'),meta=node('small'),text=node('p',item.text)
+    const detail=button('查看动态',()=>openIssue(item.id))
+    detail.setAttribute('aria-label','查看动态 '+item.text.slice(0,45))
+    li.append(meta,detail,text)
+    row={li,meta,detail,item}
+    issueRows.set(item.id,row)
+  }
+  row.item=item
+  row.detail.hidden=!Number.isSafeInteger(item.revision)
+  const metadata=`${new Date(item.created_at).toLocaleString()} · 图片 ${item.image_count} · 日志 ${item.log_count}`
+  const label=lookup(issueStatuses,item.status)
+  row.meta.textContent=label?`${label} · ${metadata}`:metadata
+}
+function closeIssue(refresh=true) {
+  const opened=selectedIssue
+  selectedIssue=null
+  $('issue-detail').hidden=true; $('issue-list').hidden=false; $('issue-form').hidden=false
+  $('issue-comment').reset(); $('issue-comment').hidden=true
+  $('issue-comment-text').disabled=$('issue-comment-send').disabled=false
+  $('issue-current-status').textContent=$('issue-original').textContent=$('issue-detail-hint').textContent=''
+  $('issue-activities').replaceChildren(); $('issue-older').hidden=true
+  if(refresh){
+    issueRows.get(opened?.id)?.detail.focus()
+    loadIssues()
+  }
+}
+function openIssue(id) {
+  selectedIssue={id,activities:new Map(),before:null}
+  $('issue-detail').hidden=false; $('issue-list').hidden=true; $('issue-form').hidden=true
+  $('issue-back').focus()
+  loadIssue()
+}
+async function loadIssue(older=false,background=false,force=false) {
+  const detail=selectedIssue
+  if(!detail||detail.loading||(!force&&detail.sending)||(older&&!detail.before))return
+  detail.loading=true; $('issue-older').disabled=true
+  try {
+    const r=await call({op:'issue_detail',id:detail.id,...(older&&{before_revision:detail.before})})
+    if(detail!==selectedIssue)return
+    if(!r.ok){if(!background)$('issue-detail-hint').textContent=issueErrorText(r.error?.code);return}
+    const item=r.issues
+    if(!older&&item.revision===detail.item?.revision)return
+    if(!older&&item.activities.at(-1)?.revision>(detail.item?.revision??0)+1) detail.activities.clear()
+    if(older||!detail.activities.size) detail.before=item.next_before_revision
+    for(const event of item.activities)detail.activities.set(event.revision,event)
+    if(!older){
+      detail.item=item
+      paintIssueRow(item)
+      $('issue-current-status').textContent=lookup(issueStatuses,item.status)
+      $('issue-original').textContent=item.text
+      $('issue-comment').hidden=!item.actions.includes('comment')
+    }
+    const rows=[...detail.activities.values()].sort((a,b)=>b.revision-a.revision).map(event=>{
+      const row=node('li')
+      row.append(node('small',`${event.role==='platform'?'平台管理员':'我'} · ${new Date(event.created_at).toLocaleString()}`))
+      const status=lookup(issueStatuses,event.status)
+      if(status)row.append(node('p','状态改为 '+status))
+      if(event.text)row.append(node('p',event.text))
+      return row
+    })
+    $('issue-activities').replaceChildren(...(rows.length?rows:[node('li','暂无处理动态')]))
+    $('issue-older').hidden=!detail.before
+  }catch{if(detail===selectedIssue&&!background)$('issue-detail-hint').textContent='反馈详情加载失败，请查看诊断日志'}
+  finally{if(detail===selectedIssue){detail.loading=false;$('issue-older').disabled=false}}
+}
+$('issue-back').onclick=()=>closeIssue()
+$('issue-older').onclick=()=>loadIssue(true)
+$('issue-comment').onsubmit=async event=>{
+  event.preventDefault()
+  const detail=selectedIssue,text=$('issue-comment-text').value.trim()
+  if(!detail?.item||detail.loading||detail.sending||!text)return
+  if(detail.attempt?.text!==text){
+    const key=Array.from(crypto.getRandomValues(new Uint8Array(16)),byte=>byte.toString(16).padStart(2,'0')).join('')
+    detail.attempt={text,revision:detail.item.revision,key}
+  }
+  detail.sending=$('issue-comment-text').disabled=$('issue-comment-send').disabled=true
+  const hint=$('issue-detail-hint')
+  hint.textContent='正在发送…'
+  try{
+    const r=await call({op:'issue_comment',id:detail.id,revision:detail.attempt.revision,text,request_id:detail.attempt.key})
+    if(detail!==selectedIssue)return
+    if(!r.ok){
+      hint.textContent=issueErrorText(r.error?.code)
+      if(r.error?.code==='conflict'){
+        detail.attempt=null
+        await loadIssue(false,false,true)
+      }
+      return
+    }
+    $('issue-comment').reset(); detail.attempt=null
+    hint.textContent='回复已发送'
+    await loadIssue(false,false,true)
+  }catch{if(detail===selectedIssue)hint.textContent='回复发送失败，请查看诊断日志'}
+  finally{if(detail===selectedIssue)detail.sending=$('issue-comment-text').disabled=$('issue-comment-send').disabled=false}
+}
+function refreshIssues(background=false) {
+  if(diagnostics.open&&!$('issue-panel').hidden&&!document.hidden) {
+    if(selectedIssue)loadIssue(false,background)
+    else loadIssues(false,background)
+  }
 }
 $('issue-more').onclick=()=>loadIssues(true)
 function selectFooter(issue){
   $('issue-panel').hidden=!issue; $('logs-panel').hidden=issue
   $('logs-tab').setAttribute('aria-selected',String(!issue)); $('issue-tab').setAttribute('aria-selected',String(issue))
-  if(issue)loadIssues();else refreshDiagnostics()
+  if(issue)refreshIssues();else refreshDiagnostics()
 }
 $('logs-tab').onclick=()=>selectFooter(false); $('issue-tab').onclick=()=>selectFooter(true)
 $('issue-form').onsubmit=async event=>{
@@ -508,7 +628,7 @@ $('issue-form').onsubmit=async event=>{
     if(epoch!==issueEpoch)return
     const r=await call({op:'issue_submit',text,images,include_logs});if(epoch!==issueEpoch)return
     if(!r.ok){$('issue-status').textContent=issueErrorText(r.error?.code);return}
-    $('issue-form').reset();$('issue-status').textContent='已提交';await loadIssues()
+    $('issue-form').reset();$('issue-status').textContent='已提交';await loadIssues(false,false,true)
   }catch{if(epoch===issueEpoch)$('issue-status').textContent=readingImages?'图片读取失败':'反馈提交失败，请查看诊断日志'}
   finally{if(epoch===issueEpoch)$('issue-fields').disabled=false}
 }
@@ -688,12 +808,13 @@ updateDialog.onkeydown=event=>{
     closeUpdateDialog()
   }
 }
-diagnostics.ontoggle=()=>{if(diagnostics.open){paintDiagnostics();if($('issue-panel').hidden)refreshDiagnostics();else loadIssues()}}
+diagnostics.ontoggle=()=>{if(diagnostics.open){paintDiagnostics();if($('issue-panel').hidden)refreshDiagnostics();else refreshIssues()}}
 for (const id of ['diagnostics-source','diagnostics-level','diagnostics-query']) $(id).oninput=paintDiagnostics
 if(!call){$('title').textContent='未连接桌面服务';$('content').append(styled('p','empty-state','请从 OneX Desktop 打开；浏览器演示请显式使用 ?mock=1。'))}else{
   $('diagnostics-footer').hidden=false
   await refresh()
   const poll=()=>{refresh();refreshDiagnostics()}
   setInterval(poll,2000)
-  document.addEventListener('visibilitychange',poll)
+  setInterval(()=>refreshIssues(true),15000)
+  document.addEventListener('visibilitychange',()=>{poll();refreshIssues(true)})
 }

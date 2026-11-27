@@ -39,7 +39,7 @@ async fn desktop_call(
         Ok(op) => op,
         Err(_) => return Ok(reply_err("invalid", "请检查输入内容")),
     };
-    if matches!(op, Op::IssueSubmit { .. } | Op::IssueList { .. }) {
+    if op.issue_command().is_some() {
         return Ok(bridge.issue(op).await.unwrap_or_else(|e| reply_err(&e.code, &e.message)));
     }
     if matches!(op, Op::Diagnostics) {

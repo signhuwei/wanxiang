@@ -61,14 +61,40 @@ try {
   if (process.argv.includes('--issues-only')) {
     const user = app.store.system.get('SELECT owner_user_id FROM tenants WHERE id=?',[seed.tenantId])
     await app.store.system.write(sql => {
-      sql.run('INSERT INTO issues VALUES (?,?,?,?,?,?,?,?,?)', ['iss_test',seed.tenantId,user.owner_user_id,'fixture-device','浏览器反馈样例','[]',new Date().toISOString(),0,0])
+      const at = new Date().toISOString()
+      for (const [id, text] of [['iss_test', '浏览器反馈样例'], ['iss_second', '浏览器反馈第二条'], ['iss_third', '浏览器反馈第三条']]) {
+        sql.run(`INSERT INTO issues (id,tenant_id,user_id,device_id,text,logs_json,created_at,image_count,log_count,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?)`, [id,seed.tenantId,user.owner_user_id,'fixture-device',text,'[]',at,0,0,at])
+      }
     })
     await link('运维管理').click()
     await link('用户反馈').click()
     await page.getByText('浏览器反馈样例',{exact:true}).click()
     await page.getByRole('heading',{name:'反馈详情'}).waitFor()
     await page.locator('.inline-body').getByText('浏览器反馈样例',{exact:true}).waitFor()
+    await page.locator('.inline-body').getByLabel('处理状态').selectOption('in_progress')
+    await page.getByLabel('公开回复').fill('已接手，正在核对复现步骤')
+    await button('发布更新').click()
+    await page.getByText('当前状态 · 处理中',{exact:true}).waitFor()
+    await page.getByText('已接手，正在核对复现步骤',{exact:true}).waitFor()
+    const rows = page.locator('tbody')
+    const reply = page.getByLabel('公开回复')
+    await reply.fill('第一条反馈的草稿')
+    const openIssue = async (id, text) => {
+      await rows.locator(`tr[data-key="${id}"] td`).first().click()
+      await page.locator('.inline-body').getByText(text,{exact:true}).waitFor()
+      await reply.waitFor()
+    }
+    await openIssue('iss_second', '浏览器反馈第二条')
+    assert.equal(await reply.inputValue(), '')
+    await openIssue('iss_test', '浏览器反馈样例')
+    assert.equal(await reply.inputValue(), '第一条反馈的草稿')
+    await openIssue('iss_third', '浏览器反馈第三条')
+    assert.equal(await page.locator('.inline-drill').count(), 1)
     await button('← 返回').click()
+    await rows.getByText('处理中',{exact:true}).waitFor()
+    assert.equal(await page.locator('.inline-drill').count(), 0)
+    assert.equal(await rows.locator('tr.selected').getAttribute('data-key'), 'iss_third')
     assert.deepEqual(errors,[])
   } else {
   await enterTenant()

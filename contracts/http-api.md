@@ -124,7 +124,9 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 
 ## Desktop 用户反馈
 
-- `GET /v1/edge/issues?q=&cursor=&limit=` 使用活动设备令牌，按设备所属租户和用户返回本人记录。
+- `GET /v1/edge/issues?q=&cursor=&limit=` 使用活动设备令牌，按设备所属租户和用户返回本人记录。已有反馈初始状态为 `open`，列表包含 `status,revision,updated_at`，按提交时间分页。
 - `POST /v1/edge/issues` 使用活动设备令牌，JSON `{text,images:[{mime,data}],logs}`；最多 3 张 base64 图片，MIME 为 PNG/JPEG/WebP，每张不超过 1 MiB；日志最多 28 条、总大小不超过 100 KiB。提交文本不超过 20,000 字符。每用户每小时最多 20 条。
-- `GET /v1/platform/issues?q=&cursor=&limit=`、`GET /v1/platform/issues/:id` 与 `GET /v1/platform/issues/:id/images/:index` 仅平台管理员 token 可访问。图片响应经鉴权，设置 no-sniff。
+- `GET /v1/platform/issues?q=&status=&cursor=&limit=`、`GET /v1/platform/issues/:id` 与 `GET /v1/platform/issues/:id/images/:index` 仅平台管理员会话可访问。图片响应经鉴权，设置 no-sniff。
+- 两端的 `GET …/issues/:id?before_revision=` 返回反馈详情与最近 20 条活动。活动按修订倒序排列，字段为 `revision,role,text,status,created_at`，`role` 为 `platform` 或 `member`。用返回的 `next_before_revision` 加载更早记录。Desktop 使用活动设备令牌，只能查看本租户本人提交的反馈。
+- `POST …/issues/:id/activities` 需要 `Idempotency-Key` 与 `{revision,text?,status?}`。回复为最多 1,200 字符的纯文本。平台管理员可回复、调整状态或同时执行两项操作。状态为 `open`（待处理）、`in_progress`（处理中）、`resolved`（已解决）、`closed`（已关闭），可重新打开。提交者可补充回复。修订冲突返回 409，客户端保留草稿并读回最新详情。成功操作原子追加活动并更新当前修订，历史记录保持可读。
 - 图片在平台管理界面呈现；日志只存诊断白名单字段，并由 master 展开查看。

@@ -136,7 +136,7 @@ test('feedback binds the submitting device to its user and restricts platform at
   expect(created.status).toBe(201);
   const {id} = await created.json() as {id:string};
   const own = await f.request('/edge/issues',undefined,edge.device_token);
-  expect(await own.json()).toMatchObject({total:1,items:[{id,image_count:1,log_count:28}]});
+  expect(await own.json()).toMatchObject({total:1,items:[{id,image_count:1,log_count:28,status:'open',revision:1}]});
   expect(await (await f.request('/edge/issues',undefined,other.device_token)).json()).toMatchObject({total:0});
   for (const path of ['/platform/issues',`/platform/issues/${id}`,`/platform/issues/${id}/images/0`]) {
     expect((await f.request(path,undefined,a.global)).status).toBe(403);
@@ -146,6 +146,42 @@ test('feedback binds the submitting device to its user and restricts platform at
   const image = await f.request(`/platform/issues/${id}/images/0`,undefined,b.global);
   expect(image.headers.get('content-type')).toBe('image/png');
   expect(Buffer.from(await image.arrayBuffer()).toString('base64')).toBe(png);
+  const edgePath = `/edge/issues/${id}`, platformPath = `/platform/issues/${id}`;
+  const publish = (revision: number, status: string, text?: string, key = `master-${revision}`) =>
+    f.request(platformPath + '/activities', {revision, status, ...(text && {text})}, b.global, key);
+  expect((await f.request(edgePath, undefined, other.device_token)).status).toBe(404);
+  expect((await f.request(edgePath + '/activities', {revision:1,text:'foreign'}, other.device_token,'outside')).status).toBe(404);
+  expect((await f.request(edgePath + '/activities', {revision:1,status:'resolved'}, edge.device_token,'status-denied')).status).toBe(422);
+  expect((await f.request(platformPath + '/activities', {revision:1,status:'resolved'}, b.scoped,'tenant-denied')).status).toBe(403);
+  f.advance(1000);
+  const first = await publish(1,'in_progress','平台已接手');
+  expect(first.status).toBe(201);
+  expect(await first.json()).toEqual({id,revision:2});
+  expect(await (await publish(1,'in_progress','平台已接手')).json()).toEqual({id,revision:2});
+  expect((await publish(1,'resolved',undefined,'stale')).status).toBe(409);
+  expect((await publish(1,'in_progress','覆盖已提交的回复')).status).toBe(409);
+  const updated = await (await f.request(edgePath,undefined,edge.device_token)).json() as {
+    created_at: string; updated_at: string; activities: Array<Record<string, unknown>>;
+  };
+  expect(updated).toMatchObject({status:'in_progress',revision:2,activities:[
+    {revision:2,role:'platform',text:'平台已接手',status:'in_progress'},
+  ]});
+  expect(updated.updated_at > updated.created_at).toBe(true);
+  expect(updated).not.toHaveProperty('logs');
+  expect(updated.activities[0]).not.toHaveProperty('actor_id');
+  const reply = await f.request(edgePath + '/activities',{revision:2,text:'补充复现步骤'},edge.device_token,'employee-2');
+  expect(reply.status).toBe(201);
+  expect((await publish(3,'resolved')).status).toBe(201);
+  expect((await publish(4,'closed','本次反馈已结案')).status).toBe(201);
+  expect((await publish(5,'open','需要复查')).status).toBe(201);
+  expect(await (await f.request(platformPath,undefined,b.global)).json()).toMatchObject({
+    status:'open',revision:6,activities:[
+      {role:'platform',status:'open'}, {role:'platform',status:'closed'}, {role:'platform',status:'resolved'},
+      {role:'member',status:null,text:'补充复现步骤'}, {role:'platform',status:'in_progress'},
+    ],
+  });
+  expect(await (await f.request('/platform/issues?status=closed',undefined,b.global)).json()).toMatchObject({total:0});
+  expect(await (await f.request('/platform/issues?status=open',undefined,b.global)).json()).toMatchObject({total:1});
 });
 
 test('owner requests a logs diag job, online Edge uploads it, and only an authorized reader can download it', async (): Promise<void> => {

@@ -275,9 +275,16 @@ async fn dispatch(req: Request, ipc: &Arc<Ipc>, socket: &Path) -> (Value, bool) 
         Request::Status => (ok(status(ipc)), false),
         Request::IssueSubmit { device_id, text, images, logs } => {
             let body = json!({"text": text, "images": images, "logs": logs});
-            (issue_request(ipc, &device_id, Some(body), None).await, false)
+            (issue_request(ipc, &device_id, IssueRequest::Submit(body)).await, false)
         }
-        Request::IssueList { device_id, cursor } => (issue_request(ipc, &device_id, None, cursor).await, false),
+        Request::IssueList { device_id, cursor } =>
+            (issue_request(ipc, &device_id, IssueRequest::List(cursor)).await, false),
+        Request::IssueDetail { device_id, id, before_revision } =>
+            (issue_request(ipc, &device_id, IssueRequest::Detail { id, before_revision }).await, false),
+        Request::IssueComment { device_id, id, text, revision, request_id } => {
+            let body = json!({"text": text, "revision": revision});
+            (issue_request(ipc, &device_id, IssueRequest::Comment { id, body, request_id }).await, false)
+        }
         Request::Login { token, server, device_id } => (login(ipc, token, server, device_id), false),
         Request::ResumeDevice { server, session_token } => resume_device(ipc, &server, &session_token).await,
         Request::Logout => logout(ipc),
@@ -362,9 +369,28 @@ async fn dispatch(req: Request, ipc: &Arc<Ipc>, socket: &Path) -> (Value, bool) 
     }
 }
 
-async fn issue_request(ipc: &Ipc, device: &str, body: Option<Value>, cursor: Option<String>) -> Value {
-    let operation = if body.is_some() { "submit" } else { "list" };
-    let _identity = ipc.identity_transition.lock().await;
+enum IssueRequest {
+    List(Option<String>),
+    Submit(Value),
+    Detail { id: String, before_revision: Option<u64> },
+    Comment { id: String, body: Value, request_id: String },
+}
+
+async fn issue_request(ipc: &Ipc, device: &str, route: IssueRequest) -> Value {
+    let (operation, writes) = match &route {
+        IssueRequest::List(_) => ("list", false),
+        IssueRequest::Submit(_) => ("submit", true),
+        IssueRequest::Detail { .. } => ("detail", false),
+        IssueRequest::Comment { .. } => ("comment", true),
+    };
+    if let IssueRequest::Detail { id, .. } | IssueRequest::Comment { id, .. } = &route {
+        if !id.strip_prefix("iss_").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.len() <= 60 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        }) {
+            return issue_failure(operation, "invalid", "issue_input_invalid", "validate", None);
+        }
+    }
+    let mut identity = Some(ipc.identity_transition.lock().await);
     if ipc.state.expected_device_id.read().unwrap().as_deref() != Some(device) {
         return issue_failure(operation, "conflict", "issue_identity_changed", "identity", None);
     }
@@ -374,6 +400,9 @@ async fn issue_request(ipc: &Ipc, device: &str, body: Option<Value>, cursor: Opt
     let Some(origin) = ipc.server_url.as_deref().and_then(normalize_origin) else {
         return issue_failure(operation, "invalid", "issue_origin_invalid", "origin", None);
     };
+    if !writes {
+        drop(identity.take());
+    }
     // Feedback is a OneX control-plane operation carrying the same device bearer.
     // Use the configured origin directly, just like device history recovery.
     let Ok(client) = reqwest::Client::builder()
@@ -385,13 +414,24 @@ async fn issue_request(ipc: &Ipc, device: &str, body: Option<Value>, cursor: Opt
         return issue_failure(operation, "internal", "issue_client_failed", "request", None);
     };
     let url = format!("{origin}/v1/edge/issues");
-    let request = if let Some(data) = body {
-        client.post(url).json(&data)
-    } else {
-        let request = client.get(url).query(&[("limit", "20")]);
-        if let Some(cursor) = cursor { request.query(&[("cursor", cursor)]) } else { request }
+    let request = match route {
+        IssueRequest::List(cursor) => {
+            let request = client.get(url).query(&[("limit", "20")]);
+            if let Some(cursor) = cursor { request.query(&[("cursor", cursor)]) } else { request }
+        }
+        IssueRequest::Submit(body) => client.post(url).json(&body),
+        IssueRequest::Detail { id, before_revision } => {
+            let request = client.get(format!("{url}/{id}"));
+            if let Some(revision) = before_revision {
+                request.query(&[("before_revision", revision)])
+            } else {
+                request
+            }
+        }
+        IssueRequest::Comment { id, body, request_id } =>
+            client.post(format!("{url}/{id}/activities")).header("Idempotency-Key", request_id).json(&body),
     };
-    let response = match request.bearer_auth(token).send().await {
+    let response = match request.bearer_auth(&token).send().await {
         Ok(response) => response,
         Err(error) => {
             let reason = if error.is_timeout() { "issue_request_timeout" } else { "issue_transport_failed" };
@@ -403,6 +443,8 @@ async fn issue_request(ipc: &Ipc, device: &str, body: Option<Value>, cursor: Opt
         let code = match status.as_u16() {
             401 => "unauthenticated",
             403 => "forbidden",
+            404 => "not_found",
+            409 => "conflict",
             429 => "rate_limited",
             422 | 413 => "invalid",
             _ => "upstream_error",
@@ -410,6 +452,9 @@ async fn issue_request(ipc: &Ipc, device: &str, body: Option<Value>, cursor: Opt
         return issue_failure(operation, code, "issue_http_status", "response", Some(status.as_u16()));
     }
     match response.json::<Value>().await {
+        Ok(_) if !writes && (ipc.state.expected_device_id.read().unwrap().as_deref() != Some(device) ||
+            ipc.state.token.borrow().as_ref() != Some(&token)) =>
+            issue_failure(operation, "conflict", "issue_identity_changed", "identity", None),
         Ok(data) => json!({"ok":true,"issues":data}),
         Err(_) => issue_failure(operation, "upstream_error", "issue_response_invalid", "decode", Some(status.as_u16())),
     }
@@ -1570,8 +1615,9 @@ mod issue_tests {
     use super::*;
     use axum::{
         Json,
+        extract::Query,
         http::{HeaderMap, StatusCode},
-        routing::post,
+        routing::{get, post},
     };
 
     #[tokio::test]
@@ -1602,17 +1648,26 @@ mod issue_tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
-        let http = axum::Router::new().route(
-            "/v1/edge/issues",
-            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+        let http = axum::Router::new()
+            .route("/v1/edge/issues", post(|headers: HeaderMap, Json(body): Json<Value>| async move {
                 assert_eq!(headers["authorization"], "Bearer test-device");
                 if body["text"] == "accepted" {
                     (StatusCode::CREATED, Json(json!({"id":"iss_test"})))
                 } else {
                     (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"SECRET_RAW_RESPONSE"})))
                 }
-            }),
-        );
+            }))
+            .route("/v1/edge/issues/iss_test", get(|headers: HeaderMap, Query(values): Query<std::collections::HashMap<String, String>>| async move {
+                assert_eq!(headers["authorization"], "Bearer test-device");
+                assert_eq!(values.get("before_revision").map(String::as_str), Some("10"));
+                Json(json!({"id": "iss_test", "activities": []}))
+            }))
+            .route("/v1/edge/issues/iss_test/activities", post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers["authorization"], "Bearer test-device");
+                assert_eq!(headers["idempotency-key"], "comment-fixture");
+                assert_eq!(body, json!({"text": "fixture", "revision": 2}));
+                StatusCode::CONFLICT
+            }));
         let server = tokio::spawn(async move {
             axum::serve(listener, http).await.unwrap();
         });
@@ -1635,15 +1690,21 @@ mod issue_tests {
             identity_transition: Default::default(),
             shutdown: CancellationToken::new(),
         };
-        let success = issue_request(&ipc, "dev_test", Some(json!({"text":"accepted"})), None).await;
+        let success = issue_request(&ipc, "dev_test", IssueRequest::Submit(json!({"text":"accepted"}))).await;
         assert_eq!(success, json!({"ok":true,"issues":{"id":"iss_test"}}));
-        let failure = issue_request(&ipc, "dev_test", Some(json!({"text":"SECRET_FEEDBACK"})), None).await;
+        let failure = issue_request(&ipc, "dev_test", IssueRequest::Submit(json!({"text":"SECRET_FEEDBACK"}))).await;
         assert_eq!(failure["error"]["code"], "upstream_error");
         assert_eq!(
             failure["error"]["detail"],
             json!({"reason_code":"issue_http_status","stage":"response","http_status":503})
         );
         assert!(!failure.to_string().contains("SECRET"));
+        let detail = issue_request(&ipc, "dev_test", IssueRequest::Detail { id: "iss_test".into(), before_revision: Some(10) }).await;
+        assert_eq!(detail, json!({"ok":true,"issues":{"id":"iss_test","activities":[]}}));
+        let comment = issue_request(&ipc, "dev_test", IssueRequest::Comment {
+            id: "iss_test".into(), body: json!({"text":"fixture","revision":2}), request_id: "comment-fixture".into(),
+        }).await;
+        assert_eq!(comment["error"]["code"], "conflict");
         server.abort();
     }
 }

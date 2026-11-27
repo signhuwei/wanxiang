@@ -1,9 +1,10 @@
 import type { Context, Hono } from 'hono';
 import { ulid } from 'ulid';
-import { ApiError, field, json } from './api';
+import { ApiError, field, invalid, json, operation } from './api';
 import { bearer, hash, iso } from './credentials';
-import { pagination, platformActor, type ManagementOptions } from './management';
-import type { Store } from './store';
+import { enumField, expectRevision, int, pagination, platformActor, type ManagementOptions } from './management';
+import { strictObject } from './routing-http';
+import type { Store, Transaction } from './store';
 
 const maxText = 20_000;
 const maxLogs = 28;
@@ -53,16 +54,79 @@ function deviceActor(store: Store, c: Context, at: number) {
   return {tenant:scope.tenant_id, user:device.user_id, device:device.id};
 }
 const source = ' FROM issues i JOIN tenants t ON t.id=i.tenant_id JOIN platform_users u ON u.id=i.user_id ';
-const columns = 'i.id,i.tenant_id,i.user_id,t.name tenant_name,u.name user_name,i.text,i.created_at,i.image_count,i.log_count';
+const columns = 'i.id,i.tenant_id,i.user_id,t.name tenant_name,u.name user_name,i.text,i.created_at,i.image_count,i.log_count,i.status,i.revision,i.updated_at';
+const issueStatuses = ['open', 'in_progress', 'resolved', 'closed'] as const;
+type DeviceActor = ReturnType<typeof deviceActor>;
+type Issue = { id: string; revision: number; status: typeof issueStatuses[number]; logs_json?: string };
+type Activity = { revision: number; role: 'member' | 'platform'; text: string | null; status: Issue['status'] | null; created_at: string };
+
+function readIssue(sql: Pick<Transaction, 'get'>, id: string, own?: DeviceActor) {
+  const scope = own ? ' AND i.tenant_id=? AND i.user_id=?' : '';
+  const row = sql.get<Issue>('SELECT ' + columns + (own ? '' : ',i.logs_json') + source + ' WHERE i.id=?' + scope,
+    own ? [id, own.tenant, own.user] : [id]);
+  if (!row) throw new ApiError('not_found');
+  return row;
+}
+
 export function issueRoutes(app: Hono, store: Store, opts: ManagementOptions) {
-  function list(c:Context, own?:ReturnType<typeof deviceActor>) {
-    const p=pagination(c), args=own?[own.tenant,own.user,p.query]:[p.query];
-    const where=' WHERE '+(own?'i.tenant_id=? AND i.user_id=? AND ':'')+"instr(lower(i.text||' '||t.name||' '||u.name),lower(?))>0";
+  function list(c: Context, own?: DeviceActor) {
+    const p = pagination(c);
+    const filters = ["instr(lower(i.text||' '||t.name||' '||u.name),lower(?))>0"];
+    const args = [p.query];
+    if (own) {
+      filters.push('i.tenant_id=? AND i.user_id=?');
+      args.push(own.tenant, own.user);
+    }
+    const status = c.req.query('status');
+    if (status !== undefined) {
+      filters.push('i.status=?');
+      args.push(enumField(status, 'status', issueStatuses));
+    }
+    const where = ' WHERE ' + filters.join(' AND ');
     const total=store.system.get<{n:number}>('SELECT count(*) n'+source+where,args)!.n;
     const rows=store.system.all<Record<string,unknown>>('SELECT '+columns+source+where+' ORDER BY i.created_at DESC,i.id DESC LIMIT ? OFFSET ?', [...args,p.limit,p.offset]);
     return c.json(p.page(rows.map(r=>({...r,actions:['read']})),total));
   }
+  function detail(c: Context, id: string, own?: DeviceActor) {
+    const { logs_json, ...row } = readIssue(store.system, id, own);
+    const before = c.req.query('before_revision');
+    if (before !== undefined && !/^\d{1,16}$/.test(before)) invalid('before_revision');
+    const maximum = before === undefined ? row.revision + 1 : int(Number(before), 'before_revision', 2);
+    const activities = store.system.all<Activity>(`SELECT revision,role,text,status,created_at FROM issue_activities
+      WHERE issue_id=? AND revision<? ORDER BY revision DESC LIMIT 21`, [id, maximum]);
+    const next_before_revision = activities.length > 20 ? activities[19]!.revision : null;
+    return c.json({ ...row, ...(logs_json !== undefined && { logs: JSON.parse(logs_json) }),
+      activities: activities.slice(0, 20), next_before_revision, actions: own ? ['comment'] : ['comment', 'set_status'] });
+  }
+  async function addActivity(c: Context, id: string, role: Activity['role']) {
+    const now = opts.now();
+    const own = role === 'member' ? deviceActor(store, c, now) : undefined;
+    const actor = own?.user ?? platformActor(store, c, now);
+    const body = strictObject(await json(c), 'body', own ? ['text', 'revision'] : ['text', 'status', 'revision']);
+    const text = body.text === undefined ? null : field(body.text, 'text', 1200).trim();
+    const status = body.status === undefined ? null : enumField(body.status, 'status', issueStatuses);
+    if (text === null && status === null) invalid('text', 'status');
+    const op = operation(c, opts.codeSecret, now, own ? JSON.stringify([own.tenant, actor]) : actor, body);
+    if (!op.key) invalid('Idempotency-Key');
+    return store.system.write(sql => {
+      if (own) deviceActor(store, c, opts.now());
+      else platformActor(store, c, opts.now());
+      const row = readIssue(sql, id, own);
+      const cached = op.read(sql);
+      if (cached) return cached;
+      expectRevision(body.revision, row.revision);
+      const changedStatus = status === row.status ? null : status;
+      if (text === null && changedStatus === null) invalid('status');
+      const revision = row.revision + 1, at = iso(opts.now());
+      sql.run('UPDATE issues SET status=?, revision=?, updated_at=? WHERE id=?', [changedStatus ?? row.status, revision, at, id]);
+      sql.run(`INSERT INTO issue_activities (issue_id,revision,actor_id,role,text,status,created_at)
+        VALUES (?,?,?,?,?,?,?)`, [id, revision, actor, role, text, changedStatus, at]);
+      return op.complete(sql, { status: 201, payload: { id, revision } });
+    });
+  }
   app.get('/v1/edge/issues', c=>list(c,deviceActor(store,c,opts.now())));
+  app.get('/v1/edge/issues/:id', c => detail(c, c.req.param('id'), deviceActor(store,c,opts.now())));
+  app.post('/v1/edge/issues/:id/activities', c => addActivity(c, c.req.param('id'), 'member'));
   app.post('/v1/edge/issues', async c=>{
     const actor=deviceActor(store,c,opts.now());
     const body=await json(c), text=field(body.text,'text',maxText).trim();
@@ -73,7 +137,8 @@ export function issueRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     await store.system.write(sql=>{
       deviceActor(store,c,opts.now());
       if (sql.get('SELECT 1 FROM issues WHERE tenant_id=? AND user_id=? AND created_at>? LIMIT 1 OFFSET 19',[actor.tenant,actor.user,iso(opts.now()-3600000)])) throw new ApiError('rate_limited');
-      sql.run('INSERT INTO issues (id,tenant_id,user_id,device_id,text,logs_json,created_at,image_count,log_count) VALUES (?,?,?,?,?,?,?,?,?)', [id,actor.tenant,actor.user,actor.device,text,JSON.stringify(logs),at,decoded.length,logs.length]);
+      sql.run('INSERT INTO issues (id,tenant_id,user_id,device_id,text,logs_json,created_at,image_count,log_count,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+        [id,actor.tenant,actor.user,actor.device,text,JSON.stringify(logs),at,decoded.length,logs.length,at]);
       decoded.forEach((image,index)=>sql.run('INSERT INTO issue_images VALUES (?,?,?,?)',[id,index,image.mime,image.bytes]));
     });
     return c.json({id},201);
@@ -81,10 +146,9 @@ export function issueRoutes(app: Hono, store: Store, opts: ManagementOptions) {
   app.get('/v1/platform/issues', c=>{platformActor(store,c,opts.now());return list(c)});
   app.get('/v1/platform/issues/:id', c=>{
     platformActor(store,c,opts.now());
-    const row=store.system.get<Record<string,unknown>&{logs_json:string}>('SELECT '+columns+',i.logs_json'+source+' WHERE i.id=?',[c.req.param('id')]);
-    if (!row) throw new ApiError('not_found');
-    const {logs_json,...rest}=row; return c.json({...rest,logs:JSON.parse(logs_json)});
+    return detail(c, c.req.param('id'));
   });
+  app.post('/v1/platform/issues/:id/activities', c => addActivity(c, c.req.param('id'), 'platform'));
   app.get('/v1/platform/issues/:id/images/:index', c=>{
     platformActor(store,c,opts.now());
     if (!/^[0-2]$/.test(c.req.param('index'))) throw new ApiError('not_found');

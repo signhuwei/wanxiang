@@ -37,6 +37,12 @@ try{
   await p.getByRole('button',{name:'提交',exact:true}).click()
   await p.locator('#issue-history').getByText('合成反馈：测试记录').waitFor()
   await p.locator('#issue-history').getByText(/图片 1/).waitFor()
+  await p.getByRole('button',{name:/查看动态 合成反馈/}).click()
+  await p.locator('#issue-current-status').getByText('待处理',{exact:true}).waitFor()
+  await p.getByLabel('补充回复').fill('补充复现步骤')
+  await p.getByRole('button',{name:'发送回复'}).click()
+  await p.locator('#issue-activities').getByText('补充复现步骤',{exact:true}).waitFor()
+  await p.getByRole('button',{name:'返回我的反馈'}).click()
   await p.locator('#diagnostics > summary').click()
   assert.equal(await update.getByRole('button').count(), 0)
   await p.getByRole('button', {name:'启动',exact:true}).click()
@@ -88,7 +94,8 @@ try{
     window.desktopDiagnostics=[]
     window.__TAURI__={core:{invoke:async (_, {request})=>{
       if(request.op==='diagnostics')return {ok:true,diagnostics:{desktop_version:'0.1.0-rc28',daemon_version:'0.1.0-rc27',entries:window.desktopDiagnostics}}
-      if(request.op==='issue_list')return {ok:true,issues:{items:[],next_cursor:null}}
+      if(request.op==='issue_list')return {ok:true,issues:{items:window.desktopIssue?[window.desktopIssue]:[],next_cursor:null}}
+      if(request.op==='issue_detail')return {ok:true,issues:structuredClone(window.desktopIssue)}
       if(request.op==='issue_submit'){
         window.desktopDiagnostics.unshift({at_ms:1795654805000,source:'desktop',component:'onex_desktop::bridge',level:'error',
           event:'issue_submit_failed',code:'issue_http_status',stage:'response',http_status:502})
@@ -258,7 +265,23 @@ try{
   assert.equal(await diagnostics.getByRole('listitem').count(),1)
   await diagnostics.getByLabel('级别').selectOption('')
   await diagnostics.getByLabel('筛选').fill('')
+  await workbench.evaluate(()=>{
+    window.desktopIssue={id:'iss_fixture',text:'同步测试',created_at:new Date().toISOString(),log_count:0,image_count:0,
+      status:'open',revision:1,activities:[],actions:['comment'],next_before_revision:null}
+  })
   await diagnostics.getByRole('tab',{name:'issue',exact:true}).click()
+  await diagnostics.getByRole('button',{name:'查看动态 同步测试'}).click()
+  await diagnostics.getByLabel('补充回复').fill('同步时保留这段草稿')
+  await workbench.evaluate(()=>{
+    Object.assign(window.desktopIssue,{status:'resolved',revision:2,activities:[{
+      role:'platform',revision:2,status:'resolved',text:'平台已经修复',created_at:new Date().toISOString()
+    }]})
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  await diagnostics.locator('#issue-current-status').getByText('已解决',{exact:true}).waitFor()
+  await diagnostics.locator('#issue-activities').getByText('平台已经修复',{exact:true}).waitFor()
+  assert.equal(await diagnostics.getByLabel('补充回复').inputValue(),'同步时保留这段草稿')
+  await diagnostics.getByRole('button',{name:'返回我的反馈'}).click()
   await diagnostics.locator('#issue-text').fill('保留失败的反馈草稿')
   await diagnostics.getByRole('button',{name:'提交',exact:true}).click()
   await diagnostics.getByText('反馈服务请求失败，请查看诊断日志',{exact:true}).waitFor()
