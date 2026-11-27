@@ -39,6 +39,7 @@ bun test ./desktop-ui/tests                                      # Desktop 前�
 
 - **安全边界**：上游密钥只在 onexd 内存中解密，不写日志、不进 Agent 配置；读取对话正文必写审计；计费不超发（实耗以 `lease_renew.used_milli` 为准，租户扣款不超过租约，超出部分单列待核对）。
 - **管理端 UI 规则**（来自 SIMA）：只有台账、钻取、表单三种页面；钻取时台账左缩；主表单不用弹窗和遮罩；服务端分页；按钮按 API 返回的 `actions` 显示，不在页面推导权限。
+- **管理端实时更新**：接收 WebSocket 或 SSE 消息的页面应按稳定标识局部更新受影响的区域，保留现有列表、选中项、焦点和滚动位置。后台刷新期间保留已显示的数据，并让当前点击完成后再应用可能移动列表项的更新。
 - **利旧知识，不利旧代码**：SIMA（`/Users/HHH/Code/SA/SIMA`）和 Magpie（`/Users/HHH/Code/OneX/refs/magpie`）只作参考。
 - **211 上还跑着 SIMA**（`sima.service`、`~/apps/sima`），部署 OneX 不能碰它。OneX 只用 `onex-*` systemd 单元和 18700–18702 端口。
 - 结束测试进程用保存的子进程句柄，或 `lsof -ti:<端口>` 查 PID 后单独结束。**不要用 `pkill -f onex`**，它曾误杀过整个开发环境。

@@ -12,7 +12,7 @@ function el(tag, className, text) {
 
 export function createLedger(host, {
   title,
-  columns,          // [{key, title, render?(item), width?}]
+  columns,          // [{key, title, render?(item), update?(current, next), width?}]
   fetchPage,        // async ({q, filters, cursor, limit, signal}) => {items, next_cursor, total}
   rowKey = 'id',
   filters = [],     // [{key, label, options?:[{value,label}], value}]；缺省 options 时用文本筛选
@@ -115,14 +115,52 @@ export function createLedger(host, {
     return tr
   }
 
-  function renderRows() {
-    tbody.textContent = ''
-    if (loading) {
-      tbody.appendChild(statusRow('empty', td => { td.textContent = '加载中…' }))
+  function renderCell(td, column, item, previous) {
+    if (!column.render && previous && item[column.key] === previous[column.key]) return
+    const out = column.render ? column.render(item) : item[column.key]
+    if (out instanceof Node) {
+      const current = td.firstChild
+      if (column.update && current?.nodeType === Node.ELEMENT_NODE) column.update(current, out)
+      else td.replaceChildren(out)
+    } else if (td.textContent !== String(out ?? '—') || td.childElementCount) td.textContent = out ?? '—'
+  }
+
+  function updateRow(tr, item) {
+    const canRead = onOpen && Array.isArray(item.actions) && item.actions.includes(openAction)
+    tr.classList.toggle('clickable', Boolean(canRead))
+    if (tr.dataset.key !== String(item[rowKey])) tr.dataset.key = item[rowKey]
+    const previous = tr._ledgerItem
+    tr._ledgerItem = item
+    columns.forEach((column, index) => renderCell(tr.children[index], column, item, previous))
+    if (!onOpen) return
+    const action = tr.children[columns.length]
+    if (previous && Boolean(previous.actions?.includes?.(openAction)) === Boolean(canRead)) return
+    action.replaceChildren()
+    if (canRead) action.appendChild(el('button', 'link', '查看'))
+    else if (noOpenText) action.appendChild(el('span', 'muted', noOpenText))
+  }
+
+  function createRow() {
+    const tr = el('tr')
+    for (const column of columns) tr.appendChild(el('td'))
+    if (onOpen) tr.appendChild(el('td'))
+    tr.addEventListener('click', () => {
+      const current = tr._ledgerItem
+      if (!onOpen || !current || !Array.isArray(current.actions) || !current.actions.includes(openAction)) return
+      selectedKey = current[rowKey]
+      markSelected()
+      onOpen(current)
+    })
+    return tr
+  }
+
+  function renderRows(background = false) {
+    if (loading && !background) {
+      tbody.replaceChildren(statusRow('empty', td => { td.textContent = '加载中…' }))
       return
     }
     if (loadError) {
-      tbody.appendChild(statusRow('error-row', td => {
+      tbody.replaceChildren(statusRow('error-row', td => {
         td.appendChild(el('span', null, loadError))
         td.appendChild(document.createTextNode(' '))
         const retry = el('button', 'link', '重试')
@@ -132,62 +170,78 @@ export function createLedger(host, {
       return
     }
     if (!items.length) {
-      tbody.appendChild(statusRow('empty', td => { td.textContent = emptyText }))
+      if (tbody.querySelector('td.empty')?.textContent !== emptyText) {
+        tbody.replaceChildren(statusRow('empty', td => { td.textContent = emptyText }))
+      }
       return
     }
-    for (const item of items) {
-      const canRead = onOpen && Array.isArray(item.actions) && item.actions.includes(openAction)
-      const tr = el('tr', canRead ? 'clickable' : null)
-      tr.dataset.key = item[rowKey]
-      if (selectedKey === item[rowKey]) tr.classList.add('selected')
-      for (const c of columns) {
-        const td = el('td')
-        const out = c.render ? c.render(item) : item[c.key]
-        if (out instanceof Node) td.appendChild(out)
-        else td.textContent = out ?? '—'
-        tr.appendChild(td)
-      }
-      if (onOpen) {
-        const action = el('td')
-        if (canRead) {
-          action.appendChild(el('button', 'link', '查看'))
-          tr.addEventListener('click', () => {
-            selectedKey = item[rowKey]
-            markSelected()
-            onOpen(item)
-          })
-        } else if (noOpenText) {
-          action.appendChild(el('span', 'muted', noOpenText))
-        }
-        tr.appendChild(action)
-      }
-      tbody.appendChild(tr)
+
+    if (!background) tbody.replaceChildren()
+    const existing = new Map([...tbody.querySelectorAll('tr[data-key]')].map(row => [row.dataset.key, row]))
+    const rows = items.map(item => {
+      const key = String(item[rowKey])
+      const row = existing.get(key) || createRow()
+      updateRow(row, item)
+      row.classList.toggle('selected', selectedKey === item[rowKey])
+      return row
+    })
+    const focused = tbody.contains(document.activeElement) ? document.activeElement : null
+    const keep = new Set(rows)
+    for (const row of [...tbody.children]) if (!keep.has(row)) row.remove()
+    let cursor = tbody.firstElementChild
+    for (const row of rows) {
+      if (row === cursor) cursor = cursor.nextElementSibling
+      else if (tbody.moveBefore && row.parentNode === tbody) tbody.moveBefore(row, cursor)
+      else tbody.insertBefore(row, cursor)
     }
+    if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true })
   }
 
   function markSelected() {
     for (const tr of tbody.querySelectorAll('tr')) {
-      tr.classList.toggle('selected', tr.dataset.key === selectedKey)
+      tr.classList.toggle('selected', tr._ledgerItem?.[rowKey] === selectedKey)
     }
   }
 
   function renderPager() {
     prevBtn.disabled = loading || !pager.canPrev()
     nextBtn.disabled = loading || !pager.canNext()
-    pageInfo.textContent = '第 ' + (pager.page + 1) + ' 页'
-    totalEl.textContent = '共 ' + total + ' 条'
-    countEl.textContent = total ? total + ' 条' : ''
+    const labels = [[pageInfo, '第 ' + (pager.page + 1) + ' 页'], [totalEl, '共 ' + total + ' 条'], [countEl, total ? total + ' 条' : '']]
+    for (const [node, text] of labels) if (node.textContent !== text) node.textContent = text
   }
 
-  async function load() {
+  let backgroundPending = false
+  let pointer
+  tbody.addEventListener('pointerdown', event => {
+    if (!event.isPrimary || event.button !== 0 || pointer) return
+    pointer = new AbortController()
+    const release = e => {
+      if (e.type !== 'blur' && e.pointerId !== event.pointerId) return
+      pointer?.abort()
+      // Keep the guard through the click dispatched after pointerup.
+      setTimeout(() => { pointer = null; flushBackground() }, 0)
+    }
+    for (const name of ['pointerup', 'pointercancel', 'blur']) {
+      window.addEventListener(name, release, { capture: true, signal: pointer.signal })
+    }
+  })
+  function flushBackground() {
+    if (!backgroundPending || loading || pointer || routeSignal?.aborted || !host.isConnected) return
+    backgroundPending = false
+    void load(true)
+  }
+
+  async function load(background = false) {
     if (routeSignal?.aborted) return
     if (abort) abort.abort()
     const ctrl = new AbortController()
     abort = ctrl
     loading = true
-    loadError = null
-    renderRows()
-    renderPager()
+    if (!background) {
+      loadError = null
+      renderRows()
+      renderPager()
+    }
     try {
       const data = await fetchPage({
         q,
@@ -197,15 +251,25 @@ export function createLedger(host, {
         signal: ctrl.signal
       })
       if (ctrl.signal.aborted) return
+      if (background && pointer) {
+        backgroundPending = true
+        return
+      }
       if (createBtn && createAction) {
         createBtn.hidden = !(Array.isArray(data.actions) && data.actions.includes(createAction))
       }
+      loadError = null
       items = data.items || []
       total = data.total ?? items.length
       pager.applyResult(data.next_cursor ?? null)
+      if (background) {
+        loading = false
+        renderRows(true)
+        renderPager()
+      }
     } catch (e) {
       if (e && e.name === 'AbortError') return
-      if (ctrl.signal.aborted) return
+      if (ctrl.signal.aborted || background) return
       if (createBtn && createAction) createBtn.hidden = true
       items = []
       total = 0
@@ -214,8 +278,8 @@ export function createLedger(host, {
       if (abort === ctrl) {
         loading = false
         abort = null
-        renderRows()
-        renderPager()
+        if (!background && !ctrl.signal.aborted) { renderRows(); renderPager() }
+        flushBackground()
       }
     }
   }
@@ -245,6 +309,7 @@ export function createLedger(host, {
   routeSignal?.addEventListener('abort', () => {
     clearTimeout(debounceTimer)
     abort?.abort()
+    pointer?.abort()
   }, { once: true })
   prevBtn.addEventListener('click', () => { if (pager.prev()) load() })
   nextBtn.addEventListener('click', () => { if (pager.next()) load() })
@@ -252,7 +317,8 @@ export function createLedger(host, {
   load()
 
   return {
-    reload: load,
+    reload: () => load(),
+    reloadInBackground() { backgroundPending = true; flushBackground() },
     restoreScroll(top) { scroll.scrollTop = top },
     refresh,
     setSelected(key) {

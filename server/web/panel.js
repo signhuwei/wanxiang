@@ -15,26 +15,38 @@ export function button(text, fn, cls) {
 }
 
 // 同级选择替换右栏，嵌套台账可以在自己的 host 上另开一层。
-export function detailPanel(host, ledger = () => null) {
-  let active, dirty = false
+export function detailPanel(host, ledger = () => null, { live = false } = {}) {
+  let active, dirty = false, replacing = false
   return (title, draw) => {
     const list = ledger(), snap = list?.suspend()
-    if (active) active.close()
+    if (active) {
+      replacing = true
+      active.close()
+      replacing = false
+    }
     const controller = new AbortController()
     active = openDrill(host, { title, onClose() {
       controller.abort()
       active = null
-      if (list && snap) {
-        list.resume(snap)
-        if (dirty) list.reload().then(() => list.restoreScroll(snap.scrollTop))
+      if (!replacing && list && snap) {
+        if (live) {
+          if (dirty) list.reloadInBackground()
+        } else {
+          list.resume(snap)
+          if (dirty) list.reload().then(() => list.restoreScroll(snap.scrollTop))
+        }
       }
-      dirty = false
+      if (!replacing) dirty = false
     }, render(pane) {
       const tools = { ...pane, signal: controller.signal, changed: () => { dirty = true } }
       Promise.resolve(draw(tools)).catch(e => {
         if (!controller.signal.aborted) pane.body.replaceChildren(el('p', 'error-row', e.message))
       })
     } })
+    if (list && snap) list.restoreScroll(snap.scrollTop)
+    if (document.activeElement === document.body) {
+      active.pane.querySelector('.inline-head .back').focus({ preventScroll: true })
+    }
   }
 }
 

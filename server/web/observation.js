@@ -57,6 +57,13 @@ function eventRow(e) {
 function compactCell(title,stats) {
   const cell=el('div','observe-identity');cell.append(el('span',null,title),el('small','observe-stats',stats));return cell
 }
+function updateCompactCell(current, next) {
+  for (let i = 0; i < next.children.length; i++) {
+    if (current.children[i].textContent !== next.children[i].textContent) {
+      current.children[i].textContent = next.children[i].textContent
+    }
+  }
+}
 const monthCost=p=>p.month_cost_milli == null ? '未提供' : formatMilli(p.month_cost_milli)+' 块橡皮'
 const turns=s=>s.turn_count == null ? '轮数未提供' : s.turn_count+' 轮'
 function usageText(s) {
@@ -134,36 +141,38 @@ export async function observePage(host,api,session,signal) {
   host.classList.add('page')
   const status=el('div','observe-status'), peopleHost=el('div','page'); host.append(status,peopleHost)
   let first, sessions, reading, timer
+  let refreshAll = false
+  const affectedUsers = new Set()
   try { first=await api.get('/observe/people',{params:{limit:50},signal}) }
   catch(e) {if(!signal.aborted)status.textContent=e.message;return}
   if(signal.aborted) return
   const live=el('span','muted')
   status.append(live)
-  const openPerson=detailPanel(peopleHost,()=>people)
+  const openPerson=detailPanel(peopleHost,()=>people,{live:true})
   function quotaCell(p) {
     if (p.quota_milli===undefined || p.month_used_milli===undefined) return null
     const level=quotaUsageLevel(p.month_used_milli,p.quota_milli)
     if (level!=='error') return null
     return el('span','status error',formatQuotaUsage(p.month_used_milli,p.quota_milli)+' · 已达配额')
   }
-  const people=createLedger(peopleHost,{title:'监察人员',rowKey:'user_id',columns:[{key:'name',title:'人员',render:p=>compactCell(p.name+' · '+formatDateTime(p.last_active_at),`${p.session_count} 个会话 · 本月 ${monthCost(p)}`)},
+  const people=createLedger(peopleHost,{title:'监察人员',rowKey:'user_id',columns:[{key:'name',title:'人员',render:p=>compactCell(p.name+' · '+formatDateTime(p.last_active_at),`${p.session_count} 个会话 · 本月 ${monthCost(p)}`),update:updateCompactCell},
     {key:'last_agent',title:'Agent',render:p=>p.last_agent ? agentLabel(p.last_agent) : '—'},{key:'session_count',title:'会话数'},
-    {key:'month_cost_milli',title:'本月费用',render:monthCost},{key:'quota',title:'配额',render:p=>quotaCell(p) || '—'},
+    {key:'month_cost_milli',title:'本月费用',render:monthCost},{key:'quota',title:'配额',render:p=>quotaCell(p) || '—',update:(current,next)=>{if(current.textContent!==next.textContent)current.textContent=next.textContent}},
     {key:'last_active_at',title:'最近活动',render:p=>formatDateTime(p.last_active_at)}],
     fetchPage:({q,cursor,limit})=>{if(first&&!q&&!cursor){const data=first;first=null;return data}return api.get('/observe/people',{params:{q,cursor,limit},signal})},
     onOpen:p=>openPerson(p.name,pane=>{
       pane.body.classList.add('child-ledger'); reading=null
       let list
-      const open=detailPanel(pane.body,()=>list)
-      sessions={host:pane.body,list:list=createLedger(pane.body,{title:'会话',rowKey:'id',openAction:'read_content',noOpenText:'无正文查看权限，可请户主开放',
+      const open=detailPanel(pane.body,()=>list,{live:true})
+      sessions={host:pane.body,userId:p.user_id,list:list=createLedger(pane.body,{title:'会话',rowKey:'id',signal:pane.signal,openAction:'read_content',noOpenText:'无正文查看权限，可请户主开放',
         filters:[{key:'agent',label:'Agent',options:[{value:'',label:'全部 Agent'},...AGENT_OPTIONS]}],
-        columns:[{key:'agent',title:'Agent',render:s=>agentLabel(s.agent)},{key:'started_at',title:'开始时间 ↓',render:s=>compactCell(formatDateTime(s.started_at),`${turns(s)} · ${formatMilli(s.cost_milli)} 块橡皮`)},{key:'model',title:'模型'},
+        columns:[{key:'agent',title:'Agent',render:s=>agentLabel(s.agent)},{key:'started_at',title:'开始时间 ↓',render:s=>compactCell(formatDateTime(s.started_at),`${turns(s)} · ${formatMilli(s.cost_milli)} 块橡皮`),update:updateCompactCell},{key:'model',title:'模型'},
         {key:'turn_count',title:'轮数',render:turns},{key:'input_tokens',title:'输入 token'},{key:'output_tokens',title:'输出 token'},{key:'cost_milli',title:'橡皮',render:s=>formatMilli(s.cost_milli)}],
         fetchPage:async ({q,filters,cursor,limit,signal:listSignal})=>{
           const data=await api.get('/observe/sessions',{params:{user_id:p.user_id,agent:filters.agent,q,cursor,limit},signal:listSignal})
           if (!listSignal.aborted && reading?.node.isConnected) {
             const row=data.items.find(s=>s.id===reading.id)
-            if (row) reading.summary.textContent=usageText(row)
+            if (row && reading.summary.textContent !== usageText(row)) reading.summary.textContent=usageText(row)
           }
           return data
         },
@@ -194,7 +203,19 @@ export async function observePage(host,api,session,signal) {
     })})
   function refresh(summary) {
     if(reading?.node.isConnected && (!summary.session_id || summary.session_id===reading.id)) reading.load()
-    if (!timer) timer=setTimeout(()=>{timer=null;if(!signal.aborted){people.reload();if(sessions?.host.isConnected)sessions.list.reload()}},200)
+    if (summary.user_id) affectedUsers.add(summary.user_id)
+    else refreshAll = true
+    if (timer) return
+    timer = setTimeout(() => {
+      timer = null
+      if (signal.aborted) return
+      people.reloadInBackground()
+      if (sessions?.host.isConnected && (refreshAll || affectedUsers.has(sessions.userId))) {
+        sessions.list.reloadInBackground()
+      }
+      affectedUsers.clear()
+      refreshAll = false
+    }, 200)
   }
   let retry
   async function connect() {
