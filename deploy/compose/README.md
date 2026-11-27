@@ -21,6 +21,8 @@ bash bootstrap.sh /secure/server-release.pub
 
 脚本在目标机生成业务运行密钥和 `age` 身份，并输出该环境的 `age` 公钥。保存这个公钥用于后续打包。重复执行首装脚本使用已有服务容器和密钥。实验环境可以在调用前指定独立项目名与监听地址，例如 `ONEX_PROJECT_NAME=onex-drill ONEX_HOST_BIND=127.0.0.1 bash bootstrap.sh /secure/server-release.pub`。
 
+需要在保留卷的情况下重建服务时，仍用 `bootstrap.sh`。它会核对维护卷记录的生效镜像 ID 并启动该镜像。若脚本报告发布中断，先用同一 Compose 项目启动 `valkey rustfs release-worker`，由执行器完成恢复，再运行首装脚本。
+
 默认将容器 `18700` 映射至 macOS 宿主机 `18700`。生产入口通过 TLS 转发 HTTP 和 WebSocket 至这个端口。外部反代须实际验证到宿主机端口的连通性，并支持 Server 发布制品的上传大小与耗时。
 
 | 卷 | 挂载 |

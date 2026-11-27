@@ -42,8 +42,16 @@ bundle=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
   compose=(docker compose --env-file deployment.env -f compose.yaml)
   docker image load --input images.tar.gz </dev/null >&2
-  recipient=$(printf '%s\n' "$public_key_pem" | "${compose[@]}" --profile bootstrap run --rm -T --no-deps config-init)
+  initialized=$(printf '%s\n' "$public_key_pem" | "${compose[@]}" --profile bootstrap run --rm -T --no-deps config-init)
+  recipient=${initialized%%$'\n'*}
   [[ $recipient =~ ^age1[0-9a-z]{58}$ ]] || fail 'Bootstrap did not return a Server release encryption recipient.'
+  if [[ $initialized == *$'\n'* ]]; then
+    active_image=${initialized#*$'\n'}
+    [[ $active_image =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'Bootstrap returned an invalid active Server image ID.'
+    loaded_image=$(docker image inspect --format '{{.Id}}' "$active_image") || fail "Promoted Server image is missing: $active_image"
+    [[ $loaded_image == "$active_image" ]] || fail 'Promoted Server image ID does not match the local image.'
+    export ONEX_SERVER_IMAGE=$active_image
+  fi
   "${compose[@]}" up -d --no-recreate valkey rustfs server release-worker </dev/null >&2
   printf '%s\n' "$recipient"
 )

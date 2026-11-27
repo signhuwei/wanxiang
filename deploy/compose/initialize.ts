@@ -1,11 +1,13 @@
 import { createPublicKey, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, linkSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { imageIdPattern } from '../../server/src/release-package';
 
 const serverSecrets = '/run/onex-server-secrets';
 const objectSecrets = '/run/onex-object-secrets';
 const releaseTrust = '/run/onex-release-trust';
 const releaseIdentity = '/run/onex-release-identity';
+const maintenance = '/run/onex-maintenance';
 
 function signingPublicKey(value: string) {
   const pem = value.trim();
@@ -43,6 +45,17 @@ function ensureSecret(path: string, encoding: 'base64' | 'hex') {
 }
 
 const signingKey = signingPublicKey(await Bun.stdin.text());
+if (['.rollout-maintenance', '.docker-rollout.json'].some(name => lstatSync(join(maintenance, name), { throwIfNoEntry: false }))) {
+  throw new Error('A Server rollout requires recovery. Start valkey, rustfs and release-worker without Server, then retry bootstrap.');
+}
+const activePath = join(maintenance, 'active-image');
+const activeFile = lstatSync(activePath, { throwIfNoEntry: false });
+let activeImage: string | undefined;
+if (activeFile) {
+  if (!activeFile.isFile()) throw new Error('Expected active-image to be a regular file');
+  activeImage = readFileSync(activePath, 'utf8').replace(/\n$/, '');
+  if (!imageIdPattern.test(activeImage)) throw new Error('Invalid active Server image ID');
+}
 for (const directory of [serverSecrets, objectSecrets, releaseTrust, releaseIdentity]) {
   if (!lstatSync(directory).isDirectory()) throw new Error(`Expected a key directory at ${directory}`);
   chmodSync(directory, 0o700);
@@ -73,4 +86,4 @@ const recipient = result.stdout.toString().trim();
 if (!result.success || !/^age1[0-9a-z]{58}$/.test(recipient)) {
   throw new Error('Could not read the Server release encryption recipient');
 }
-console.log(recipient);
+console.log(activeImage ? `${recipient}\n${activeImage}` : recipient);

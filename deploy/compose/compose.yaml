@@ -117,6 +117,7 @@ services:
       - object-secrets:/run/onex-object-secrets
       - release-trust:/run/onex-release-trust
       - release-identity:/run/onex-release-identity
+      - maintenance:/run/onex-maintenance:ro
 
 volumes:
   server-data:
