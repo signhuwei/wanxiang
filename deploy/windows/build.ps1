@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [string] $ServerOrigin,
+    [string] $ServerOrigin = $env:ONEX_PUBLIC_ORIGIN,
 
     [ValidateLength(1, 64)]
     [ValidateScript({
@@ -25,7 +24,7 @@ if ($env:OS -ne 'Windows_NT') {
 if (-not [Uri]::TryCreate($ServerOrigin, [UriKind]::Absolute, [ref] $origin) -or
     $origin.Scheme -notin @('http', 'https') -or $origin.UserInfo -or
     $origin.AbsolutePath -ne '/' -or $origin.Query -or $origin.Fragment) {
-    throw 'ServerOrigin must be an HTTP or HTTPS origin with no credentials, path, or query.'
+    throw 'Set ONEX_PUBLIC_ORIGIN or pass -ServerOrigin as an HTTP or HTTPS origin with no credentials, path, or query.'
 }
 
 function Invoke-Checked {

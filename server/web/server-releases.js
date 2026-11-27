@@ -61,6 +61,7 @@ export function serverReleasesPage(host, api, signal) {
         const data = el('div', 'kv')
         data.append(field('提交', record.commit), field('SHA-256', record.sha256), field('大小', formatBytes(record.size)),
           field('制品', record.uploaded_at ? '已校验' : '等待上传'), field('上传时间', formatDateTime(record.uploaded_at)))
+        if (record.format) data.append(field('制品格式', record.format), field('目标平台', record.platform))
         if (record.last_rollout) {
           const job = record.last_rollout
           data.append(field('最近部署', state[job.status]), field('任务 ID', job.id), field('检测到的版本', job.observed_commit))
@@ -105,7 +106,9 @@ export function serverReleasesPage(host, api, signal) {
         }
       }
       function upload(record) {
-        const archive = fileField('Server 制品（.tar.gz）', '.gz,application/gzip')
+        const archive = record.format
+          ? fileField('加密 Server 制品（.tar.gz.age）', '.age')
+          : fileField('Server 制品（.tar.gz）', '.gz,application/gzip')
         const send = button('上传并校验', async () => {
           if (!archive.input.files?.[0]) return showError(new Error('请选择 Server 制品'))
           await sendFile(record, archive.input.files[0], send)
@@ -134,7 +137,7 @@ export function serverReleasesPage(host, api, signal) {
         return
       }
       const manifest = fileField('签名清单（.json）', '.json,application/json')
-      const archive = fileField('Server 制品（.tar.gz）', '.gz,application/gzip')
+      const archive = fileField('Server 制品（.tar.gz 或 .tar.gz.age）', '.gz,.age,application/gzip')
       const send = button('上传并校验', async () => {
         const metadata = manifest.input.files?.[0]
         const file = archive.input.files?.[0]

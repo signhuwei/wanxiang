@@ -2,7 +2,14 @@
 
 在 Windows PowerShell 中执行。构建端使用 Git、Rust MSVC、Bun 1.4.5 和 Tauri CLI 2.10.0。构建脚本按 [deploy/bun-version](../bun-version) 检查 Bun，使用 mise 时在仓库根目录运行 `mise install`。按 Tauri 指南准备 Microsoft C++ Build Tools 的「使用 C++ 的桌面开发」工作负载及 WebView2。 [Tauri Windows 前置条件](https://v2.tauri.app/start/prerequisites/#windows)
 
-在已拉取的候选提交根目录运行以下命令。内测 Server 地址和发行版本号按本次发布填写。
+在已拉取的候选提交根目录运行以下命令。将 `ONEX_PUBLIC_ORIGIN` 设为本次发布的公共地址。
+
+```powershell
+$env:ONEX_PUBLIC_ORIGIN = 'https://x.onc-ai.com'
+.\deploy\windows\build.ps1 -Version '0.1.0-rc20'
+```
+
+内测时可以用 `-ServerOrigin` 覆盖环境变量。
 
 ```powershell
 .\deploy\windows\build.ps1 -ServerOrigin 'http://192.168.3.211:18700' -Version '0.1.0-rc20'

@@ -1,0 +1,129 @@
+name: ${ONEX_PROJECT_NAME:-onex}
+
+services:
+  server:
+    image: ${ONEX_SERVER_IMAGE:?set ONEX_SERVER_IMAGE}
+    pull_policy: never
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs: [/tmp]
+    ports:
+      - "${ONEX_HOST_BIND:-0.0.0.0}:${ONEX_HOST_PORT:-18700}:18700"
+    environment:
+      NODE_ENV: ${ONEX_NODE_ENV:-production}
+      ONEX_PUBLIC_ORIGIN: ${ONEX_PUBLIC_ORIGIN:?set ONEX_PUBLIC_ORIGIN}
+      ONEX_HOST: 0.0.0.0
+      ONEX_PORT: "18700"
+      ONEX_DATA_DIR: /data/server
+      ONEX_ROUTE_POOL_DEVICES: ${ONEX_ROUTE_POOL_DEVICES:-}
+      ONEX_VALKEY_URL: redis://valkey:6379
+      ONEX_RUSTFS_ENDPOINT: http://rustfs:9000
+      ONEX_RUSTFS_ACCESS_KEY: onex-sidecar
+      ONEX_RELEASE_FORMAT: docker-archive-age-v1
+      ONEX_RELEASE_PUBLIC_KEY: /run/onex-release-trust/server-release.pub
+      ONEX_RELEASE_HEARTBEAT: /data/server/maintenance/release-worker-heartbeat
+      ONEX_RELEASE_MAINTENANCE_FILE: /data/server/maintenance/.rollout-maintenance
+    volumes:
+      - server-data:/data/server
+      - maintenance:/data/server/maintenance
+      - server-secrets:/run/onex-server-secrets:ro
+      - object-secrets:/run/onex-object-secrets:ro
+      - release-trust:/run/onex-release-trust:ro
+    healthcheck:
+      test: [CMD, curl, -fsS, --max-time, "3", http://127.0.0.1:18700/v1/healthz]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+    depends_on:
+      valkey:
+        condition: service_healthy
+      rustfs:
+        condition: service_started
+
+  valkey:
+    image: ${ONEX_VALKEY_IMAGE:-valkey/valkey:8.1.5}
+    pull_policy: never
+    restart: unless-stopped
+    command: [valkey-server, --appendonly, "yes", --dir, /data]
+    volumes: [valkey-data:/data]
+    healthcheck:
+      test: [CMD, valkey-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  rustfs:
+    image: ${ONEX_RUSTFS_IMAGE:-rustfs/rustfs:1.0.6}
+    pull_policy: never
+    restart: unless-stopped
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        RUSTFS_SECRET_KEY=$$(cat /run/onex-object-secrets/rustfs.key)
+        test -n "$$RUSTFS_SECRET_KEY"
+        export RUSTFS_SECRET_KEY
+        exec rustfs /data
+    environment:
+      RUSTFS_ACCESS_KEY: onex-sidecar
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ENABLE: "false"
+    volumes:
+      - rustfs-data:/data
+      - object-secrets:/run/onex-object-secrets:ro
+
+  release-worker:
+    image: ${ONEX_WORKER_IMAGE:?set ONEX_WORKER_IMAGE}
+    pull_policy: never
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:mode=0700,size=536870912
+    environment:
+      DOCKER_CONFIG: /tmp/docker-config
+      ONEX_PROJECT_NAME: ${COMPOSE_PROJECT_NAME}
+      ONEX_SERVER_IMAGE: ${ONEX_SERVER_IMAGE:?set ONEX_SERVER_IMAGE}
+      ONEX_WORKER_IMAGE: ${ONEX_WORKER_IMAGE:?set ONEX_WORKER_IMAGE}
+      ONEX_PUBLIC_ORIGIN: ${ONEX_PUBLIC_ORIGIN:?set ONEX_PUBLIC_ORIGIN}
+      ONEX_HOST_BIND: ${ONEX_HOST_BIND:-0.0.0.0}
+      ONEX_HOST_PORT: ${ONEX_HOST_PORT:-18700}
+      ONEX_NODE_ENV: ${ONEX_NODE_ENV:-production}
+      ONEX_ROUTE_POOL_DEVICES: ${ONEX_ROUTE_POOL_DEVICES:-}
+      ONEX_VALKEY_IMAGE: ${ONEX_VALKEY_IMAGE:-valkey/valkey:8.1.5}
+      ONEX_RUSTFS_IMAGE: ${ONEX_RUSTFS_IMAGE:-rustfs/rustfs:1.0.6}
+      ONEX_RELEASE_PUBLIC_KEY: /run/onex-release-trust/server-release.pub
+      ONEX_RELEASE_DECRYPTION_KEY_FILE: /run/onex-release-identity/age.key
+      ONEX_RELEASE_HEARTBEAT: /data/server/maintenance/release-worker-heartbeat
+      ONEX_RELEASE_MAINTENANCE_FILE: /data/server/maintenance/.rollout-maintenance
+    volumes:
+      - server-data:/data/server
+      - maintenance:/data/server/maintenance
+      - release-trust:/run/onex-release-trust:ro
+      - release-identity:/run/onex-release-identity:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  config-init:
+    image: ${ONEX_WORKER_IMAGE:?set ONEX_WORKER_IMAGE}
+    pull_policy: never
+    profiles: [bootstrap]
+    network_mode: none
+    entrypoint: [bun, --no-env-file, /opt/onex/deploy/compose/initialize.ts]
+    volumes:
+      - server-secrets:/run/onex-server-secrets
+      - object-secrets:/run/onex-object-secrets
+      - release-trust:/run/onex-release-trust
+      - release-identity:/run/onex-release-identity
+
+volumes:
+  server-data:
+  maintenance:
+  valkey-data:
+  rustfs-data:
+  server-secrets:
+  object-secrets:
+  release-trust:
+  release-identity:

@@ -1,5 +1,7 @@
 # OneX MVP deployment
 
+For the ARM64 Docker Compose installation with encrypted image uploads, see [Docker deployment and releases](compose/README.md).
+
 Run these commands from the checkout root. The non-root dependency installer supports macOS arm64 and Ubuntu 22.04 x86_64. It verifies pinned SHA-256 checksums before extraction. Valkey uses the official Jammy binary on Linux and builds the official source with `make` and Xcode command-line tools on macOS. RustFS uses the Linux musl build. The runtime needs `bash`, `curl`, `tar`, `unzip` and a SHA-256 tool; macOS needs `make` and the Xcode CLI tools.
 
 ## Local verification (macOS)

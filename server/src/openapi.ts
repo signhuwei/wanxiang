@@ -3,7 +3,7 @@ import { personalLoginTokenPattern } from './credentials';
 import { INPUT_MULTIPLIER_BASIS } from './input-multiplier';
 import { observedAgents } from './observe';
 import { quoteDimensions } from './procurement';
-import { commitPattern, digestPattern, MAX_RELEASE_BYTES } from './release-package';
+import { commitPattern, digestPattern, DOCKER_RELEASE_FORMAT, DOCKER_RELEASE_PLATFORM, imageIdPattern, MAX_RELEASE_BYTES } from './release-package';
 import toolTargetCatalog from './tool-targets.json';
 
 const text = { type: 'string' };
@@ -62,14 +62,27 @@ const commitId = { ...text, pattern: commitPattern.source };
 const releaseDigest = { ...text, pattern: digestPattern.source };
 const releaseSize = { type: 'integer', minimum: 1, maximum: MAX_RELEASE_BYTES };
 const commitPath = { name: 'commit', in: 'path', required: true, schema: commitId };
-const releaseManifest = object({ commit: commitId, sha256: releaseDigest, size: releaseSize,
-  signature: { ...text, pattern: '^[A-Za-z0-9_-]{86}$' } });
+const releaseManifestFields = { commit: commitId, sha256: releaseDigest, size: releaseSize,
+  signature: { ...text, pattern: '^[A-Za-z0-9_-]{86}$' } };
+const dockerReleaseFormat = { ...text, enum: [DOCKER_RELEASE_FORMAT] };
+const dockerReleaseFields = {
+  format: dockerReleaseFormat,
+  platform: { ...text, enum: [DOCKER_RELEASE_PLATFORM] },
+  image_id: { ...text, pattern: imageIdPattern.source },
+};
+const absentReleaseField = { type: 'null' };
+const releaseManifest = { oneOf: [
+  object({ ...releaseManifestFields, format: absentReleaseField, platform: absentReleaseField, image_id: absentReleaseField },
+    Object.keys(releaseManifestFields)),
+  object({ ...releaseManifestFields, ...dockerReleaseFields }),
+] };
 const rollout = object({ id: text, commit: commitId, expected_commit: commitId, observed_commit: nullableText, actor_id: text,
   status: { type: 'string', enum: ['queued', 'running', 'succeeded', 'failed'] },
   error_code: nullableText, created_at: timestamp, started_at: nullableTimestamp, finished_at: nullableTimestamp });
 const optionalRollout = { anyOf: [rollout, { type: 'null' }] };
-const serverRelease = object({ id: commitId, commit: commitId, size: releaseSize, sha256: releaseDigest, created_at: timestamp,
-  uploaded_at: nullableTimestamp, active: { type: 'boolean' }, last_rollout: optionalRollout, actions });
+const serverReleaseFields = { id: commitId, commit: commitId, size: releaseSize, sha256: releaseDigest, created_at: timestamp,
+  uploaded_at: nullableTimestamp, active: boolean, last_rollout: optionalRollout, actions };
+const serverRelease = object({ ...serverReleaseFields, ...dockerReleaseFields }, Object.keys(serverReleaseFields));
 const desktopOs = { type: 'string', enum: ['darwin', 'windows'] };
 const desktopArch = { type: 'string', enum: ['arm64', 'x64'] };
 const desktopUpdate = object({ id: text, version: text, os: desktopOs, arch: desktopArch, size: releaseSize,
@@ -968,12 +981,13 @@ export const openapi = {
         202: response('相同调用仍在执行', searchReply), 404: error('发行或活动会话不匹配'),
         413: error('请求体超限'), 502: response('搜索未完成且没有扣费', searchReply) } } },
     '/v1/platform/maintenance': { get: { ...detailOf(object({ active_commit: text, runner_ready: { type: 'boolean' },
-      active_rollout: optionalRollout, actions }), false), summary: '平台维护状态' } },
+      active_rollout: optionalRollout, actions, release_format: dockerReleaseFormat },
+    ['active_commit', 'runner_ready', 'active_rollout', 'actions']), false), summary: '平台维护状态' } },
     '/v1/platform/server-releases': { get: listOf(serverRelease), post: { summary: '登记签名的 Server 发布包',
       security: bearer, requestBody: requestBody(releaseManifest), responses: { ...status, 200: response('既有发布', serverRelease),
         201: response('已登记', serverRelease) } } },
     '/v1/platform/server-releases/{commit}': { get: { ...detailOf(serverRelease, false), parameters: [commitPath] } },
-    '/v1/platform/server-releases/{commit}/artifact': { put: { summary: '上传签名清单对应的 tar.gz',
+    '/v1/platform/server-releases/{commit}/artifact': { put: { summary: '上传签名清单对应的制品',
       security: bearer, parameters: [commitPath],
       requestBody: { required: true, content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
       responses: { ...status, 200: response('大小与摘要通过校验', serverRelease), 404: error('对象不存在'), 413: error('文件超限') } } },

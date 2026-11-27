@@ -3,6 +3,7 @@ set -euo pipefail
 
 usage() {
   echo 'Usage: package.sh <OneX Desktop.app> <onex> <onexd> <server-origin> <output.pkg> [--release] [--preserve-daemon]' >&2
+  echo 'Pass an empty server-origin to use ONEX_PUBLIC_ORIGIN.' >&2
   exit 2
 }
 [[ $# -ge 5 && $# -le 7 ]] || usage
@@ -12,7 +13,8 @@ usage() {
 app=$1
 cli=$2
 daemon=$3
-origin=${4%/}
+origin=${4:-${ONEX_PUBLIC_ORIGIN:-}}
+origin=${origin%/}
 output=$5
 release=0
 preserve_daemon=0

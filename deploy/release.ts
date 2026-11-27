@@ -1,7 +1,7 @@
 import { createHash, createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import { createReadStream, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { commitPattern, isManifest, signManifest, type ServerManifest } from '../server/src/release-package';
+import { commitPattern, isDockerManifest, isManifest, signManifest, type ServerManifest } from '../server/src/release-package';
 import { desktopUpdateBytes, desktopUpdateKind } from '../server/src/desktop-update-signature';
 
 process.umask(0o077);
@@ -66,7 +66,7 @@ async function packServer(output: string, revision = 'HEAD') {
 class RequestError extends Error {
   constructor(readonly status: number, readonly code: string) { super(`HTTP ${status}: ${code}`); }
 }
-async function connect(origin: string) {
+async function connect(origin: string, artifactTimeoutMs = 130_000) {
   const base = new URL(origin);
   if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.pathname !== '/' || base.search || base.hash) {
     throw new Error('Use the OneX base URL');
@@ -79,7 +79,8 @@ async function connect(origin: string) {
     if (body) headers.set('Content-Type', body instanceof Blob ? 'application/octet-stream' : 'application/json');
     if (key) headers.set('Idempotency-Key', key);
     const response = await fetch(new URL('/v1' + path, base), { method, headers, redirect: 'error',
-      body: body instanceof Blob ? body : body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(body instanceof Blob ? 130_000 : 8_000) });
+      body: body instanceof Blob ? body : body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(body instanceof Blob ? artifactTimeoutMs : 8_000) });
     const value = await response.json().catch(() => null) as any;
     if (!response.ok) throw new RequestError(response.status, value?.error?.detail?.reason || value?.error?.code || 'request_failed');
     return value;
@@ -123,7 +124,7 @@ async function waitForRollout(api: Request, id: string) {
 
 async function publishServer(origin: string, manifestPath: string, archive: string) {
   const manifest = await verifyBundle(manifestPath, archive);
-  const api = await connect(origin);
+  const api = await connect(origin, isDockerManifest(manifest) ? 600_000 : undefined);
   const base = '/platform/server-releases';
   const maintenance = await api('/platform/maintenance');
   const expected_commit = process.env.ONEX_EXPECTED_COMMIT ?? maintenance.active_commit;

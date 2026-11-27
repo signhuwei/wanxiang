@@ -25,6 +25,10 @@
 
     "@duckdb/node-bindings-darwin-x64": ["@duckdb/node-bindings-darwin-x64@2.0.1-r.1", "https://registry.npmmirror.com/@duckdb/node-bindings-darwin-x64/-/node-bindings-darwin-x64-2.0.1-r.1.tgz", { "os": "darwin", "cpu": "x64" }, "sha512-aEHIDa/isgQLUzkxAbgOhsu4oE8IunLzBS+/90Jnxab892FQ1HJa+AcXTaoWrDZLPfhOA+HKniN68QK6ioZ1wA=="],
 
+    "@duckdb/node-bindings-linux-arm64": ["@duckdb/node-bindings-linux-arm64@2.0.1-r.1", "https://registry.npmjs.org/@duckdb/node-bindings-linux-arm64/-/node-bindings-linux-arm64-2.0.1-r.1.tgz", { "os": "linux", "cpu": "arm64" }, "sha512-nJv2mDZo3BsGhEo/q+F4gh5Icc6ch3tYo8DvgNJNLPEiwiK8qvMds23uZG7i78uUV3n5VUxch1I0VqYsa/8ezQ=="],
+
+    "@duckdb/node-bindings-linux-arm64-musl": ["@duckdb/node-bindings-linux-arm64-musl@2.0.1-r.1", "https://registry.npmjs.org/@duckdb/node-bindings-linux-arm64-musl/-/node-bindings-linux-arm64-musl-2.0.1-r.1.tgz", { "os": "linux", "cpu": "arm64" }, "sha512-b4Lo5+ioDQDq+SghRTusUzAZh8FP1yM60Boe61Re0ffibhFGsh7tuIWiTuoARTDAH7uof3Yy4NYD1GCw/dpjPw=="],
+
     "@duckdb/node-bindings-linux-x64": ["@duckdb/node-bindings-linux-x64@2.0.1-r.1", "https://registry.npmmirror.com/@duckdb/node-bindings-linux-x64/-/node-bindings-linux-x64-2.0.1-r.1.tgz", { "os": "linux", "cpu": "x64" }, "sha512-BTVwKGQ1Np/CkOhNq5VNDJRJHKC6+XgVJ23wqjxviHDGdkeFmnfdCs6OzUADQ42BTKhnBzh+5bKQX1lB0gbo9A=="],
 
     "@duckdb/node-bindings-linux-x64-musl": ["@duckdb/node-bindings-linux-x64-musl@2.0.1-r.1", "https://registry.npmmirror.com/@duckdb/node-bindings-linux-x64-musl/-/node-bindings-linux-x64-musl-2.0.1-r.1.tgz", { "os": "linux", "cpu": "x64" }, "sha512-PiEMFB3c3cH7Y1SwkTF749M/bOlzhBP/xlc/QwaHgKJPstNEfSWe8S3Q0XQrlbcYxokJJG83g3Q8EQVjnmbtkg=="],

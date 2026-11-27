@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import type { ServerManifest } from './release-package';
+import { DOCKER_RELEASE_FORMAT, type ServerManifest, type ServerReleaseFormat } from './release-package';
 
 export type ServerRelease = ServerManifest & { uploaded_at: string | null; created_at: string; created_by: string };
 export type Rollout = {
@@ -12,7 +12,12 @@ export type Rollout = {
 
 export function releasePaths(dataDir: string) {
   const dir = join(dataDir, 'maintenance');
-  return { dir, database: join(dir, 'releases.sqlite'), artifact: (commit: string) => join(dir, `${commit}.tar.gz`) };
+  return {
+    dir,
+    database: join(dir, 'releases.sqlite'),
+    artifact: (commit: string, format?: ServerReleaseFormat | null) =>
+      join(dir, format === DOCKER_RELEASE_FORMAT ? `${commit}.tar.gz.age` : `${commit}.tar.gz`),
+  };
 }
 
 export function openReleaseStore(dataDir: string) {
@@ -25,7 +30,8 @@ export function openReleaseStore(dataDir: string) {
     PRAGMA foreign_keys = ON;
     CREATE TABLE IF NOT EXISTS server_releases (
       "commit" TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL, signature TEXT NOT NULL,
-      created_at TEXT NOT NULL, created_by TEXT NOT NULL, uploaded_at TEXT
+      created_at TEXT NOT NULL, created_by TEXT NOT NULL, uploaded_at TEXT,
+      format TEXT, platform TEXT, image_id TEXT
     );
     CREATE TABLE IF NOT EXISTS server_rollouts (
       id TEXT PRIMARY KEY, "commit" TEXT NOT NULL REFERENCES server_releases("commit"), expected_commit TEXT NOT NULL,
@@ -38,6 +44,17 @@ export function openReleaseStore(dataDir: string) {
       WHERE status IN ('queued', 'running');
     CREATE INDEX IF NOT EXISTS server_rollouts_by_commit ON server_rollouts ("commit", created_at DESC, id DESC);
   `);
+  const metadataColumns = ['format', 'platform', 'image_id'];
+  const columns = () => db.query<{ name: string }, []>('PRAGMA table_info(server_releases)').all().map(row => row.name);
+  const existingColumns = columns();
+  if (metadataColumns.some(column => !existingColumns.includes(column))) {
+    db.transaction(() => {
+      const existing = columns();
+      for (const column of metadataColumns) {
+        if (!existing.includes(column)) db.exec(`ALTER TABLE server_releases ADD COLUMN ${column} TEXT`);
+      }
+    }).immediate();
+  }
   return db;
 }
 

@@ -7,19 +7,26 @@ import { ApiError, invalid, json } from './api';
 import { receiveArtifact } from './artifact-upload';
 import { iso } from './credentials';
 import { pagination, platformActor, type ManagementOptions } from './management';
-import { commitPattern, isManifest, MAX_RELEASE_BYTES, releaseKey, verifyManifest } from './release-package';
+import { commitPattern, DOCKER_RELEASE_FORMAT, isManifest, MAX_RELEASE_BYTES, releaseKey, verifyManifest,
+  type ServerReleaseFormat } from './release-package';
 import { activeRollout, openReleaseStore, releasePaths, type Rollout, type ServerRelease } from './release-store';
 import { sqliteTransaction } from './sqlite-transaction';
 import type { Store } from './store';
 
 const base = '/v1/platform/server-releases';
+const ageHeader = 'age-encryption.org/v1\n';
 export const SERVER_ARTIFACT_UPLOAD_PATH = /^\/v1\/platform\/server-releases\/[0-9a-f]{40}\/artifact$/;
-export type ReleaseRuntime = { publicKeyPath: string; heartbeatPath: string };
+export type ReleaseRuntime = { publicKeyPath: string; heartbeatPath: string; format?: ServerReleaseFormat };
 
 export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOptions & { commit: string; releaseRuntime?: ReleaseRuntime }) {
   const db = openReleaseStore(opts.dataDir);
   const paths = releasePaths(opts.dataDir);
   const key = () => releaseKey(opts.releaseRuntime?.publicKeyPath);
+  const format = opts.releaseRuntime?.format ?? null;
+  const compatible = (release: { format?: ServerReleaseFormat | null }) => (release.format ?? null) === format;
+  const requireFormat = (release: Parameters<typeof compatible>[0]) => {
+    if (!compatible(release)) throw new ApiError('conflict', { reason: 'artifact_format_incompatible' });
+  };
   const ready = () => {
     const heartbeat = opts.releaseRuntime?.heartbeatPath;
     const stat = heartbeat ? lstatSync(heartbeat, { throwIfNoEntry: false }) : undefined;
@@ -40,10 +47,14 @@ export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOpt
   const view = (row: ServerRelease, canDeploy: boolean) => {
     const last = db.query<Rollout, [string]>(
       'SELECT * FROM server_rollouts WHERE "commit" = ? ORDER BY created_at DESC, id DESC LIMIT 1').get(row.commit);
+    const actions = ['read'];
+    if (compatible(row) && row.uploaded_at && canDeploy) actions.push('deploy');
+    if (compatible(row) && !row.uploaded_at && key()) actions.push('upload_artifact');
     return {
       id: row.commit, commit: row.commit, size: row.size, sha256: row.sha256, created_at: row.created_at,
+      ...(row.format === DOCKER_RELEASE_FORMAT && { format: row.format, platform: row.platform, image_id: row.image_id }),
       uploaded_at: row.uploaded_at, active: row.commit === opts.commit, last_rollout: last ? rolloutView(last) : null,
-      actions: ['read', ...(row.uploaded_at ? canDeploy ? ['deploy'] : [] : key() ? ['upload_artifact'] : [])],
+      actions,
     };
   };
 
@@ -51,6 +62,7 @@ export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOpt
     checkActor(c);
     const active = activeRollout(db);
     return c.json({ active_commit: opts.commit, runner_ready: ready(), active_rollout: active ? rolloutView(active) : null,
+      ...(format && { release_format: format }),
       actions: key() ? ['create_server_release'] : [] });
   });
   app.get(base, (c) => {
@@ -67,21 +79,31 @@ export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOpt
     const actor = checkActor(c);
     const body = await json(c);
     checkActor(c);
-    if (!isManifest(body)) invalid('commit', 'sha256', 'size', 'signature');
+    if (!isManifest(body)) {
+      if (body.format != null || body.platform != null || body.image_id != null) {
+        invalid('commit', 'sha256', 'size', 'signature', 'format', 'platform', 'image_id');
+      }
+      invalid('commit', 'sha256', 'size', 'signature');
+    }
     const signer = key();
     if (!signer) throw new ApiError('conflict', { reason: 'signer_unavailable' });
     if (!verifyManifest(signer, body)) invalid('signature');
+    requireFormat(body);
     const result = sqliteTransaction(db, () => {
       const previous = db.query<ServerRelease, [string]>('SELECT * FROM server_releases WHERE "commit" = ?').get(body.commit);
       if (previous) {
-        if (previous.size !== body.size || previous.sha256 !== body.sha256) throw new ApiError('conflict', { reason: 'commit_has_other_artifact' });
+        if (previous.size !== body.size || previous.sha256 !== body.sha256 || !compatible(previous)
+          || previous.platform !== (body.platform ?? null) || previous.image_id !== (body.image_id ?? null)) {
+          throw new ApiError('conflict', { reason: 'commit_has_other_artifact' });
+        }
         if (previous.signature !== body.signature) {
           db.run('UPDATE server_releases SET signature = ? WHERE "commit" = ?', [body.signature, body.commit]);
         }
         return { item: view(previous, ready() && !activeRollout(db)), status: 200 as const };
       }
-      db.run('INSERT INTO server_releases ("commit", sha256, size, signature, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?)',
-        [body.commit, body.sha256, body.size, body.signature, iso(opts.now()), actor]);
+      db.run(`INSERT INTO server_releases ("commit", sha256, size, signature, created_at, created_by, format, platform, image_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [body.commit, body.sha256, body.size, body.signature, iso(opts.now()), actor, body.format ?? null, body.platform ?? null, body.image_id ?? null]);
       return { item: view(release(body.commit), false), status: 201 as const };
     });
     return c.json(result.item, result.status);
@@ -93,6 +115,7 @@ export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOpt
   app.put(`${base}/:commit/artifact`, async (c) => {
     checkActor(c);
     const row = release(c.req.param('commit'));
+    requireFormat(row);
     const signer = key();
     if (!signer || !verifyManifest(signer, row)) throw new ApiError('conflict', { reason: 'signer_unavailable' });
     if (row.uploaded_at) return c.json(view(row, ready() && !activeRollout(db)));
@@ -100,13 +123,14 @@ export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOpt
     try {
       const { sha256 } = await receiveArtifact(c.req.raw, temp, MAX_RELEASE_BYTES, row.size);
       if (sha256 !== row.sha256) invalid('artifact');
+      if (row.format === DOCKER_RELEASE_FORMAT && await Bun.file(temp).slice(0, ageHeader.length).text() !== ageHeader) invalid('artifact');
       checkActor(c);
       const currentKey = key();
       if (!currentKey || !verifyManifest(currentKey, row)) throw new ApiError('conflict', { reason: 'signer_unavailable' });
       const updated = sqliteTransaction(db, () => {
         const current = release(row.commit);
         if (!current.uploaded_at) {
-          renameSync(temp, paths.artifact(row.commit));
+          renameSync(temp, paths.artifact(row.commit, row.format));
           db.run('UPDATE server_releases SET uploaded_at = ? WHERE "commit" = ?', [iso(opts.now()), row.commit]);
         }
         return release(row.commit);
@@ -136,6 +160,7 @@ export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOpt
       const active = activeRollout(db);
       if (active) throw new ApiError('conflict', { reason: 'rollout_in_progress', rollout_id: active.id });
       const row = release(commit);
+      requireFormat(row);
       const signer = key();
       if (!row.uploaded_at || !signer || !verifyManifest(signer, row)) throw new ApiError('conflict', { reason: 'artifact_unavailable' });
       const id = `roll_${ulid()}`;

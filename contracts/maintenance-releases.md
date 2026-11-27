@@ -4,9 +4,9 @@
 
 ## Server 发布包
 
-Server 制品为 Git 提交中 `server/` 和 `deploy/` 加上锁定的生产依赖形成的 gzip tar 包，最大 256 MiB。Ed25519 公钥由部署主机管理员配置，私钥留在受信任的打包环境。平台管理员凭据授权上传与部署。主机只接受受信任签名的可执行包。
+Server 制品最大 256 MiB。Ed25519 公钥由部署主机管理员配置，私钥留在受信任的打包环境。平台管理员凭据授权上传与部署。主机只接受与自身运行方式兼容的已签名制品。
 
-清单 JSON 包含 `commit`（40 位小写十六进制）、`sha256`（64 位小写十六进制）、`size`（字节数）和 `signature`（无填充 Base64URL）。签名消息是 UTF-8 编码的四行，每行以 LF 结尾：
+清单 JSON 包含 `commit`（40 位小写十六进制）、`sha256`（64 位小写十六进制）、`size`（字节数）和 `signature`（无填充 Base64URL）。原生发布制品为 Git 提交中 `server/` 和 `deploy/` 加上锁定的生产依赖形成的 gzip tar 包，签名消息按以下格式编码。每行使用 UTF-8，以 LF 结尾。
 
 ```text
 onex-server-release-v1
@@ -14,6 +14,20 @@ onex-server-release-v1
 <sha256>
 <size>
 ```
+
+容器制品为 `linux/arm64` Docker 镜像的 gzip tar 归档，经目标部署的 age 公钥加密后上传。清单增加 `format`、`platform` 和 `image_id`，其中大小与 SHA-256 按整个密文计算。Server 校验 Ed25519 签名、密文摘要和 age 文件头后保存为 `<commit>.tar.gz.age`。独立执行器复核后解密并加载镜像。
+
+```text
+onex-server-release-v2
+<commit>
+<sha256>
+<size>
+docker-archive-age-v1
+linux/arm64
+sha256:<image-id>
+```
+
+容器部署设置 `ONEX_RELEASE_FORMAT=docker-archive-age-v1`，维护状态返回 `release_format`。一个部署目标的每个提交对应一个固定制品。同一提交重试时上传同一份密文。历史发布仍可查询，当前执行器只上传和部署兼容格式的制品。
 
 | API | 请求与结果 |
 | --- | --- |
@@ -27,7 +41,7 @@ onex-server-release-v1
 
 任务依次进入 `queued`、`running` 和 `succeeded` 或 `failed`。一次只允许一个活动任务。相同操作人和幂等键返回原任务，同键异参返回 409。部署会核对正在运行的版本仍等于 `expected_commit`。同版本任务执行制品与运行状态校验。Server 重启期间轮询可能暂时失败，重连后可继续查询原任务 ID。
 
-独立 Linux 执行器复核签名和摘要，验证归档成员后才执行固定 OneX 发布流程。发布之前备份业务 SQLite 库。只有健康接口报告目标提交才算成功。启动失败时尝试切回上一版代码，保留业务数据与备份供核对。历史制品在签名和数据兼容性满足时可重新选择部署。异地授权、系统组件策略和 Desktop 自动安装属于另外的维护场景。
+独立执行器复核签名和摘要后执行固定 OneX 发布流程。发布之前备份业务 SQLite 库。只有健康接口报告目标提交才算成功。启动失败时尝试切回上一版，保留业务数据与备份供核对。历史制品在签名和数据兼容性满足时可重新选择部署。容器执行器可在切换期间创建 `ONEX_RELEASE_MAINTENANCE_FILE`，此时 Server 仅响应健康检查和鉴权后的部署任务查询，其他 HTTP 请求及 WebSocket 握手返回 503。异地授权、系统组件策略和 Desktop 自动安装属于另外的维护场景。
 
 ## Agent 制品库
 

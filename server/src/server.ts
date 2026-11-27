@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { purgeExpiredContent } from './session-governance';
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
@@ -59,6 +60,7 @@ type Options = {
   /** 诊断日志包的对象存储；缺省时诊断功能对外报 `not_found`（见 diag.ts）。 */
   objectStorage?: ObjectStorage;
   releaseRuntime?: ReleaseRuntime;
+  releaseMaintenanceFile?: string;
   /** Fixtures can supply their own grants and synthetic credential versions. */
   routingProjection?: RoutingProjectionInputs;
   routePoolDevices?: readonly RoutePoolDevice[];
@@ -159,7 +161,19 @@ export async function createServer(opts: Options) {
     authRoutes(app, store, { ...management, onDeviceTokenRotated: edge.invalidateDeviceToken });
     let shuttingDown = false;
     const server = Bun.serve({ hostname: opts.hostname, port: opts.port,
-      fetch: (request, server) => shuttingDown ? new Response(null, { status: 503 }) : pending.track(Promise.resolve(app.fetch(request, server))),
+      fetch: (request, server) => {
+        if (shuttingDown) return new Response(null, { status: 503 });
+        if (opts.releaseMaintenanceFile && existsSync(opts.releaseMaintenanceFile)) {
+          const path = new URL(request.url).pathname;
+          const health = (request.method === 'GET' || request.method === 'HEAD') && path === '/v1/healthz';
+          const rolloutStatus = request.method === 'GET' && /^\/v1\/platform\/server-rollouts\/[^/]+$/.test(path);
+          if (request.headers.has('upgrade') || (!health && !rolloutStatus)) {
+            return Response.json({ error: { code: 'maintenance', message: 'Server 正在升级，请稍后再试' } },
+              { status: 503, headers: { 'Cache-Control': 'no-store', 'Retry-After': '5' } });
+          }
+        }
+        return pending.track(Promise.resolve(app.fetch(request, server)));
+      },
       websocket: { ...websocket, maxPayloadLength: 4 * 1024 * 1024, idleTimeout: 0, sendPings: false },
       // Each raw upload route applies its own cap. Other routes remain limited to small JSON requests.
       maxRequestBodySize: DESKTOP_ARTIFACT_MAX_BYTES,

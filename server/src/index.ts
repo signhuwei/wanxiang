@@ -4,9 +4,12 @@ import { MemoryPresence, ValkeyPresence } from './presence';
 import { createServer } from './server';
 import { masterKeyFromEnv } from './provider-secret';
 import { configuredRoutePoolDevices } from './route-production';
+import { DOCKER_RELEASE_FORMAT } from './release-package';
 
 const env = process.env;
 const dev = env.NODE_ENV !== 'production';
+const releaseFormat = env.ONEX_RELEASE_FORMAT || undefined;
+if (releaseFormat !== undefined && releaseFormat !== DOCKER_RELEASE_FORMAT) throw new Error('Invalid ONEX_RELEASE_FORMAT');
 function integer(name: string, fallback: number, min: number, max: number) {
   const val = Number(env[name] ?? fallback);
   if (!Number.isSafeInteger(val) || val < min || val > max) throw new Error(`Invalid ${name}`);
@@ -38,7 +41,8 @@ try {
     heartbeatMs: 15_000, commit: env.ONEX_COMMIT ?? 'unknown', codeSecret, masterKey, presence, objectStorage,
     routePoolDevices: configuredRoutePoolDevices(env.ONEX_ROUTE_POOL_DEVICES),
     releaseRuntime: env.ONEX_RELEASE_PUBLIC_KEY && env.ONEX_RELEASE_HEARTBEAT
-      ? { publicKeyPath: env.ONEX_RELEASE_PUBLIC_KEY, heartbeatPath: env.ONEX_RELEASE_HEARTBEAT } : undefined,
+      ? { publicKeyPath: env.ONEX_RELEASE_PUBLIC_KEY, heartbeatPath: env.ONEX_RELEASE_HEARTBEAT, format: releaseFormat } : undefined,
+    releaseMaintenanceFile: releaseFormat === DOCKER_RELEASE_FORMAT ? env.ONEX_RELEASE_MAINTENANCE_FILE : undefined,
     deliverCode: dev ? (target, code) => console.info(`[onex-dev] login code for ${target}: ${code}`) : undefined,
   });
   const shutdown = () => {
