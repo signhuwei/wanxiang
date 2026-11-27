@@ -7,7 +7,7 @@
 构建机需要 `deploy/bun-version` 指定的 Bun、Docker Buildx、`gzip` 和 `age`。以下命令在已提交的 checkout 运行。保管现有 Ed25519 发布签名私钥，首次只向目标机提供对应公钥。
 
 ```sh
-export ONEX_PUBLIC_ORIGIN=https://x.onc-ai.com
+export ONEX_PUBLIC_ORIGIN=https://x.onec-ai.com
 bun --no-env-file deploy/compose/pack.ts bootstrap /secure/output HEAD
 ```
 
@@ -37,7 +37,7 @@ bash bootstrap.sh /secure/server-release.pub
 每个部署环境对同一 Git 提交使用一份固定密文。重新提交同一发布任务时复用原包。`age` 每次加密会生成不同的密文字节。
 
 ```sh
-export ONEX_PUBLIC_ORIGIN=https://x.onc-ai.com
+export ONEX_PUBLIC_ORIGIN=https://x.onec-ai.com
 export ONEX_RELEASE_PRIVATE_KEY=/secure/server-release.key
 export ONEX_RELEASE_RECIPIENT=age1...
 export ONEX_RELEASE_LOGIN_TOKEN_FILE=/secure/platform-login.token
@@ -54,6 +54,6 @@ bun --no-env-file deploy/release.ts publish-server "$ONEX_PUBLIC_ORIGIN" \
 
 ## 3. Edge 和正式迁移
 
-用同一个 `ONEX_PUBLIC_ORIGIN` 给 macOS 打包与 Windows 构建传入公网入口，两端会派生 `wss://x.onc-ai.com/v1/edge/ws`。现有签名 Edge 制品仍通过 Desktop 发布入口上传。旧版 macOS 自动更新会拒绝替换 `ONEX_SERVER`，设备身份也按公网 origin 匹配。域名切换前先用隔离设备验收，旧 origin 可临时透传到同一个 Server。
+用同一个 `ONEX_PUBLIC_ORIGIN` 给 macOS 打包与 Windows 构建传入公网入口，两端会派生 `wss://x.onec-ai.com/v1/edge/ws`。现有签名 Edge 制品仍通过 Desktop 发布入口上传。旧版 macOS 自动更新会拒绝替换 `ONEX_SERVER`，设备身份也按公网 origin 匹配。域名切换前先用隔离设备验收，旧 origin 可临时透传到同一个 Server。
 
 正式迁移前，先在空数据环境完成首装、API 上传、换版和回退演练。随后核对 211 实际运行版本及存储路径，用备份恢复系统和租户库、对象存储、Valkey 及对应运行密钥。检查旧 Desktop 下载记录中的绝对路径和下载摘要。历史 v1 Server 发布档案保存在原环境，迁移的发布台账可保留其历史记录。生产入口切换前停止旧环境写入。

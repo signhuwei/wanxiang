@@ -5,7 +5,7 @@
 在已拉取的候选提交根目录运行以下命令。将 `ONEX_PUBLIC_ORIGIN` 设为本次发布的公共地址。
 
 ```powershell
-$env:ONEX_PUBLIC_ORIGIN = 'https://x.onc-ai.com'
+$env:ONEX_PUBLIC_ORIGIN = 'https://x.onec-ai.com'
 .\deploy\windows\build.ps1 -Version '0.1.0-rc20'
 ```
 
