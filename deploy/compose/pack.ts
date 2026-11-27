@@ -49,10 +49,15 @@ async function digest(path: string) {
   return { sha256: hash.digest('hex'), size: Bun.file(path).size };
 }
 
-async function saveImages(images: string[], destination: string) {
+async function saveImages(images: string[], destination: string, recipient?: string) {
   const save = Bun.spawn(['docker', 'image', 'save', ...images], { stdout: 'pipe', stderr: 'inherit' });
-  const gzip = Bun.spawn(['gzip', '-n'], { stdin: save.stdout, stdout: Bun.file(destination), stderr: 'inherit' });
-  if ((await Promise.all([save.exited, gzip.exited])).some(status => status !== 0)) throw new Error('Could not export Docker images');
+  const gzip = Bun.spawn(['gzip', '-n'], { stdin: save.stdout, stdout: recipient ? 'pipe' : Bun.file(destination), stderr: 'inherit' });
+  const tasks = [save.exited, gzip.exited];
+  if (recipient) {
+    const encrypt = Bun.spawn(['age', '-r', recipient, '-o', destination], { stdin: gzip.stdout, stderr: 'inherit' });
+    tasks.push(encrypt.exited);
+  }
+  if ((await Promise.all(tasks)).some(status => status !== 0)) throw new Error('Could not export Docker images');
 }
 
 async function packUpgrade(commit: string, directory: string, staging: string) {
@@ -64,14 +69,8 @@ async function packUpgrade(commit: string, directory: string, staging: string) {
   await build(directory, 'server', image, commit);
   const imageId = await capture(['docker', 'image', 'inspect', '--format', '{{.Id}}', image]);
   if (!/^sha256:[a-f0-9]{64}$/.test(imageId)) throw new Error('Missing Docker image ID');
-  const plaintext = join(directory, 'server.tar.gz');
   const encrypted = join(staging, 'server.tar.gz.age');
-  await saveImages([image], plaintext);
-  try {
-    await run(['age', '-r', recipient, '-o', encrypted, plaintext]);
-  } finally {
-    rmSync(plaintext, { force: true });
-  }
+  await saveImages([image], encrypted, recipient);
   const artifact = await digest(encrypted);
   if (artifact.size > MAX_RELEASE_BYTES) throw new Error(`Encrypted image exceeds ${MAX_RELEASE_BYTES} bytes`);
   const manifest = signManifest(key, {
