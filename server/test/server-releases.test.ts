@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync }
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
+import { receiveArtifact } from '../src/artifact-upload';
 import { MemoryPresence } from '../src/presence';
 import { DOCKER_RELEASE_FORMAT, DOCKER_RELEASE_PLATFORM, manifestBytes, signManifest } from '../src/release-package';
 import { releasePaths } from '../src/release-store';
@@ -13,6 +14,21 @@ import { seedTenant } from '../src/seed';
 
 const active = 'a'.repeat(40);
 const candidate = 'b'.repeat(40);
+
+test('a stalled upload expires at its configured deadline and removes the partial artifact', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'onex-release-timeout-'));
+  const path = join(dataDir, 'artifact');
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(new Uint8Array([1])); },
+  });
+  try {
+    await expect(receiveArtifact({ body, headers: new Headers() }, path, 2, undefined, 25))
+      .rejects.toMatchObject({ detail: { reason: 'upload_timed_out' } });
+    expect(existsSync(path)).toBe(false);
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
 
 test('only platform admins can queue signed immutable releases; state and request identity survive restart', async () => {
   const dataDir = mkdtempSync(join(tmpdir(), 'onex-release-test-'));

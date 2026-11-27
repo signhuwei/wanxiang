@@ -7,7 +7,7 @@ import { ApiError, invalid, json } from './api';
 import { receiveArtifact } from './artifact-upload';
 import { iso } from './credentials';
 import { pagination, platformActor, type ManagementOptions } from './management';
-import { commitPattern, DOCKER_RELEASE_FORMAT, isManifest, MAX_RELEASE_BYTES, releaseKey, verifyManifest,
+import { commitPattern, DOCKER_RELEASE_FORMAT, DOCKER_RELEASE_UPLOAD_TIMEOUT_MS, isManifest, MAX_RELEASE_BYTES, releaseKey, verifyManifest,
   type ServerReleaseFormat } from './release-package';
 import { activeRollout, openReleaseStore, releasePaths, type Rollout, type ServerRelease } from './release-store';
 import { sqliteTransaction } from './sqlite-transaction';
@@ -121,7 +121,8 @@ export function serverReleaseRoutes(app: Hono, store: Store, opts: ManagementOpt
     if (row.uploaded_at) return c.json(view(row, ready() && !activeRollout(db)));
     const temp = join(paths.dir, `.${ulid()}.part`);
     try {
-      const { sha256 } = await receiveArtifact(c.req.raw, temp, MAX_RELEASE_BYTES, row.size);
+      const timeout = row.format === DOCKER_RELEASE_FORMAT ? DOCKER_RELEASE_UPLOAD_TIMEOUT_MS : undefined;
+      const { sha256 } = await receiveArtifact(c.req.raw, temp, MAX_RELEASE_BYTES, row.size, timeout);
       if (sha256 !== row.sha256) invalid('artifact');
       if (row.format === DOCKER_RELEASE_FORMAT && await Bun.file(temp).slice(0, ageHeader.length).text() !== ageHeader) invalid('artifact');
       checkActor(c);

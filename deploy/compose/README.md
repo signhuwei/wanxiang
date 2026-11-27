@@ -23,7 +23,7 @@ bash bootstrap.sh /secure/server-release.pub
 
 需要在保留卷的情况下重建服务时，仍用 `bootstrap.sh`。它会核对维护卷记录的生效镜像 ID 并启动该镜像。若脚本报告发布中断，先用同一 Compose 项目启动 `valkey rustfs release-worker`，由执行器完成恢复，再运行首装脚本。
 
-默认将容器 `18700` 映射至 macOS 宿主机 `18700`。生产入口通过 TLS 转发 HTTP 和 WebSocket 至这个端口。外部反代须实际验证到宿主机端口的连通性，并支持 Server 发布制品的上传大小与耗时。
+默认将容器 `18700` 映射至 macOS 宿主机 `18700`。生产入口通过 TLS 转发 HTTP 和 WebSocket 至这个端口。外部反代须实际验证到宿主机端口的连通性，并支持 Docker 加密制品的 256 MiB 上限和 10 分钟上传窗口。
 
 | 卷 | 挂载 |
 | --- | --- |

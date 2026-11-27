@@ -2,6 +2,7 @@ import { createPublicKey, sign, verify, type KeyObject } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
 export const MAX_RELEASE_BYTES = 256 * 1024 * 1024;
+export const DOCKER_RELEASE_UPLOAD_TIMEOUT_MS = 10 * 60_000;
 export const DOCKER_RELEASE_FORMAT = 'docker-archive-age-v1';
 export const DOCKER_RELEASE_PLATFORM = 'linux/arm64';
 export const commitPattern = /^[0-9a-f]{40}$/;

@@ -2,7 +2,9 @@ import { createHash } from 'node:crypto';
 import { open, unlink } from 'node:fs/promises';
 import { ApiError, invalid } from './api';
 
-export async function receiveArtifact(request: Pick<Request, 'body' | 'headers'>, path: string, max: number, expected?: number) {
+export async function receiveArtifact(
+  request: Pick<Request, 'body' | 'headers'>, path: string, max: number, expected?: number, timeoutMs = 120_000,
+) {
   const header = request.headers.get('content-length');
   const declared = header === null ? null : Number(header);
   if (!request.body || (declared !== null && (!Number.isSafeInteger(declared) || declared <= 0))) invalid('artifact');
@@ -11,7 +13,7 @@ export async function receiveArtifact(request: Pick<Request, 'body' | 'headers'>
   const hash = createHash('sha256');
   const reader = request.body.getReader();
   let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; void reader.cancel().catch(() => {}); }, 120_000);
+  const timer = setTimeout(() => { timedOut = true; void reader.cancel().catch(() => {}); }, timeoutMs);
   let created = false;
   try {
     const file = await open(path, 'wx', 0o600);

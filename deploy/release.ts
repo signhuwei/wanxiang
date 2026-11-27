@@ -1,7 +1,7 @@
 import { createHash, createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import { createReadStream, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { commitPattern, isDockerManifest, isManifest, signManifest, type ServerManifest } from '../server/src/release-package';
+import { commitPattern, DOCKER_RELEASE_UPLOAD_TIMEOUT_MS, isDockerManifest, isManifest, signManifest, type ServerManifest } from '../server/src/release-package';
 import { desktopUpdateBytes, desktopUpdateKind } from '../server/src/desktop-update-signature';
 
 process.umask(0o077);
@@ -124,7 +124,7 @@ async function waitForRollout(api: Request, id: string) {
 
 async function publishServer(origin: string, manifestPath: string, archive: string) {
   const manifest = await verifyBundle(manifestPath, archive);
-  const api = await connect(origin, isDockerManifest(manifest) ? 600_000 : undefined);
+  const api = await connect(origin, isDockerManifest(manifest) ? DOCKER_RELEASE_UPLOAD_TIMEOUT_MS + 10_000 : undefined);
   const base = '/platform/server-releases';
   const maintenance = await api('/platform/maintenance');
   const expected_commit = process.env.ONEX_EXPECTED_COMMIT ?? maintenance.active_commit;
