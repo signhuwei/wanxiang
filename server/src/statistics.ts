@@ -46,17 +46,25 @@ export function statisticsRoutes(app: Hono, store: Store, opts: { dataDir: strin
   let inFlight = 0;
   async function run(command: Record<string, unknown>) {
     if (inFlight >= 8) throw new ApiError('rate_limited');
-    const worker = Bun.spawn([process.execPath, '--no-env-file', workerPath], {
-      stdin: new Blob([JSON.stringify(command)]), stdout: 'pipe', stderr: 'ignore',
-      env: Object.fromEntries(['PATH', 'TMPDIR', 'TEMP', 'SystemRoot'].flatMap(name => process.env[name] ? [[name, process.env[name]!]] : [])),
-    });
+    const spillDirectory = mkdtempSync(join(root, '.duckdb-'));
     inFlight++;
-    const timeout = setTimeout(() => worker.kill('SIGKILL'), 30_000);
     try {
-      const output = await new Response(worker.stdout).text();
-      if (await worker.exited !== 0) throw new Error('Statistics worker failed');
-      return JSON.parse(output) as Record<string, unknown>;
-    } finally { clearTimeout(timeout); inFlight--; }
+      const worker = Bun.spawn([process.execPath, '--no-env-file', workerPath], {
+        stdin: new Blob([JSON.stringify({ ...command, spillDirectory })]), stdout: 'pipe', stderr: 'ignore',
+        env: Object.fromEntries(['PATH', 'TMPDIR', 'TEMP', 'SystemRoot'].flatMap(name => process.env[name] ? [[name, process.env[name]!]] : [])),
+      });
+      const timeout = setTimeout(() => worker.kill('SIGKILL'), 30_000);
+      try {
+        const [result, exit] = await Promise.allSettled([new Response(worker.stdout).text(), worker.exited]);
+        if (result.status !== 'fulfilled' || exit.status !== 'fulfilled' || exit.value !== 0) {
+          throw new Error('Statistics worker failed');
+        }
+        return JSON.parse(result.value) as Record<string, unknown>;
+      } finally { clearTimeout(timeout); }
+    } finally {
+      try { await rm(spillDirectory, { recursive: true, force: true }); }
+      finally { inFlight--; }
+    }
   }
 
   function snapshot(tenantId: string) {

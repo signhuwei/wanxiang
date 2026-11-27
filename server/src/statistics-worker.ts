@@ -75,10 +75,11 @@ async function summarize(connection: DuckDBConnection, input: Query) {
   return { totals: (await read(totals))[0], daily: await read(daily), agents: await read(agents) };
 }
 
-const command = await Bun.stdin.json() as Snapshot | Query;
+const command = await Bun.stdin.json() as (Snapshot | Query) & { spillDirectory: string };
 const connection = await DuckDBConnection.create();
 try {
-  await connection.run("SET threads=2; SET memory_limit='256MB'");
+  await connection.run(`SET threads=2; SET memory_limit='256MB';
+    SET temp_directory=${sqlString(command.spillDirectory)}; SET max_temp_directory_size='8GiB'`);
   const result = command.operation === 'snapshot' ? await makeSnapshot(connection, command) : await summarize(connection, command);
   console.log(JSON.stringify(result));
 } finally { connection.closeSync(); }

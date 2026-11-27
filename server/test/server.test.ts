@@ -1,6 +1,6 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DESKTOP_AGENT_PART_BYTES } from '../src/agent-catalog';
@@ -1454,6 +1454,7 @@ test('statistics exports scoped daily aggregates without conversation bodies', a
   const parquet = Buffer.from(await exportFile.arrayBuffer());
   expect(parquet.subarray(0, 4).toString()).toBe('PAR1');
   expect(parquet.toString().includes('private message')).toBe(false);
+  expect(readdirSync(join(f.dataDir, 'statistics'))).toEqual([`${f.tenantId}.parquet`]);
   expect(f.store.tenant(f.tenantId).get("SELECT actor FROM audit WHERE action = 'observe.statistics.export'")).toEqual({ actor: employeeAuth.user.id });
 }, 15_000);
 

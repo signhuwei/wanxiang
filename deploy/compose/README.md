@@ -32,6 +32,22 @@ bash bootstrap.sh /secure/server-release.pub
 | `valkey-data`、`rustfs-data` | 分别挂给对应服务的 `/data`，读写。 |
 | 密钥卷 | 服务运行时按需只读挂载，`age` 私钥只挂给发布执行器。 |
 
+### 存储容量
+
+Mac mini 的 `onex` Colima profile 使用 `onex_data01` 上的稀疏数据盘，已配置为 2 TiB。镜像层、容器日志及所有命名卷共享这个文件系统。扩容后同时核对 Colima 内的文件系统容量和 macOS 外置盘物理余量。虚拟盘名义容量与它在外置盘上的实际占用分别用 `ls -lh` 和 `du -h` 查看。
+
+进一步扩容前，确认当前 profile 只运行可短暂停机的服务，且没有进行中的发布任务。停机后备份数据盘，使用同一 profile 增大数据盘，将 `ONEX_DATA_DISK_GIB` 设为目标 GiB。启动后核对镜像版本、命名卷和健康接口。
+
+```sh
+colima stop --profile onex
+# 在此处备份停止后的数据盘。
+colima start --profile onex --disk "$ONEX_DATA_DISK_GIB"
+colima ssh --profile onex -- df -h /var/lib/docker
+docker --context colima-onex ps
+```
+
+统计查询在 `server-data` 卷的 `/data/server/statistics` 下生成独立的 DuckDB 临时目录。每个统计进程最多使用 8 GiB 临时磁盘，进程退出后由 Server 清理。
+
 ## 2. 后续发版
 
 每个部署环境对同一 Git 提交使用一份固定密文。重新提交同一发布任务时复用原包。`age` 每次加密会生成不同的密文字节。
