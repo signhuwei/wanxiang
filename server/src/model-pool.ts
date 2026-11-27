@@ -110,7 +110,15 @@ function deploymentState(sql: Reader, deploymentId: string, revision: number) {
 }
 type MatchRow = { candidate_id: string; model_id: string; identity_revision: number; deployment_id: string; deployment_revision: number; status: string; decided_at: string | null };
 type EvidenceRow = { evidence_id: string; deployment_id: string; deployment_revision: number; source_kind: string; outcome: string; identity_verified: number;
-  capabilities_json: string; valid_until: string | null; observed_at: string };
+  capabilities_json: string; key_fields_json: string; valid_until: string | null; observed_at: string };
+
+function capabilityExtension(row: EvidenceRow) {
+  if (row.source_kind !== 'manual_review' || row.identity_verified !== 1) return undefined;
+  const extension = JSON.parse(row.key_fields_json)?.capability_extension;
+  if (typeof extension?.candidate_id === 'string' && Array.isArray(extension.capabilities)) {
+    return extension as { candidate_id: string; capabilities: string[] };
+  }
+}
 
 /**
  * Checks one draft member against the model's current identity. Returns blocking codes and a
@@ -122,7 +130,7 @@ function assessMember(sql: Reader, modelId: string, identity: { identity_revisio
   const match = sql.get<MatchRow>(`SELECT candidate_id, model_id, identity_revision, deployment_id, deployment_revision, status, decided_at
     FROM model_discovery_matches WHERE candidate_id = ?`, [member.approved_match_id]) ?? null;
   const evidence = member.evidence_ids.map((evidenceId) => sql.get<EvidenceRow>(`SELECT evidence_id, deployment_id, deployment_revision, outcome,
-    source_kind, identity_verified, capabilities_json, valid_until, observed_at FROM model_evidence WHERE evidence_id = ?`, [evidenceId]) ?? null);
+    source_kind, identity_verified, capabilities_json, key_fields_json, valid_until, observed_at FROM model_evidence WHERE evidence_id = ?`, [evidenceId]) ?? null);
   if (!deployment || !deployment.upstream_model) codes.push('deployment_not_found');
   else {
     if (deployment.status !== 'active' || deployment.provider_status !== 'active' || deployment.account_status !== 'active'
@@ -135,7 +143,8 @@ function assessMember(sql: Reader, modelId: string, identity: { identity_revisio
   if (!identity || !match || match.status !== 'accepted' || match.model_id !== modelId || match.identity_revision !== identity.identity_revision
     || match.deployment_id !== member.deployment_id || match.deployment_revision !== member.deployment_revision) codes.push('model_identity_unverified');
   const own = evidence.filter((row): row is EvidenceRow => !!row && row.deployment_id === member.deployment_id
-    && row.deployment_revision === member.deployment_revision && row.outcome === 'passed');
+    && row.deployment_revision === member.deployment_revision && row.outcome === 'passed'
+    && (capabilityExtension(row)?.candidate_id ?? member.approved_match_id) === member.approved_match_id);
   if (own.length !== evidence.length) codes.push('evidence_invalid');
   const superseded = new Set(member.evidence_ids.length ? sql.all<{ supersedes_id: string }>(`SELECT supersedes_id FROM model_evidence
     WHERE supersedes_id IN (SELECT value FROM json_each(?))`, [JSON.stringify(member.evidence_ids)]).map((row) => row.supersedes_id) : []);
@@ -144,8 +153,15 @@ function assessMember(sql: Reader, modelId: string, identity: { identity_revisio
   if (own.some((row) => !superseded.has(row.evidence_id) && !live.includes(row))) codes.push('evidence_expired');
   const evidenceProblem = codes.some((code) => code.startsWith('evidence_'));
   if (!evidenceProblem && !live.some((row) => row.identity_verified === 1) && !codes.includes('model_identity_unverified')) codes.push('model_identity_unverified');
-  const verified = new Set(live.flatMap((row) => JSON.parse(row.capabilities_json) as string[]));
+  const verified = new Set<string>();
   const declared = new Set(deployment?.capabilities_json ? JSON.parse(deployment.capabilities_json) as string[] : []);
+  for (const row of live) {
+    const additions = capabilityExtension(row)?.capabilities ?? [];
+    for (const capability of JSON.parse(row.capabilities_json) as string[]) {
+      verified.add(capability);
+      if (additions.includes(capability)) declared.add(capability);
+    }
+  }
   const floor = identity ? JSON.parse(identity.capability_floor_json) as string[] : [];
   if (!evidenceProblem && floor.some((capability) => !verified.has(capability) || !declared.has(capability))) codes.push('capability_unverified');
   // A catalogue claim is not evidence that an authenticated Chat Completions route accepts image input.
@@ -161,10 +177,10 @@ function assessMember(sql: Reader, modelId: string, identity: { identity_revisio
       deployment.endpoint_current_revision, deployment.revision_endpoint_id, deployment.endpoint_revision],
     match: match && [match.status, match.model_id, match.identity_revision, match.deployment_id, match.deployment_revision, match.decided_at],
     evidence: evidence.map((row) => row && [row.evidence_id, row.deployment_id, row.deployment_revision, row.source_kind, row.outcome, row.identity_verified,
-      row.capabilities_json, row.observed_at, row.valid_until, superseded.has(row.evidence_id)]),
+      row.capabilities_json, row.observed_at, row.valid_until, superseded.has(row.evidence_id), capabilityExtension(row) ?? null]),
     blocking: [...new Set(codes)].sort(),
   };
-  return { codes: [...new Set(codes)], deployment, dependency, inputCapabilities };
+  return { codes: [...new Set(codes)], deployment, dependency, inputCapabilities, capabilities: [...declared] };
 }
 
 export function legacyInputCapabilities(sql: Reader, route: LegacyCapabilityRoute, now: string) {
@@ -268,15 +284,27 @@ export function modelPoolRoutes(app: Hono, store: Store, opts: ManagementOptions
       account_id: string; endpoint_id: string; capabilities_json: string; status: string }>(`SELECT d.deployment_id, d.edit_revision, d.current_revision,
       d.display_name, r.upstream_model, d.account_id, d.endpoint_id, r.capabilities_json, d.status ${where}
       ORDER BY d.display_name, d.deployment_id LIMIT ? OFFSET ?`, [...params, p.limit, p.offset]);
-    const items = rows.map((row) => ({
-      id: row.deployment_id, revision: row.edit_revision, deployment_revision: row.current_revision, display_name: row.display_name,
-      raw_model: row.upstream_model, account_id: row.account_id, endpoint_id: row.endpoint_id,
-      capabilities: JSON.parse(row.capabilities_json) as string[], status: row.status,
-      archive_blockers: store.system.all<{ model_id: string; pool_revision: number }>(`SELECT h.model_id, h.pool_revision FROM model_pool_heads h
-        JOIN model_pool_deployments m ON m.model_id = h.model_id AND m.pool_revision = h.pool_revision WHERE m.deployment_id = ? ORDER BY h.model_id`,
-        [row.deployment_id]).map((ref) => ({ kind: 'active_pool', ...ref })),
-      actions: ['read', 'read_quotes'],
-    }));
+    const now = iso(opts.now());
+    const items = rows.map((row) => {
+      const references = store.system.all<Omit<Member, 'evidence_ids'> & { model_id: string; pool_revision: number; evidence_ids_json: string }>(
+        `SELECT h.model_id, h.pool_revision, m.deployment_id, m.deployment_revision, m.approved_match_id, m.priority, m.evidence_ids_json
+         FROM model_pool_heads h JOIN model_pool_deployments m ON m.model_id = h.model_id AND m.pool_revision = h.pool_revision
+         WHERE m.deployment_id = ? ORDER BY h.model_id`, [row.deployment_id]);
+      const capabilities = new Set<string>(JSON.parse(row.capabilities_json));
+      for (const { model_id, evidence_ids_json, ...member } of references) {
+        if (member.deployment_revision !== row.current_revision) continue;
+        const review = assessMember(store.system, model_id, currentIdentity(store.system, model_id),
+          { ...member, evidence_ids: JSON.parse(evidence_ids_json) }, now);
+        if (!review.codes.length) for (const capability of review.capabilities) capabilities.add(capability);
+      }
+      return {
+        id: row.deployment_id, revision: row.edit_revision, deployment_revision: row.current_revision, display_name: row.display_name,
+        raw_model: row.upstream_model, account_id: row.account_id, endpoint_id: row.endpoint_id,
+        capabilities: [...capabilities], status: row.status,
+        archive_blockers: references.map(({ model_id, pool_revision }) => ({ kind: 'active_pool', model_id, pool_revision })),
+        actions: ['read', 'read_quotes'],
+      };
+    });
     return c.json(p.page(items, n, []));
   });
 
@@ -301,23 +329,24 @@ export function modelPoolRoutes(app: Hono, store: Store, opts: ManagementOptions
     const { n } = store.system.get<{ n: number }>(`SELECT count(*) AS n ${where}`, params)!;
     const rows = store.system.all<{ candidate_id: string; discovery_id: string | null; catalog_item_id: string | null; deployment_id: string;
       deployment_revision: number; provider_id: string; account_id: string; endpoint_id: string; upstream_model: string; match_rule_id: string | null;
-      rule_revision: number | null; match_kind: string; confidence: string; reasons_json: string; status: string; capabilities_json: string }>(
+      rule_revision: number | null; match_kind: string; confidence: string; reasons_json: string; status: string }>(
       `SELECT mt.candidate_id, mt.discovery_id, mt.catalog_item_id, mt.deployment_id, mt.deployment_revision, d.provider_id, d.account_id,
-        d.endpoint_id, r.upstream_model, mt.match_rule_id, mt.rule_revision, mt.match_kind, mt.confidence, mt.reasons_json, mt.status,
-        r.capabilities_json ${where} ORDER BY d.provider_id, r.upstream_model, mt.candidate_id LIMIT ? OFFSET ?`, [...params, p.limit, p.offset]);
+        d.endpoint_id, r.upstream_model, mt.match_rule_id, mt.rule_revision, mt.match_kind, mt.confidence, mt.reasons_json, mt.status
+        ${where} ORDER BY d.provider_id, r.upstream_model, mt.candidate_id LIMIT ? OFFSET ?`, [...params, p.limit, p.offset]);
     const now = iso(opts.now());
     const identity = currentIdentity(store.system, modelId);
     const items = rows.map((row) => {
       // Prefer currently valid evidence; when none is valid, assess the passed records so the reason names why.
       const passed = store.system.all<{ evidence_id: string; live: number }>(`SELECT evidence_id, (observed_at <= ? AND (valid_until IS NULL OR valid_until > ?)
           AND evidence_id NOT IN (SELECT supersedes_id FROM model_evidence WHERE supersedes_id IS NOT NULL)) AS live
-        FROM model_evidence WHERE deployment_id = ? AND deployment_revision = ? AND outcome = 'passed' ORDER BY evidence_id`,
-        [now, now, row.deployment_id, row.deployment_revision]);
+        FROM model_evidence WHERE deployment_id = ? AND deployment_revision = ? AND outcome = 'passed'
+        AND coalesce(json_extract(key_fields_json, '$.capability_extension.candidate_id'), ?) = ? ORDER BY evidence_id`,
+        [now, now, row.deployment_id, row.deployment_revision, row.candidate_id, row.candidate_id]);
       const valid = passed.filter((e) => e.live === 1).map((e) => e.evidence_id);
       const evidence_ids = valid.length ? valid : passed.map((e) => e.evidence_id);
       const member = { deployment_id: row.deployment_id, deployment_revision: row.deployment_revision, priority: 0,
         approved_match_id: row.candidate_id, evidence_ids };
-      const reasons = assessMember(store.system, modelId, identity, member, now).codes;
+      const { codes: reasons, capabilities } = assessMember(store.system, modelId, identity, member, now);
       const eligible = reasons.length === 0;
       return {
         candidate_id: row.candidate_id, discovery_id: row.discovery_id, catalog_item_id: row.catalog_item_id,
@@ -325,7 +354,7 @@ export function modelPoolRoutes(app: Hono, store: Store, opts: ManagementOptions
         account_id: row.account_id, endpoint_id: row.endpoint_id, raw_model: row.upstream_model,
         match: { match_rule_id: row.match_rule_id, rule_revision: row.rule_revision, kind: row.match_kind, confidence: row.confidence,
           reason: (JSON.parse(row.reasons_json) as string[])[0] ?? row.match_kind, reasons: JSON.parse(row.reasons_json) as string[], review_status: row.status },
-        capabilities: JSON.parse(row.capabilities_json) as string[], health: { state: 'unknown', reason: 'not_observed' }, quote_ref: null,
+        capabilities, health: { state: 'unknown', reason: 'not_observed' }, quote_ref: null,
         eligible, reason: reasons[0] ?? null, reasons,
         ...(eligible && { approved_match_id: row.candidate_id, evidence_ids }),
         actions: eligible && draftable ? ['read', 'select'] : ['read'],

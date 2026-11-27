@@ -7,6 +7,7 @@ import type { PoolMember } from '../src/model-pool';
 import { MemoryPresence } from '../src/presence';
 import { seedTenant } from '../src/seed';
 import { createServer } from '../src/server';
+import { effectiveModelConfig } from '../src/edge-config';
 
 test('real HTTP channel actions retain all pages and publish a one-to-many pool from reviewed exact discoveries', async () => {
   const scratch = mkdtempSync(join(tmpdir(), 'onex-channel-catalog-'));
@@ -109,28 +110,68 @@ test('real HTTP channel actions retain all pages and publish a one-to-many pool 
     expect(requestLog.filter(({ path }) => path === '/a/v1/models').map(({ cursor }) => cursor)).toEqual([null, null, 'next-1']);
     expect(requestLog.every(({ method }) => method === 'GET')).toBe(true);
 
+    await svc.store.system.write((sql) => sql.run(`INSERT INTO rates (model_id, input_milli_per_mtok, output_milli_per_mtok,
+      cache_read_milli_per_mtok, cache_write_milli_per_mtok, effective_from) VALUES (?, 100, 200, 50, 100, ?)`,
+    [model.id, iso(Date.now() - 1000)]));
+    const contract = { allowed_models_json: JSON.stringify([model.id]), lease_budget_milli: 1000 };
+    const route = () => effectiveModelConfig(svc!.store, contract, Date.now()).routes[0];
+    expect(route()?.upstream_model).toBe('Supplier-A/M');
+    expect(route()?.input_capabilities).toBeUndefined();
+    const refreshedSameChannel = await api(`/providers/${a.id}/discoveries`, { revision: a.revision }, 202);
+    const [sameModel] = (await api(`/probe-jobs/${refreshedSameChannel.id}/results?q=Supplier-A%2FM`)).items;
+    const extended = await api(`/models/${model.id}/pool/candidates/review`, {
+      expected_identity_revision: identity.identity.identity_revision, reason: '核对同一端点的图片输入能力',
+      decisions: [{ discovery_id: sameModel.discovery_id, catalog_item_id: sameModel.catalog_item_id,
+        decision: 'accept', capabilities: ['text', 'images'] }],
+    });
+    const [addition] = extended.items;
+    const original = draft.members[0]!;
+    expect(addition).toMatchObject({ deployment_id: original.deployment_id, deployment_revision: original.deployment_revision });
+    expect(route()?.input_capabilities).toBeUndefined();
+    const candidates = (await api(`/deployments?target_model_id=${model.id}`)).items;
+    expect(candidates.find((row: Record<string, unknown>) => row.candidate_id === original.approved_match_id))
+      .toMatchObject({ capabilities: ['text'], evidence_ids: original.evidence_ids });
+    expect(candidates.find((row: Record<string, unknown>) => row.candidate_id === addition.approved_match_id))
+      .toMatchObject({ capabilities: ['text', 'images'], eligible: true });
+    const revisionDraft = { ...draft, expected_pool_revision: published.pool_revision,
+      members: [{ ...original, evidence_ids: addition.evidence_ids }, draft.members[1]!],
+      reason: '发布新增的图片输入能力' };
+    expect(await api(`/models/${model.id}/pool/preview`, revisionDraft)).toMatchObject({
+      publishable: false, blocking: [expect.objectContaining({ code: 'evidence_invalid' })],
+    });
+    revisionDraft.members[0]!.approved_match_id = addition.approved_match_id;
+    const visionPreview = await api(`/models/${model.id}/pool/preview`, revisionDraft);
+    expect(visionPreview).toMatchObject({ publishable: true });
+    await api(`/models/${model.id}/pool/revisions`, { ...revisionDraft, preview_basis: visionPreview.preview_basis }, 201);
+    expect(route()?.input_capabilities?.modalities).toEqual(['text', 'image']);
+    expect((await api(`/providers/${a.id}/deployments?q=Supplier-A%2FM`)).items).toMatchObject([
+      { deployment_revision: original.deployment_revision, capabilities: ['text', 'images'] },
+    ]);
+    expect(await api(`/models/${model.id}/pool/revisions/${published.pool_revision}`)).toEqual(
+      { ...real, current: false });
+
     const refreshed = await api(`/providers/${a.id}`, { revision: a.revision, base_url: new URL('/a/refresh/v1', upstream.url).href });
     const viewChannel = () => api(`/providers/${a.id}/channel`);
     const pullRefreshed = () => api(`/providers/${a.id}/discoveries`, { revision: refreshed.revision }, 202);
     expect(await viewChannel()).toMatchObject({ latest_catalog: null,
-      historical_catalog: { id: resultA.id, scope: { provider_revision: a.revision } } });
+      historical_catalog: { id: refreshedSameChannel.id, scope: { provider_revision: a.revision } } });
     const partial = await pullRefreshed();
     expect(partial).toMatchObject({ status: 'partial', summary: { reason: 'pagination_incomplete', model_count: 1 } });
     expect(await viewChannel()).toMatchObject({ latest_catalog: { id: partial.id, scope: { provider_revision: refreshed.revision } },
-      historical_catalog: { id: resultA.id } });
+      historical_catalog: { id: refreshedSameChannel.id } });
     expect((await api(`/probe-jobs/${resultA.id}/results`)).actions).toEqual(['read']);
     expect((await api(`/probe-jobs/${partial.id}/results`)).actions).toEqual(['read', 'review_candidates']);
 
     refreshedCatalog = 'failed';
     const failed = await pullRefreshed();
     expect(await viewChannel()).toMatchObject({ latest_discovery: { id: failed.id, status: 'failed' },
-      latest_catalog: { id: partial.id }, historical_catalog: { id: resultA.id } });
+      latest_catalog: { id: partial.id }, historical_catalog: { id: refreshedSameChannel.id } });
     refreshedCatalog = 'succeeded';
     const succeeded = await pullRefreshed();
     refreshedCatalog = 'partial';
     const newerPartial = await pullRefreshed();
     expect(await viewChannel()).toMatchObject({ latest_discovery: { id: newerPartial.id }, latest_catalog: { id: succeeded.id },
-      historical_catalog: { id: resultA.id } });
+      historical_catalog: { id: refreshedSameChannel.id } });
 
     const adoptionPath = `/probe-jobs/${succeeded.id}/adoptions`;
     const [incoming] = (await api(`/probe-jobs/${succeeded.id}/results`)).items;

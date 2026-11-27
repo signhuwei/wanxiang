@@ -217,11 +217,13 @@ function deploymentFor(db: Transaction, item: Discovery, allowed: string[], acto
   [item.account_id, item.endpoint_id, item.catalog_item_id]);
   if (previous?.status === 'archived') throw conflict('deployment_archived');
   const deploymentId = previous?.deployment_id ?? `dep_${ulid()}`;
-  if (previous && !accepted) return { deployment_id: deploymentId, deployment_revision: previous.current_revision };
+  if (previous && !accepted) return { deployment_id: deploymentId, deployment_revision: previous.current_revision, addedCapabilities: [] };
   if (previous?.endpoint_revision === item.endpoint_revision && previous.status === 'active') {
     const registered: string[] = JSON.parse(previous.capabilities_json);
-    if (!allowed.every((capability) => registered.includes(capability))) throw conflict('deployment_capability_changed');
-    return { deployment_id: deploymentId, deployment_revision: previous.current_revision };
+    // Keep the endpoint, runtime limits and revision-bound procurement references stable.
+    // Additional capabilities take effect only with the new review and a pool publication.
+    return { deployment_id: deploymentId, deployment_revision: previous.current_revision,
+      addedCapabilities: allowed.filter(capability => !registered.includes(capability)) };
   }
   const revision = (previous?.current_revision ?? 0) + 1;
   if (!previous) db.run(`INSERT INTO model_deployments(deployment_id,provider_id,account_id,endpoint_id,catalog_item_id,display_name,
@@ -233,7 +235,7 @@ function deploymentFor(db: Transaction, item: Discovery, allowed: string[], acto
     item.snapshot_claim, item.variant_claim, actor, at]);
   if (previous) db.run(`UPDATE model_deployments SET current_revision = ?, status = 'active', edit_revision = edit_revision + 1
     WHERE deployment_id = ?`, [revision, deploymentId]);
-  return { deployment_id: deploymentId, deployment_revision: revision };
+  return { deployment_id: deploymentId, deployment_revision: revision, addedCapabilities: [] };
 }
 
 function reviewedCandidate(db: Transaction, modelId: string, identity: Identity, decision: Decision, reason: string, actor: string, at: string) {
@@ -243,14 +245,15 @@ function reviewedCandidate(db: Transaction, modelId: string, identity: Identity,
   if (review) throw conflict('candidate_already_reviewed');
   const accepted = decision.decision === 'accept';
   if (accepted) verifyMatch(item, identity, decision.capabilities);
-  const deployment = deploymentFor(db, item, accepted ? decision.capabilities : [], actor, at, accepted);
+  const { addedCapabilities, ...deployment } = deploymentFor(db, item, accepted ? decision.capabilities : [], actor, at, accepted);
   const candidate = `mt_${ulid()}`;
   const evidence = accepted ? `ev_${ulid()}` : null;
   const status = accepted ? 'accepted' : 'rejected';
   if (evidence) db.run(`INSERT INTO model_evidence(evidence_id,deployment_id,deployment_revision,source_kind,outcome,identity_verified,
     capabilities_json,key_fields_json,observed_at,created_by) VALUES (?,?,?,'manual_review','passed',1,?,?,?,?)`,
   [evidence, deployment.deployment_id, deployment.deployment_revision, JSON.stringify(decision.capabilities),
-    JSON.stringify({ model_id: modelId, identity_revision: identity.identity_revision, discovery_id: item.id, reason }), at, actor]);
+    JSON.stringify({ model_id: modelId, identity_revision: identity.identity_revision, discovery_id: item.id, reason,
+      ...(addedCapabilities.length && { capability_extension: { candidate_id: candidate, capabilities: addedCapabilities } }) }), at, actor]);
   db.run(`INSERT INTO model_discovery_matches(candidate_id,model_id,identity_revision,deployment_id,deployment_revision,catalog_item_id,discovery_id,
     match_kind,normalized_key,confidence,reasons_json,status,decided_by,decided_at,decision_reason,created_at)
     VALUES (?,?,?,?,?,?,?,'manual',?,'high',?,?,?,?,?,?)`,

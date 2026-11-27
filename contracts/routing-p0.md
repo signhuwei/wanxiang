@@ -32,6 +32,8 @@
 - `POST /providers/:provider_id/probes` 接受 `{kind:"connectivity",revision}`，`POST /providers/:provider_id/discoveries` 接受 `{revision}`。两个操作均需幂等键，使用已登记的端点执行只读模型目录请求。返回 `202` 及已记录的 `succeeded`、`partial` 或 `failed` 结果。`GET /probe-jobs/:job_id` 回读结果，`GET /probe-jobs/:job_id/results` 按 `q,limit,cursor` 读取原始型号及目录声明。拉取处理上游分页，异常或截断显示原因，失败和部分结果保留此前的完整目录。请求和结果均保持推理密钥私密，连通测试不生成模型输出。
 - `GET/POST /models/:model_id/identity` 读取或创建初始逻辑身份，提交 `revision,maker_id,model_family,model_variant,identity_mode,model_snapshot?,capability_floor`。`POST /models/:model_id/pool/candidates/review` 接受 `{expected_identity_revision,reason,decisions:[{discovery_id,catalog_item_id,decision,capabilities}]}`，按平台管理员显式确认记录 `manual_review` 证据。固定快照的目录声明必须相符，渠道声明本身不会使候选合格。有效候选进入现有预览和池发布。
 
+同一活动端点与部署的新增能力通过候选审核证据登记。只有新池版本选择该候选及其证据并发布后，新增能力才会下发。部署修订和采购报价可以沿用，既有池版本仍对应各自的审核证据。
+
 `blocking[]` 和 `warnings[]` 的项目为 `{code,message,deployment_id?,field?}`。`impact` 提供 `tenant_count,device_count`。展示需区分活动池与已应用设备。后续 WebUI 的充值与签发按已确认设计在右栏上下排列。`desktop-ui/` 和生效模型标签由 Edge 组维护。
 
 `preview_basis` 绑定调用者、操作、型号、规范化草稿、活动池修订及影响资格的已审核依赖。发布在一个系统库事务中重新核验授权，查同键重放，再核验期望版本、预览根据及候选资格。成功原子保存池版本、活动头、审计和发布任务。同键同体复用原成功响应，同键异体返回 409 `idempotency_mismatch`，池修订过时返回 `revision_changed`，部署、审核或证据改变导致预览过时返回 `preview_stale`。若某类权限或写入还未提供，对应 `actions` 保持缺省。计划任务与设备应用是两项状态。
