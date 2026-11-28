@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+umask 022
 
 usage() {
   echo 'Usage: package.sh <OneX Desktop.app> <onex> <onexd> <server-origin> <output.pkg> [--release] [--preserve-daemon]' >&2
@@ -101,6 +102,8 @@ launch_agents=$payload/Library/LaunchAgents
 cli_entries=$payload/usr/local/bin
 mkdir -p "$payload/Applications" "$launch_agents" "$cli_entries" "$stage/scripts"
 /usr/bin/ditto "$app" "$bundle"
+# Installer owns the bundle as root, so the login user needs access to its contents.
+chmod -R -P a+rX "$bundle"
 mkdir -p "$resources/onex/bin"
 install -m 0755 "$cli" "$resources/onex/bin/onex"
 install -m 0755 "$daemon" "$resources/onex/bin/onexd"
