@@ -8,7 +8,7 @@
 
 所有公开对象带 `revision` 和 `actions`。
 
-客户端按块录入和展示橡皮数量。充值 0.5 块橡皮时向接口提交 `amount_milli: 500`，查询得到 `cost_milli: 1` 时展示为 0.001 块橡皮。金额和费率的字段单位见[通用约定](README.md)。
+客户端按粒录入和展示橡皮数量。充值 0.5 粒橡皮时向接口提交 `amount_milli: 500`，查询得到 `cost_milli: 1` 时展示为 0.001 粒橡皮。金额和费率的字段单位见[通用约定](README.md)。
 
 条目库、合约版本、租户配置和充值凭证使用[能力合约 v2](capability-policy-v2.md#2-http-协议)。
 
@@ -30,20 +30,26 @@
 | POST | `/devices/:id/resume-challenge` | `{}`，200，返回 `{key_id, nonce, ciphertext}`。需要当前账号的 Desktop 租户会话，且设备和所属成员均有效。 |
 | POST | `/devices/:id/resume` | `{proof}`，必须带 `Idempotency-Key`。使用同一个 Desktop 租户会话，200，返回 `{device_id, device_token}`。 |
 
-`tenant` 可填完整租户 ID 或简称。简称、用户名按 Unicode NFKC 归一并忽略大小写，允许多个租户共享简称，密码按原样校验。简称须唯一匹配有效成员的用户名和密码才可登录。若匹配结果不确定，用户可用完整租户 ID 指定租户。凭据错误统一为 401，频率超限返回 429。密码会话的 `/me` 含 `tenant_password_login: true`，只在所选租户内操作。平台管理员沿用个人令牌入口。
+`tenant` 可填完整租户 ID 或简称。简称、用户名按 Unicode NFKC 归一并忽略大小写，允许多个租户共享简称，密码按原样校验。简称须唯一匹配有效成员的用户名和密码才可登录。若匹配结果不确定，用户可用完整租户 ID 指定租户。凭据错误统一为 401，频率超限返回 429。租户密码或其签发的租户绑定令牌产生的会话，其 `/me` 含 `tenant_password_login: true`，只能在绑定租户内操作。平台管理员沿用个人令牌入口。
 
 设备恢复使用和 Edge 密钥下发一致的 X25519、HKDF-SHA256 和 XChaCha20-Poly1305 信封。将 UTF-8 `onex-device-resume-v1` 用作附加认证数据，用当前设备私钥解开信封，然后将完整 UTF-8 明文作为 `proof` 发送。挑战两分钟内可用于当前会话，成功后重新签发设备令牌，保留设备 ID、已有会话和回传确认序号。设备令牌过期时仍可恢复有效设备。旧令牌和对应的 WebSocket 在成功后失效。请求超时可用相同幂等键重试同一请求以取回已签发的令牌。
+
+### Master 网页密码登录
+
+- `GET /auth/master-password` 用现有全局平台管理员 Web 会话查看本人的 `{username,revision,actions}`。首次设置前 `username` 为 `null`、`revision` 为 0。
+- `PUT /auth/master-password` 需要同一授权与 `Idempotency-Key`，请求 `{username,password,revision}`。用户名按 NFKC 归一并忽略大小写，在 Master 账号中唯一。密码至少 12 字符、最多 256 UTF-8 字节，仅保存 Argon2id 摘要。设置写入 `auth.master_password.set` 审计并结束该账号其他由 Master 密码签发的 Web 会话，已有的个人令牌登录仍可使用。修订冲突或用户名重复返回 409。
+- `POST /auth/master-password-login` 接收 `{username,password}`，成功返回 `{token,user,tenants}`，令牌为该平台管理员本人的全局 Web 会话。以现有平台管理员授权为准，管理员资格撤销后该凭据及其会话不再有效。凭据错误统一为 401，请求过快返回 429。
 
 ### 网页个人登录令牌
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/auth/personal-tokens` | 已登录账号自己的令牌台账，使用通用分页，不返回令牌明文。 |
-| POST | `/auth/personal-tokens` | 自己的网页会话创建 `{name}`，201，首次响应附 `token`。同一幂等请求重放仅返回记录。 |
-| POST | `/auth/personal-tokens/:id/revoke` | `{revision}`，撤销自己的令牌，204。同时结束由该令牌签发的全局和租户网页会话。 |
-| POST | `/auth/token-login` | `{token}`，200，与验证码登录相同的 `{token,user,tenants}`。输入为个人登录令牌，输出为普通网页会话。 |
+| GET | `/auth/personal-tokens` | 已登录账号自己的令牌台账，使用通用分页，不返回令牌明文。受限租户会话只能查看绑定本租户的记录。 |
+| POST | `/auth/personal-tokens` | 自己的网页会话创建 `{name}`，201，首次响应附 `token`。同一幂等请求重放仅返回记录。受限租户会话签发的令牌绑定本租户。 |
+| POST | `/auth/personal-tokens/:id/revoke` | `{revision}`，撤销自己的令牌，204。受限租户会话只能撤销绑定本租户的记录。撤销同时使由该令牌签发的网页会话及租户绑定的后续令牌失效。 |
+| POST | `/auth/token-login` | `{token}`，200，与验证码登录同形的 `{token,user,tenants}`。全局令牌换取全局网页会话，租户绑定令牌直接换取绑定租户的网页会话。 |
 
-台账记录返回 `id`、`name`、`created_at`、`expires_at`、`last_used_at`、`revoked_at`、`revision` 和 `actions`。网页会话的列表动作含 `create_personal_token`，有效记录含 `revoke`。服务器只存登录令牌的哈希。同一账号最多同时有 10 个有效令牌，每个最长有效 7 天。实体权限以登录时当前账号及租户为准，由令牌签发的会话不能换成 Desktop 会话或注册设备，且不会超过令牌原有效期。
+台账记录返回 `id`、`name`、`created_at`、`expires_at`、`last_used_at`、`revoked_at`、`revision` 和 `actions`。绑定租户的记录还返回 `tenant_id`。网页会话的列表动作含 `create_personal_token`，有效记录含 `revoke`。受限租户的 Desktop 会话不访问该台账。服务器只存登录令牌的哈希。同一账号最多同时有 10 个有效令牌，每个最长有效 7 天。租户绑定令牌只允许有效成员交换网页会话，权限由请求时的租户角色与服务资源授权决定。交换出的会话及其新签发的租户绑定令牌均不得超过原令牌的有效期。任何个人登录令牌都不能直接作为 API Bearer，交换出的会话不能切换为 Desktop 会话或注册设备。
 
 ## 写入与角色（v0.3）
 
@@ -60,7 +66,7 @@ S0 不提供邀请管理 API，用本地 seed 命令创建租户、成员和邀�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET/POST | `/members`，`/members/:id` | 成员台账与详情 |
+| GET/POST | `/members`，`/members/:id` | 成员台账与详情。创建时提交已有 OneX 用户的 `user_id`，成员返回 `disable` 动作时可更新 `status` 为 `disabled` 或 `active`。 |
 | GET/POST | `/groups`，`/groups/:id` | 组 |
 | POST | `/invites` | `{role, group_id, max_uses, expires_in_ms}`，返回邀请码（只返回一次） |
 | GET/PUT | `/contract` | 当前租户合约 |

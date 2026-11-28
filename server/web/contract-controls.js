@@ -26,7 +26,7 @@ export function hasAction(object, action) {
 
 export function eraserMilli(value, label) {
   const parsed = parseEraserMilli(value)
-  if (parsed === null) throw new Error(label + '须为不小于 0 的块数，精确到 0.001 块')
+  if (parsed === null) throw new Error(label + '须为不小于 0 的粒数，精确到 0.001 粒')
   return parsed
 }
 
@@ -37,7 +37,7 @@ const summaryRows = [
   ['Agent', data => data.allowed_agents, null, value => itemList(value, agentLabel)],
   ['模型', data => data.allowed_models, null, itemList],
   ['租约时长（分钟）', data => data.lease_minutes],
-  ['租约额度（块）', data => data.lease_budget_milli, null, formatMilli],
+  ['租约额度（粒）', data => data.lease_budget_milli, null, formatMilli],
   ['固定发行', data => data.agent_release_ids, null, itemList],
   ['组及成员配额', data => data.quota_distribution, '平台签发', yesNo],
   ...visibilityFields.map(([role, field, label]) => [label, data => data.visibility?.[role]?.[field], null, yesNo])

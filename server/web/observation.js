@@ -31,7 +31,7 @@ function contentText(value) {
 export function eventText(e) {
   const p=e.payload || {}
   switch(e.kind) {
-    case 'session_start': return `${[agentLabel(p.agent),p.agent_version].filter(Boolean).join(' ')} · 模型 ${p.model || '未知'} · 开始于 ${formatDateTime(e.at)}`
+    case 'session_start': return `${[agentLabel(p.agent),p.agent_version].filter(Boolean).join(' ')} · 模型 ${p.model || '未知'}`
     case 'user_message': case 'assistant_message': case 'system_message': return contentText(p.content) || '无可展示的正文'
     case 'tool_call': return p.tool || '未命名工具'
     case 'tool_result': return (contentText(p.output) || '无可展示的输出') + (p.truncated ? '\n（结果已截断）' : '')
@@ -47,8 +47,11 @@ export function eventText(e) {
 }
 function eventRow(e) {
   const row=el('article',e.kind==='gap'?'message gap':e.kind==='user_message'?'message user-message':'message')
-  if(e.kind==='session_start') { row.append(el('span',null,eventText(e))); return row }
-  row.append(el('strong',null,names[e.kind] || '其他事件'),el('small',null,' · '+formatDateTime(e.at)),el('pre',null,eventText(e)))
+  const header=el('header','message-meta')
+  const time=el('time',null,formatDateTime(e.at))
+  time.dateTime=e.at
+  header.append(el('strong',null,names[e.kind] || '其他事件'),time)
+  row.append(header,el(e.kind==='tool_result'?'pre':'div','message-body',eventText(e)))
   if(e.kind==='tool_call' && e.payload?.input != null) {
     const details=el('details');details.append(el('summary',null,'查看工具输入'),el('pre',null,JSON.stringify(e.payload.input,null,2)));row.append(details)
   }
@@ -64,10 +67,10 @@ function updateCompactCell(current, next) {
     }
   }
 }
-const monthCost=p=>p.month_cost_milli == null ? '未提供' : formatMilli(p.month_cost_milli)+' 块橡皮'
+const monthCost=p=>p.month_cost_milli == null ? '未提供' : formatMilli(p.month_cost_milli)+' 粒橡皮'
 const turns=s=>s.turn_count == null ? '轮数未提供' : s.turn_count+' 轮'
 function usageText(s) {
-  return `输入 ${s.input_tokens} · 输出 ${s.output_tokens} · 缓存读取 ${s.cache_read_tokens} · 缓存写入 ${s.cache_write_tokens} token · ${formatMilli(s.cost_milli)} 块橡皮` +
+  return `输入 ${s.input_tokens} · 输出 ${s.output_tokens} · 缓存读取 ${s.cache_read_tokens} · 缓存写入 ${s.cache_write_tokens} token · ${formatMilli(s.cost_milli)} 粒橡皮` +
     (s.pending_usage_count ? ` · ${s.pending_usage_count} 笔待结算` : '')
 }
 function sessionActions(view,api,session,signal) {
@@ -124,6 +127,7 @@ export function sharedSessions(host,api,signal) {
       return {...data,items:data.items.map(item=>({...item,actions:['read']}))}
     },
     onOpen:s=>open(s.agent,pane=>{
+      pane.body.classList.add('conversation')
       let seq=0
       const more=button('读取更多',async()=>{
         more.disabled=true
@@ -166,7 +170,7 @@ export async function observePage(host,api,session,signal) {
       const open=detailPanel(pane.body,()=>list,{live:true})
       sessions={host:pane.body,userId:p.user_id,list:list=createLedger(pane.body,{title:'会话',rowKey:'id',signal:pane.signal,openAction:'read_content',noOpenText:'无正文查看权限，可请户主开放',
         filters:[{key:'agent',label:'Agent',options:[{value:'',label:'全部 Agent'},...AGENT_OPTIONS]}],
-        columns:[{key:'agent',title:'Agent',render:s=>agentLabel(s.agent)},{key:'started_at',title:'开始时间 ↓',render:s=>compactCell(formatDateTime(s.started_at),`${turns(s)} · ${formatMilli(s.cost_milli)} 块橡皮`),update:updateCompactCell},{key:'model',title:'模型'},
+        columns:[{key:'agent',title:'Agent',render:s=>agentLabel(s.agent)},{key:'started_at',title:'开始时间 ↓',render:s=>compactCell(formatDateTime(s.started_at),`${turns(s)} · ${formatMilli(s.cost_milli)} 粒橡皮`),update:updateCompactCell},{key:'model',title:'模型'},
         {key:'turn_count',title:'轮数',render:turns},{key:'input_tokens',title:'输入 token'},{key:'output_tokens',title:'输出 token'},{key:'cost_milli',title:'橡皮',render:s=>formatMilli(s.cost_milli)}],
         fetchPage:async ({q,filters,cursor,limit,signal:listSignal})=>{
           const data=await api.get('/observe/sessions',{params:{user_id:p.user_id,agent:filters.agent,q,cursor,limit},signal:listSignal})

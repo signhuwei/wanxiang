@@ -48,7 +48,7 @@ Server 绑定在 `127.0.0.2`（仍是本机回环）而不是 `127.0.0.1`，因�
 
 ### 真实监察延迟
 
-运行 `bun server/web/tests/workspace-check.js`（可追加已有截图目录）。脚本在隔离租户中授权 admin 阅读其他成员正文，模拟一个 Edge 完成 WS 握手，并通过真实 `/v1/edge/ws` 发出一条唯一的 `assistant_message`。用同一单调时钟从发送前计时，到 Chrome 阅读区出现该正文并经过两次 `requestAnimationFrame`；超过 5000 ms 测试失败。随后检查 usage 增量、待结算提示、无重复正文和读取审计。`observe-real.png` 来自这个链路；离线脚本不提供模拟监察。这个单样本不能替代真机或负载验收。
+运行 `bun server/web/tests/workspace-check.js --observe-only`（可追加已有截图目录，或加 `--summary-only` 检查只有摘要权限的账号）。脚本在隔离租户中授权 admin 阅读其他成员正文，模拟一个 Edge 完成 WS 握手，并通过真实 `/v1/edge/ws` 发出一条唯一的 `assistant_message`。用同一单调时钟从发送前计时，到 Chrome 阅读区出现该正文并经过两次 `requestAnimationFrame`；超过 5000 ms 测试失败。随后检查 usage 增量、待结算提示、无重复正文和读取审计。`observe-real.png` 来自这个链路；离线脚本不提供模拟监察。这个单样本不能替代真机或负载验收。
 
 - 模拟账号：`admin@onex.dev`（两个租户）、`demo@onex.dev`（一个租户）
 - 固定验证码 `246810`；邀请码 `ONEX2026` 可将模拟账号加入「示例制造」，不能代替验证码。

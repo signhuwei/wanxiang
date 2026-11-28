@@ -5,12 +5,12 @@ import { formatMilli, formatQuotaUsage, quotaUsageLevel, QUOTA_HINT, QUOTA_INVAL
 const viewFields = [
   { key: 'name', label: '组名', readonly: true },
   { key: 'parent_id', label: '上级组 ID', readonly: true, nullText: '—' },
-  { key: 'quota_eraser', label: '橡皮配额（块）', readonly: true, nullText: '不限' }
+  { key: 'quota_eraser', label: '橡皮配额（粒）', readonly: true, nullText: '不限' }
 ]
 const editFields = [
   { key: 'name', label: '组名' },
   { key: 'parent_id', label: '上级组 ID' },
-  { key: 'quota_eraser', label: '橡皮配额（块）', placeholder: '不限', hint: QUOTA_HINT }
+  { key: 'quota_eraser', label: '橡皮配额（粒）', placeholder: '不限', hint: QUOTA_HINT }
 ]
 
 function quotaUsageCell(item) {
@@ -36,9 +36,9 @@ export function groupsPage(host, api, actions, { policyManaged = false } = {}) {
         if (!usage) return null
         const kv = el('div', 'kv')
         kv.append(
-          el('span', null, '本月已结算（块）'), document.createTextNode(formatMilli(usage.used_milli)),
-          el('span', null, '预留（块）'), document.createTextNode(formatMilli(usage.reserved_milli)),
-          el('span', null, '剩余（块）'), document.createTextNode(usage.remaining_milli === null ? '不限' : formatMilli(usage.remaining_milli))
+          el('span', null, '本月已结算（粒）'), document.createTextNode(formatMilli(usage.used_milli)),
+          el('span', null, '预留（粒）'), document.createTextNode(formatMilli(usage.reserved_milli)),
+          el('span', null, '剩余（粒）'), document.createTextNode(usage.remaining_milli === null ? '不限' : formatMilli(usage.remaining_milli))
         )
         return kv
       }
@@ -67,7 +67,7 @@ export function groupsPage(host, api, actions, { policyManaged = false } = {}) {
     })
   }
   list = createLedger(host, { title: '分组', columns: [{ key: 'name', title: '组名' }, { key: 'parent_id', title: '上级组' },
-    { key: 'month_used_milli', title: '本月已用 / 配额（块）', render: quotaUsageCell }],
+    { key: 'month_used_milli', title: '本月已用 / 配额（粒）', render: quotaUsageCell }],
     fetchPage: ({ q, cursor, limit, signal }) => api.get('/groups', { params: { q, cursor, limit }, signal }),
     onOpen: entry, createLabel: '新建分组', onCreate: actions.includes('create_group') ? () => entry(null) : null })
 }

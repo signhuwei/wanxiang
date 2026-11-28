@@ -7,8 +7,9 @@ import { join } from 'node:path'
 import { chromium } from 'playwright'
 import { checkLiveObservation } from './observe-live.js'
 import { createServer } from '../../src/server.ts'
-import { seedTenant } from '../../src/seed.ts'
+import { ensureUser, seedTenant } from '../../src/seed.ts'
 import { MemoryPresence } from '../../src/presence.ts'
+import { indexMember } from '../../src/store.ts'
 
 const dir = await mkdtemp(join(tmpdir(), 'onex-web-test-'))
 const target = 'owner@example.test'
@@ -22,7 +23,7 @@ try {
   const page = await browser.newPage({ baseURL:app.server.url.href, viewport: { width: 1280, height: 720 } })
   page.setDefaultTimeout(3500)
   const summaryOnly=process.argv.includes('--summary-only')
-  const shots = process.argv.slice(2).find(a=>a!=='--summary-only')
+  const shots = process.argv.slice(2).find(a=>!a.startsWith('--'))
   async function capture(label) {
     if (!shots) return
     for (const [width,height] of [[1280,720],[1440,900]]) {
@@ -58,7 +59,28 @@ try {
   await page.getByPlaceholder('6 位验证码').fill(code)
   await button('登录').click()
   await page.waitForURL(/#\/platform$/)
-  if (process.argv.includes('--issues-only')) {
+  if (process.argv.includes('--observe-only')) {
+    const email = 'observer@example.test'
+    const user = await app.store.system.write(sql => ensureUser(sql, { kind: 'email', value: email }, Date.now()))
+    const member = { user_id: user.id, role: 'admin', status: 'active' }
+    const visibility = { admin: { summary: true, content: !summaryOnly }, group_admin: { summary: false, content: false } }
+    await app.store.tenant(seed.tenantId).write(sql => {
+      sql.run('INSERT INTO members(user_id,role,status) VALUES (?,?,?)', [member.user_id, member.role, member.status])
+      sql.run('UPDATE contract SET visibility_json=? WHERE revision=1', [JSON.stringify(visibility)])
+    })
+    await app.store.system.write(sql => indexMember(sql, seed.tenantId, member))
+    await account.click()
+    await button('退出').click()
+    await openCodeLogin(page)
+    await page.getByPlaceholder('邮箱或手机号').fill(email)
+    await button('发送验证码').click()
+    await page.getByText('验证码已发送，请查收').waitFor()
+    await page.getByPlaceholder('6 位验证码').fill(code)
+    await button('登录').click()
+    await page.waitForURL(/#\/tenant\/members$/)
+    await checkLiveObservation({app,seed,page,target,capture,summaryOnly})
+    assert.deepEqual(errors, [])
+  } else if (process.argv.includes('--issues-only')) {
     const user = app.store.system.get('SELECT owner_user_id FROM tenants WHERE id=?',[seed.tenantId])
     await app.store.system.write(sql => {
       const at = new Date().toISOString()
@@ -175,10 +197,10 @@ try {
   await button('编辑租户配置').click()
   await page.getByLabel('管理员查看正文').selectOption('')
   await page.getByLabel('组管查看摘要').selectOption('false')
-  await page.getByLabel('租约额度（块）').fill('0.0005')
+  await page.getByLabel('租约额度（粒）').fill('0.0005')
   await button('预览变更').click()
-  await page.getByText('租约额度须为不小于 0 的块数，精确到 0.001 块').waitFor()
-  await page.getByLabel('租约额度（块）').fill('1.125')
+  await page.getByText('租约额度须为不小于 0 的粒数，精确到 0.001 粒').waitFor()
+  await page.getByLabel('租约额度（粒）').fill('1.125')
   await page.getByLabel('模型配置方式').selectOption('inherit')
   await button('预览变更').click()
   await page.getByText('发布后生效', { exact: true }).waitFor()

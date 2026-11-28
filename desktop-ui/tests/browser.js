@@ -321,7 +321,7 @@ try{
   }
   const rejectedRequest=diagnostics.getByRole('listitem').filter({hasText:'模型请求被拒绝'})
   await rejectedRequest.locator('summary').click()
-  for (const value of ['deepseek-flash','lease_request_too_large','lease','402','1.267 块','1 块']) {
+  for (const value of ['deepseek-flash','lease_request_too_large','lease','402','1.267 粒','1 粒']) {
     await rejectedRequest.getByText(value,{exact:true}).waitFor()
   }
   const cappedOutput=diagnostics.getByRole('listitem').filter({hasText:'已按租约调整模型输出上限'})

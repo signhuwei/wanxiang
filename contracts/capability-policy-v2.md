@@ -36,7 +36,7 @@
 }
 ```
 
-基础类型为 `boolean`、`integer`、`money_milli`、`ratio_ppm`、`enum`、`resource_set` 和仅用于说明的 `text`。金额使用安全整数毫橡皮，1000 对应 1 块。倍率使用百万分比整数，900000 对应 0.9 倍。资源集合为去重的规范 ID 数组，schema 声明授权目录。枚举值及人类可读标签随定义版本固定。
+基础类型为 `boolean`、`integer`、`money_milli`、`ratio_ppm`、`enum`、`resource_set` 和仅用于说明的 `text`。金额使用安全整数毫橡皮，1000 对应 1 粒。倍率使用百万分比整数，900000 对应 0.9 倍。资源集合为去重的规范 ID 数组，schema 声明授权目录。枚举值及人类可读标签随定义版本固定。
 
 合并算子只接受与该值类型匹配的 `fixed`、`min`、`max`、`intersection`、`and`。数值下限使用 `max`，签约席位等平台专属值使用 `fixed`。说明条目可无绑定。执行条目必须绑定受信任且已登记的适配器及 ABI，适配器决定允许类型、作用域、目标参数及唯一性，运行时拒绝未知绑定或不受支持版本。API 不接受可执行表达式、脚本或动态代码。新增模型、Agent 发行、条目组合、范围、单位阈值及模板版本通过发布数据；首次引入新的执行动作需要实现并注册适配器。
 
@@ -106,7 +106,7 @@ Server 持有生效策略与发包目标，Edge 持有最后成功应用的运�
 
 条目库发布采用定义正文加 `expected_version`。模板发布为 `{id,expected_version,name,description,scope,entries:[{clause_ref,value}]}`，平台模板 `scope: "platform"`，组织模板 `"group"` 或 `"member"`。模板没有自定义脚本及运行入口。
 
-充值登记请求为 `{amount_milli,note?}`。Server 在事务里确定关联签发和入账余额，返回 `{ledger_id,tenant_id,platform_revision,amount_milli,balance_before_milli,balance_after_milli,by,at,note,actions}`。平台及租户对同笔凭证的授权信息完全一致。各端金额展示使用块，且只接受精确到 0.001 块的输入。
+充值登记请求为 `{amount_milli,note?}`。Server 在事务里确定关联签发和入账余额，返回 `{ledger_id,tenant_id,platform_revision,amount_milli,balance_before_milli,balance_after_milli,by,at,note,actions}`。平台及租户对同笔凭证的授权信息完全一致。各端金额展示使用粒，且只接受精确到 0.001 粒的输入。
 
 发布和充值要求 `Idempotency-Key`。幂等键跨实体绑定操作者、路径和请求体，同键异体返回 409。普通写入遵循项目操作记录的保留期；充值的这次登记在资金记录生命周期内只记一次。预览不写入，也不作为授权凭据。409 返回当前修订，页面保留草稿，需重新预览后提交。422 的 `error.detail.fields` 提供字段路径，条目错误同时使用 `error.detail.clauses`（每项 `{clause_ref,code}`），身份越权适用现有 403/404。
 

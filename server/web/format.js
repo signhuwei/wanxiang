@@ -31,7 +31,7 @@ export function formatQuotaUsage(usedMilli, quotaMilli) {
 }
 
 export const QUOTA_HINT = '按北京时间自然月重置，留空为不限'
-export const QUOTA_INVALID_MESSAGE = '橡皮配额须为不小于 0 的块数，精确到 0.001 块'
+export const QUOTA_INVALID_MESSAGE = '橡皮配额须为不小于 0 的粒数，精确到 0.001 粒'
 
 // 配额表单输入是橡皮，最多三位小数；换算成毫橡皮（契约字段 quota_milli，非负整数）后再校验。
 export function parseQuotaEraserInput(value) {

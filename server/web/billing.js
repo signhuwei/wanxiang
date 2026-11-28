@@ -4,7 +4,7 @@ import { formatMilli, formatDateTime, parseEraserMilli } from './format.js'
 
 export function topupMilli(value) {
   const n = parseEraserMilli(value)
-  if (n === null || n <= 0) throw new Error('请输入大于 0 的块数，精确到 0.001 块')
+  if (n === null || n <= 0) throw new Error('请输入大于 0 的粒数，精确到 0.001 粒')
   return n
 }
 export const kinds = {subscription_grant:'月度橡皮包',topup:'充值',reserve:'预留',settle:'结算',release:'释放',adjust:'调整',overage_pending:'超租约差额待核对'}
@@ -12,9 +12,9 @@ export const kinds = {subscription_grant:'月度橡皮包',topup:'充值',reserv
 function discountDetail(pane, data) {
   const facts = el('dl', 'policy-facts')
   for (const [label, value] of [
-    ['原扣款', formatMilli(data.gross_milli) + ' 块'], ['折后扣款', formatMilli(data.net_milli) + ' 块'],
-    ['折扣总额', formatMilli(data.discount_milli) + ' 块'], ['返还永久余额', formatMilli(data.cash_credit_milli ?? data.discount_milli) + ' 块'],
-    ['到期月包抵免', formatMilli(data.expired_package_credit_milli ?? 0) + ' 块'], ['结算时间', formatDateTime(data.closed_at)]
+    ['原扣款', formatMilli(data.gross_milli) + ' 粒'], ['折后扣款', formatMilli(data.net_milli) + ' 粒'],
+    ['折扣总额', formatMilli(data.discount_milli) + ' 粒'], ['返还永久余额', formatMilli(data.cash_credit_milli ?? data.discount_milli) + ' 粒'],
+    ['到期月包抵免', formatMilli(data.expired_package_credit_milli ?? 0) + ' 粒'], ['结算时间', formatDateTime(data.closed_at)]
   ]) {
     const row = el('div')
     row.append(el('dt', null, label), el('dd', null, value))
@@ -22,7 +22,7 @@ function discountDetail(pane, data) {
   }
   const breakdown = el('table')
   const head = breakdown.createTHead().insertRow()
-  for (const heading of ['签发版本', '结算比例', '原扣款（块）', '折后扣款（块）', '返还（块）']) head.append(el('th', null, heading))
+  for (const heading of ['签发版本', '结算比例', '原扣款（粒）', '折后扣款（粒）', '返还（粒）']) head.append(el('th', null, heading))
   const rows = breakdown.createTBody()
   for (const bucket of data.buckets) {
     const row = rows.insertRow()
@@ -39,7 +39,7 @@ export function billingPage(host, api, signal) {
     try {
       const balance = await api.get('/balance', { signal })
       summary.replaceChildren(...[['balance_milli','可用余额'],['reserved_milli','已预留'],['month_used_milli','本月消耗']].map(([k,label]) => {
-        const tile = el('div'); tile.append(el('small',null,label+'（块）'),el('strong','num',balance[k] == null ? '—' : formatMilli(balance[k]))); return tile
+        const tile = el('div'); tile.append(el('small',null,label+'（粒）'),el('strong','num',balance[k] == null ? '—' : formatMilli(balance[k]))); return tile
       }))
     } catch(e) { if (!signal?.aborted) summary.replaceChildren(el('span','error-row',e.message)) }
   }
@@ -48,7 +48,7 @@ export function billingPage(host, api, signal) {
   ledger = createLedger(table,{title:'橡皮流水', signal, openAction:'read_discount',
     columns:[{key:'at',title:'时间',render:i=>formatDateTime(i.at)},{key:'kind',title:'类型',render:i=>
       i.kind==='adjust'&&i.request_ref?.startsWith('policy-discount:')?'月结折扣返还':kinds[i.kind]||i.kind},
-      {key:'amount_milli',title:'金额（块）',render:i=>formatMilli(i.amount_milli)}, {key:'by',title:'操作人'}, {key:'request_ref',title:'业务参考'}],
+      {key:'amount_milli',title:'金额（粒）',render:i=>formatMilli(i.amount_milli)}, {key:'by',title:'操作人'}, {key:'request_ref',title:'业务参考'}],
     fetchPage:({q,cursor,limit,signal})=>api.get('/ledger',{params:{q,cursor,limit},signal}),
     onOpen: row => drill(row.discount_month + ' 月结折扣', async pane => {
       pane.body.append(el('p', 'muted', '正在读取月结…'))

@@ -12,7 +12,7 @@ const valuesKey = (role, field) => role + '_' + field
 const entitlementFields = [
   { key: 'seat_limit', label: '签约席位', type: 'number' },
   { key: 'lease_minutes', label: '租约时长（分钟）', type: 'number' },
-  { key: 'lease_blocks', label: '租约额度（块）', placeholder: '如 2.5' },
+  { key: 'lease_blocks', label: '租约额度（粒）', placeholder: '如 2.5' },
   toggle('quota_distribution', '组及成员配额'),
   ...visibilityFields.map(([role, field, label]) => toggle(valuesKey(role, field), label))
 ]

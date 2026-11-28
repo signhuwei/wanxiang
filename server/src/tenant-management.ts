@@ -48,7 +48,7 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
   const memberView = (row: MemberRow, role: string, month_used_milli: number, quota_configurable: boolean) => {
     const user = profile(row.user_id);
     return { ...row, id: row.user_id, name: user?.name ?? row.user_id, email: user?.email ?? null, phone: user?.phone ?? null, quota_configurable,
-      month_used_milli, actions: canEditMember(role, row.role) ? ['read', 'update'] : ['read'] };
+      month_used_milli, actions: canEditMember(role, row.role) ? ['read', 'update', 'disable'] : ['read'] };
   };
   function manager(c: Context, at: number) {
     const actor = tenantActor(store, c, at);
@@ -117,7 +117,6 @@ export function tenantRoutes(app: Hono, store: Store, opts: ManagementOptions) {
     if (!row) throw new ApiError('not_found');
     return c.json(memberView(row, role, selfMonthUsage(db, row.user_id, at), quotaConfigurable(db)));
   });
-  // CONTRACT-PENDING: POST creates from a known user_id; POST/PATCH /:id updates.
   const writeMember = async (c: Context) => {
     const body = await json(c);
     const at = opts.now();

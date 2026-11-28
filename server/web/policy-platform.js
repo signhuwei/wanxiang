@@ -165,7 +165,7 @@ function signaturesPage(host, api, endpoint, tenant, onChange, signal, openRecor
   host.classList.add('policy-signatures')
   let ledger
   const open = (title, draw) => openRecord(title, draw, ledger)
-  function show(row) {
+  function show(row, startEditing = false) {
     open(row ? '合约条目 · v' + row.revision : '首次签发', async pane => {
       let data
       if (row) {
@@ -220,8 +220,8 @@ function signaturesPage(host, api, endpoint, tenant, onChange, signal, openRecor
           }
         })
       }
-      if (row) draw()
-      else if (hasAction(tenant, 'sign')) edit()
+      if ((!row || startEditing) && hasAction(data ?? tenant, 'sign')) edit()
+      else if (row) draw()
       else pane.body.append(el('p', 'empty', '没有可执行的签发操作'))
     })
   }
@@ -248,6 +248,7 @@ function signaturesPage(host, api, endpoint, tenant, onChange, signal, openRecor
     onOpen: show,
     onCreate: () => show()
   })
+  return () => show(tenant.platform_revision ? { revision: tenant.platform_revision } : null, true)
 }
 
 export function platformPolicyContracts(host, api, signal) {
@@ -286,10 +287,11 @@ export function platformPolicyContracts(host, api, signal) {
         account: accountPane=>commerceAccountPanel(accountPane.body,api,row.tenant_id,signal),
         onChange: pane.changed
       })
-      signaturesPage(signatures, api, endpoint, tenant, () => {
+      const sign = signaturesPage(signatures, api, endpoint, tenant, () => {
         pane.changed()
         refreshRecharge()
       }, signal, openRecord)
+      if (hasAction(tenant, 'sign')) pane.headActions.append(button('签发合约', sign, 'primary'))
     })
   }
   ledger = createLedger(host, {

@@ -13,7 +13,7 @@ export function targetSummary(target) {
   const section = el('section')
   section.append(el('h3', null, '当前生效能力'), el('p', 'muted', '按 ' + target.os + ' / ' + target.arch + ' 与当前配置计算。设备实际应用情况见下发回执。'))
   for (const [label, rows] of [
-    ['模型与费率', target.models.map(m => m.name + ' · ' + m.provider_id + (m.rate ? ' · 输入 ' + formatMilli(m.rate.input_milli_per_mtok) + '，输出 ' + formatMilli(m.rate.output_milli_per_mtok) + ' 块/百万 token' : ''))],
+    ['模型与费率', target.models.map(m => m.name + ' · ' + m.provider_id + (m.rate ? ' · 输入 ' + formatMilli(m.rate.input_milli_per_mtok) + '，输出 ' + formatMilli(m.rate.output_milli_per_mtok) + ' 粒/百万 token' : ''))],
     ['上游顺序', (target.routes ?? []).map(r => r.model_id + ' · ' + r.candidates.map(c => c.provider_id).join(' → '))],
     ['Agent 发行', target.releases.map(r => r.agent + ' ' + r.version)],
     ['工具发行', target.tools.map(t => t.name + ' ' + t.version)],

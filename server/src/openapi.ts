@@ -40,8 +40,9 @@ const managed = (properties: Record<string, unknown>) => object({ ...properties,
 const tokenName = { ...text, minLength: 1, maxLength: 128 };
 const timestamp = { ...text, format: 'date-time' };
 const nullableTimestamp = { ...nullableText, format: 'date-time' };
-const personalTokenRecord = managed({ id: text, name: tokenName, created_at: timestamp, expires_at: timestamp,
-  last_used_at: nullableTimestamp, revoked_at: nullableTimestamp });
+const personalTokenFields = { id: text, name: tokenName, created_at: timestamp, expires_at: timestamp,
+  last_used_at: nullableTimestamp, revoked_at: nullableTimestamp, revision, actions };
+const personalTokenRecord = object({ ...personalTokenFields, tenant_id: tenantId }, Object.keys(personalTokenFields));
 const listOf = (schema: object, parameters: object[] = []) => ({ security: bearer, parameters: [...listParams, ...parameters], responses: { 200: response('分页结果',
   object({ items: { type: 'array', items: schema }, total: sequence, next_cursor: nullableText, actions })), 401: status[401], 403: status[403], 422: status[422] } });
 const detailOf = (schema: object, hasId = true) => ({ security: bearer, ...(hasId && { parameters: [idPath] }),
@@ -774,19 +775,34 @@ export const openapi = {
       responses: { 200: response('租户范围的会话令牌', loginResponse), 401: status[401], 422: status[422],
         429: error('登录请求过快'), 500: status[500] },
     } },
+    '/v1/auth/master-password-login': { post: { summary: '使用 Master 用户名与密码登录平台',
+      requestBody: requestBody(object({ username: { ...text, minLength: 1, maxLength: 64 },
+        password: { ...text, format: 'password', minLength: 1, maxLength: 256, writeOnly: true } })),
+      responses: { 200: response('平台 Web 会话', loginResponse), 401: status[401], 422: status[422],
+        429: error('登录请求过快'), 500: status[500] } } },
+    '/v1/auth/master-password': {
+      get: { summary: '查看当前平台管理员的 Master 登录设置', security: bearer,
+        responses: { 200: response('登录设置', object({ username: nullableText, revision: { type: 'integer', minimum: 0 }, actions })), 401: status[401], 403: status[403] } },
+      put: { summary: '设置当前平台管理员的 Master 用户名和密码', security: bearer, parameters: headers,
+        requestBody: requestBody(object({ username: { ...text, minLength: 1, maxLength: 64 },
+          password: { ...text, format: 'password', minLength: 12, maxLength: 256, writeOnly: true },
+          revision: { type: 'integer', minimum: 0 } })),
+        responses: { 200: response('已保存', object({ username: text, revision, actions })), 401: status[401], 403: status[403],
+          409: status[409], 422: status[422], 429: error('设置请求过快'), 500: status[500] } },
+    },
     '/v1/auth/token-login': { post: { summary: '使用个人登录令牌换取 Web 会话',
       requestBody: requestBody(object({ token: personalToken })),
-      responses: { 200: response('Web 全局会话令牌', loginResponse), 401: status[401], 422: status[422], 500: status[500] } } },
+      responses: { 200: response('全局或绑定租户的 Web 会话令牌', loginResponse), 401: status[401], 422: status[422], 500: status[500] } } },
     '/v1/auth/personal-tokens': {
       get: { ...listOf(personalTokenRecord), summary: '当前账户的个人登录令牌台账' },
       post: { ...write(object({ name: tokenName }), { ...personalTokenRecord,
         properties: { ...personalTokenRecord.properties, token: personalToken } }, 'create'),
         summary: '为当前账户创建个人登录令牌，需要 Web 会话',
-        description: '令牌有效期七天，每账户最多十枚有效令牌。明文只在首次创建时返回，幂等重放仅返回记录。' },
+        description: '令牌最长有效七天。租户受限会话新签发的令牌绑定本租户，并受上级令牌有效期限制。每账户最多十枚有效令牌。明文只在首次创建时返回。' },
     },
     '/v1/auth/personal-tokens/{id}/revoke': { post: { summary: '撤销当前账户的个人登录令牌及其会话',
       security: bearer, parameters: [idPath, ...headers], requestBody: requestBody(object({ revision })),
-      responses: { 204: response('已撤销'), 401: status[401], 404: error('令牌不存在或不属于当前账户'),
+      responses: { 204: response('令牌、租户子令牌及其会话已撤销'), 401: status[401], 403: status[403], 404: error('令牌不存在或不在当前权限范围内'),
         409: status[409], 422: status[422], 500: status[500] } } },
     '/v1/auth/select-tenant': { post: { summary: '签发租户范围令牌', security: bearer, parameters: headers,
       requestBody: requestBody(object({ tenant_id: tenantId, kind }, ['tenant_id'])), responses: { 200: response('租户令牌', object({ token })), ...status } } },
@@ -795,7 +811,7 @@ export const openapi = {
     '/v1/me': { get: { summary: '当前用户与权限范围', security: bearer, responses: {
       200: response('用户与当前租户', object({ user: ref('User'), tenant: { anyOf: [ref('Tenant'), { type: 'null' }] },
         role: { anyOf: [role, { type: 'null' }] }, agents: { type: 'array', items: text }, is_platform_admin: { type: 'boolean' }, actions, quota: meQuota,
-        tenant_password_login: { const: true, description: '当前会话通过租户范围的密码登录签发。' } },
+        tenant_password_login: { const: true, description: '当前会话通过租户密码或与之绑定的租户令牌签发，只能在该租户内操作。' } },
       ['user', 'tenant', 'role', 'agents', 'is_platform_admin', 'actions', 'quota'])), 401: status[401], 403: status[403], 500: status[500],
     } } },
     '/v1/devices': { post: { summary: '注册设备，需要租户令牌', security: bearer, parameters: headers,

@@ -6,6 +6,7 @@ import { idempotencyKey } from './idempotency.js'
 const PATH = '/auth/personal-tokens'
 const action = (record, verb) => Array.isArray(record.actions) && record.actions.includes(verb)
 const dateField = (key, title) => ({ key, title, render: row => formatDateTime(row[key]) })
+const tokenScope = row => row.tenant_id ? '绑定租户' : '全局账号'
 
 function tokenStatus(row) {
   if (row.revoked_at) return '已撤销'
@@ -78,10 +79,11 @@ export function personalTokensPage(host, api, signal) {
     open(row.name, pane => {
       editForm(pane, {
         mode: 'view',
-        values: { ...row, status: tokenStatus(row) },
+        values: { ...row, status: tokenStatus(row), scope: row.tenant_id ?? tokenScope(row) },
         fields: [
           { key: 'name', label: '令牌名称' },
           { key: 'status', label: '状态' },
+          { key: 'scope', label: '权限范围' },
           { key: 'created_at', label: '创建时间', format: formatDateTime },
           { key: 'expires_at', label: '到期时间', format: formatDateTime },
           { key: 'last_used_at', label: '最近使用', format: formatDateTime },
@@ -121,6 +123,7 @@ export function personalTokensPage(host, api, signal) {
     title: '令牌管理',
     columns: [
       { key: 'name', title: '令牌名称' },
+      { key: 'scope', title: '权限范围', render: tokenScope },
       { key: 'status', title: '状态', render: tokenStatus },
       dateField('created_at', '创建时间'),
       dateField('expires_at', '到期时间'),

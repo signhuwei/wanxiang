@@ -29,6 +29,7 @@ import { renderMembersPage } from './members.js'
 import { releasesPage } from './releases.js'
 import { serverReleasesPage } from './server-releases.js'
 import { personalTokensPage } from './personal-tokens.js'
+import { masterPasswordPage } from './master-password.js'
 import { formatMilli } from './format.js'
 import { mockEnabled, installMock } from './mock/index.js'
 
@@ -63,6 +64,7 @@ const api = createApi({
 
 const platformApi = createApi({ getToken: () => session?.globalToken, onUnauthorized: clearSession })
 const app = document.getElementById('app')
+let serverBuild
 
 function signOut() {
   const tokens = new Set([session?.token, session?.globalToken].filter(Boolean))
@@ -88,7 +90,7 @@ function canReadAudit() {
 function appendQuotaItem(items, quota) {
   const remainingText = quota.remaining_milli === null || quota.remaining_milli === undefined
     ? '不限'
-    : formatMilli(quota.remaining_milli) + ' 块橡皮'
+    : formatMilli(quota.remaining_milli) + ' 粒橡皮'
   const line = el('div', 'quota-item muted')
   const label = el('span', null, '本月剩余：')
   const value = el('span', 'quota-item-value', remainingText)
@@ -143,7 +145,25 @@ function renderTop(hash, signal) {
     brand.classList.add('token-login-trigger')
     bindTokenLoginTrigger(brand, 'OneX 万象，令牌登录', () => openLoginTokenForm())
   }
-  top.appendChild(brand)
+  if (session && !mockOn) {
+    const identity = el('div', 'server-identity')
+    const build = el('div', 'server-build muted', '正在读取 Server 版本…')
+    identity.append(brand, build)
+    top.append(identity)
+    serverBuild ??= createApi().get('/healthz', { signal: AbortSignal.timeout(5000) }).catch(() => {
+      serverBuild = null
+      return null
+    })
+    serverBuild.then(info => {
+      if (signal.aborted) return
+      if (typeof info?.version !== 'string' || typeof info?.commit !== 'string') {
+        build.textContent = 'Server 版本暂不可用'
+        return
+      }
+      build.textContent = `Server ${info.version} · ${info.commit.slice(0, 12)}`
+      build.title = `Git 提交 ${info.commit}`
+    })
+  } else top.appendChild(brand)
 
   if (session) {
     const tenantView = inWorkspace(hash, 'tenant') && hash !== tenantSelection && session.tenant
@@ -212,7 +232,12 @@ function renderTop(hash, signal) {
     document.addEventListener('pointerdown', closeOutside, { capture: true, signal })
     document.addEventListener('focusin', closeOutside, { signal })
     items.append(download)
-    if (!session.tenant_password_login) items.append(tokens)
+    items.append(tokens)
+    if (canUsePlatform()) {
+      const credentials = el('a', null, 'Master 登录设置')
+      credentials.href = '#/account/master-password'
+      items.append(credentials)
+    }
     items.append(logout)
     account.append(summary, items)
     tools.append(account)
@@ -307,8 +332,13 @@ function route() {
   }
 
   if (hash === '#/account/tokens') {
-    if (session.tenant_password_login) location.replace(defaultHash())
-    else personalTokensPage(ws, api, lifecycle.signal)
+    personalTokensPage(ws, api, lifecycle.signal)
+    return
+  }
+
+  if (hash === '#/account/master-password') {
+    if (canUsePlatform()) masterPasswordPage(ws, platformApi, lifecycle.signal)
+    else location.replace(defaultHash())
     return
   }
 

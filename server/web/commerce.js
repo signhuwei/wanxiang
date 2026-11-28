@@ -11,7 +11,7 @@ const base = '/platform/commerce'
 const prices = ['input', 'output', 'cache_read', 'cache_write']
 const labels = ['输入', '输出', '缓存读', '缓存写']
 const tierNames = { floor: '兜底', standard: '标准', pro: '专业', advanced: '高级', top: '顶级' }
-const blocks = (value) => formatMilli(value) + ' 块'
+const blocks = (value) => formatMilli(value) + ' 粒'
 const select = (key, label, options) => ({ key, label, type: 'select', options, allowEmpty: false })
 const amount = (key, label) => ({ key, label, placeholder: '0.000' })
 const ratio = { key: 'ratio', label: '折扣系数（0 至 1）', placeholder: '0.90' }
@@ -115,7 +115,7 @@ function priceRows(host, api, signal, models, initial) {
     fillSources(value.model_id ? (original ?? '') : null)
     const grid = el('div', 'form-grid')
     grid.append(inputField('模型', model), inputField('费率来源', source, true),
-      ...prices.map((k, i) => inputField(labels[i] + '（块 / 百万 Token）', inputs[k])))
+      ...prices.map((k, i) => inputField(labels[i] + '（粒 / 百万 Token）', inputs[k])))
     const entry = { collect: () => ({ model_id: model.value, source_rate_key: source.value || null,
       amounts: Object.fromEntries(prices.map(k => [k, inputs[k].value])) }) }
     row.append(grid, note, button('移除', () => { rows.delete(entry); row.remove() }, 'link'))
@@ -156,19 +156,19 @@ async function planEditor(pane, api, signal, plan) {
   const form = renderForm(section, { mode: 'edit', sections: [{ fields: [
     { key: 'name', label: '方案名称' },
     ...(plan ? [select('publication', '发布到', [{ value: 'version', label: '原方案的新版本' }, { value: 'copy', label: '独立方案（可单独签发给租户）' }])] : []),
-    amount('grant', '每月发放（块）'), amount('fee', '月费（元）'),
-    amount('commitment', '承诺额度（块）'), { ...ratio, key: 'commit_ratio', label: '承诺额度内折扣系数' },
+    amount('grant', '每月发放（粒）'), amount('fee', '月费（元）'),
+    amount('commitment', '承诺额度（粒）'), { ...ratio, key: 'commit_ratio', label: '承诺额度内折扣系数' },
   ] }], values: { name: plan?.name, publication: 'version', grant: formatMilli(t.monthly_grant_milli ?? 0), fee: (t.monthly_fee_fen ?? 0) / 100,
     commitment: t.commitment ? formatMilli(t.commitment.up_to_milli) : '', commit_ratio: t.commitment ? t.commitment.ratio_ppm / 1000000 : '' } })
-  const levels = repeated(pane.body, '阶梯', [amount('from', '起始用量（块）'), ratio],
+  const levels = repeated(pane.body, '阶梯', [amount('from', '起始用量（粒）'), ratio],
     (t.tiers ?? []).map(r => ({ from: formatMilli(r.from_milli), ratio: r.ratio_ppm / 1000000 })))
   const rates = priceRows(pane.body, api, signal, models, (t.model_prices ?? []).map(priceRowFromSaved))
-  const budgets = repeated(pane.body, '单模型月预算', [m, amount('monthly', '每月额度（块）')],
+  const budgets = repeated(pane.body, '单模型月预算', [m, amount('monthly', '每月额度（粒）')],
     (t.model_budgets ?? []).map(r => ({ model_id: r.model_id, monthly: formatMilli(r.monthly_milli) })))
   const fees = repeated(pane.body, '工具调用费', [
     select('release_id', '计费工具发行', tools.filter(r => ['mcp', 'http_search'].includes(r.kind) && r.status === 'published')
       .map(r => ({ value: r.id, label: r.name + ' · ' + r.version + ' · ' + (r.kind === 'http_search' ? 'HTTP 搜索' : r.os + '/' + r.arch) }))),
-    amount('price', '每次费用（块）'),
+    amount('price', '每次费用（粒）'),
   ], (t.tool_prices ?? []).map(r => ({ release_id: r.release_id, price: formatMilli(r.per_call_milli) })))
   saver(pane, '发布方案', () => {
     const f = form.collect()

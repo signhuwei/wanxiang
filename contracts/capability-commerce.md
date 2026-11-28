@@ -17,7 +17,7 @@
 
 ## 钱包、租约及工具
 
-平台读取 `GET /v1/platform/commerce/tenants/:tenant_id`，户主读取 `GET /v1/commerce/account`。返回当月及已有月包记录、永久额度和包月可用余额、未结租约、单模型用量与预留、协议档位、最近 100 条工具计费记录。金额字段 `*_milli` 为整数，一块橡皮为 1,000 毫橡皮。
+平台读取 `GET /v1/platform/commerce/tenants/:tenant_id`，户主读取 `GET /v1/commerce/account`。返回当月及已有月包记录、永久额度和包月可用余额、未结租约、单模型用量与预留、协议档位、最近 100 条工具计费记录。金额字段 `*_milli` 为整数，一粒橡皮为 1,000 毫橡皮。
 
 包月优先预留和抵扣，未使用余额在上海月界到期。旧租约延迟结清仍只支用其预留的原月套餐，原月余额到期后不再发放。原租约总额继续写一次 settle，模型明细仅归属消费。商业租约响应附 `commerce_plan_id`，有月度限制的实际模型附 `model_budgets: {model_id: allowance_milli}`。Edge 将模型的累计支出和按模型计的在途预留限制在已授额度内，实际目标模型 ID 同时用于用量与账目；在途尾差登记已用，耗尽后停止放行。
 

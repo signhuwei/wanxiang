@@ -43,7 +43,7 @@ function seedRates(sql) {
   sql.run("INSERT INTO platform_rate_heads (model_id,source_rate_key,updated_at) VALUES ('mdl_m','prate_m_2',?)", [now])
   sql.run(`INSERT INTO route_release_jobs (job_id,model_id,pool_revision,job_kind,source_digest,status,created_at)
     VALUES ('rol_stub_6','mdl_m',6,'project','seed','done',?)`, [now])
-  // 旧方案：引用早先的 prate_m_1，输出为显式手调值 11 块。
+  // 旧方案：引用早先的 prate_m_1，输出为显式手调值 11 粒。
   const terms = { monthly_grant_milli: 0, monthly_fee_fen: 0, tiers: [], commitment: null, model_budgets: [], tool_prices: [],
     model_prices: [{ model_id: 'mdl_m', source_rate_key: 'prate_m_1', input_milli_per_mtok: 3000, output_milli_per_mtok: 11000,
       cache_read_milli_per_mtok: 1000, cache_write_milli_per_mtok: 5000 }] }
@@ -100,13 +100,13 @@ try {
   await row.getByText('手填完整四项，不引用平台费率版本。').waitFor()
   await row.getByLabel('模型', { exact: true }).selectOption('mdl_m')
   assert.equal(await row.getByLabel('费率来源', { exact: true }).inputValue(), 'prate_m_2')
-  await row.getByText('引用 prate_m_2 · 输入倍率 4× · 输入 4 · 输出 12 · 缓存读 1 · 缓存写 5 块／百万 Token。四项留空，按该版本展开。').waitFor()
+  await row.getByText('引用 prate_m_2 · 输入倍率 4× · 输入 4 · 输出 12 · 缓存读 1 · 缓存写 5 粒／百万 Token。四项留空，按该版本展开。').waitFor()
   await capture('plan-rate-reference')
   // 引用时只填一部分显式价：客户端拒绝，不发送
-  await row.getByLabel('输入（块 / 百万 Token）', { exact: true }).fill('4.5')
+  await row.getByLabel('输入（粒 / 百万 Token）', { exact: true }).fill('4.5')
   await pane.getByRole('button', { name: '发布方案', exact: true }).click()
   await pane.getByText('mdl_m 引用费率版本时四项须全部留空或全部填写').waitFor()
-  await row.getByLabel('输入（块 / 百万 Token）', { exact: true }).fill('')
+  await row.getByLabel('输入（粒 / 百万 Token）', { exact: true }).fill('')
   const created = page.waitForRequest(r => r.method() === 'POST' && new URL(r.url()).pathname === '/v1/platform/commerce/plans')
   await pane.getByRole('button', { name: '发布方案', exact: true }).click()
   assert.deepEqual((await created).postDataJSON().terms.model_prices, [{ model_id: 'mdl_m', source_rate_key: 'prate_m_2' }])
@@ -120,13 +120,13 @@ try {
   const old = pane.locator('.commerce-price-row').last()
   assert.equal(await old.getByLabel('费率来源', { exact: true }).inputValue(), 'prate_m_1')
   assert.deepEqual(await old.getByLabel('费率来源', { exact: true }).locator('option').evaluateAll(o => o.map(n => n.value)), ['', 'prate_m_2', 'prate_m_1'])
-  assert.equal(await old.getByLabel('输出（块 / 百万 Token）', { exact: true }).inputValue(), '11')
+  assert.equal(await old.getByLabel('输出（粒 / 百万 Token）', { exact: true }).inputValue(), '11')
   await old.getByText(/引用 prate_m_1 · 输入倍率 3× .*显式价与版本不同，按显式价保存（手调）。/).waitFor()
   // 切到当前版本会清空显式价；切回原引用恢复原值
   await old.getByLabel('费率来源', { exact: true }).selectOption('prate_m_2')
-  assert.equal(await old.getByLabel('输出（块 / 百万 Token）', { exact: true }).inputValue(), '')
+  assert.equal(await old.getByLabel('输出（粒 / 百万 Token）', { exact: true }).inputValue(), '')
   await old.getByLabel('费率来源', { exact: true }).selectOption('prate_m_1')
-  assert.equal(await old.getByLabel('输出（块 / 百万 Token）', { exact: true }).inputValue(), '11')
+  assert.equal(await old.getByLabel('输出（粒 / 百万 Token）', { exact: true }).inputValue(), '11')
   await pane.getByLabel('发布到', { exact: true }).selectOption('copy')
   await pane.getByLabel('方案名称', { exact: true }).fill('旧协议方案副本')
   const copied = page.waitForRequest(r => r.method() === 'POST' && new URL(r.url()).pathname === '/v1/platform/commerce/plans')

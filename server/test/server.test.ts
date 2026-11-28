@@ -71,6 +71,52 @@ const standardEntitlements = {
   quota_distribution: true,
 };
 
+test('Master password uses the existing platform identity and rotation expires old password sessions', async () => {
+  const f = await fixture();
+  const master = await f.login(f.owner, 'web');
+  const settings = '/auth/master-password';
+  const login = '/auth/master-password-login';
+  const password = randomUUID();
+  const updated = randomUUID();
+  const username = 'Dedicated.Master';
+  const credentials = { username, password };
+
+  expect((await f.request(settings, undefined, master)).status).toBe(403);
+  await f.store.system.write(sql => sql.run('INSERT INTO platform_admins VALUES (?)', [f.userId]));
+  const tenant = await f.select(master);
+  expect((await f.request(settings, undefined, tenant)).status).toBe(403);
+  expect(await (await f.request(settings, undefined, master)).json()).toEqual({ username: null, revision: 0, actions: ['set_master_password'] });
+  expect((await f.request(settings, { ...credentials, revision: 0 }, master, undefined, 'PUT')).status).toBe(422);
+  const set = await f.request(settings, { ...credentials, revision: 0 }, master, 'master-setup', 'PUT');
+  expect(set.status).toBe(200);
+  expect(await set.json()).toMatchObject({ username, revision: 1 });
+  const protectedRow = f.store.system.get<{ password_hash: string }>('SELECT password_hash FROM master_login_accounts WHERE user_id=?', [f.userId])!;
+  expect(protectedRow.password_hash).toStartWith('$argon2id$');
+  expect(protectedRow.password_hash).not.toContain(password);
+  expect((await f.request(login, { username, password: updated })).status).toBe(401);
+  const signedIn = await f.request(login, { username: username.toLowerCase(), password });
+  expect(signedIn.status).toBe(200);
+  const { token } = await signedIn.json() as { token: string };
+  expect(await (await f.request('/me', undefined, token)).json()).toMatchObject({ tenant: null, is_platform_admin: true });
+  expect((await f.request('/auth/select-tenant', { tenant_id: f.tenantId, kind: 'desktop' }, token)).status).toBe(403);
+  const derivedTenant = await f.select(token);
+  expect((await f.request(settings, { username, password: updated, revision: 1 }, master, 'master-rotate', 'PUT')).status).toBe(200);
+  expect((await f.request('/me', undefined, token)).status).toBe(401);
+  expect((await f.request('/me', undefined, derivedTenant)).status).toBe(401);
+  expect((await f.request('/me', undefined, master)).status).toBe(200);
+  expect((await f.request(login, credentials)).status).toBe(401);
+  const reauthenticated = await f.request(login, { username, password: updated });
+  expect(reauthenticated.status).toBe(200);
+  const replacement = (await reauthenticated.json() as { token: string }).token;
+  expect(f.store.system.get<{ n: number }>("SELECT count(*) n FROM platform_audit WHERE action='auth.master_password.set' AND actor=?", [f.userId])?.n).toBe(2);
+  await f.store.system.write(sql => {
+    sql.run('DELETE FROM platform_admins WHERE user_id=?', [f.userId]);
+    sql.run('INSERT INTO platform_admins VALUES (?)', [f.userId]);
+  });
+  expect((await f.request('/me', undefined, replacement)).status).toBe(401);
+  expect((await f.request(login, { username, password: updated })).status).toBe(401);
+});
+
 async function issueFixtureContract(f: Awaited<ReturnType<typeof fixture>>, global: string, scoped: string, entitlements = standardEntitlements) {
   await f.store.system.write(sql => sql.run('INSERT OR IGNORE INTO platform_admins VALUES (?)', [f.userId]));
   const template = { id: 'fixture', name: 'Fixture', revision: 0, entitlements };
@@ -342,6 +388,70 @@ test('personal tokens are account-owned, disclosed once, and can be managed by o
   }
 });
 
+test('tenant-password Web accounts can only issue and exchange personal tokens within their own tenant', async () => {
+  const f = await fixture();
+  const other = await seedTenant(f.store, { target: f.owner, name: 'Other test tenant', platformAdmin: true });
+  const password = 'Tenant account fixture password';
+  await setPassword(f, f.tenantId, f.userId, 'First', 'Owner', password);
+  await setPassword(f, other.tenantId, f.userId, 'Second', 'Owner', password);
+  const webLogin = async (tenant: string) => {
+    const response = await f.request(passwordLogin, { tenant, username: 'owner', password, kind: 'web' });
+    expect(response.status).toBe(200);
+    return (await response.json() as { token: string }).token;
+  };
+  const firstWeb = await webLogin(f.tenantId);
+  const secondWeb = await webLogin(other.tenantId);
+  const masterWeb = await f.login(f.owner, 'web');
+  const name = { name: 'Automation login' };
+  const legacy = await (await f.request(personalTokens, name, masterWeb, 'once')).json() as PersonalTokenReply;
+  const issued = await f.request(personalTokens, name, firstWeb, 'once');
+  expect(issued.status).toBe(201);
+  const personal = await issued.json() as PersonalTokenReply & { tenant_id: string };
+  expect(personal.tenant_id).toBe(f.tenantId);
+  expect(personal.id).not.toBe(legacy.id);
+  const replay = await (await f.request(personalTokens, name, firstWeb, 'once')).json();
+  const { token: rawPersonal, ...metadata } = personal;
+  expect(replay).toEqual(metadata);
+  expect(await (await f.request(personalTokens, undefined, firstWeb)).json()).toMatchObject({ items: [metadata], total: 1 });
+  expect(await (await f.request(personalTokens, undefined, secondWeb)).json()).toMatchObject({ items: [], total: 0 });
+  for (const [id, session] of [[legacy.id, firstWeb], [personal.id, secondWeb]]) {
+    expect((await f.request(`${personalTokens}/${id}/revoke`, { revision: 1 }, session)).status).toBe(404);
+  }
+
+  const lookup = await f.request(tokenLogin, { token: rawPersonal });
+  expect(lookup.status).toBe(200);
+  const parent = await lookup.json() as { token: string; tenants: { id: string; role: string }[] };
+  expect(parent.tenants).toHaveLength(1);
+  expect(parent.tenants[0]).toMatchObject({ id: f.tenantId, role: 'owner' });
+  expect(await (await f.request('/me', undefined, parent.token)).json()).toMatchObject({
+    tenant: { id: f.tenantId }, role: 'owner', is_platform_admin: false, tenant_password_login: true,
+  });
+  expect((await f.request('/me', undefined, rawPersonal)).status).toBe(401);
+  expect((await f.request('/platform/tenants', undefined, parent.token)).status).toBe(403);
+  expect((await f.request('/auth/select-tenant', { tenant_id: other.tenantId }, parent.token)).status).toBe(403);
+  expect((await f.request('/devices', f.device, parent.token)).status).toBe(403);
+
+  // A copied automation token cannot outlive the credential that authorized it.
+  f.advance(10 * 60_000);
+  const childIssue = await f.request(personalTokens, { name: 'Child automation login' }, parent.token);
+  expect(childIssue.status).toBe(201);
+  const child = await childIssue.json() as PersonalTokenReply & { tenant_id: string };
+  expect(child).toMatchObject({ tenant_id: f.tenantId, expires_at: personal.expires_at });
+  const childLogin = await f.request(tokenLogin, { token: child.token });
+  expect(childLogin.status).toBe(200);
+  const childSession = (await childLogin.json() as { token: string }).token;
+  await f.store.tenant(f.tenantId).write(sql => sql.run("UPDATE members SET role = 'member' WHERE user_id = ?", [f.userId]));
+  expect(await (await f.request('/me', undefined, childSession)).json()).toMatchObject({ role: 'member', is_platform_admin: false });
+  expect((await f.request('/groups', { name: 'Forbidden group' }, childSession)).status).toBe(403);
+  await f.store.tenant(f.tenantId).write(sql => sql.run("UPDATE members SET status = 'disabled' WHERE user_id = ?", [f.userId]));
+  expect((await f.request(tokenLogin, { token: rawPersonal })).status).toBe(401);
+  await f.store.tenant(f.tenantId).write(sql => sql.run("UPDATE members SET status = 'active' WHERE user_id = ?", [f.userId]));
+  expect((await f.request(`${personalTokens}/${personal.id}/revoke`, { revision: 1 }, firstWeb, 'revoke')).status).toBe(204);
+  for (const raw of [rawPersonal, child.token]) expect((await f.request(tokenLogin, { token: raw })).status).toBe(401);
+  for (const stale of [parent.token, childSession]) expect((await f.request('/me', undefined, stale)).status).toBe(401);
+  expect((await f.request(tokenLogin, { token: legacy.token })).status).toBe(200);
+});
+
 test('token exchange is web-only and revokes all derived sessions at once', async () => {
   const f = await fixture();
   const otp = await f.login(f.owner, 'web');
@@ -609,7 +719,9 @@ test('tenant management enforces scope, revisions, pagination, and one-time invi
   const employee = await f.select(token);
   expect((await f.request('/members', undefined, employee)).status).toBe(403);
   const update = { revision: 1, quota_milli: 100 };
-  expect(await (await f.request(`/members/${user.id}`, update, scoped, undefined, 'PATCH')).json()).toMatchObject({ revision: 2, group_id: group.id, quota_milli: 100 });
+  expect(await (await f.request(`/members/${user.id}`, update, scoped, undefined, 'PATCH')).json()).toMatchObject({
+    revision: 2, group_id: group.id, quota_milli: 100, actions: ['read', 'update', 'disable'],
+  });
   expect((await f.request(`/members/${user.id}`, update, scoped)).status).toBe(409);
   const set = { revision: 1, seat_limit: 2, allowed_agents: ['claude-code'], allowed_models: [], lease_minutes: 10, lease_budget_milli: 2000, visibility: {} };
   expect((await f.request('/contract', set, employee, undefined, 'PUT')).status).toBe(403);

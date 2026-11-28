@@ -21,7 +21,7 @@ const types = {
   model: { path:'models', label:'模型', title:'模型目录', name:'display_name', parent:'provider_id', child:'rate', drill:'倍率记录',
     fields:[text('display_name','名称'),text('upstream_name','上游模型名'), ...modelTokenFields] },
   rate: { path:'rates', label:'倍率', title:'倍率记录', name:'effective_from', parent:'model_id', fields:[text('effective_from','生效时间（UTC）'),
-    ...[['input','输入'],['output','输出'],['cache_read','缓存读取'],['cache_write','缓存写入']].map(([k,label]) => text(k+'_milli_per_mtok',label+'（块/百万 token）'))] }
+    ...[['input','输入'],['output','输出'],['cache_read','缓存读取'],['cache_write','缓存写入']].map(([k,label]) => text(k+'_milli_per_mtok',label+'（粒/百万 token）'))] }
 }
 
 export function catalog(host, api, actions, kind = 'provider', parent = null, signal) {

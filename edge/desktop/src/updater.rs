@@ -1,15 +1,19 @@
+use std::fs::File;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, RANGE};
 use reqwest::{Client, StatusCode, Url};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::update_platform;
 
@@ -221,32 +225,24 @@ impl Updater {
     }
 
     async fn download_and_install(&self, origin: &Url, manifest: &Manifest) -> Result<()> {
+        let home = onex_core::ipc::default_home().map_err(anyhow::Error::msg)?;
+        let cache = home.join("desktop-update-download");
+        tokio::fs::create_dir_all(&cache).await?;
+        let lock = File::options().write(true).create(true).truncate(false).open(cache.join("download.lock"))?;
+        lock.try_lock().context("could not lock the Desktop update download")?;
         ensure!(self.current_release(origin).await?.as_ref() == Some(manifest), "update is no longer current");
-        let directory = tempfile::Builder::new().prefix("onex-desktop-update-").tempdir()?;
-        let artifact =
-            directory.path().join(if cfg!(target_os = "macos") { "OneX Desktop.pkg" } else { "windows.onex-update" });
-        let url = origin.join(&format!("/v1/desktop-releases/{}/update-download", manifest.id))?;
-        let mut response = self.client.get(url).timeout(Duration::from_secs(300)).send().await?.error_for_status()?;
-        ensure!(response.content_length().is_none_or(|size| size == manifest.size), "update byte count changed");
-        let mut bytes = 0u64;
-        let mut sha = Sha256::new();
-        let mut file = tokio::fs::File::create_new(&artifact).await?;
-        while let Some(chunk) = response.chunk().await? {
-            bytes += chunk.len() as u64;
-            ensure!(bytes <= manifest.size, "update is bigger than the signed manifest");
-            sha.update(&chunk);
-            file.write_all(&chunk).await?;
+        let partial = update_partial(&cache, origin, manifest).await?;
+        download_artifact(&self.client, origin, manifest, &partial, |bytes| {
             if let Some(view) = &mut self.state.lock().unwrap().view {
                 view.downloaded_bytes = bytes;
             }
-        }
-        ensure!(
-            bytes == manifest.size && format!("{:x}", sha.finalize()) == manifest.sha256,
-            "update hash or size mismatch"
-        );
-        file.sync_all().await?;
-        drop(file);
+        })
+        .await?;
         ensure!(self.current_release(origin).await?.as_ref() == Some(manifest), "update is no longer current");
+        let directory = tempfile::Builder::new().prefix("install-").tempdir_in(cache)?;
+        let artifact =
+            directory.path().join(if cfg!(target_os = "macos") { "OneX Desktop.pkg" } else { "windows.onex-update" });
+        tokio::fs::rename(&partial, &artifact).await?;
         if let Some(view) = &mut self.state.lock().unwrap().view {
             view.phase = Phase::Installing;
         }
@@ -268,8 +264,6 @@ impl Updater {
 
     #[cfg(windows)]
     pub(crate) async fn resume_windows_components(&self, home: &std::path::Path) -> Result<()> {
-        use tokio::io::AsyncReadExt;
-
         let version = self.current.to_string();
         let directory = home.join("windows-edge-updates").join(&version);
         let manifest_path = directory.join("manifest.json");
@@ -286,7 +280,7 @@ impl Updater {
         ensure!(manifest.version == version, "pending components belong to a different Desktop version");
         manifest.validate(key, &self.current)?;
         let artifact = directory.join("windows.onex-update");
-        ensure!(valid_windows_bundle(&artifact, &manifest).await?, "pending Windows update bytes changed");
+        ensure!(valid_artifact(&artifact, &manifest).await?, "pending Windows update bytes changed");
         let scratch = tempfile::Builder::new().prefix("onex-components-").tempdir()?;
         let (cli, daemon) = crate::windows_update_bundle::sidecars(&artifact, scratch.path())?;
         loop {
@@ -311,6 +305,110 @@ impl Updater {
     }
 }
 
+async fn update_partial(cache: &Path, origin: &Url, manifest: &Manifest) -> Result<PathBuf> {
+    let key = Sha256::digest(format!("{origin}\n{}\n{}\n{}", manifest.id, manifest.sha256, manifest.size));
+    let partial = cache.join(format!("{key:x}.part"));
+    // The caller holds the cache lock. Keep at most one signed candidate's partial bytes.
+    let mut entries = tokio::fs::read_dir(cache).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path != partial && path.extension().is_some_and(|ext| ext == "part") && entry.file_type().await?.is_file() {
+            tokio::fs::remove_file(path).await?;
+        }
+    }
+    Ok(partial)
+}
+
+async fn download_artifact(
+    client: &Client,
+    origin: &Url,
+    manifest: &Manifest,
+    partial: &Path,
+    progress: impl Fn(u64),
+) -> Result<()> {
+    let mut offset = match tokio::fs::symlink_metadata(partial).await {
+        Ok(metadata) => {
+            ensure!(metadata.is_file(), "update partial is not a regular file");
+            metadata.len()
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => 0,
+        Err(error) => return Err(error).context("inspect update partial"),
+    };
+    if offset >= manifest.size {
+        if offset == manifest.size && valid_artifact(partial, manifest).await? {
+            progress(offset);
+            return Ok(());
+        }
+        tokio::fs::remove_file(partial).await?;
+        offset = 0;
+    }
+    progress(offset);
+    let url = origin.join(&format!("/v1/desktop-releases/{}/update-download", manifest.id))?;
+    let request = || client.get(url.clone()).timeout(Duration::from_secs(300)).header(ACCEPT_ENCODING, "identity");
+    let (mut response, start) = if offset > 0 {
+        let response = request().header(RANGE, format!("bytes={offset}-")).send().await?;
+        let size = manifest.size;
+        let expected_range = format!("bytes {offset}-{}/{size}", size - 1);
+        match response.status() {
+            StatusCode::PARTIAL_CONTENT
+                if response.headers().get(CONTENT_RANGE).is_some_and(|range| range == expected_range.as_str())
+                    && response.content_length().is_none_or(|bytes| bytes == size - offset) =>
+            {
+                (response, offset)
+            }
+            StatusCode::PARTIAL_CONTENT | StatusCode::RANGE_NOT_SATISFIABLE => {
+                drop(response);
+                (request().send().await?, 0)
+            }
+            _ => (response, 0),
+        }
+    } else {
+        (request().send().await?, 0)
+    };
+    let expected_status = if start == 0 { StatusCode::OK } else { StatusCode::PARTIAL_CONTENT };
+    ensure!(response.status() == expected_status, "update download failed: HTTP {}", response.status());
+    ensure!(
+        response.headers().get(CONTENT_ENCODING).is_none_or(|value| value.as_bytes().eq_ignore_ascii_case(b"identity")),
+        "unexpected content encoding for update"
+    );
+    ensure!(response.content_length().is_none_or(|bytes| bytes == manifest.size - start), "update byte count changed");
+    if start != offset {
+        progress(start);
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(start == 0).append(start > 0);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(partial).await?;
+    let mut written = start;
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                file.flush().await?;
+                return Err(error).context("read update download");
+            }
+        };
+        written += chunk.len() as u64;
+        if written > manifest.size {
+            drop(file);
+            tokio::fs::remove_file(partial).await?;
+            anyhow::bail!("update is bigger than the signed manifest");
+        }
+        file.write_all(&chunk).await?;
+        progress(written);
+    }
+    file.sync_all().await?;
+    drop(file);
+    ensure!(written == manifest.size, "update was interrupted before the signed size was reached");
+    if !valid_artifact(partial, manifest).await? {
+        tokio::fs::remove_file(partial).await?;
+        anyhow::bail!("update hash or size mismatch");
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 async fn stage_windows_bundle(artifact: &std::path::Path, manifest: &Manifest) -> Result<()> {
     let home = onex_core::ipc::default_home().map_err(anyhow::Error::msg)?;
@@ -320,7 +418,7 @@ async fn stage_windows_bundle(artifact: &std::path::Path, manifest: &Manifest) -
     if directory.exists() {
         let existing: Manifest = serde_json::from_slice(&tokio::fs::read(directory.join("manifest.json")).await?)?;
         ensure!(
-            &existing == manifest && valid_windows_bundle(&directory.join("windows.onex-update"), manifest).await?,
+            &existing == manifest && valid_artifact(&directory.join("windows.onex-update"), manifest).await?,
             "a different Windows bundle is already staged for this version"
         );
         return Ok(());
@@ -332,10 +430,7 @@ async fn stage_windows_bundle(artifact: &std::path::Path, manifest: &Manifest) -
     Ok(())
 }
 
-#[cfg(windows)]
-async fn valid_windows_bundle(path: &std::path::Path, manifest: &Manifest) -> Result<bool> {
-    use tokio::io::AsyncReadExt;
-
+async fn valid_artifact(path: &Path, manifest: &Manifest) -> Result<bool> {
     let mut file = tokio::fs::File::open(path).await?;
     if file.metadata().await?.len() != manifest.size {
         return Ok(false);
@@ -359,6 +454,40 @@ async fn valid_windows_bundle(path: &std::path::Path, manifest: &Manifest) -> Re
 mod tests {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    fn artifact_manifest(bytes: &[u8]) -> Manifest {
+        Manifest {
+            id: "dsk_01M88NV5GP9AGYN38CD2GG8WBK".into(),
+            version: "0.1.0-rc22".into(),
+            os: PLATFORM.0.into(),
+            arch: PLATFORM.1.into(),
+            kind: update_platform::ARTIFACT_KIND.into(),
+            size: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            signature: String::new(),
+        }
+    }
+
+    async fn artifact_server(replies: &'static [(Option<&str>, &str, &str)]) -> (Url, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let task = tokio::spawn(async move {
+            for (range, headers, bytes) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert_eq!(request.lines().find_map(|line| line.strip_prefix("range: ")), *range);
+                assert!(request.contains("\r\naccept-encoding: identity\r\n"));
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket.write_all(bytes.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        (url, task)
+    }
 
     #[test]
     fn update_verifies_target_and_rejects_tampering_or_downgrade() {
@@ -385,5 +514,55 @@ mod tests {
         assert!(!update.validate(public_key, &Version::parse("0.1.0-rc22+metadata").unwrap()).unwrap());
         update.sha256 = "b".repeat(64);
         assert!(update.validate(public_key, &Version::parse("0.1.0-rc21").unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn interrupted_update_retains_prefix_and_resumes_on_retry() {
+        let manifest = artifact_manifest(b"0123456789");
+        let cache = tempfile::tempdir().unwrap();
+        let (origin, server) = artifact_server(&[
+            (None, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n", "0123"),
+            (
+                Some("bytes=4-"),
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-9/10\r\nContent-Length: 6\r\nConnection: close\r\n\r\n",
+                "456789",
+            ),
+        ])
+        .await;
+        let partial = update_partial(cache.path(), &origin, &manifest).await.unwrap();
+        let client = Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        assert!(download_artifact(&client, &origin, &manifest, &partial, |_| {}).await.is_err());
+        assert_eq!(tokio::fs::read(&partial).await.unwrap(), b"0123");
+
+        let progress = Mutex::new(Vec::new());
+        download_artifact(&client, &origin, &manifest, &partial, |bytes| progress.lock().unwrap().push(bytes))
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&partial).await.unwrap(), b"0123456789");
+        let progress = progress.into_inner().unwrap();
+        assert_eq!((progress.first(), progress.last()), (Some(&4), Some(&10)));
+        tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_update_range_is_discarded_and_tampered_replacement_is_rejected() {
+        let manifest = artifact_manifest(b"0123456789");
+        let cache = tempfile::tempdir().unwrap();
+        let (origin, server) = artifact_server(&[
+            (
+                Some("bytes=4-"),
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-9/10\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+                "56789",
+            ),
+            (None, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n", "012345678!"),
+        ])
+        .await;
+        let partial = update_partial(cache.path(), &origin, &manifest).await.unwrap();
+        tokio::fs::write(&partial, b"0123").await.unwrap();
+        let client = Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        let error = download_artifact(&client, &origin, &manifest, &partial, |_| {}).await.unwrap_err();
+        assert!(error.to_string().contains("hash or size mismatch"));
+        assert!(!partial.exists());
+        tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
     }
 }

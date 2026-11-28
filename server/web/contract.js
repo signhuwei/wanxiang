@@ -49,7 +49,7 @@ function effectiveByDevice(api, signal) {
         return el('li', null, row.name + ' · ' + row.model + ' · ' + row.protocol + ' · ' + prices.join(' / '))
       })
       current.replaceChildren()
-      for (const [title, rows] of [['Agent 发行', agents], ['模型费率（块/百万 token，依次为输入、输出、缓存读、缓存写）', modelRows]]) {
+      for (const [title, rows] of [['Agent 发行', agents], ['模型费率（粒/百万 token，依次为输入、输出、缓存读、缓存写）', modelRows]]) {
         const list = el('ul')
         list.append(...rows)
         current.append(el('h4', null, title), rows.length ? list : el('p', 'muted', '当前设备无可用项'))
@@ -142,7 +142,7 @@ function configurationEditor(record, releases, existing, draft) {
   const models = choiceList('模型', platform.allowed_models.map(id => [id, id]), choice.allowed_models)
   const minutes = leaseLimit('租约时长（分钟）', choice.lease_minutes, platform.lease_minutes)
   minutes.node.querySelector('input').inputMode = 'numeric'
-  const budget = leaseLimit('租约额度（块）', choice.lease_budget_milli == null ? null : formatMilli(choice.lease_budget_milli),
+  const budget = leaseLimit('租约额度（粒）', choice.lease_budget_milli == null ? null : formatMilli(choice.lease_budget_milli),
     formatMilli(platform.lease_budget_milli))
   const release = releasePicker(() => agents.value() ?? platform.allowed_agents, releases, choice.agent_release_ids, existing)
   agents.node.addEventListener('change', release.refresh)
@@ -170,7 +170,7 @@ function configurationEditor(record, releases, existing, draft) {
       }
       const leaseBudget = budget.value()
       const budgetMilli = leaseBudget === undefined ? undefined : eraserMilli(leaseBudget, '租约额度')
-      if (budgetMilli > platform.lease_budget_milli) throw new Error('租约额度不能超过 ' + formatMilli(platform.lease_budget_milli) + ' 块')
+      if (budgetMilli > platform.lease_budget_milli) throw new Error('租约额度不能超过 ' + formatMilli(platform.lease_budget_milli) + ' 粒')
       const visibility = {}
       for (const { role, key, control } of controls) {
         if (control.value === '') continue

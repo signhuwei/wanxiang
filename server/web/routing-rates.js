@@ -61,7 +61,7 @@ export function salesRateTable(rates, { title, label, tenant = false, frozen = t
     node.append(el('p', 'empty', empty))
     return node
   }
-  node.append(el('p', 'muted', '输入倍率以 1× = 1 块／百万输入 Token 为基准；四项单位为块／百万 Token。'))
+  node.append(el('p', 'muted', '输入倍率以 1× = 1 粒／百万输入 Token 为基准；四项单位为粒／百万 Token。'))
   const wrap = el('div', 'routing-table')
   const table = el('table')
   table.setAttribute('aria-label', label)

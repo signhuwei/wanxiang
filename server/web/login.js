@@ -67,8 +67,10 @@ export function renderLogin(host, { api, mockOn, signal, setPendingToken, onSess
   tabs.append(tabCode, tabInvite)
   const alternate = el('div', 'login-alternate')
   const backToPassword = el('button', 'link', '返回密码登录')
+  const useToken = el('button', 'link', '令牌登录')
+  const useMaster = el('button', 'link', 'Master 密码登录')
   const useCode = el('button', 'link', '验证码或邀请')
-  alternate.append(backToPassword, useCode)
+  alternate.append(backToPassword, useToken, useMaster, useCode)
 
   const fieldsBox = el('div')
   const hint = el('p', 'login-hint')
@@ -181,12 +183,18 @@ export function renderLogin(host, { api, mockOn, signal, setPendingToken, onSess
 
   function renderFields() {
     fieldsBox.textContent = ''
-    sub.textContent = tab === 'token' ? '使用个人令牌登录' : defaultHint
+    sub.textContent = tab === 'master' ? '使用 Master 用户名和密码登录平台' : tab === 'token' ? '使用个人令牌登录' : defaultHint
     tabs.hidden = tab !== 'code' && tab !== 'invite'
-    alternate.hidden = tab === 'password'
+    backToPassword.hidden = tab === 'password'
+    useToken.hidden = tab === 'token'
+    useMaster.hidden = tab === 'master'
     useCode.hidden = tab !== 'token'
     if (tab === 'password') {
       fieldsBox.append(field('租户', tenantInput), field('用户名', usernameInput), field('密码', passwordInput))
+      return
+    }
+    if (tab === 'master') {
+      fieldsBox.append(field('用户名', usernameInput), field('密码', passwordInput))
       return
     }
     if (tab === 'token') {
@@ -208,11 +216,14 @@ export function renderLogin(host, { api, mockOn, signal, setPendingToken, onSess
     renderFields()
     if (tab === 'token') tokenInput.focus()
     else if (tab === 'password') tenantInput.focus()
+    else if (tab === 'master') usernameInput.focus()
     else targetInput.focus()
   }
   tabCode.addEventListener('click', () => switchTab('code'))
   tabInvite.addEventListener('click', () => switchTab('invite'))
   backToPassword.addEventListener('click', () => switchTab('password'))
+  useToken.addEventListener('click', () => switchTab('token'))
+  useMaster.addEventListener('click', () => switchTab('master'))
   useCode.addEventListener('click', () => switchTab('code'))
 
   // 用全局令牌换租户令牌，再取完整会话
@@ -279,6 +290,17 @@ export function renderLogin(host, { api, mockOn, signal, setPendingToken, onSess
       }
       path = '/auth/password-login'
       body = { tenant, username, password, kind: 'web' }
+    } else if (tab === 'master') {
+      const username = usernameInput.value.trim()
+      const password = passwordInput.value
+      if (!username || !password) {
+        setHint('请输入 Master 用户名和密码', true)
+        const missing = username ? passwordInput : usernameInput
+        missing.focus()
+        return
+      }
+      path = '/auth/master-password-login'
+      body = { username, password }
     } else if (tab === 'token') {
       const token = tokenInput.value.trim()
       if (!token) {

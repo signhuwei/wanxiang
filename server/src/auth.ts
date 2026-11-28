@@ -10,7 +10,7 @@ import { bearer, day, hash, hmac, iso, normalizedTarget, personalLoginTokenPatte
 import { encryptEdgeSecret } from './edge-secret';
 import { ensureUser, findUser, type User } from './seed';
 import { indexDevice, indexMember, type Member, type Store, type Transaction } from './store';
-import { normalizeLoginName, passwordLoginLimiter, validLoginPassword, verifyLoginPassword } from './tenant-passwords';
+import { hashLoginPassword, normalizeLoginName, passwordLoginLimiter, validLoginPassword, verifyLoginPassword } from './tenant-passwords';
 
 const codeCooldown = 60_000;
 const codeTtl = 10 * 60_000;
@@ -19,7 +19,7 @@ const resumeContext = 'onex-device-resume-v1';
 const deviceIdPattern = /^dev_[0-9A-HJKMNP-TV-Z]{26}$/;
 export const deviceTtl = 30 * day;
 type Kind = 'web' | 'desktop';
-type Session = { user_id: string; tenant_id: string | null; kind: Kind; expires_at: string; login_token_id: string | null; tenant_password_login: number };
+type Session = { user_id: string; tenant_id: string | null; kind: Kind; expires_at: string; login_token_id: string | null; tenant_password_login: number; master_password_login: number };
 type LoginTokenLink = { id: string; expires_at: string };
 type ResumeDevice = { id: string; public_key: string; token_hash: string };
 type Tenant = { id: string; name: string; status: string; revision: number };
@@ -34,12 +34,13 @@ export function isTenantId(value: unknown): value is string {
 }
 
 function insertSession(sql: Transaction, token: string, user: string, tenant: string | null, kind: Kind, now: number,
-  loginToken?: LoginTokenLink, tenantPasswordLogin = false) {
+  loginToken?: LoginTokenLink, tenantPasswordLogin = false, masterPasswordLogin = false) {
   const expiresAt = iso(now + (kind === 'desktop' ? 7 * day : day));
   const expiry = loginToken && loginToken.expires_at < expiresAt ? loginToken.expires_at : expiresAt;
   sql.run('DELETE FROM sessions WHERE expires_at <= ?', [iso(now)]);
-  sql.run('INSERT INTO sessions (token_hash, user_id, tenant_id, kind, expires_at, login_token_id, tenant_password_login) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [hash(token), user, tenant, kind, expiry, loginToken?.id ?? null, Number(tenantPasswordLogin)]);
+  sql.run(`INSERT INTO sessions (token_hash, user_id, tenant_id, kind, expires_at, login_token_id, tenant_password_login, master_password_login)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [hash(token), user, tenant, kind, expiry, loginToken?.id ?? null, Number(tenantPasswordLogin), Number(masterPasswordLogin)]);
 }
 
 function tokenOf(c: Context) {
@@ -49,9 +50,12 @@ function tokenOf(c: Context) {
 }
 
 function readSession(sql: Pick<Transaction, 'get'>, tokenHash: string, at: number) {
-  const s = sql.get<Session>(`SELECT user_id, tenant_id, kind, expires_at, login_token_id, tenant_password_login
+  const s = sql.get<Session>(`SELECT user_id, tenant_id, kind, expires_at, login_token_id, tenant_password_login, master_password_login
     FROM sessions WHERE token_hash = ? AND expires_at > ?`, [tokenHash, iso(at)]);
   if (!s) throw new ApiError('unauthenticated');
+  if (s.master_password_login && !sql.get('SELECT 1 FROM master_login_accounts WHERE user_id=?', [s.user_id])) {
+    throw new ApiError('unauthenticated');
+  }
   return s;
 }
 
@@ -63,6 +67,7 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
   const { now, codeSecret } = opts;
   const pending = new Map<string, Promise<Response>>();
   const limitPasswordLogin = passwordLoginLimiter();
+  const limitMasterLogin = passwordLoginLimiter();
   const tenant = (id: string, sql: Pick<Transaction, 'get'> = store.system) =>
     sql.get<Tenant>("SELECT id, name, status, revision FROM tenants WHERE id = ? AND status = 'active'", [id]);
   const user = (id: string) => store.system.get<User>('SELECT * FROM platform_users WHERE id = ?', [id]);
@@ -255,23 +260,109 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
     if (body.kind !== undefined && body.kind !== 'web') invalid('kind');
     const tokenHash = hash(body.token);
     const activeToken = (sql: Pick<Transaction, 'get'>, at: number) =>
-      sql.get<LoginTokenLink & { user_id: string }>(`SELECT id, user_id, expires_at FROM personal_login_tokens
+      sql.get<LoginTokenLink & { user_id: string; tenant_id: string | null }>(`SELECT id, user_id, expires_at, tenant_id FROM personal_login_tokens
         WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?`, [tokenHash, iso(at)]);
     const personal = activeToken(store.system, now());
     if (!personal) throw new ApiError('unauthenticated');
-    const tenantIds = await store.tenantIdsForUser(personal.user_id);
+    const tenantIds = personal.tenant_id ? [personal.tenant_id] : await store.tenantIdsForUser(personal.user_id);
     return store.system.write((sql) => {
       const at = now();
       const current = activeToken(sql, at);
-      if (!current || current.id !== personal.id || current.user_id !== personal.user_id) throw new ApiError('unauthenticated');
+      if (!current || current.id !== personal.id || current.user_id !== personal.user_id || current.tenant_id !== personal.tenant_id) {
+        throw new ApiError('unauthenticated');
+      }
       const account = sql.get<User>('SELECT * FROM platform_users WHERE id = ?', [current.user_id]);
       if (!account) throw new ApiError('unauthenticated');
       const memberships = loginMemberships(sql, account.id, tenantIds);
+      if (current.tenant_id && !memberships.length) throw new ApiError('unauthenticated');
       const token = randomToken();
-      insertSession(sql, token, account.id, null, 'web', at, current);
+      insertSession(sql, token, account.id, current.tenant_id, 'web', at, current, current.tenant_id !== null);
       sql.run('UPDATE personal_login_tokens SET last_used_at = ? WHERE id = ?', [iso(at), current.id]);
       return c.json({ token, user: publicUser(account), tenants: memberships });
     });
+  });
+
+  type MasterAccount = { user_id: string; username: string; username_key: string; password_hash: string; revision: number };
+  function requireMaster(sql: Pick<Transaction, 'get'>, token: string, at: number) {
+    const identity = readSession(sql, token, at);
+    if (identity.kind !== 'web' || identity.tenant_id || !sql.get('SELECT 1 FROM platform_admins WHERE user_id=?', [identity.user_id])) {
+      throw new ApiError('forbidden');
+    }
+    return identity.user_id;
+  }
+
+  app.get('/v1/auth/master-password', c => {
+    const id = requireMaster(store.system, tokenOf(c), now());
+    const row = store.system.get<Pick<MasterAccount, 'username' | 'revision'>>(
+      'SELECT username, revision FROM master_login_accounts WHERE user_id=?', [id]);
+    return c.json({ username: row?.username ?? null, revision: row?.revision ?? 0, actions: ['set_master_password'] });
+  });
+
+  app.put('/v1/auth/master-password', async c => {
+    const token = tokenOf(c);
+    const id = requireMaster(store.system, token, now());
+    const body = await json(c);
+    const name = normalizeLoginName(body.username);
+    if (!name) invalid('username');
+    if (!validLoginPassword(body.password) || Array.from(body.password).length < 12) invalid('password');
+    if (typeof body.revision !== 'number' || !Number.isSafeInteger(body.revision) || body.revision < 0) invalid('revision');
+    const at = now();
+    const op = operation(c, codeSecret, at, id, [name.display, body.password, body.revision]);
+    if (!op.key) invalid('Idempotency-Key');
+    const cached = op.read(store.system);
+    if (cached) return cached;
+    const address = (c.env as Pick<Bun.Server<unknown>, 'requestIP'> | undefined)?.requestIP(c.req.raw)?.address ?? '';
+    const release = limitMasterLogin(at, address, `configure:${id}`);
+    try {
+      const digest = await hashLoginPassword(body.password);
+      return await store.system.write(sql => {
+        requireMaster(sql, token, now());
+        const cached = op.read(sql);
+        if (cached) return cached;
+        const prior = sql.get<{ revision: number }>('SELECT revision FROM master_login_accounts WHERE user_id=?', [id]);
+        if (body.revision !== (prior?.revision ?? 0)) throw new ApiError('conflict', { revision: prior?.revision ?? 0 });
+        if (sql.get('SELECT 1 FROM master_login_accounts WHERE username_key=? AND user_id<>?', [name.key, id])) {
+          throw new ApiError('conflict', { fields: ['username'] });
+        }
+        const revision = (prior?.revision ?? 0) + 1;
+        sql.run(`INSERT INTO master_login_accounts(user_id,username,username_key,password_hash,revision) VALUES (?,?,?,?,?)
+          ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,username_key=excluded.username_key,
+            password_hash=excluded.password_hash,revision=excluded.revision`, [id, name.display, name.key, digest, revision]);
+        sql.run('DELETE FROM sessions WHERE user_id=? AND master_password_login=1 AND token_hash<>?', [id, token]);
+        sql.run('INSERT INTO platform_audit (id,actor,action,target,detail_json,at) VALUES (?,?,?,?,?,?)',
+          ['aud_' + ulid(), id, 'auth.master_password.set', id, JSON.stringify({ revision }), iso(at)]);
+        return op.complete(sql, { status: 200, payload: { username: name.display, revision, actions: ['set_master_password'] } });
+      });
+    } finally { release(); }
+  });
+
+  app.post('/v1/auth/master-password-login', async c => {
+    const body = await json(c);
+    const name = normalizeLoginName(body.username);
+    if (!name) invalid('username');
+    const password = body.password;
+    if (!validLoginPassword(password)) invalid('password');
+    const address = (c.env as Pick<Bun.Server<unknown>, 'requestIP'> | undefined)?.requestIP(c.req.raw)?.address ?? '';
+    const release = limitMasterLogin(now(), address, `login:${name.key}`);
+    const account = (sql: Pick<Transaction, 'get'>) => sql.get<MasterAccount>(`SELECT m.* FROM master_login_accounts m
+      JOIN platform_admins a ON a.user_id=m.user_id WHERE m.username_key=?`, [name.key]);
+    try {
+      const checked = account(store.system);
+      const valid = await verifyLoginPassword(password, checked?.password_hash);
+      if (!valid || !checked) throw new ApiError('unauthenticated');
+      const tenantIds = await store.tenantIdsForUser(checked.user_id);
+      return await store.system.write(sql => {
+        const row = account(sql);
+        if (!row || row.user_id !== checked.user_id || row.revision !== checked.revision || row.password_hash !== checked.password_hash) {
+          throw new ApiError('unauthenticated');
+        }
+        const u = sql.get<User>('SELECT * FROM platform_users WHERE id=?', [row.user_id]);
+        if (!u) throw new ApiError('unauthenticated');
+        const token = randomToken();
+        insertSession(sql, token, row.user_id, null, 'web', now(), undefined, false, true);
+        return c.json({ token, user: publicUser(u), tenants: loginMemberships(sql, u.id, tenantIds) });
+      });
+    } finally { release(); }
   });
 
   app.post('/v1/auth/select-tenant', async (c) => {
@@ -283,7 +374,7 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
     const id = body.tenant_id;
     if (!isTenantId(id)) invalid('tenant_id');
     const k = kind(body.kind) ?? s.kind;
-    if (s.login_token_id && k !== 'web') throw new ApiError('forbidden');
+    if ((s.login_token_id || s.master_password_login) && k !== 'web') throw new ApiError('forbidden');
     await requireMember(id, s.user_id);
     const op = operation(c, codeSecret, at, token, [id, k]);
     return store.system.write((sql) => {
@@ -294,7 +385,7 @@ export function authRoutes(app: Hono, store: Store, opts: { codeSecret: string; 
       if (current.login_token_id && !loginToken) throw new ApiError('unauthenticated');
       const cached = op.read(sql);
       if (cached) return cached;
-      insertSession(sql, op.token, current.user_id, id, k, checkedAt, loginToken ?? undefined);
+      insertSession(sql, op.token, current.user_id, id, k, checkedAt, loginToken ?? undefined, false, !!current.master_password_login);
       return op.complete(sql, { status: 200, credential: 'token' });
     });
   });

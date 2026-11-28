@@ -228,7 +228,7 @@ function definitionEditor(record, adapterRows, api, prefix, signal) {
       schemaFields.push(inputField('枚举选项', options))
     }
     const defaultInput = textInput(kind === record?.schema.kind ?
-      kind === 'resource_set' ? record.default_value.join(',') : policyValue(record, record.default_value).replace(/ (块|倍)$/, '') : '')
+      kind === 'resource_set' ? record.default_value.join(',') : policyValue(record, record.default_value).replace(/ (粒|倍)$/, '') : '')
     if (kind === 'boolean') {
       const select = optionSelect([['false', '关闭'], ['true', '开启']], record?.schema.kind === kind ? String(record.default_value) : 'false')
       schemaFields.push(inputField('默认值', select))

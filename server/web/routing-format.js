@@ -248,7 +248,7 @@ export function planRateSummary(plan) {
   return prices.map(p => p.model_id + ' ' + formatMultiplier(p.input_milli_per_mtok * 1000) + ' · ' + (p.source_rate_key ?? '方案手填')).join('；')
 }
 
-export const rateAmountsText =rate => RATE_FIELDS.map(([key, label]) => label + ' ' + blocks(rate?.[milliKey(key)])).join(' · ') + ' 块／百万 Token'
+export const rateAmountsText =rate => RATE_FIELDS.map(([key, label]) => label + ' ' + blocks(rate?.[milliKey(key)])).join(' · ') + ' 粒／百万 Token'
 
 // 售价表行。tenant=true 时只取户主可见字段，忽略多余字段。
 export function salesRateRow(rate, { tenant = false, frozen = true } = {}) {

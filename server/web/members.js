@@ -2,8 +2,7 @@
 
 import { createLedger } from './ledger.js'
 import { invitePanel } from './groups.js'
-import { detailPanel } from './panel.js'
-import { openDrill } from './drill.js'
+import { button, detailPanel, editForm } from './panel.js'
 import { renderForm } from './form.js'
 import { formatMilli, formatDateTime, roleLabel, memberStatusLabel, formatQuotaUsage, quotaUsageLevel, QUOTA_HINT, parseQuotaEraserInput } from './format.js'
 import { showToast } from './toast.js'
@@ -24,7 +23,7 @@ const ROLE_OPTIONS = [
 export function renderMembersPage(host, { api, actions = [], policyManaged = false }) {
   const grantable = ROLE_OPTIONS.filter(({value}) => actions.includes('assign_role:' + value))
   let ledger
-  const invite = detailPanel(host, () => ledger)
+  const open = detailPanel(host, () => ledger)
 
   async function fetchPage({ q, filters, cursor, limit, signal }) {
     return await api.get('/members', {
@@ -51,42 +50,35 @@ export function renderMembersPage(host, { api, actions = [], policyManaged = fal
     return frag
   }
 
-  let detail = null
-  let snap
-  let dirty = false
   function openMember(item) {
-    snap = ledger.suspend()
-    function display() {
-      detail.setTitle(item.name)
-      // 每次切换成员使用独立容器，旧请求完成时不会覆盖新成员。
-      const body = el('div')
-      const foot = el('div', 'actions')
-      detail.body.replaceChildren(body)
-      detail.foot.replaceChildren(foot)
-      renderDetail(body, foot, item.user_id, () => { dirty = true })
-    }
-    if (detail) return display()
-    openDrill(host, {
-      title: item.name,
-      onClose: async () => {
-        detail = null
-        const state = snap
-        ledger.resume(state)
-        if (dirty) {
-          dirty = false
-          await ledger.reload()
-          ledger.restoreScroll(state.scrollTop)
-        }
-      },
-      render: pane => {
-        detail = pane
-        ledger.restoreScroll(snap.scrollTop)
-        display()
-      }
-    })
+    open(item.name, pane => renderDetail(pane.body, pane.foot, item.user_id, pane.changed, pane.signal))
   }
 
-  async function renderDetail(body, foot, userId, markDirty) {
+  function addMember() {
+    open('新增成员', pane => editForm(pane, {
+      mode: 'create',
+      label: '添加成员',
+      values: { role: grantable.find(option => option.value === 'member')?.value ?? grantable[0].value },
+      fields: [
+        { key: 'user_id', label: '已有用户 ID', hint: '新用户可通过邀请码加入。' },
+        { key: 'role', label: '角色', type: 'select', options: grantable, allowEmpty: false },
+        { key: 'group_id', label: '分组 ID', hint: '组管须指定分组。' }
+      ],
+      submit: ({ user_id, role, group_id }, opts) => {
+        const userId = user_id?.trim()
+        const groupId = group_id?.trim() || null
+        if (!userId) throw new Error('请输入已有 OneX 用户的 ID。')
+        if (role === 'group_admin' && !groupId) throw new Error('请为组管指定分组。')
+        return api.post('/members', { user_id: userId, role, group_id: groupId }, { ...opts, signal: pane.signal })
+      },
+      done() {
+        pane.close()
+        showToast('已添加成员')
+      }
+    }))
+  }
+
+  async function renderDetail(body, foot, userId, markDirty, signal) {
     body.textContent = ''
     foot.textContent = ''
     body.appendChild(el('p', 'empty', '加载中…'))
@@ -94,23 +86,25 @@ export function renderMembersPage(host, { api, actions = [], policyManaged = fal
     let groupsPromise = null
     function loadGroups() {
       if (!groupsPromise) {
-        groupsPromise = api.get('/groups', { params: { limit: 200 } }).then(d => d.items || [])
+        groupsPromise = api.get('/groups', { params: { limit: 200 }, signal }).then(d => d.items || [])
       }
       return groupsPromise
     }
 
     let member
     try {
-      member = await api.get('/members/' + encodeURIComponent(userId))
+      member = await api.get('/members/' + encodeURIComponent(userId), { signal })
     } catch (e) {
+      if (signal.aborted) return
       body.textContent = ''
       body.appendChild(el('p', 'error-row', e.message || '加载失败'))
       return
     }
 
-    const usage = await api.get('/quota/usage', { params: { scope: 'member', id: userId } }).catch(() => null)
+    const usage = await api.get('/quota/usage', { params: { scope: 'member', id: userId }, signal }).catch(() => null)
 
     async function paint(mode) {
+      if (signal.aborted) return
       body.textContent = ''
       foot.textContent = ''
 
@@ -123,11 +117,11 @@ export function renderMembersPage(host, { api, actions = [], policyManaged = fal
       )
       if (usage) {
         kv.append(
-          el('span', null, '本月已结算（块）'),
+          el('span', null, '本月已结算（粒）'),
           document.createTextNode(formatMilli(usage.used_milli)),
-          el('span', null, '预留（块）'),
+          el('span', null, '预留（粒）'),
           document.createTextNode(formatMilli(usage.reserved_milli)),
-          el('span', null, '剩余（块）'),
+          el('span', null, '剩余（粒）'),
           document.createTextNode(usage.remaining_milli === null ? '不限' : formatMilli(usage.remaining_milli))
         )
       }
@@ -142,19 +136,21 @@ export function renderMembersPage(host, { api, actions = [], policyManaged = fal
           : { key: 'role', label: '角色', readonly: true, format: roleLabel },
         { key: 'group_id', label: '分组', type: 'select', options: [] },
         mode === 'view'
-          ? { key: 'quota_eraser', label: '橡皮配额（块）', readonly: true, nullText: '不限' }
-          : { key: 'quota_eraser', label: '橡皮配额（块）', placeholder: '不限', hint: QUOTA_HINT },
+          ? { key: 'quota_eraser', label: '橡皮配额（粒）', readonly: true, nullText: '不限' }
+          : { key: 'quota_eraser', label: '橡皮配额（粒）', placeholder: '不限', hint: QUOTA_HINT },
         { key: 'status', label: '状态', readonly: true, format: memberStatusLabel }
       ]
 
       if (mode !== 'view') {
         try {
           const groups = await loadGroups()
+          if (signal.aborted) return
           fields[3].options = groups.map(g => ({ value: g.id, label: g.name }))
           if (member.group_id && !groups.some(g => g.id === member.group_id)) {
             fields[3].options.push({ value: member.group_id, label: member.group_name || member.group_id })
           }
         } catch (e) {
+          if (signal.aborted) return
           groupsPromise = null
           await paint('view')
           showToast(e.message || '无法加载分组，请重试', 'error')
@@ -247,8 +243,9 @@ export function renderMembersPage(host, { api, actions = [], policyManaged = fal
 
   ledger = createLedger(host, {
     title: '成员',
-    createLabel: '生成邀请码',
-    onCreate: actions.includes('create_invite') && grantable.length ? () => invite('生成邀请码', pane => invitePanel(pane, api, grantable)) : null,
+    createLabel: '新增成员',
+    createAction: 'create_member',
+    onCreate: grantable.length ? addMember : null,
     rowKey: 'user_id',
     fetchPage,
     onOpen: openMember,
@@ -282,6 +279,9 @@ export function renderMembersPage(host, { api, actions = [], policyManaged = fal
       { key: 'last_active_at', title: '最近活动', render: m => formatDateTime(m.last_active_at) }
     ]
   })
+  if (actions.includes('create_invite') && grantable.length) {
+    host.querySelector('.toolbar').append(button('生成邀请码', () => open('生成邀请码', pane => invitePanel(pane, api, grantable))))
+  }
 
   return ledger
 }

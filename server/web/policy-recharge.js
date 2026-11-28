@@ -4,7 +4,7 @@ import { formatDateTime, formatMilli } from './format.js'
 import { topupMilli } from './billing.js'
 import { encode, fetchPolicyPage } from './policy-controls.js'
 
-const amount = value => Number.isSafeInteger(value) ? formatMilli(value) + ' 块' : '—'
+const amount = value => Number.isSafeInteger(value) ? formatMilli(value) + ' 粒' : '—'
 const revision = value => value ? 'v' + value : '未签发'
 
 function fields(body, values) {
@@ -75,7 +75,7 @@ export function rechargePage(host, { api, endpoint, tenantName, balance, getBala
       editForm(pane, {
         mode: 'create', label: '确认充值',
         fields: [
-          { key: 'amount', label: '充值橡皮（块）', placeholder: '如 2.075' },
+          { key: 'amount', label: '充值橡皮（粒）', placeholder: '如 2.075' },
           { key: 'note', label: '备注', type: 'textarea', wide: true }
         ],
         submit: (value, options) => api.post(endpoint, {

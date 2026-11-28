@@ -284,7 +284,7 @@ function paintUsage(content,usage) {
   heading.id='usage-heading'
   panel.setAttribute('aria-labelledby',heading.id)
   const totals=styled('dl','workbench-totals')
-  for (const [label,value] of [['计量用量（块）',usage.cost_milli/1000],
+  for (const [label,value] of [['计量用量（粒）',usage.cost_milli/1000],
     ['模型请求时长（秒）',usage.model_duration_ms/1000],['输入及输出 Token',usage.input_tokens+usage.output_tokens]]) {
     const metric=node('div')
     metric.append(node('dt',label),node('dd',metricFormat.format(value)))
@@ -542,7 +542,7 @@ const diagnosticTime=new Intl.DateTimeFormat('zh-CN',{year:'numeric',month:'2-di
 const safeVersion=version=>typeof version==='string'&&/^\d[\w.+-]{0,47}$/.test(version)?version:null
 const safeDiagnosticModel=model=>typeof model==='string'&&model.length<=128&&/^[a-zA-Z0-9][a-zA-Z0-9._:+-]*(?:\/[a-zA-Z0-9][a-zA-Z0-9._:+-]*)*$/.test(model)?model:null
 const diagnosticCount=value=>Number.isSafeInteger(value)&&value>=0?value:null
-const diagnosticBlocks=value=>diagnosticCount(value)==null?null:metricFormat.format(value/1000)+' 块'
+const diagnosticBlocks=value=>diagnosticCount(value)==null?null:metricFormat.format(value/1000)+' 粒'
 const lookup=(dictionary,key)=>typeof key==='string'&&Object.hasOwn(dictionary,key)?dictionary[key]:null
 function visibleDiagnostic(entry) {
   return entry&&lookup(diagnosticSources,entry.source)&&lookup(diagnosticLevels,entry.level)&&

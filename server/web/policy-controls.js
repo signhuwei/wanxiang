@@ -81,7 +81,7 @@ export function policyValue(definition, value, display) {
   const schema = definition.schema
   switch (schema.kind) {
     case 'boolean': return value ? '开启' : '关闭'
-    case 'money_milli': return formatMilli(value) + ' 块'
+    case 'money_milli': return formatMilli(value) + ' 粒'
     case 'ratio_ppm': return formatRatio(value) + ' 倍'
     case 'resource_set':
       return value.length ? value.map(id => display?.[id] ?? id).join('、') : '无'
@@ -222,7 +222,7 @@ export function valueField(api, prefix, definition, value, { display, signal, de
     }
     input.value = initial
   }
-  const unit = schema.kind === 'money_milli' ? '（块）' : schema.kind === 'ratio_ppm' ? '（倍）' : ''
+  const unit = schema.kind === 'money_milli' ? '（粒）' : schema.kind === 'ratio_ppm' ? '（倍）' : ''
   return { node: inputField(definition.title + unit, input, true), collect: () => parsePolicyValue(definition, input.value.trim()) }
 }
 

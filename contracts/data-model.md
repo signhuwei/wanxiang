@@ -84,7 +84,7 @@ S0 和 S1 只运行一个 Server 写进程（SQLite 本身也要求单节点写�
 
 依据访谈“租户可以把额度分到组和个人，也可以选择不限制”。
 
-- `members.quota_milli`、`groups.quota_milli` 都是**每个自然月**的橡皮上限。配额按块设置，入库时换算为整数毫橡皮，例如 12.5 块橡皮存为 `12500`。`null` 表示不限。月份按租户时区，S2 仍固定 Asia/Shanghai，与 `month_cost_milli` 同口径。
+- `members.quota_milli`、`groups.quota_milli` 都是**每个自然月**的橡皮上限。配额按粒设置，入库时换算为整数毫橡皮，例如 12.5 粒橡皮存为 `12500`。`null` 表示不限。月份按租户时区，S2 仍固定 Asia/Shanghai，与 `month_cost_milli` 同口径。
 - 一个成员的有效上限同时受本人配额、所在组配额、所有祖先组配额约束，先到先停。组配额计的是该组及其全部子组成员的合计。
 - 本月已用 = 本月 `settle` 金额加上**仍在 active 的租约**的 `budget_milli`（按租约的 `user_id` 归属）。也就是预留计入配额，与租户余额同理。`overage_pending` 不计入。
 - 月份按 `ledger.at` 落在 Asia/Shanghai 的哪个自然月计；active 租约的预留不论何时签发都计入当月（v0.13）。

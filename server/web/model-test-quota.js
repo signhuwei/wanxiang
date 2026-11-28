@@ -14,7 +14,7 @@ function historyTable(rows) {
   const table = el('table')
   table.setAttribute('aria-label', '管理员模型实测流水')
   const head = el('thead'), titles = el('tr'), body = el('tbody')
-  titles.append(...['时间', '渠道原始型号', '状态', '输入 / 输出 Token', '已扣（块）', '预留（块）'].map(name => el('th', null, name)))
+  titles.append(...['时间', '渠道原始型号', '状态', '输入 / 输出 Token', '已扣（粒）', '预留（粒）'].map(name => el('th', null, name)))
   head.append(titles)
   for (const record of rows) {
     const tr = el('tr')
@@ -47,8 +47,8 @@ function quotaDetail(pane, api, row, signal) {
     pane.headActions.replaceChildren()
     if (hasAction(row, 'allocate')) pane.headActions.append(button('分配测试额度', showForm))
     pane.foot.replaceChildren()
-    const summary = el('p', 'muted', row.period + ' · 额度 ' + cost(row.limit_milli) + ' 块 · 可用 ' + cost(row.available_milli) +
-      ' 块 · 已扣 ' + cost(row.spent_milli) + ' 块 · 预留 ' + cost(row.reserved_milli) + ' 块')
+    const summary = el('p', 'muted', row.period + ' · 额度 ' + cost(row.limit_milli) + ' 粒 · 可用 ' + cost(row.available_milli) +
+      ' 粒 · 已扣 ' + cost(row.spent_milli) + ' 粒 · 预留 ' + cost(row.reserved_milli) + ' 粒')
     const notice = el('p', 'notice', message)
     notice.setAttribute('role', 'status')
     const selected = el('input')
@@ -98,7 +98,7 @@ function quotaDetail(pane, api, row, signal) {
       mode: 'edit', label: '保存测试额度',
       values: { limit: formatMilli(row.limit_milli), reason: '' },
       fields: [
-        { key: 'limit', label: '当月测试额度（块）', hint: '填当月总额度，可精确到 0.001 块。' },
+        { key: 'limit', label: '当月测试额度（粒）', hint: '填当月总额度，可精确到 0.001 粒。' },
         { key: 'reason', label: '分配原因' }
       ],
       submit(values, options) {
@@ -125,10 +125,10 @@ export function modelTestQuotaPage(host, api, signal) {
     title: '管理员测试额度', searchLabel: '查询平台管理员', signal, rowKey: 'user_id',
     columns: [
       { key: 'name', title: '平台管理员' }, { key: 'period', title: '月份' },
-      { title: '额度（块）', render: row => formatMilli(row.limit_milli) },
-      { title: '可用（块）', render: row => formatMilli(row.available_milli) },
-      { title: '已扣（块）', render: row => formatMilli(row.spent_milli) },
-      { title: '预留（块）', render: row => formatMilli(row.reserved_milli) }
+      { title: '额度（粒）', render: row => formatMilli(row.limit_milli) },
+      { title: '可用（粒）', render: row => formatMilli(row.available_milli) },
+      { title: '已扣（粒）', render: row => formatMilli(row.spent_milli) },
+      { title: '预留（粒）', render: row => formatMilli(row.reserved_milli) }
     ],
     fetchPage: opts => api.get(path, { params: { q: opts.q, cursor: opts.cursor, limit: opts.limit }, signal: opts.signal }),
     onOpen: row => open(row.name + ' / ' + row.period, pane => quotaDetail(pane, api, row, signal))

@@ -250,7 +250,7 @@ export function modelTestsPanel(pane, api, discovered, writable, signal, back) {
   function reconcile(test) {
     pane.setTitle('核对实测费用 / ' + discovered.raw_model)
     editForm(pane, { mode: 'edit', label: '确认费用', fields: [
-      { key: 'amount', label: '应扣费用（块橡皮）', hint: '本次预留 ' + formatMilli(test.reserved_milli) + ' 块橡皮' },
+      { key: 'amount', label: '应扣费用（粒橡皮）', hint: '本次预留 ' + formatMilli(test.reserved_milli) + ' 粒橡皮' },
       { key: 'reference', label: '结算凭证' }, { key: 'reason', label: '核对说明', type: 'textarea' }
     ], submit(form, options) {
       const amount = parseEraserMilli(form.amount)
@@ -270,8 +270,8 @@ export function modelTestsPanel(pane, api, discovered, writable, signal, back) {
       options: data.test_modes.map(value => ({ value, label: modelTestModes[value] })),
       hint: '仅在上游支持聊天模板关闭思考参数时选择，例如使用相应模板的 Qwen 推理服务。' })
     if (data.requires_tariff) fields.push(
-      { key: 'input', label: '实测输入计费（块橡皮/百万 Token）' },
-      { key: 'output', label: '实测输出计费（块橡皮/百万 Token）' },
+      { key: 'input', label: '实测输入计费（粒橡皮/百万 Token）' },
+      { key: 'output', label: '实测输出计费（粒橡皮/百万 Token）' },
       { key: 'source', label: '实测计费依据', hint: '填写供应商价表或经批准的测试报价。' },
     )
     if (writable && hasAction(data, 'run_model_test')) editForm(pane, { mode: 'edit', label: '执行一次文本实测',
@@ -299,8 +299,8 @@ export function modelTestsPanel(pane, api, discovered, writable, signal, back) {
       if (test.test_mode === noThinking) line.append(el('p', 'muted', modelTestModes[noThinking]))
       if (test.usage) line.append(el('p', null,
         '输入 ' + test.usage.input_tokens + ' · 输出 ' + test.usage.output_tokens + ' Token'))
-      if (test.charged_milli != null) line.append(el('p', null, '实扣 ' + formatMilli(test.charged_milli) + ' 块橡皮'))
-      else if (test.reserved_milli > 0) line.append(el('p', null, '已预留 ' + formatMilli(test.reserved_milli) + ' 块橡皮'))
+      if (test.charged_milli != null) line.append(el('p', null, '实扣 ' + formatMilli(test.charged_milli) + ' 粒橡皮'))
+      else if (test.reserved_milli > 0) line.append(el('p', null, '已预留 ' + formatMilli(test.reserved_milli) + ' 粒橡皮'))
       if (test.reason_code) line.append(el('p', 'muted', modelTestReasons[test.reason_code] ?? jobReasons[test.reason_code] ?? test.reason_code))
       if (hasAction(test, 'reconcile')) line.append(button('核对实测费用', () => reconcile(test), 'link'))
       rows.append(line)

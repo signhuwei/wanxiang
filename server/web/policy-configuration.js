@@ -228,7 +228,7 @@ async function quotaUsageView(body, api, scope, id, signal) {
     for (const [title, key] of [['本月配额', 'quota_milli'], ['已结算', 'used_milli'], ['已预留', 'reserved_milli'], ['剩余', 'remaining_milli']]) {
       const row = el('div')
       const amount = data[key]
-      row.append(el('dt', null, title), el('dd', null, amount == null ? '不限' : formatMilli(amount) + ' 块'))
+      row.append(el('dt', null, title), el('dd', null, amount == null ? '不限' : formatMilli(amount) + ' 粒'))
       facts.append(row)
     }
     body.replaceChildren(el('h3', null, '本月配额'), facts)

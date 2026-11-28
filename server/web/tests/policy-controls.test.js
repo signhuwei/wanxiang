@@ -9,7 +9,7 @@ test('a registered clause uses its schema and label without a hard-coded policy 
   expect(() => parsePolicyValue(ratio, '0.8123456')).toThrow()
   const money = { ...base, schema: { kind: 'money_milli', min: 0, max: 10000 } }
   expect(parsePolicyValue(money, '2.125')).toBe(2125)
-  expect(policyValue(money, 2125)).toBe('2.125 块')
+  expect(policyValue(money, 2125)).toBe('2.125 粒')
   expect(() => parsePolicyValue(money, '10.001')).toThrow()
 })
 

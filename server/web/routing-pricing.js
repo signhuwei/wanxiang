@@ -355,7 +355,7 @@ const channelHead = ['部署', '报价', '原币输入价', '汇率', '人民币
 function renderRate(host, r) {
   facts(host, [['费率版本', r.source_rate_key], ['状态', r.status === 'available_to_sign' ? '平台可签' : (r.status ?? '平台可签')],
     ['可签输入倍率', formatMultiplier(r.input_multiplier_ppm)],
-    ['签约输入价', Number.isSafeInteger(r.input_milli_per_mtok) ? formatMilli(r.input_milli_per_mtok) + ' 块／百万输入 Token' : '—'],
+    ['签约输入价', Number.isSafeInteger(r.input_milli_per_mtok) ? formatMilli(r.input_milli_per_mtok) + ' 粒／百万输入 Token' : '—'],
     ['建议倍率', formatMultiplier(r.recommended_input_multiplier_ppm)], ['试算状态', calculationLabel(r.calculation_status)],
     ['计算时刻', r.pricing_at ? formatDateTime(r.pricing_at) : '—'], ['基准', r.input_multiplier_basis === 'cny_1_per_mtok_input' ? '¥1／百万普通输入 Token = 1×' : r.input_multiplier_basis],
     ['手调理由', r.override_reason ?? r.reason], ...operator(r)])
@@ -463,7 +463,7 @@ export function multiplierTab(area, api, model, signal, onChanged) {
         facts(result, [['试算状态', calculationLabel(data.calculation_status)],
           ['建议倍率', data.recommended_input_multiplier_ppm == null ? '无法给出建议' : formatMultiplier(data.recommended_input_multiplier_ppm)],
           ['最终倍率', formatMultiplier(data.input_multiplier_ppm)],
-          ['签约输入价', Number.isSafeInteger(data.input_milli_per_mtok) ? formatMilli(data.input_milli_per_mtok) + ' 块／百万输入 Token' : '—']])
+          ['签约输入价', Number.isSafeInteger(data.input_milli_per_mtok) ? formatMilli(data.input_milli_per_mtok) + ' 粒／百万输入 Token' : '—']])
         result.append(table(channelHead, channelRows(data.channels), '渠道输入价'))
         adopt.hidden = data.recommended_input_multiplier_ppm == null
         publish.hidden = !(hasAction(data, 'publish_input_multiplier') && data.preview_basis)

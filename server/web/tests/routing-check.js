@@ -506,7 +506,7 @@ try {
   assert.equal(await button('发布可签倍率').isVisible(), false)
   await page.getByLabel('倍率理由').fill('按签约标准报价')
   await button('重新试算').click()
-  await page.getByText('4 块／百万输入 Token').waitFor()
+  await page.getByText('4 粒／百万输入 Token').waitFor()
   await button('发布可签倍率').waitFor()
   assert.equal(ps.lastRatePreview.input_multiplier_ppm, fixture.pricing.signed_input_multiplier_ppm)
   await capture('multiplier-preview')
