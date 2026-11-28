@@ -35,6 +35,7 @@ const modelTestReasons = {
   model_test_price_required: '请填写经核实的实测输入、输出费率。', completion_unknown: '请求结果尚待核对。',
   model_test_mode_unsupported: '当前渠道协议不支持在实测中请求关闭思考。',
   upstream_model_mismatch: '上游响应型号与测试目标不符。', no_text_returned: '上游未返回文本。',
+  image_answer_unverified: '上游回复未能识别合成图片中的验证码。',
   reconciled_manually: '已按凭证核对费用。'
 }
 
@@ -97,7 +98,7 @@ function discoveryResults(host, api, job, signal, onReview, onTest) {
     const declared = capabilityList(row.capabilities_claim)
     if (declared.length) entry.append(el('small', 'muted', '上游声明 ' + declared.join('、')))
     if (reviewable || row.latest_model_test) {
-      entry.append(el('small', 'muted', '文本实测 ' + modelTestLabel(row.latest_model_test)))
+      entry.append(el('small', 'muted', (row.latest_model_test?.input_kind === 'image' ? '图片实测 ' : '文本实测 ') + modelTestLabel(row.latest_model_test)))
       if (onTest) {
         const test = button('模型实测', () => onTest(row, reviewable), 'link')
         test.setAttribute('aria-label', '实测 ' + row.raw_model)
@@ -263,10 +264,12 @@ export function modelTestsPanel(pane, api, discovered, writable, signal, back) {
   }
 
   function draw(data) {
-    pane.setTitle('模型文本实测 / ' + discovered.raw_model)
+    pane.setTitle('模型实测 / ' + discovered.raw_model)
     pane.body.replaceChildren()
     const fields = []
-    if (data.test_modes?.includes(noThinking)) fields.push({ key: 'test_mode', label: '文本实测模式', type: 'select', allowEmpty: false,
+    if (data.input_kinds?.includes('image')) fields.push({ key: 'input_kind', label: '输入类型', type: 'select', allowEmpty: false,
+      options: [{ value: 'text', label: '文本' }, { value: 'image', label: '合成测试图' }] })
+    if (data.test_modes?.includes(noThinking)) fields.push({ key: 'test_mode', label: '实测模式', type: 'select', allowEmpty: false,
       options: data.test_modes.map(value => ({ value, label: modelTestModes[value] })),
       hint: '仅在上游支持聊天模板关闭思考参数时选择，例如使用相应模板的 Qwen 推理服务。' })
     if (data.requires_tariff) fields.push(
@@ -274,9 +277,10 @@ export function modelTestsPanel(pane, api, discovered, writable, signal, back) {
       { key: 'output', label: '实测输出计费（粒橡皮/百万 Token）' },
       { key: 'source', label: '实测计费依据', hint: '填写供应商价表或经批准的测试报价。' },
     )
-    if (writable && hasAction(data, 'run_model_test')) editForm(pane, { mode: 'edit', label: '执行一次文本实测',
-      fields, values: { test_mode: 'default' }, async submit(form, options) {
-      const payload = { catalog_item_id: discovered.catalog_item_id, test_mode: form.test_mode ?? 'default' }
+    if (writable && hasAction(data, 'run_model_test')) editForm(pane, { mode: 'edit', label: '执行一次模型实测',
+      fields, values: { test_mode: 'default', input_kind: 'text' }, async submit(form, options) {
+      const payload = { catalog_item_id: discovered.catalog_item_id, test_mode: form.test_mode ?? 'default',
+        ...(form.input_kind === 'image' && { input_kind: 'image' }) }
       if (data.requires_tariff) {
         const input = parseEraserMilli(form.input)
         const output = parseEraserMilli(form.output)
@@ -287,8 +291,9 @@ export function modelTestsPanel(pane, api, discovered, writable, signal, back) {
       try { return await api.post(path, payload, { ...options, signal }) }
       catch (error) { throw Error(modelTestReasons[error.detail?.reason] ?? error.message) }
     }, done() { void load() } })
-    pane.body.prepend(el('p', 'muted', '实测发送固定短文本，最多生成 ' + data.output_token_limit +
-      ' 个 Token。实际用量计入当前管理员橡皮配额。'))
+    const imageLimit = data.image_output_token_limit ? '，图片最多生成 ' + data.image_output_token_limit + ' 个 Token' : ''
+    pane.body.prepend(el('p', 'muted', '文本实测最多生成 ' + data.output_token_limit + ' 个 Token' + imageLimit +
+      '。实际用量计入当前管理员橡皮配额。'))
     if (data.blocked_reason) pane.body.append(el('p', 'notice', modelTestReasons[data.blocked_reason] ?? jobReasons[data.blocked_reason] ?? data.blocked_reason))
     if (writable && !data.requires_tariff && hasAction(data, 'run_model_test')) pane.body.append(el('p', 'muted', '本次使用此渠道原始型号已登记的生效费率。'))
     const rows = el('section', 'deployment-section')
@@ -296,6 +301,7 @@ export function modelTestsPanel(pane, api, discovered, writable, signal, back) {
     for (const test of data.items ?? []) {
       const line = el('article', 'deployment-card')
       line.append(el('strong', null, modelTestLabel(test) + ' · ' + formatDateTime(test.completed_at ?? test.created_at)))
+      if (test.input_kind === 'image') line.append(el('p', 'muted', '图片实测'))
       if (test.test_mode === noThinking) line.append(el('p', 'muted', modelTestModes[noThinking]))
       if (test.usage) line.append(el('p', null,
         '输入 ' + test.usage.input_tokens + ' · 输出 ' + test.usage.output_tokens + ' Token'))

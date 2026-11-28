@@ -38,13 +38,14 @@ const narrow = (f: { db: Store['system'] }, user: string, hot: Record<string, st
   }
 });
 
-test('projects image input only for the matching chat deployment and live reviewed evidence', async () => {
+test.each(['openai_chat', 'anthropic'] as const)('projects image input for matching %s deployments with live reviewed evidence', async (protocol) => {
   const f = await projectionSetup();
   const at = minutes(0);
   const media = '["text","stream","images"]';
+  const auth = protocol === 'anthropic' ? 'x_api_key' : 'bearer';
   await f.store.system.write(sql => {
-    sql.run("UPDATE providers SET protocol = 'openai_chat' WHERE id IN ('prv_a','prv_b')");
-    sql.run("UPDATE provider_endpoint_revisions SET protocol = 'openai_chat' WHERE endpoint_id IN ('ep_a','ep_b')");
+    sql.run("UPDATE providers SET protocol = ?, auth = NULL WHERE id IN ('prv_a','prv_b')", [protocol]);
+    sql.run("UPDATE provider_endpoint_revisions SET protocol = ?, auth_adapter = ? WHERE endpoint_id IN ('ep_a','ep_b')", [protocol, auth]);
     sql.run("INSERT INTO provider_channel_defaults (provider_id,account_id,endpoint_id,credential_scope) VALUES ('prv_a','acct_a','ep_a','[]')");
     sql.run("UPDATE model_deployment_revisions SET capabilities_json = ? WHERE deployment_id IN ('dep_a','dep_b')", [media]);
     sql.run("UPDATE model_evidence SET capabilities_json = ? WHERE evidence_id IN ('ev_a','ev_b')", [media]);
@@ -56,7 +57,7 @@ test('projects image input only for the matching chat deployment and live review
   expect(legacy()).toEqual(verified);
   expect(legacy(Date.parse(minutes(60)))).toBeUndefined();
 
-  f.setGrants([{ ...follow, ingress_protocol: 'openai_chat', user_ids: [f.userId] }]);
+  f.setGrants([{ ...follow, ingress_protocol: protocol, user_ids: [f.userId] }]);
   await f.projector.project(f.tenantId, 'dev_lin');
   const projected = payload(f, 'dev_lin').routes;
   expect(projected.map((route: any) => [route.deployment_id, route.input_capabilities])).toEqual([['dep_a', verified], ['dep_b', undefined]]);
@@ -257,7 +258,7 @@ test('existing tenant 20 and system 17 databases upgrade with the legacy applica
   const system = new QueuedDatabase(join(dir, 'system.sqlite'), 'system');
   try {
     expect(tenant.get('PRAGMA user_version')).toEqual({ user_version: 24 });
-    expect(system.get('PRAGMA user_version')).toEqual({ user_version: 32 });
+    expect(system.get('PRAGMA user_version')).toEqual({ user_version: 33 });
     expect(tenant.get('SELECT device_id, config_revision, policy_revision, projection_id FROM policy_device_applications'))
       .toEqual({ device_id: 'dev_old', config_revision: 40, policy_revision: 3, projection_id: null });
     for (const db of [tenant, system]) {

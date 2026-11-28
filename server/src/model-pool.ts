@@ -164,9 +164,9 @@ function assessMember(sql: Reader, modelId: string, identity: { identity_revisio
   }
   const floor = identity ? JSON.parse(identity.capability_floor_json) as string[] : [];
   if (!evidenceProblem && floor.some((capability) => !verified.has(capability) || !declared.has(capability))) codes.push('capability_unverified');
-  // A catalogue claim is not evidence that an authenticated Chat Completions route accepts image input.
+  // A catalogue claim is not evidence that the authenticated route accepts image input.
   let inputCapabilities: InputCapabilities | undefined;
-  if (!codes.length && deployment?.protocol === 'openai_chat' && declared.has('images') && live.some(row =>
+  if (!codes.length && (deployment?.protocol === 'openai_chat' || deployment?.protocol === 'anthropic') && declared.has('images') && live.some(row =>
     (row.source_kind === 'manual_review' || row.source_kind === 'runtime_probe') && (JSON.parse(row.capabilities_json) as string[]).includes('images'))) {
     const expires = live.map(row => row.valid_until).filter((value): value is string => value !== null).sort()[0];
     inputCapabilities = { modalities: ['text', 'image'], ...(expires && { valid_until: expires }) };
@@ -184,7 +184,8 @@ function assessMember(sql: Reader, modelId: string, identity: { identity_revisio
 }
 
 export function legacyInputCapabilities(sql: Reader, route: LegacyCapabilityRoute, now: string) {
-  if (route.protocol !== 'openai_chat' || route.upstream_model.includes('*') || (route.proxy && route.proxy !== 'none')) return undefined;
+  if ((route.protocol !== 'openai_chat' && route.protocol !== 'anthropic') ||
+    route.upstream_model.includes('*') || (route.proxy && route.proxy !== 'none')) return undefined;
   const current = headRevision(sql, route.model_id);
   if (!current) return undefined;
   // Legacy inference uses only the default Provider credential. Evidence for a different account is not transferable.
@@ -192,11 +193,12 @@ export function legacyInputCapabilities(sql: Reader, route: LegacyCapabilityRout
     'SELECT account_id, endpoint_id FROM provider_channel_defaults WHERE provider_id = ?', [route.provider_id]);
   if (!origin) return undefined;
   const identity = currentIdentity(sql, route.model_id);
-  const auth = route.auth ?? 'bearer';
+  const auth = route.auth ?? (route.protocol === 'anthropic' ? 'x_api_key' : 'bearer');
   for (const member of poolMembers(sql, route.model_id, current)) {
     const { deployment, inputCapabilities } = assessMember(sql, route.model_id, identity, member, now);
     if (inputCapabilities && deployment?.provider_id === route.provider_id && deployment.account_id === origin.account_id &&
-      deployment.endpoint_id === origin.endpoint_id && deployment.base_url === route.base_url && deployment.auth_adapter === auth &&
+      deployment.endpoint_id === origin.endpoint_id && deployment.protocol === route.protocol &&
+      deployment.base_url === route.base_url && deployment.auth_adapter === auth &&
       deployment.upstream_model === route.upstream_model) return inputCapabilities;
   }
   return undefined;
@@ -403,7 +405,7 @@ export function modelPoolRoutes(app: Hono, store: Store, opts: ManagementOptions
       }
       const legacy = sql.get<LegacyCapabilityRoute>(`SELECT m.id AS model_id, m.upstream_name AS upstream_model, m.provider_id,
         p.protocol, p.base_url, p.auth, p.proxy FROM models m JOIN providers p ON p.id = m.provider_id
-        WHERE m.id = ? AND p.protocol = 'openai_chat' AND p.status = 'active'`, [modelId]);
+        WHERE m.id = ? AND p.protocol IN ('openai_chat', 'anthropic') AND p.status = 'active'`, [modelId]);
       const beforeInput = legacy && legacyInputCapabilities(sql, legacy, now);
       const latest = sql.get<{ n: number }>('SELECT coalesce(max(pool_revision), 0) AS n FROM model_pool_revisions WHERE model_id = ?', [modelId])!.n;
       const revision = Math.max(latest, result.current) + 1;

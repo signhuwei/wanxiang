@@ -134,15 +134,21 @@ async fn router_fixture(
     let upstream = TcpListener::bind("127.0.0.1:0").await?;
     let base_url = format!("http://{}/v1", upstream.local_addr()?);
     let images = observe.is_some();
+    let observe_messages = observe.clone();
     let route = post(move |headers: HeaderMap, body: Json<Value>| async move {
         if let Some(observe) = observe {
             let _ = observe.send(body.0.clone());
         }
         reply(headers, body).await
     });
+    let messages = post(move |headers: HeaderMap, body: Json<Value>| async move {
+        if let Some(observe) = observe_messages {
+            let _ = observe.send(body.0.clone());
+        }
+        anthropic_reply(headers, body).await
+    });
     tokio::spawn(async move {
-        let fixture =
-            axum::Router::new().route("/v1/chat/completions", route).route("/v1/messages", post(anthropic_reply));
+        let fixture = axum::Router::new().route("/v1/chat/completions", route).route("/v1/messages", messages);
         axum::serve(upstream, fixture).await.unwrap();
     });
 
@@ -245,6 +251,66 @@ async fn deepseek_rejects_unverified_image_routes_and_unmatched_documents() -> a
         assert_eq!(response.status().as_u16(), expected);
         assert!(incoming.try_recv().is_err());
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn deepseek_accepts_images_on_verified_native_anthropic_routes() -> anyhow::Result<()> {
+    let release = fixture_release("deepseek-desktop");
+    let (observed, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+    let (state, addr, mut usage) = router_fixture(&release, Some(observed)).await?;
+    let choices = {
+        let mut config = state.config.write().unwrap();
+        let route = &mut config.routes[0];
+        route.protocol = "anthropic".into();
+        route.auth = UpstreamAuth::XApiKey;
+        route.upstream_model = Some("wire-claude".into());
+        let choices = crate::ipc::deepseek_model_choices(&config);
+        assert_eq!(choices.len(), 1);
+        assert!(choices[0].image_input);
+        choices
+    };
+    let root = tempfile::tempdir()?;
+    let outbox = Arc::new(Outbox::open(&root.path().join("events.sqlite"))?);
+    state.desktop_sessions.start(
+        "anthropic-image-test".into(),
+        "device".into(),
+        release.agent,
+        release.version,
+        release.id,
+        "onex-qa".into(),
+        "workspace".into(),
+        outbox,
+    );
+    state.desktop_sessions.set_deepseek_models("anthropic-image-test", &choices);
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let grant: Value = client
+        .post(format!("http://{addr}/v1/onex/desktop/session"))
+        .bearer_auth("anthropic-image-test")
+        .json(&json!({"native_id":"native","records":[],"model":"onex-qa","bind_model":true}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let result = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", grant["model_token"].as_str().unwrap())
+        .json(&json!({
+            "model":"onex-qa", "stream":true, "max_tokens":16,
+            "messages":[{"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAE="}}
+            ]}]
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    assert!(result.contains("verified reply"));
+    let sent = tokio::time::timeout(Duration::from_secs(2), incoming.recv()).await?.unwrap();
+    assert_eq!(sent["messages"][0]["content"][0]["source"]["data"], "AAE=");
+    assert!(tokio::time::timeout(Duration::from_secs(2), usage.recv()).await?.is_some());
     Ok(())
 }
 

@@ -45,7 +45,7 @@ v0.15 的 `config` 可携带平台合约和租户配置修订，字段和兼容�
 | `diag` | `diag_id`、`kind`（`logs`、`status`）、`upload_url` | `logs` 将白名单日志打包，经当前控制连接同源的 `/v1/diag/:id/upload` 上传，使用该连接的设备令牌。`status` 直接回 `diag_result` |
 | `agent_cmd` | `agent`、`action`（`stop`） | 管理指令 |
 
-`routes[].input_capabilities` 可含 `modalities: ["text", "image"]` 和可选 `valid_until`（UTC 时间）。Edge 将缺失或已过期的字段按仅支持文本处理。Server 只对经审核且有有效图片输入证据的 `openai_chat` 路由下发该字段。普通 Provider 路由还须匹配当前活动池中的默认账户、端点、认证方式和原始型号。
+`routes[].input_capabilities` 可含 `modalities: ["text", "image"]` 和可选 `valid_until`（UTC 时间）。Edge 将缺失或已过期的字段按仅支持文本处理。Server 只对经审核且有有效图片输入证据的 `openai_chat` 和 `anthropic` 路由下发该字段。普通 Provider 路由还须匹配当前活动池中的默认账户、端点、协议、认证方式和原始型号。
 
 普通 `config` 可带 `model_limits`，按本帧实际下发的 `model_id` 提供签约型号的 `context_window` 及已登记的 `max_output_tokens`，单位均为 Token。受管 DeepSeek 在启动时按型号读取这些值，输出上限还受显式签发的 `policy.runtime["model.max_output_tokens"]` 约束。字段缺失时才使用客户端默认值。模型参数和额度租约独立处理。
 

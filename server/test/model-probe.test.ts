@@ -25,7 +25,7 @@ test('channel inference tests reserve, charge and replay under one administrator
   let arrived = () => {};
   let release = () => {};
   let status = 200;
-  let mode: 'text' | 'no_text' | 'no_usage' | 'too_many_tokens' | 'model_mismatch' = 'text';
+  let mode: 'text' | 'no_text' | 'no_usage' | 'too_many_tokens' | 'model_mismatch' | 'wrong_image_answer' = 'text';
   let now = Date.parse('2026-11-24T14:00:00Z');
 
   const relay = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
@@ -36,7 +36,19 @@ test('channel inference tests reserve, charge and replay under one administrator
     expect(request.headers.get(path === '/v1/messages' ? 'x-api-key' : 'Authorization')).toBe(path === '/v1/messages' ? secret : 'Bearer ' + secret);
     const input = await request.json() as Record<string, unknown>;
     expect(input).toMatchObject({ model: 'native/model-001', stream: false });
-    if (path === '/v1/responses') expect(input).toMatchObject({ max_output_tokens: 16, store: false, input: 'Reply OK.' });
+    const image = JSON.stringify(input).includes('iVBORw0KGgo');
+    if (image) {
+      expect(JSON.stringify(input)).not.toContain('X7D4Q9');
+      const prompt = 'Read the six characters in the image. Reply with only those characters.';
+      if (path === '/v1/responses') expect(input).toMatchObject({ max_output_tokens: 256, store: false, input: [
+        { role: 'user', content: [{ type: 'input_text', text: prompt }, { type: 'input_image', image_url: expect.stringMatching(/^data:image\/png;base64,/) }] },
+      ] });
+      else expect(input).toMatchObject({ max_tokens: 256, messages: [{ role: 'user', content: [
+        { type: 'text', text: prompt },
+        path === '/v1/messages' ? { type: 'image', source: { type: 'base64', media_type: 'image/png' } } :
+          { type: 'image_url', image_url: { url: expect.stringMatching(/^data:image\/png;base64,/) } },
+      ] }] });
+    } else if (path === '/v1/responses') expect(input).toMatchObject({ max_output_tokens: 16, store: false, input: 'Reply OK.' });
     else {
       expect(['/v1/chat/completions', '/v1/messages']).toContain(path);
       expect(input).toMatchObject({ max_tokens: 16, messages: [{ role: 'user', content: 'Reply OK.' }] });
@@ -51,7 +63,7 @@ test('channel inference tests reserve, charge and replay under one administrator
     arrived();
     if (blocked) await blocked;
     if (status !== 200) return Response.json({ error: secret }, { status });
-    const output = mode === 'no_text' && !noThinking ? '' : 'OK';
+    const output = mode === 'no_text' && !noThinking ? '' : image && mode !== 'wrong_image_answer' ? 'X7D4Q9' : 'OK';
     const tokens = mode === 'too_many_tokens' ? 400 : 10;
     let body;
     if (path === '/v1/messages') body = {
@@ -207,6 +219,24 @@ test('channel inference tests reserve, charge and replay under one administrator
     expect(audit.map(row => JSON.parse(row.detail_json).test_mode)).toEqual([explicit.test_mode, explicit.test_mode]);
     expect(calls).toBe(9);
     expect(noThinkingCalls).toBe(1);
+
+    mode = 'text';
+    const imageTariff = { input_milli_per_mtok: 120_000, output_milli_per_mtok: 120_000, source_reference: 'fixture image tariff' };
+    for (const protocol of ['openai_chat', 'openai_responses', 'anthropic']) {
+      const source = await api('/providers', { name: 'Image ' + protocol, protocol, base_url: upstream + '/v1', secret }, 201);
+      const target = await discover(source);
+      const imagePayload = { catalog_item_id: target.item, input_kind: 'image', test_tariff: imageTariff };
+      expect(await api(target.path + '?catalog_item_id=' + target.item, undefined, 200, second)).toMatchObject({ input_kinds: ['text', 'image'] });
+      const key = 'image-' + protocol;
+      const verified = await api(target.path, imagePayload, 202, second, key);
+      expect(verified).toMatchObject({ status: 'succeeded', input_kind: 'image' });
+      expect(await api(target.path, imagePayload, 202, second, key)).toEqual(verified);
+      await api(target.path, { ...imagePayload, input_kind: 'text' }, 409, second, key);
+      mode = 'wrong_image_answer';
+      expect(await api(target.path, imagePayload, 202, second)).toMatchObject({ status: 'failed', input_kind: 'image', reason_code: 'image_answer_unverified' });
+      mode = 'text';
+    }
+    expect(calls).toBe(15);
   } finally {
     release();
     await app?.close();

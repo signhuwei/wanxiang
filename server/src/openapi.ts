@@ -492,10 +492,11 @@ const testQuotaFields = { user_id: routingId, name: text, period: text, revision
   reserved_milli: sequence, spent_milli: sequence, available_milli: sequence };
 const testTariff = { input_milli_per_mtok: sequence, output_milli_per_mtok: sequence, source_reference: text };
 const testMode = { ...text, enum: ['default', 'chat_template_no_thinking'] };
+const testInputKind = { ...text, enum: ['text', 'image'] };
 const testReconciliationProof = { reason: text, evidence_reference: text };
 const modelTest = object({ id: routingId, discovery_id: routingId, catalog_item_id: routingId, raw_model: text, provider_id: routingId,
   provider_revision: revision, account_id: routingId, endpoint_id: routingId, endpoint_revision: revision,
-  actor_id: routingId, period: text, created_at: timestamp, test_mode: testMode,
+  actor_id: routingId, period: text, created_at: timestamp, test_mode: testMode, input_kind: testInputKind,
   completed_at: nullableTimestamp, status: { enum: ['running','succeeded','failed','pending_reconciliation'] },
   reason_code: nullableText, reserved_milli: sequence, charged_milli: nullable(sequence), usage: nullable(object({
     input_tokens: sequence, output_tokens: sequence, cache_read_tokens: sequence, cache_write_tokens: sequence
@@ -546,9 +547,10 @@ const routingPaths = {
     { name: 'period', in: 'query', schema: { ...text, pattern: '^[0-9]{4}-(0[1-9]|1[0-2])$' } }, ...routingPagination], actions, { period: text }) },
   [channelJobPath + '/model-tests']: {
     get: routingList(modelTest, [channelJobId, ...routingPagination, { name: 'catalog_item_id', in: 'query', schema: routingId }], actions,
-      { requires_tariff: boolean, blocked_reason: nullableText, output_token_limit: revision, test_modes: listItems(testMode) }),
+      { requires_tariff: boolean, blocked_reason: nullableText, output_token_limit: revision, test_modes: listItems(testMode),
+        input_kinds: listItems(testInputKind), image_output_token_limit: revision }),
     post: { security: bearer, parameters: [channelJobId, ...contractIdempotency],
-      requestBody: requestBody(object({ catalog_item_id: routingId, test_tariff: object(testTariff), test_mode: testMode }, ['catalog_item_id'])),
+      requestBody: requestBody(object({ catalog_item_id: routingId, test_tariff: object(testTariff), test_mode: testMode, input_kind: testInputKind }, ['catalog_item_id'])),
       responses: { 202: response('已记录平台管理员的限额推理实测', modelTest), ...status } }
   },
   [channelJobPath + '/model-tests/{test_id}/reconcile']: { post: policyWrite(

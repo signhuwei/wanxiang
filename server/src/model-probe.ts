@@ -14,20 +14,32 @@ const testPath = '/v1/platform/probe-jobs/:job_id/model-tests';
 const timeoutMs = 15_000;
 const interruptedMs = timeoutMs + 5000;
 const maxInput = 256;
+const maxImageInput = 2048;
 const maxOutput = 16;
+const maxImageOutput = 256;
+const testLimits = {
+  text: { input: maxInput, output: maxOutput },
+  image: { input: maxImageInput, output: maxImageOutput },
+};
 const maxReserve = 1_000;
 const prompt = 'Reply OK.';
+const imagePrompt = 'Read the six characters in the image. Reply with only those characters.';
+const imageAnswer = 'X7D4Q9';
+// Monochrome PNG containing imageAnswer, with no text metadata.
+const fixturePng = 'iVBORw0KGgoAAAANSUhEUgAAAMAAAAA4AQAAAACDZsreAAABIklEQVR42u2TPU7DMBiGH7sePADyARDkCBlhoI0EB+EIjEzFQpXaY3AMNsLPAThCYGJMNlcyNkMS5IR2QOpYS16+R+/3+v1si8jmJdmDHYHF+lwcClAo7jsSY4zxub7lgFmYeEJbia2ivZR38MyxSavsZhmYEnDOn5UJMAKMcNCox6vUoxbRH8+W7vLD5+E08dASMryzUlbjHB4KqEY5lIICmj8Bpcb1lfl4JBY+Ab1IQXDUgOr2QCGAEpAyBd5TAStA+IFiioS35sJCyBLgHmgndNKVe68aFN1YB62EwRJ1fL3zxVeRgAqreTFg9Dqzg+RPQAZaWJG2KsFACUpy1OUafTVT//dd/Q55YkekTzhWfF9vaVVsM89zNh93/513CX4ABKZmOtk6UlAAAAAASUVORK5CYII=';
+const imageUrl = 'data:image/png;base64,' + fixturePng;
 const noThinking = 'chat_template_no_thinking';
 type Reader = Pick<Transaction, 'get'>;
 type Status = 'running' | 'succeeded' | 'failed' | 'pending_reconciliation';
 type TestMode = 'default' | typeof noThinking;
+type InputKind = 'text' | 'image';
 type Quota = { user_id: string; name: string; revision: number; limit_milli: number; reserved_milli: number; spent_milli: number };
 type Scope = { discovery_id: string; catalog_item_id: string; raw_model: string; provider_id: string; provider_revision: number;
   account_id: string; endpoint_id: string; endpoint_revision: number };
 type Target = Scope & { protocol: 'openai_chat' | 'openai_responses' | 'anthropic'; auth: 'bearer' | 'x_api_key';
   base_url: string; credential_scope: string; proxy: string | null; secret_ciphertext: Uint8Array };
 type Tariff = RoutingSalesRates & { source_reference: string; source: 'manual' | 'legacy_rate'; effective_from?: string; model_id?: string };
-type Job = Scope & { id: string; actor_id: string; period: string; request_key: string; fingerprint: string; status: Status; test_mode: TestMode;
+type Job = Scope & { id: string; actor_id: string; period: string; request_key: string; fingerprint: string; status: Status; test_mode: TestMode; input_kind: InputKind;
   created_at: string; completed_at: string | null; reason_code: string | null; reserved_milli: number; charged_milli: number | null;
   usage_json: string | null; tariff_json: string; reconciliation_json: string | null };
 type Outcome = { status: Exclude<Status, 'running'>; reason_code: string | null; charged_milli: number | null; usage: RoutingTokenUsage | null };
@@ -108,32 +120,38 @@ function existingTariff(db: Reader, target: Target, at: number): Tariff | null {
   return active ? { ...active, source: 'legacy_rate', source_reference: active.model_id } : null;
 }
 
-function reserveFor(tariff: Tariff) {
+function reserveFor(tariff: Tariff, { input: inputLimit, output: outputLimit }: (typeof testLimits)[InputKind]) {
   const input = Math.max(tariff.input_milli_per_mtok, tariff.cache_read_milli_per_mtok, tariff.cache_write_milli_per_mtok);
-  const amount = Math.max(1, salesCostMilli({ input_tokens: maxInput, output_tokens: maxOutput, cache_read_tokens: 0,
+  const amount = Math.max(1, salesCostMilli({ input_tokens: inputLimit, output_tokens: outputLimit, cache_read_tokens: 0,
     cache_write_tokens: 0 }, { ...tariff, input_milli_per_mtok: input }));
   if (amount > maxReserve) throw conflict('model_test_cost_limit_exceeded');
   return amount;
 }
 
-function requestFor(target: Target, secret: string, mode: TestMode) {
+function requestFor(target: Target, secret: string, mode: TestMode, inputKind: InputKind) {
   const url = new URL(target.base_url);
   const base = url.pathname.replace(/\/+$/, '').replace(/\/v1$/, '');
   const headers = new Headers({ Accept: 'application/json', 'Content-Type': 'application/json' });
   headers.set(target.auth === 'bearer' ? 'Authorization' : 'x-api-key', target.auth === 'bearer' ? 'Bearer ' + secret : secret);
-  const messages = [{ role: 'user', content: prompt }];
+  const testImage = inputKind === 'image';
+  const outputLimit = testLimits[inputKind].output;
+  const chatContent = testImage ? [{ type: 'text', text: imagePrompt }, { type: 'image_url', image_url: { url: imageUrl } }] : prompt;
   const common = { model: target.raw_model, stream: false };
   if (target.protocol === 'anthropic') {
     url.pathname = base + '/v1/messages';
     headers.set('anthropic-version', '2023-06-01');
-    return { url, headers, body: JSON.stringify({ ...common, messages, max_tokens: maxOutput }) };
+    const content = testImage ? [{ type: 'text', text: imagePrompt },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: fixturePng } }] : prompt;
+    return { url, headers, body: JSON.stringify({ ...common, messages: [{ role: 'user', content }], max_tokens: outputLimit }) };
   }
   if (target.protocol === 'openai_responses') {
     url.pathname = base + '/v1/responses';
-    return { url, headers, body: JSON.stringify({ ...common, input: prompt, store: false, max_output_tokens: maxOutput }) };
+    const input = testImage ? [{ role: 'user', content: [{ type: 'input_text', text: imagePrompt },
+      { type: 'input_image', image_url: imageUrl, detail: 'low' }] }] : prompt;
+    return { url, headers, body: JSON.stringify({ ...common, input, store: false, max_output_tokens: outputLimit }) };
   }
   url.pathname = base + '/v1/chat/completions';
-  const body = { ...common, messages, max_tokens: maxOutput, n: 1,
+  const body = { ...common, messages: [{ role: 'user', content: chatContent }], max_tokens: outputLimit, n: 1,
     ...(mode === noThinking && { chat_template_kwargs: { enable_thinking: false } }) };
   return { url, headers, body: JSON.stringify(body) };
 }
@@ -163,21 +181,22 @@ function measured(body: Record<string, unknown>, protocol: Target['protocol']): 
 }
 
 function returnedText(body: Record<string, unknown>, protocol: Target['protocol']) {
-  const nonEmpty = (value: unknown) => typeof value === 'string' && value.trim().length > 0;
+  const asText = (value: unknown) => typeof value === 'string' ? value : '';
   if (protocol === 'openai_chat') {
-    return Array.isArray(body.choices) && body.choices.some(choice => nonEmpty(object(object(choice).message).content));
+    return Array.isArray(body.choices) ? body.choices.map(choice => asText(object(object(choice).message).content)).join('') : '';
   }
-  const textPart = (value: unknown, kind: string) => Array.isArray(value) &&
-    value.some(part => object(part).type === kind && nonEmpty(object(part).text));
+  const textPart = (value: unknown, kind: string) => Array.isArray(value) ?
+    value.map(object).filter(part => part.type === kind).map(part => asText(part.text)).join('') : '';
   if (protocol === 'anthropic') return textPart(body.content, 'text');
-  return Array.isArray(body.output) && body.output.some(row => object(row).type === 'message' && textPart(object(row).content, 'output_text'));
+  return Array.isArray(body.output) ? body.output.map(object).filter(row => row.type === 'message')
+    .map(row => textPart(row.content, 'output_text')).join('') : '';
 }
 
 function pending(reason_code: string, usage: RoutingTokenUsage | null = null): Outcome {
   return { status: 'pending_reconciliation', reason_code, charged_milli: null, usage };
 }
 
-async function execute(target: Target, tariff: Tariff, mode: TestMode, masterKey: Uint8Array, reserved: number,
+async function execute(target: Target, tariff: Tariff, mode: TestMode, inputKind: InputKind, masterKey: Uint8Array, reserved: number,
   send: ProviderModelProbeFetch): Promise<Outcome> {
   const failed = (reason_code: string): Outcome => ({ status: 'failed', reason_code, charged_milli: 0, usage: null });
   let secret: Buffer;
@@ -186,7 +205,7 @@ async function execute(target: Target, tariff: Tariff, mode: TestMode, masterKey
   try {
     const apiKey = secret.toString().trim();
     if (!/^[\x21-\x7e]+$/.test(apiKey)) return failed('missing_credential');
-    const { url, headers, body } = requestFor(target, apiKey, mode);
+    const { url, headers, body } = requestFor(target, apiKey, mode, inputKind);
     const signal = AbortSignal.timeout(timeoutMs);
     const response = await send(url, headers, signal, body);
     if (!response.ok) {
@@ -200,14 +219,16 @@ async function execute(target: Target, tariff: Tariff, mode: TestMode, masterKey
     const usage = measured(data, target.protocol);
     if (!usage) return pending('usage_unavailable');
     const input = usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
-    if (!Number.isSafeInteger(input) || input > maxInput || usage.output_tokens > maxOutput) return pending('usage_outside_limit', usage);
+    const limits = testLimits[inputKind];
+    if (!Number.isSafeInteger(input) || input > limits.input || usage.output_tokens > limits.output) return pending('usage_outside_limit', usage);
     const cost = salesCostMilli(usage, tariff);
     if (cost > reserved) return pending('cost_outside_reservation', usage);
     if (typeof data.model === 'string' && data.model !== target.raw_model) {
       return { status: 'failed', reason_code: 'upstream_model_mismatch', charged_milli: cost, usage };
     }
-    const text = returnedText(data, target.protocol);
-    return { status: text ? 'succeeded' : 'failed', reason_code: text ? null : 'no_text_returned', charged_milli: cost, usage };
+    const text = returnedText(data, target.protocol).trim();
+    const reason = !text ? 'no_text_returned' : inputKind === 'image' && text.toUpperCase() !== imageAnswer ? 'image_answer_unverified' : null;
+    return { status: reason ? 'failed' : 'succeeded', reason_code: reason, charged_milli: cost, usage };
   } catch (error) {
     const reason = error instanceof Error && error.message;
     if (reason === 'destination_denied') return failed(reason);
@@ -313,22 +334,26 @@ export function modelProbeRoutes(app: Hono, store: Store, opts: ManagementOption
         blocked_reason = String(error.detail?.reason ?? error.code);
       }
     }
-    return c.json({ ...page.page(records, count, actions), requires_tariff, blocked_reason, output_token_limit: maxOutput, test_modes });
+    return c.json({ ...page.page(records, count, actions), requires_tariff, blocked_reason, output_token_limit: maxOutput, test_modes,
+      input_kinds: test_modes.length ? ['text', 'image'] : [], image_output_token_limit: maxImageOutput });
   });
 
   app.post(testPath, async c => {
     const at = opts.now();
     const actor = platformActor(store, c, at);
     const discovery = routeId(c.req.param('job_id'), 'job_id');
-    const body = strictObject(await json(c), 'body', ['catalog_item_id', 'test_tariff', 'test_mode']);
+    const body = strictObject(await json(c), 'body', ['catalog_item_id', 'test_tariff', 'test_mode', 'input_kind']);
     const catalogue = routeId(body.catalog_item_id, 'catalog_item_id');
     const custom = parseTariff(body.test_tariff);
     const mode = body.test_mode === undefined ? 'default' : body.test_mode;
     if (mode !== 'default' && mode !== noThinking) invalid('test_mode');
+    const inputKind = body.input_kind === undefined ? 'text' : body.input_kind;
+    if (inputKind !== 'text' && inputKind !== 'image') invalid('input_kind');
     const key = operation(c, opts.codeSecret, at, actor, body).key;
     if (!key) invalid('Idempotency-Key');
     // Match the fingerprint stored before the optional mode was introduced.
-    const fingerprint = digest(mode === 'default' ? [discovery, catalogue, custom] : [discovery, catalogue, custom, mode]);
+    const fingerprint = digest(inputKind === 'image' ? [discovery, catalogue, custom, mode, inputKind] :
+      mode === 'default' ? [discovery, catalogue, custom] : [discovery, catalogue, custom, mode]);
     const period = periodAt(at);
     const master = opts.masterKey;
     if (!master) throw conflict('model_test_key_unavailable');
@@ -343,7 +368,7 @@ export function modelProbeRoutes(app: Hono, store: Store, opts: ManagementOption
       if (mode === noThinking && target.protocol !== 'openai_chat') throw conflict('model_test_mode_unsupported');
       const tariff = custom ?? existingTariff(db, target, at);
       if (!tariff) throw conflict('model_test_price_required');
-      const amount = reserveFor(tariff);
+      const amount = reserveFor(tariff, testLimits[inputKind]);
       const quota = db.get<Quota>(`SELECT ${quotaColumns} ${quotaJoin} WHERE a.user_id=?`, [period, actor])!;
       if (quota.revision === 0) throw conflict('model_test_quota_required');
       if (quota.limit_milli - quota.reserved_milli - quota.spent_milli < amount) throw conflict('model_test_quota_exhausted');
@@ -352,15 +377,15 @@ export function modelProbeRoutes(app: Hono, store: Store, opts: ManagementOption
       const id = `mtest_${ulid()}`;
       db.run('UPDATE platform_model_test_quotas SET reserved_milli=reserved_milli+? WHERE user_id=? AND period=?', [amount, actor, period]);
       db.run(`INSERT INTO platform_model_tests(id,discovery_id,catalog_item_id,raw_model,provider_id,provider_revision,account_id,endpoint_id,endpoint_revision,
-        actor_id,period,request_key,fingerprint,created_at,status,reserved_milli,tariff_json,test_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'running',?,?,?)`,
+        actor_id,period,request_key,fingerprint,created_at,status,reserved_milli,tariff_json,test_mode,input_kind) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'running',?,?,?,?)`,
       [id, discovery, catalogue, target.raw_model, target.provider_id, target.provider_revision, target.account_id, target.endpoint_id,
-        target.endpoint_revision, actor, period, key, fingerprint, iso(at), amount, JSON.stringify(tariff), mode]);
-      audit(db, actor, 'model_test.reserve', id, { period, reserved_milli: amount, test_mode: mode }, at);
+        target.endpoint_revision, actor, period, key, fingerprint, iso(at), amount, JSON.stringify(tariff), mode, inputKind]);
+      audit(db, actor, 'model_test.reserve', id, { period, reserved_milli: amount, test_mode: mode, input_kind: inputKind }, at);
       return { id, target, tariff, amount } as const;
     });
     if ('previous' in prepared) return c.json(jobView(prepared.previous!, at), 202);
     const { id, target, tariff, amount } = prepared;
-    const outcome = await execute(target, tariff, mode, master, amount, opts.providerModelProbeFetch ?? postModelProbeOverHttp);
+    const outcome = await execute(target, tariff, mode, inputKind, master, amount, opts.providerModelProbeFetch ?? postModelProbeOverHttp);
     const finished = opts.now();
     const recorded = await store.system.write(db => {
       const latest = db.get<Job>('SELECT * FROM platform_model_tests WHERE id=?', [id])!;
@@ -370,7 +395,7 @@ export function modelProbeRoutes(app: Hono, store: Store, opts: ManagementOption
       db.run(`UPDATE platform_model_tests SET status=?,reason_code=?,completed_at=?,charged_milli=?,usage_json=? WHERE id=?`,
         [outcome.status, outcome.reason_code, iso(finished), outcome.charged_milli, outcome.usage ? JSON.stringify(outcome.usage) : null, id]);
       audit(db, actor, 'model_test.finish', id, { status: outcome.status, charged_milli: outcome.charged_milli,
-        reason_code: outcome.reason_code, test_mode: mode }, finished);
+        reason_code: outcome.reason_code, test_mode: mode, input_kind: inputKind }, finished);
       return db.get<Job>('SELECT * FROM platform_model_tests WHERE id=?', [id])!;
     });
     return c.json(jobView(recorded, finished), 202);

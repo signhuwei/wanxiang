@@ -54,7 +54,9 @@
 3. HTTP 草稿中的尝试时限同名进入 `route_pool.pools[]`。授权从 `bindings[].aliases` 解析，`routes[].model` 不扩大权限。空绑定是无授权，未被任何绑定引用的可执行路由拒绝。首批能力词为 `text`、`stream`、`function_tools`、`images`、`reasoning`、`json_schema`。调用需要的能力以入口实际请求得出。进入低余额降档只使用新绑定中的已签替代目标。
 4. 所有尝试都能证明未写出时，Server 从 `not_sent` 导出零费用，设备无需添加用量行。可能已执行且完全未知的用量进入待核对。实际产生费用时，步骤、尝试终态和待补传用量必须能按原租约原子落盘或可靠恢复，Server 以历史快照核验归属。跨月或续租时保持同一冻结费率，重复结清不得动账。未完成这些约束不在实际连接启用新能力。
 
-兼容 `openai_chat` 的单条部署可带 [`input_capabilities`](edge-ws.md#server--edge)。它来自该部署修订的有效图片输入证据。附件请求须选用支持对应输入的合格部署。
+兼容 `openai_chat` 或 `anthropic` 的单条部署可带 [`input_capabilities`](edge-ws.md#server--edge)。它来自该部署修订的有效图片输入证据。附件请求须选用支持对应输入的合格部署。
+
+平台管理员可在已拉取的渠道目录中，用 `POST /v1/platform/probe-jobs/:job_id/model-tests` 对精确渠道型号执行 `input_kind: "image"` 实测。服务端发送一张内置合成图，只在上游返回图中的字符并能核对实际用量时记录通过。沿用管理员限额、幂等键和对账流程。实测记录可用作渠道审核依据，模型池发布仍走预览和修订校验。
 
 ## 联验断言
 

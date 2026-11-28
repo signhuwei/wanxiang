@@ -607,7 +607,7 @@ pub(crate) fn project_prompt_documents(
 }
 
 pub(crate) fn accepts_images(route: &onex_core::ws::Route) -> bool {
-    route.protocol == "openai_chat"
+    matches!(route.protocol.as_str(), "openai_chat" | "anthropic")
         && route.input_capabilities.as_ref().is_some_and(|capability| {
             capability.modalities.contains(&onex_core::ws::InputModality::Image)
                 && capability
