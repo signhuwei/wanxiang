@@ -8,6 +8,16 @@
       "../../desktop-ui/index.html",
       "../../desktop-ui/app.css",
       "../../desktop-ui/app.js",
+      "../../desktop-ui/agent-claude-code.png",
+      "../../desktop-ui/agent-claude-desktop.png",
+      "../../desktop-ui/agent-codex-cli.png",
+      "../../desktop-ui/agent-chatgpt-desktop.png",
+      "../../desktop-ui/agent-opencode.png",
+      "../../desktop-ui/agent-pi.svg",
+      "../../desktop-ui/agent-deepseek-harness.png",
+      "../../desktop-ui/agent-kimi-code.png",
+      "../../desktop-ui/agent-workbuddy.png",
+      "../../desktop-ui/agent-zcode.png",
       "../../server/web/theme.css",
       "../../server/web/logo.png"
     ]

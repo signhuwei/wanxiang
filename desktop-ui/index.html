@@ -3,24 +3,44 @@
 <body>
   <header class="app-header">
     <div class="brand"><img class="brand-mark" src="./logo.png" width="32" height="32" alt=""><div><b>OneX <small>Desktop</small></b><span id="desktop-version" hidden></span></div></div>
-    <div class="header-actions"><span id="badge" hidden>模拟模式</span><button id="desktop-update" class="primary" type="button" hidden>有更新</button></div>
-    <nav aria-label="工作区">
-      <button id="home" type="button" aria-current="page"><span class="nav-icon nav-workbench" aria-hidden="true"></span>工作台</button>
-      <button id="messages" type="button" hidden><span class="nav-icon nav-messages" aria-hidden="true"></span><span id="messages-label">消息列表</span></button>
-      <button id="prefs" type="button"><span class="nav-icon nav-settings" aria-hidden="true">⚙</span>设置</button>
-    </nav>
+    <div class="header-actions">
+      <span id="badge" hidden>模拟模式</span><button id="desktop-update" class="primary" type="button" hidden>有更新</button>
+      <div id="account-actions" hidden>
+        <button id="account-toggle" type="button" aria-expanded="false" aria-controls="account-menu">
+          <span id="connection" aria-hidden="true"></span><span id="scope">未登录</span><span class="down-chevron" aria-hidden="true"></span>
+        </button>
+        <div class="surface account-menu" id="account-menu" aria-label="账号与连接" hidden>
+          <p class="account-server"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></svg><span id="account-server"></span></p>
+          <button type="button" id="reconnect"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 4v5h-5M4 20v-5h5M4 10a8 8 0 0 1 13.8-4.8L20 9M4 15l2.2 3.8A8 8 0 0 0 20 14"/></svg>重新连接</button>
+          <button type="button" id="hide-on-close" role="switch" aria-checked="false"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M4 9h16m-11 4 3 3 3-3"/></svg>关闭窗口时隐藏到托盘<span class="account-switch" aria-hidden="true"></span></button>
+          <button type="button" id="logout"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 4H5v16h7m-2-8h11m-4-4 4 4-4 4"/></svg>退出登录</button>
+        </div>
+      </div>
+    </div>
+    <div class="workspace-tabs" id="workspace-tabs" role="tablist" aria-label="客户端页面" hidden>
+      <button type="button" id="workspace-tab" role="tab" aria-selected="true" aria-controls="workspace-panel">启动</button>
+      <button type="button" id="tasks-tab" role="tab" aria-selected="false" aria-controls="tasks-panel" tabindex="-1">工作</button>
+    </div>
   </header>
-  <main>
-    <div class="page-heading"><div><h1 id="title">正在连接本机服务</h1><p id="scope" hidden></p></div><span id="connection" class="connection" hidden></span></div>
-    <p id="notice" role="status" aria-live="polite"></p>
-    <div id="content"></div>
+  <div class="notice-slot"><p id="notice" role="status" aria-live="polite"></p></div>
+  <main id="workbench">
+    <section id="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab">
+      <div class="page-heading" id="page-heading"><h1 id="title">正在连接本机服务</h1></div>
+      <div id="content"></div>
+    </section>
+    <section id="tasks-panel" role="tabpanel" aria-labelledby="tasks-tab" tabindex="0" hidden></section>
   </main>
   <footer class="diagnostics-footer" id="diagnostics-footer" hidden>
-    <details id="diagnostics">
-      <summary aria-label="诊断日志与反馈" title="日志与反馈">....</summary>
-      <div class="diagnostics-body">
-        <div class="feedback-tabs" role="tablist" aria-label="日志与反馈"><button id="logs-tab" role="tab" aria-controls="logs-panel" aria-selected="true">logs</button><button id="issue-tab" role="tab" aria-controls="issue-panel" aria-selected="false">issue</button></div>
-        <section id="logs-panel" role="tabpanel" aria-labelledby="logs-tab">
+    <section class="diagnostics-body" id="diagnostics" aria-label="诊断信息" hidden>
+        <div class="diagnostics-header">
+          <div class="feedback-tabs" role="group" aria-label="诊断信息">
+            <button type="button" id="logs-tab" aria-controls="logs-panel" aria-pressed="true">运行日志</button>
+            <button type="button" id="messages-tab" aria-controls="messages-panel" aria-pressed="false" hidden>消息列表</button>
+            <button type="button" id="issue-tab" aria-controls="issue-panel" aria-pressed="false" hidden>反馈信息</button>
+          </div>
+          <button type="button" id="collapse-diagnostics" aria-label="收起面板"><span class="down-chevron" aria-hidden="true"></span></button>
+        </div>
+        <section id="logs-panel" aria-labelledby="logs-tab">
         <p id="diagnostics-versions" class="diagnostics-versions"></p>
         <div class="diagnostics-controls">
           <label>来源<select id="diagnostics-source"><option value="">全部来源</option><option value="desktop">Desktop</option><option value="daemon">onexd</option></select></label>
@@ -28,9 +48,11 @@
           <label>筛选<input id="diagnostics-query" type="search" placeholder="事件、Agent、版本或错误代码"></label>
         </div>
         <p id="diagnostics-hint" class="diagnostics-hint"></p>
-        <ol id="diagnostics-events" class="diagnostics-events" aria-label="最近诊断日志"></ol>
+        <ol id="diagnostics-events" class="diagnostics-events" aria-label="最近诊断日志" aria-describedby="diagnostics-scroll-hint" tabindex="0"></ol>
+        <p id="diagnostics-scroll-hint" class="diagnostics-scroll-hint" hidden></p>
         </section>
-        <section id="issue-panel" role="tabpanel" aria-labelledby="issue-tab" hidden>
+        <section id="messages-panel" aria-labelledby="messages-tab" hidden></section>
+        <section id="issue-panel" aria-labelledby="issue-tab" hidden>
           <form id="issue-form"><fieldset id="issue-fields">
             <textarea id="issue-text" required maxlength="20000" rows="3" aria-label="反馈内容" placeholder="描述你遇到的问题…"></textarea>
             <label>添加图片 <input id="issue-images" type="file" multiple accept="image/png,image/jpeg,image/webp"></label>
@@ -54,12 +76,14 @@
             <p role="status" id="issue-detail-hint"></p>
           </section>
         </section>
-      </div>
-    </details>
+    </section>
+    <button type="button" id="status-bar" aria-expanded="false" aria-controls="diagnostics">
+      <span id="messages-summary" hidden>消息</span><span id="logs-summary">日志</span><span id="issue-summary" hidden>反馈</span>
+    </button>
   </footer>
   <dialog id="desktop-update-dialog" class="app-dialog" aria-labelledby="desktop-update-title" aria-describedby="desktop-update-description">
     <h2 id="desktop-update-title">重启更新 OneX Desktop</h2>
-    <p id="desktop-update-description">将更新到 <strong id="desktop-update-version"></strong>，然后重新打开 OneX Desktop。已启动的 Agent 会继续运行，重启后仍可在工作台管理。</p>
+    <p id="desktop-update-description">将更新到 <strong id="desktop-update-version"></strong>，然后重新打开 OneX Desktop。已启动的 Agent 会继续运行，重启后仍可在客户端管理。</p>
     <div class="dialog-actions"><button id="cancel-desktop-update" type="button" autofocus>取消</button><button id="confirm-desktop-update" class="primary" type="button">重启更新</button></div>
   </dialog>
   <dialog id="reconnect-dialog" class="app-dialog" aria-labelledby="reconnect-title" aria-describedby="reconnect-description">

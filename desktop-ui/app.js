@@ -13,7 +13,7 @@ showVersion(installedVersion)
 const demo=mock&&!invoke
 const call=invoke ? request=>invoke('desktop_call',{request}) : demo ? (await import('./mock.js')).makeMock() : null
 $('badge').hidden=!demo
-let state,busy=false,activeTab='workbench',last='',serial=0,pendingLaunch
+let state,busy=false,last='',serial=0,pendingLaunch,reconnecting=false
 const seenNotices=new Set()
 const messages={unauthenticated:'登录凭据无效或已过期',forbidden:'没有权限执行此操作',not_found:'对象不存在',conflict:'状态已变化，请刷新后重试',device_already_logged_in:'本机 OneX 已登录。请用同一租户和账号登录，或先用 OneX 命令行退出。',agents_running:'请先关闭已启动的 OneX Agent',history_unavailable:'暂时无法恢复当前账号的本机会话',invalid:'请检查输入内容',seat_limit:'租户人数已达合约上限',balance_exhausted:'橡皮余额不足',lease_expired:'额度租约已过期',agent_not_allowed:'合约不允许该 Agent',model_not_allowed:'合约不允许该模型',rate_limited:'请求过快，请稍后重试',upstream_error:'上游服务出错',update_unavailable:'当前更新已不可用，请稍后重试',update_failed:'Desktop 更新失败，请重试',internal:'服务内部错误'}
 Object.assign(messages,{cwd_required:'请选择可访问的工作目录',terminal_unavailable:'无法启动系统终端，请检查 OneX CLI 安装或查看诊断日志',
@@ -23,6 +23,12 @@ const labels={update_available:'有可用更新',available:'可启动',not_downl
 const agentTones={running:'good',available:'good',update_available:'attention',downloading:'attention',verifying:'attention',starting:'attention',policy_pending:'attention',failed:'error',download_failed:'error'}
 const launchBlockLabels={daemon_update_pending:'等待后台更新',launch_in_progress:'等待当前启动完成'}
 const agentMarks={claude:'C',codex:'›_',kimi:'K',deepseek:'D',workbuddy:'W'}
+const agentIcons={
+  'claude-code':'agent-claude-code.png','claude-desktop':'agent-claude-desktop.png',
+  codex:'agent-codex-cli.png','codex-desktop':'agent-codex-cli.png','chatgpt-desktop':'agent-chatgpt-desktop.png',
+  opencode:'agent-opencode.png',pi:'agent-pi.svg','deepseek-desktop':'agent-deepseek-harness.png',
+  'kimi-code':'agent-kimi-code.png',workbuddy:'agent-workbuddy.png',zcode:'agent-zcode.png'
+}
 const updateLabels={available:'有更新',downloading:'下载更新中',installing:'安装更新中',failed:'重试更新',
   waiting_for_agents:'等待 Agent 退出',updating_components:'正在更新 CLI 和后台服务',components_failed:'组件更新未完成',
   restarting_daemon:'正在切换后台服务',daemon_restart_required:'后台服务待重启'}
@@ -44,9 +50,9 @@ async function act(request,message=''){
   if(!call||busy)return
   if(pendingLaunch){showNotice('请等待当前 Agent 启动完成');return}
   busy=true;serial++; const pane=$('content');pane.inert=true
-  const reconnecting=request.op==='reconnect'
+  reconnecting=request.op==='reconnect'
   let confirmReconnect=false
-  if(reconnecting)showNotice('正在重新连接…')
+  if(reconnecting){paintAccount();showNotice('正在重新连接…')}
   try{
     const r=await call(request)
     if(!r.ok){
@@ -55,15 +61,17 @@ async function act(request,message=''){
       return
     }
     bindState(r.state)
-    if(request.op==='logout')activeTab='workbench'
     paint()
     showNotice(message)
   }catch{
     showNotice(reconnecting?errorText('reconnect_failed'):'本机服务暂不可用，请稍后重试',true)
   }finally{
     pane.inert=false;busy=false
+    const wasReconnecting=reconnecting
+    reconnecting=false
+    paintAccount()
     if(confirmReconnect)openReconnectDialog()
-    else if(reconnecting)$('reconnect')?.focus()
+    else if(wasReconnecting)accountToggle.focus()
     refreshDiagnostics()
   }
 }
@@ -80,7 +88,7 @@ function openReconnectDialog() {
 function closeReconnectDialog() {
   if (typeof reconnectDialog.close==='function') reconnectDialog.close()
   else reconnectDialog.removeAttribute('open')
-  $('reconnect')?.focus()
+  accountToggle.focus()
 }
 
 async function launchAgent(agent) {
@@ -149,47 +157,55 @@ function paintLogin(content) {
   }
 }
 
-function paintSettings(content) {
-  $('title').textContent='设置'
-  const panel=styled('div','surface form-surface')
-  const facts=styled('div','settings-facts')
-  facts.append(node('p','Desktop 版本：'+(state.version||'未知')),node('p','服务地址：'+state.settings.server_origin))
-  const toggle=styled('label','setting-toggle'),checkbox=node('input')
-  checkbox.type='checkbox'
-  checkbox.checked=state.settings.hide_on_close
-  toggle.append(checkbox,'关闭窗口时隐藏到托盘')
-  const actions=styled('div','form-actions')
-  actions.append(button('保存设置',()=>act({op:'settings',hide_on_close:checkbox.checked},'设置已保存'),true))
-  const reconnect=button('重新连接',()=>act({op:'reconnect'},'已重新连接'))
-  reconnect.id='reconnect'
-  actions.append(reconnect)
-  if (state.phase!=='signed_out') {
-    const logout=button('退出登录',()=>act({op:'logout'}))
-    logout.classList.add('danger')
-    actions.append(logout)
+const accountToggle=$('account-toggle')
+const accountMenu=$('account-menu')
+function setAccountMenu(open,focus=false) {
+  accountMenu.hidden=!open
+  accountToggle.setAttribute('aria-expanded',String(open))
+  if(focus)accountToggle.focus()
+}
+function paintAccount() {
+  if(!state)return
+  const scope=[state.tenant?.name,state.user?.name].filter(Boolean).join(' · ')||'未登录'
+  const connection=reconnecting?'连接中':({connected:'已连接',connecting:'连接中',backoff:'断线重连中'}[state.connection]||'未连接')
+  $('account-actions').hidden=false
+  $('scope').textContent=scope
+  $('connection').dataset.connected=String(connection==='已连接')
+  accountToggle.setAttribute('aria-label',connection+' · '+scope)
+  $('account-server').textContent=state.settings?.server_origin??''
+  $('hide-on-close').setAttribute('aria-checked',String(!!state.settings?.hide_on_close))
+  $('logout').hidden=state.phase==='signed_out'
+}
+accountToggle.onclick=()=>setAccountMenu(accountMenu.hidden)
+document.addEventListener('click',event=>{
+  if(!accountMenu.hidden&&!$('account-actions').contains(event.target))setAccountMenu(false)
+})
+document.addEventListener('keydown',event=>{
+  if(event.key==='Escape'&&!accountMenu.hidden){
+    event.preventDefault()
+    setAccountMenu(false,true)
   }
-  panel.append(facts,toggle,actions)
-  content.append(panel)
+})
+$('hide-on-close').onclick=()=>act({op:'settings',hide_on_close:!state.settings.hide_on_close},'设置已保存')
+$('reconnect').onclick=()=>{
+  setAccountMenu(false,true)
+  act({op:'reconnect'},'已重新连接')
+}
+$('logout').onclick=()=>{
+  setAccountMenu(false,true)
+  act({op:'logout'})
 }
 
 function paint(){
   if (!installedVersion) showVersion(state.version)
   paintUpdate()
+  paintAccount()
+  paintWorkspaceTabs()
+  paintStatusBar()
+  renderMessages()
   const c=$('content')
   c.replaceChildren()
-  const scope=$('scope'),connection=$('connection')
-  scope.textContent=[state.tenant?.name,state.user?.name].filter(Boolean).join(' · ')
-  scope.hidden=!scope.textContent
-  connection.hidden=state.phase!=='ready'
-  connection.textContent=({connected:'已连接',connecting:'连接中',backoff:'断线重连中',idle:'未连接'}[state.connection]||'未连接')
-  connection.dataset.tone=state.connection==='connected'?'good':state.connection==='connecting'||state.connection==='backoff'?'attention':'neutral'
-  $('messages').hidden=state.phase!=='ready'
-  const unread=(state.notices??[]).filter(notice=>!seenNotices.has(notice.id)).length
-  $('messages-label').textContent=unread?`消息列表（${unread}）`:'消息列表'
-  for (const [id,tab] of [['home','workbench'],['messages','messages'],['prefs','settings']]) {
-    $(id).setAttribute('aria-current',activeTab===tab?'page':'false')
-  }
-  if(activeTab==='settings') { paintSettings(c);return }
+  $('page-heading').hidden=state.phase==='ready'
   if(state.phase==='signed_out'){
     paintLogin(c)
     return
@@ -202,11 +218,7 @@ function paint(){
     c.append(list)
     return
   }
-  if (activeTab==='messages') {
-    paintMessages(c)
-  } else {
-    paintWorkbench(c)
-  }
+  paintWorkbench(c)
 }
 
 function canInstallUpdate(update) {
@@ -220,8 +232,8 @@ function paintUpdate() {
   updateButton.disabled=!!pendingLaunch||!canInstallUpdate(update)
   updateButton.title={
     components_failed:'重新打开 Desktop 后重试组件切换',
-    waiting_for_agents:'Agent 退出后会自动切换，也可以在设置中手动重新连接',
-    daemon_restart_required:'可在设置中重新连接后台服务'
+    waiting_for_agents:'Agent 退出后会自动切换，也可以从右上角菜单重新连接',
+    daemon_restart_required:'可从右上角菜单重新连接后台服务'
   }[update.phase]??`目标版本 ${update.version}`
   updateButton.textContent=updateLabels[update.phase]
   if (update.phase==='downloading'&&update.total_bytes>0&&Number.isFinite(update.downloaded_bytes)) {
@@ -266,15 +278,6 @@ async function installUpdate() {
   }
 }
 
-function policyValue(item) {
-  const value=item.value
-  if (item.kind==='money_milli') return metricFormat.format(value/1000)+' 块'
-  if (item.kind==='ratio_ppm') return metricFormat.format(value/1000000)+' 倍'
-  if (item.kind==='boolean') return value?'开启':'关闭'
-  if (Array.isArray(value)) return value.join('、')||'无授权'
-  return String(value)
-}
-
 function paintUsage(content,usage) {
   const panel=styled('section','usage-panel')
   const heading=styled('h2','section-title','本机本次运行')
@@ -298,8 +301,14 @@ function paintAgent(agent) {
   const launchBlock=Object.hasOwn(launchBlockLabels,agent.launch_blocked)?launchBlockLabels[agent.launch_blocked]:null
   const canLaunch=agent.status!=='update_available'&&!launchBlock&&agent.actions?.includes('launch')
   const family=agent.id.split('-')[0]
-  const mark=styled('span','agent-mark',Object.hasOwn(agentMarks,family)?agentMarks[family]:'AI')
-  mark.dataset.mark=family
+  const icon=Object.hasOwn(agentIcons,agent.id)?agentIcons[agent.id]:null
+  const mark=icon?styled('img','agent-mark agent-icon'):
+    styled('span','agent-mark',Object.hasOwn(agentMarks,family)?agentMarks[family]:'AI')
+  if(icon){
+    mark.src='./'+icon
+    mark.alt=''
+    mark.width=mark.height=31
+  }else mark.dataset.mark=family
   mark.setAttribute('aria-hidden','true')
   const identity=styled('div','agent-copy'),name=styled('div','agent-name'),meta=styled('div','agent-meta')
   name.append(node('strong',agent.name))
@@ -364,20 +373,10 @@ function paintAgent(agent) {
 }
 
 function paintWorkbench(content) {
-  $('title').textContent='工作台'
   if (state.local_usage) paintUsage(content,state.local_usage)
   if (state.policy_pending) content.append(styled('p','inline-notice','等待设备策略同步，受管启动暂时不可用。'))
-  if (state.policy) {
-    const details=styled('details','policy-panel'), facts=node('dl')
-    details.append(node('summary','能力配置 · v'+state.policy.policy_revision))
-    for (const item of state.policy.display??[]) facts.append(node('dt',item.title),node('dd',policyValue(item)))
-    details.append(facts)
-    content.append(details)
-  }
-  const launch=styled('section','launch-panel'),heading=node('h2','启动区')
-  heading.id='launch-heading'
-  launch.setAttribute('aria-labelledby',heading.id)
-  launch.append(heading)
+  const launch=styled('section','launch-panel')
+  launch.setAttribute('aria-label','Agent')
   content.append(launch)
   if (!state.agents.length) {
     launch.append(styled('p','empty-state','尚无获准的 Agent。请等待配置同步或联系管理员。'))
@@ -400,15 +399,21 @@ function paintWorkbench(content) {
   launch.append(catalog)
 }
 
-function paintMessages(content) {
-  $('title').textContent='消息列表'
-  if (!state.notices?.length) {
+function renderMessages() {
+  if (diagnostics.hidden||selectedSection!=='messages'||state?.phase!=='ready') return
+  const notices=state.notices??[]
+  const serialized=JSON.stringify(notices)
+  if (messageRows===serialized) return
+  messageRows=serialized
+  const content=$('messages-panel')
+  content.replaceChildren()
+  if (!notices.length) {
     content.append(styled('p','empty-state','暂无配置变更消息。'))
     return
   }
   const list=node('ul')
   list.className='notice-list'
-  for (const notice of state.notices) {
+  for (const notice of notices) {
     const entry=node('li')
     const date=new Date(notice.at)
     const timestamp=Number.isNaN(date.getTime())?'':date.toLocaleString('zh-CN')
@@ -418,7 +423,90 @@ function paintMessages(content) {
   content.append(list)
 }
 
+const workspaceTabs=['workspace','tasks']
+let selectedWorkspace='workspace'
+function paintWorkspaceTabs() {
+  $('workspace-tabs').hidden=state?.phase!=='ready'
+  for (const name of workspaceTabs) {
+    const tab=$(name+'-tab'),selected=selectedWorkspace===name
+    tab.setAttribute('aria-selected',String(selected))
+    tab.tabIndex=selected?0:-1
+    $(name+'-panel').hidden=!selected
+  }
+}
+function selectWorkspace(name) {
+  selectedWorkspace=name
+  setDiagnosticsOpen(false)
+  paintWorkspaceTabs()
+  $(name+'-tab').focus()
+}
+for (const name of workspaceTabs) $(name+'-tab').onclick=()=>selectWorkspace(name)
+$('workspace-tabs').onkeydown=event=>{
+  const sibling=workspaceTabs.find(name=>name!==selectedWorkspace)
+  const target=({ArrowLeft:sibling,ArrowRight:sibling,Home:'workspace',End:'tasks'})[event.key]
+  if(!target)return
+  event.preventDefault()
+  selectWorkspace(target)
+}
+
 const diagnostics=$('diagnostics')
+const statusBar=$('status-bar')
+const collapseDiagnostics=$('collapse-diagnostics')
+const diagnosticsTabs=['logs','messages','issue']
+let selectedSection='logs',messageRows
+function paintStatusBar() {
+  const signedIn=state?.phase==='ready'
+  $('messages-summary').hidden=$('issue-summary').hidden=!signedIn
+  const unread=(state?.notices??[]).filter(notice=>!seenNotices.has(notice.id)).length
+  $('messages-summary').textContent='消息 '+unread+' 未读'
+  const entries=diagnosticData?.entries
+  const warnings=entries?.filter(entry=>entry.level==='warn').length
+  const errors=entries?.filter(entry=>entry.level==='error').length
+  $('logs-summary').textContent=entries?'日志 '+warnings+' 警告'+(errors?' · '+errors+' 错误':''):'日志'
+  $('logs-summary').dataset.tone=errors?'error':warnings?'attention':'neutral'
+  const openIssues=[...issueRows.values()].filter(row=>['open','in_progress'].includes(row.item.status)).length
+  $('issue-summary').textContent=issuesLoaded&&!issueCursor?'反馈 '+openIssues+' 待跟进':'反馈'
+}
+function readNotices() {
+  for (const notice of state?.notices??[]) seenNotices.add(notice.id)
+}
+function selectDiagnostics(section) {
+  selectedSection=state?.phase!=='ready'&&section!=='logs'?'logs':section
+  for (const name of diagnosticsTabs) {
+    const tab=$(name+'-tab')
+    tab.hidden=name!=='logs'&&state?.phase!=='ready'
+    tab.setAttribute('aria-pressed',String(name===selectedSection))
+    $(name+'-panel').hidden=name!==selectedSection
+  }
+  if (selectedSection==='messages'&&!diagnostics.hidden) readNotices()
+  renderMessages()
+  paintStatusBar()
+  if (diagnostics.hidden) return
+  if (selectedSection==='issue') refreshIssues()
+  else if (selectedSection==='logs') {paintDiagnostics();refreshDiagnostics()}
+}
+function setDiagnosticsOpen(open) {
+  diagnostics.hidden=!open
+  $('workbench').hidden=open
+  document.body.classList.toggle('diagnostics-open',open)
+  statusBar.setAttribute('aria-expanded',String(open))
+  statusBar.disabled=open
+  if(open)selectDiagnostics(selectedSection)
+}
+statusBar.onclick=()=>{
+  const showErrors=diagnosticData?.entries.some(entry=>entry.level==='error')
+  if(showErrors){
+    selectedSection='logs'
+    $('diagnostics-source').value=''
+    $('diagnostics-level').value='error'
+    $('diagnostics-query').value=''
+  }
+  setDiagnosticsOpen(true)
+  if(showErrors)$('diagnostics-events').scrollTop=0
+  collapseDiagnostics.focus()
+}
+collapseDiagnostics.onclick=()=>{setDiagnosticsOpen(false);statusBar.focus()}
+for (const name of diagnosticsTabs) $(name+'-tab').onclick=()=>selectDiagnostics(name)
 const diagnosticSources={desktop:'Desktop',daemon:'onexd'}
 const diagnosticLevels={info:'信息',warn:'警告',error:'错误'}
 const diagnosticEvents={
@@ -456,11 +544,15 @@ const safeDiagnosticModel=model=>typeof model==='string'&&model.length<=128&&/^[
 const diagnosticCount=value=>Number.isSafeInteger(value)&&value>=0?value:null
 const diagnosticBlocks=value=>diagnosticCount(value)==null?null:metricFormat.format(value/1000)+' 块'
 const lookup=(dictionary,key)=>typeof key==='string'&&Object.hasOwn(dictionary,key)?dictionary[key]:null
+function visibleDiagnostic(entry) {
+  return entry&&lookup(diagnosticSources,entry.source)&&lookup(diagnosticLevels,entry.level)&&
+    lookup(diagnosticEvents,entry.event)&&Number.isFinite(entry.at_ms)&&Number.isFinite(new Date(entry.at_ms).getTime())
+}
 let diagnosticData,diagnosticsTicket=0,diagnosticsPending=false,diagnosticsError=false,diagnosticRows=new Map()
 
 const issueStatuses={open:'待处理',in_progress:'处理中',resolved:'已解决',closed:'已关闭'}
 let issueEpoch=0,issueCursor=null,historyTicket=0,loadingIssues=false,expandedHistory=false
-let selectedIssue
+let selectedIssue,issuesLoaded=false
 const issueRows=new Map()
 function issueErrorText(code) {
   if(code==='issue_update_required')return '当前后台版本不支持反馈，请先完成更新'
@@ -471,11 +563,11 @@ function issueErrorText(code) {
 function resetIssues() {
   issueEpoch++; historyTicket++; issueCursor=null; loadingIssues=false; expandedHistory=false
   issueRows.clear()
+  issuesLoaded=false
   closeIssue(false)
   $('issue-form').reset(); $('issue-history').replaceChildren(); $('issue-more').hidden=true
   $('issue-fields').disabled=state?.phase!=='ready'
   $('issue-status').textContent=$('issue-fields').disabled?'登录后可提交和查看反馈':''
-  if(diagnostics.open&&!$('issue-panel').hidden) loadIssues()
 }
 async function loadIssues(more=false,background=false,reset=false) {
   if(state?.phase!=='ready'||(loadingIssues&&!reset))return
@@ -499,6 +591,8 @@ async function loadIssues(more=false,background=false,reset=false) {
     if(more||!expandedHistory)issueCursor=r.issues.next_cursor
     if(more)expandedHistory=true
     $('issue-more').hidden=!issueCursor
+    issuesLoaded=true
+    paintStatusBar()
   }catch{if(ticket===historyTicket&&!background)$('issue-status').textContent='反馈记录加载失败，请查看诊断日志'}
   finally{if(ticket===historyTicket)loadingIssues=$('issue-more').disabled=false}
 }
@@ -554,6 +648,7 @@ async function loadIssue(older=false,background=false,force=false) {
     if(!older){
       detail.item=item
       paintIssueRow(item)
+      paintStatusBar()
       $('issue-current-status').textContent=lookup(issueStatuses,item.status)
       $('issue-original').textContent=item.text
       $('issue-comment').hidden=!item.actions.includes('comment')
@@ -602,18 +697,11 @@ $('issue-comment').onsubmit=async event=>{
   finally{if(detail===selectedIssue)detail.sending=$('issue-comment-text').disabled=$('issue-comment-send').disabled=false}
 }
 function refreshIssues(background=false) {
-  if(diagnostics.open&&!$('issue-panel').hidden&&!document.hidden) {
-    if(selectedIssue)loadIssue(false,background)
-    else loadIssues(false,background)
-  }
+  if(!call||document.hidden||state?.phase!=='ready')return
+  if(!diagnostics.hidden&&selectedSection==='issue'&&selectedIssue)loadIssue(false,background)
+  else if(background||(!diagnostics.hidden&&selectedSection==='issue'))loadIssues(false,background)
 }
 $('issue-more').onclick=()=>loadIssues(true)
-function selectFooter(issue){
-  $('issue-panel').hidden=!issue; $('logs-panel').hidden=issue
-  $('logs-tab').setAttribute('aria-selected',String(!issue)); $('issue-tab').setAttribute('aria-selected',String(issue))
-  if(issue)refreshIssues();else refreshDiagnostics()
-}
-$('logs-tab').onclick=()=>selectFooter(false); $('issue-tab').onclick=()=>selectFooter(true)
 $('issue-form').onsubmit=async event=>{
   event.preventDefault(); if($('issue-fields').disabled||state?.phase!=='ready')return
   const epoch=issueEpoch,text=$('issue-text').value.trim(),files=Array.from($('issue-images').files),include_logs=$('issue-logs').checked
@@ -655,9 +743,21 @@ function diagnosticDetails(event, fields) {
   return details
 }
 
+const logEntries=$('diagnostics-events')
+const logScrollHint=$('diagnostics-scroll-hint')
+function updateLogScrollHint() {
+  const {scrollHeight,clientHeight,scrollTop}=logEntries
+  logScrollHint.hidden=clientHeight===0||scrollHeight<=clientHeight+1
+  if(!logScrollHint.hidden)logScrollHint.textContent=scrollTop+clientHeight<scrollHeight-1
+    ?'向下滚动查看更多日志':'向上滚动查看更多日志'
+}
+logEntries.addEventListener('scroll',updateLogScrollHint,{passive:true})
+logEntries.addEventListener('toggle',updateLogScrollHint,true)
+new ResizeObserver(updateLogScrollHint).observe(logEntries)
+
 function paintDiagnostics() {
-  if (!diagnostics.open) return
-  const entries=$('diagnostics-events'),hint=$('diagnostics-hint')
+  if (diagnostics.hidden||selectedSection!=='logs') return
+  const entries=logEntries,hint=$('diagnostics-hint')
   const desktop=safeVersion(diagnosticData?.desktop_version)??safeVersion(installedVersion??state?.version)??'—'
   const daemon=safeVersion(diagnosticData?.daemon_version)??'—'
   $('diagnostics-versions').textContent=`Desktop ${desktop} · onexd ${daemon} · 本地时间`
@@ -667,7 +767,6 @@ function paintDiagnostics() {
   for (const entry of diagnosticData?.entries??[]) {
     const source=lookup(diagnosticSources,entry.source),level=lookup(diagnosticLevels,entry.level),event=lookup(diagnosticEvents,entry.event)
     const time=new Date(entry.at_ms)
-    if (!source||!level||!event||!Number.isFinite(time.getTime())) continue
     const agent=lookup(diagnosticAgents,entry.agent),error=lookup(diagnosticCodes,entry.code)??lookup(messages,entry.code)
     const component=diagnosticComponents.has(entry.component)?entry.component:null
     const stage=diagnosticStages.has(entry.stage)?entry.stage:null
@@ -713,23 +812,26 @@ function paintDiagnostics() {
   entries.scrollTop=scroll
   hint.textContent=diagnosticsError?'暂时无法读取诊断日志。':!diagnosticData?'正在读取诊断日志…':rows.length?'':query||sourceFilter||levelFilter?'没有匹配的日志。':'当前没有诊断记录。'
   hint.hidden=!hint.textContent
+  updateLogScrollHint()
 }
 
 async function refreshDiagnostics() {
-  if (!call||!diagnostics.open||$('logs-panel').hidden||diagnosticsPending||document.hidden) return
+  if (!call||diagnosticsPending||document.hidden) return
   diagnosticsPending=true
   const ticket=diagnosticsTicket
   try {
     const reply=await call({op:'diagnostics'})
     if (ticket!==diagnosticsTicket) return
     diagnosticsError=!reply.ok||!Array.isArray(reply.diagnostics?.entries)
-    if (!diagnosticsError) diagnosticData=reply.diagnostics
+    if (!diagnosticsError) {
+      diagnosticData={...reply.diagnostics,entries:reply.diagnostics.entries.filter(visibleDiagnostic)}
+    }
   } catch {
     if (ticket===diagnosticsTicket) diagnosticsError=true
   } finally {
     diagnosticsPending=false
     if (ticket!==diagnosticsTicket) refreshDiagnostics()
-    else paintDiagnostics()
+    else {paintStatusBar();paintDiagnostics()}
   }
 }
 
@@ -745,9 +847,16 @@ function bindState(next) {
     }
   }
   if (changedScope) {
+    selectedWorkspace='workspace'
     seenNotices.clear()
+    messageRows=undefined
+    $('messages-panel').replaceChildren()
+    setDiagnosticsOpen(false)
     clearDiagnostics()
     resetIssues()
+    selectDiagnostics('logs')
+    refreshDiagnostics()
+    refreshIssues(true)
   }
 }
 
@@ -763,33 +872,15 @@ async function refresh() {
     }
     const serialized=JSON.stringify(response.state)
     if (last!==serialized) {
-      const previousIds=new Set(state?.notices?.map(notice=>notice.id))
-      const latest=response.state.notices?.find(notice=>!previousIds.has(notice.id))
       bindState(response.state)
-      if (activeTab==='messages') {
-        for (const notice of (response.state.notices??[])) seenNotices.add(notice.id)
-      }
+      if(!diagnostics.hidden&&selectedSection==='messages')readNotices()
       paint()
-      if (latest && activeTab!=='messages'&&!pendingLaunch) showNotice(latest.title)
     }
   } catch {
     if (seq===serial&&!pendingLaunch) showNotice('无法读取本机状态，请检查 OneX 服务。',true)
   }
 }
 
-function openTab(tab) {
-  if (!state||busy) return
-  activeTab=tab
-  if (!pendingLaunch) showNotice()
-  if (tab==='messages') {
-    for (const notice of (state.notices??[])) seenNotices.add(notice.id)
-  }
-  paint()
-}
-
-$('home').onclick=()=>openTab('workbench')
-$('messages').onclick=()=>openTab('messages')
-$('prefs').onclick=()=>openTab('settings')
 updateButton.onclick=openUpdateDialog
 $('cancel-desktop-update').onclick=closeUpdateDialog
 $('confirm-desktop-update').onclick=installUpdate
@@ -808,13 +899,15 @@ updateDialog.onkeydown=event=>{
     closeUpdateDialog()
   }
 }
-diagnostics.ontoggle=()=>{if(diagnostics.open){paintDiagnostics();if($('issue-panel').hidden)refreshDiagnostics();else refreshIssues()}}
 for (const id of ['diagnostics-source','diagnostics-level','diagnostics-query']) $(id).oninput=paintDiagnostics
 if(!call){$('title').textContent='未连接桌面服务';$('content').append(styled('p','empty-state','请从 OneX Desktop 打开；浏览器演示请显式使用 ?mock=1。'))}else{
   $('diagnostics-footer').hidden=false
   await refresh()
-  const poll=()=>{refresh();refreshDiagnostics()}
-  setInterval(poll,2000)
-  setInterval(()=>refreshIssues(true),15000)
-  document.addEventListener('visibilitychange',()=>{poll();refreshIssues(true)})
+  setInterval(()=>{
+    refresh()
+    if(!diagnostics.hidden&&selectedSection==='logs')refreshDiagnostics()
+  },2000)
+  const refreshSummaries=()=>{refreshDiagnostics();refreshIssues(true)}
+  setInterval(refreshSummaries,15000)
+  document.addEventListener('visibilitychange',()=>{refresh();refreshSummaries()})
 }
